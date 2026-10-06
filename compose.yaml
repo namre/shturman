@@ -1,0 +1,31 @@
+# «Штурман» — эталонный стек. Сейчас в нём только стоковый Hermes;
+# сервис переписки и база добавятся, когда появятся (см. docs/deployment.md).
+#
+# Запускать через ./ops/up.sh — он подставляет владельца каталога данных.
+# Локальные изменения — в compose.override.yaml и .env, этот файл на сервере не править.
+
+name: shturman
+
+services:
+  hermes:
+    # Официальный образ без изменений. Версию владелец может поднять сам: HERMES_VERSION в .env.
+    image: nousresearch/hermes-agent:${HERMES_VERSION:-v2026.9.24}
+    container_name: shturman-hermes
+    restart: unless-stopped
+    command: gateway run
+    # Как в официальном compose Hermes: сеть хоста, дашборд слушает только локальный адрес.
+    # Наружу его отдаёт прокси с аутентификацией (docs/setup.md). Порты здесь не публикуются.
+    network_mode: host
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: 127.0.0.1
+      HERMES_DASHBOARD_PORT: "9119"
+    volumes:
+      - ./data/hermes:/opt/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

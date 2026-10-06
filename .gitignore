@@ -1,6 +1,7 @@
 .env
 compose.override.yaml
 local/
+data/
 *.session
 *.session-journal
 __pycache__/

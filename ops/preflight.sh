@@ -76,7 +76,7 @@ if [ -f .env ]; then
   perms="$(stat -c '%a' .env 2>/dev/null || echo '?')"
   if [ "$perms" = "600" ]; then pass env "есть, права 600"; else warn env "есть, права $perms — должно быть 600"; fi
 else
-  warn env "нет файла .env — запустите ./ops/init-env.sh (это делает человек, не агент)"
+  warn env "нет файла .env — запустите ./ops/init-env.sh --auto"
 fi
 
 echo
