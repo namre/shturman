@@ -10,9 +10,9 @@
   POST /api/tg/accounts/{id}/logout              выйти: сессия завершается, файл удаляется
   POST /api/tg/accounts/{id}/pause               поставить на паузу
   POST /api/tg/accounts/{id}/resume              снять с паузы
-  PUT  /api/tg/accounts/{id}/options             {auto_personal?, auto_groups?}
+  PUT  /api/tg/accounts/{id}/options             {auto_personal?, auto_groups?, backfill_months?}
   GET  /api/tg/accounts/{id}/dialogs             чаты для экрана выбора: ?offset&limit&type&refresh
-  POST /api/tg/accounts/{id}/sync                включить/выключить: {enabled, chats? | types?}
+  POST /api/tg/accounts/{id}/sync                включить/выключить: {enabled, chats? | types?, since?}
   GET  /api/tg/accounts/{id}/sync                состояние синхронизации: счётчики и курсоры
 
 Секретов в ответах нет. QR-код и ссылка входа отдаются только пока код ждёт сканирования;
@@ -22,18 +22,50 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
+from .. import bridge
 from ..api_core import BadRequest, body, handler, need_str
 from ..app import AppState, state_of
-from . import gateway, normalize
-from .manager import TgError, TgManager
+from . import gateway, normalize, sync
+from .manager import KEEP, TgError, TgManager
 
 PEER_CLASSES = ("user", "chat", "channel")
+
+# Работающий модуль — для событий, которые приходят не через состояние сервиса.
+_active: TgManager | None = None
+
+
+@bridge.on_owner_change
+async def _owner_changed(conn: Any, new_user_id: int) -> None:
+    if _active is not None:
+        await _active.owner_changed(conn, new_user_id)
+
+
+def _since(data: dict[str, Any]) -> Any:
+    """Граница загрузки истории: поля нет — по настройке аккаунта; null — вся история;
+    иначе дата «ГГГГ-ММ-ДД» или дата со временем (без пояса — UTC)."""
+    if "since" not in data:
+        return sync.ACCOUNT_DEFAULT
+    raw = data["since"]
+    if raw is None:
+        return None
+    try:
+        value = datetime.fromisoformat(raw) if isinstance(raw, str) else None
+    except ValueError:
+        value = None
+    if value is None:
+        raise BadRequest("поле since: нужна дата вида 2025-10-01 или null (вся история)")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    if value > datetime.now(timezone.utc) + timedelta(days=1) or value.year < 2013:
+        raise BadRequest("поле since: дата вне разумных пределов")
+    return value
 
 
 def _manager(request: Request) -> TgManager:
@@ -141,8 +173,14 @@ async def resume(request: Request) -> JSONResponse:
 async def options(request: Request) -> JSONResponse:
     manager = _manager(request)
     data = await body(request)
+    months: Any = KEEP
+    if "backfill_months" in data:
+        months = data["backfill_months"]
+        if months is not None and (isinstance(months, bool) or not isinstance(months, int)
+                                   or not 1 <= months <= 600):
+            raise BadRequest("поле backfill_months: нужно число месяцев от 1 до 600 или null (вся история)")
     await manager.set_options(_account_id(request), auto_personal=_flag(data, "auto_personal"),
-                              auto_groups=_flag(data, "auto_groups"))
+                              auto_groups=_flag(data, "auto_groups"), backfill_months=months)
     return JSONResponse({"ok": True})
 
 
@@ -183,7 +221,7 @@ async def sync_set(request: Request) -> JSONResponse:
     if not keys and not types_:
         raise BadRequest("нужно поле chats или types")
     result = await manager.set_sync(_account_id(request), enabled=bool(enabled), chats=keys,
-                                    chat_types=list(types_ or []))
+                                    chat_types=list(types_ or []), since=_since(data))
     return JSONResponse({"chats": result})
 
 
@@ -216,11 +254,15 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
 
     Без ключей приложения модуль простаивает: шлюз есть, но ни один аккаунт не запущен.
     """
+    global _active
     manager = TgManager(state.config, state.pool, state.events)
     state.extras["tg"] = manager
+    _active = manager
     await manager.start()
     try:
         yield
     finally:
+        if _active is manager:
+            _active = None
         await manager.stop()
         state.extras.pop("tg", None)

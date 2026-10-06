@@ -8,7 +8,8 @@
     история, сообщения по номерам. Отправка, отметка прочитанным, удаление, «печатает…»,
     любые изменения аккаунта — отказ;
   * роль assistant (помощник) — то же чтение плюс ровно два запроса шлюза отправки:
-    отправить текст и показать «печатает…»;
+    отправить текст и показать «печатает…» — и только когда в окружении сервиса включён
+    главный выключатель отправки;
   * запросы входа по QR и облачного пароля разрешены только пока идёт вход.
 
 Перечень не закрывает одного: код в том же процессе может обратиться к `client._sender`
@@ -98,16 +99,19 @@ _WRAPPERS: tuple[type, ...] = (
 class RequestPolicy:
     """Перечень разрешённых запросов для роли. Всё, чего в перечне нет, запрещено."""
 
-    def __init__(self, role: str, *, login: bool = False) -> None:
+    def __init__(self, role: str, *, login: bool = False, sending: bool = True) -> None:
         if role not in ROLES:
             raise ValueError(f"неизвестная роль аккаунта: {role!r}")
         self.role = role
+        # Главный выключатель отправки сервиса (config.sending): выключен — запросы отправки
+        # не проходят и у помощника.
+        self.sending = sending
         # True — идёт вход; после входа выключается и запросы входа перестают проходить.
         self.login = login
 
     @property
     def can_send(self) -> bool:
-        return self.role == "assistant"
+        return self.role == "assistant" and self.sending
 
     def allows(self, request: Any) -> bool:
         cls = type(request)

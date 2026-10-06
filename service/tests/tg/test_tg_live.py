@@ -507,3 +507,99 @@ async def test_import_and_session_share_rows(stage, conn):
     assert [tuple(r) for r in rows] == [(1, ["import", "session"]), (2, ["session"])]
     assert (await stage.rows("SELECT count(*) AS n FROM message_versions"))[0]["n"] == 0
     assert isinstance(sync.SWEEP_EVERY, int)
+
+
+# --- реакции, исключение чата ---
+
+async def test_reaction_never_marks_message_edited_and_real_edit_still_applies(stage):
+    """Последовательность: новое → реакция → настоящая правка → реакция."""
+    await stage.start()
+    await stage.enable(IVAN_KEY)
+    hour = lambda n: T0 + timedelta(hours=n)  # noqa: E731
+
+    async def row():
+        r = (await stage.rows("SELECT text, edited_at FROM messages WHERE tg_message_id = 1"))[0]
+        versions = [v["text"] for v in await stage.rows("SELECT text FROM message_versions ORDER BY id")]
+        return r["text"], r["edited_at"], versions
+
+    await stage.emit(new_message(msg(1, IVAN_KEY, "к пятнице")))
+    stage.live.clear()
+    await stage.emit(edited(msg(1, IVAN_KEY, "к пятнице", edit_date=hour(1), edit_hide=True)))       # реакция
+    assert await row() == ("к пятнице", None, []) and stage.live == []
+    await stage.emit(edited(msg(1, IVAN_KEY, "к понедельнику", edit_date=hour(2))))                  # правка
+    assert await row() == ("к понедельнику", hour(2), ["к пятнице"])
+    assert [(p["edited"], p["outgoing"]) for p in stage.live] == [(True, False)]
+    stage.live.clear()
+    await stage.emit(edited(msg(1, IVAN_KEY, "к понедельнику", edit_date=hour(3), edit_hide=True)))  # реакция
+    assert await row() == ("к понедельнику", hour(2), ["к пятнице"]) and stage.live == []
+    await stage.emit(edited(msg(1, IVAN_KEY, "ко вторнику", edit_date=hour(4))))                     # ещё правка
+    assert await row() == ("ко вторнику", hour(4), ["к пятнице", "к понедельнику"])
+    assert len(stage.live) == 1
+    # реакция на сообщение, которого в архиве не было: запись появляется без отметки и без события
+    stage.live.clear()
+    await stage.emit(edited(msg(7, IVAN_KEY, "старое", edit_date=hour(5), edit_hide=True)))
+    assert tuple((await stage.rows("SELECT text, edited_at FROM messages WHERE tg_message_id = 7"))[0]) == ("старое", None)
+    assert stage.live == []
+
+
+async def test_missed_real_edit_hidden_behind_reaction_is_still_applied(stage):
+    """Правку пропустили (сервис не работал), потом пришла реакция: текст в ней уже новый."""
+    await stage.start()
+    await stage.enable(IVAN_KEY)
+    await stage.emit(new_message(msg(1, IVAN_KEY, "к пятнице")))
+    stage.live.clear()
+    await stage.emit(edited(msg(1, IVAN_KEY, "к понедельнику", edit_date=T0 + timedelta(hours=3), edit_hide=True)))
+    row = (await stage.rows("SELECT text, edited_at FROM messages"))[0]
+    assert (row["text"], row["edited_at"]) == ("к понедельнику", T0 + timedelta(hours=3))
+    assert [v["text"] for v in await stage.rows("SELECT text FROM message_versions")] == ["к пятнице"]
+    assert [p["edited"] for p in stage.live] == [True]
+    # то же при чтении истории: в архиве старый текст, в истории — новый под скрытой правкой
+    stage.world.add(msg(1, IVAN_KEY, "к среде", edit_date=T0 + timedelta(hours=6), edit_hide=True),
+                    msg(2, IVAN_KEY, "с реакцией", edit_date=T0 + timedelta(hours=6), edit_hide=True))
+    async with stage.manager.pool.acquire() as conn:
+        await conn.execute("UPDATE tg_sync_chats SET backfill_done = false, backfill_before = NULL")
+    stage.live.clear()
+    await stage.rt.history.backfill_all()
+    rows = await stage.rows("SELECT tg_message_id, text, edited_at FROM messages ORDER BY 1")
+    assert [tuple(r) for r in rows] == [(1, "к среде", T0 + timedelta(hours=6)), (2, "с реакцией", None)]
+    assert stage.live == []
+
+
+async def test_excluding_chat_stops_its_sync_at_once(stage):
+    stage.world.add(*[msg(i, NEWS_KEY, f"пост {i}", post=True) for i in range(1, 251)])
+    stage.world.add(msg(1, IVAN_KEY, "личное"))
+    await stage.start()
+    await stage.enable(IVAN_KEY)
+    # канал включён, первая страница истории уже запрошена — и тут владелец исключает чат
+    real = stage.client._GetHistoryRequest
+    gate, entered = asyncio.Event(), asyncio.Event()
+
+    async def slow(request):
+        if getattr(request.peer, "channel_id", None) == CHANNEL:
+            entered.set()
+            await gate.wait()
+        return await real(request)
+
+    stage.client._GetHistoryRequest = slow
+    await stage.manager.set_sync(stage.account_id, enabled=True, chats=[NEWS_KEY])
+    await asyncio.wait_for(entered.wait(), 5)
+    chat_id = (await stage.rows(
+        "SELECT chat_id FROM tg_sync_chats WHERE peer_class = 'channel' AND tg_id = $1", CHANNEL))[0]["chat_id"]
+    async with stage.manager.pool.acquire() as conn:
+        await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", chat_id)
+    stage.events.publish(ev.CHAT_EXCLUDED, {"chat_id": chat_id, "purged": True})
+    await stage.events.drain()
+    row = (await stage.rows("SELECT enabled, backfill_before, forward_id FROM tg_sync_chats WHERE chat_id = $1", chat_id))[0]
+    assert tuple(row) == (False, None, None)                  # выключено сразу, курсоры сброшены
+    assert stage.rt.live.index[NEWS_KEY].enabled is False     # и приём живых сообщений — тоже
+    await stage.emit(new_message(msg(300, NEWS_KEY, "после исключения", post=True)))
+    gate.set()
+    await stage.idle()
+    requests = [r for r in stage.client.requests if getattr(getattr(r, "peer", None), "channel_id", None) == CHANNEL]
+    assert len(requests) == 1                                 # страница в полёте — последняя
+    assert (await stage.rows("SELECT count(*) AS n FROM messages WHERE chat_id = $1", chat_id))[0]["n"] == 0
+    assert stage.live == []
+    assert (await stage.manager.sync_status(stage.account_id))["counts"]["enabled"] == 1    # личный чат не задет
+    # событие о чате, которого сессии не касаются, ничего не ломает
+    stage.events.publish(ev.CHAT_EXCLUDED, {"chat_id": 999999, "purged": False})
+    await stage.events.drain()
