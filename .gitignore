@@ -1,0 +1,7 @@
+.env
+compose.override.yaml
+local/
+*.session
+*.session-journal
+__pycache__/
+.venv/
