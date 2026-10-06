@@ -68,8 +68,26 @@ _MAX_RUN = 32
 _LONG_RUN = re.compile(r"(.)\1{%d,}" % _MAX_RUN, re.DOTALL)
 # Диакритика подряд («залго»): больше нескольких знаков на букву в обычном письме не бывает.
 _MAX_MARKS = 4
-# Подделка рамки внутри самого текста.
-_FAKE_FRAME = re.compile(r"\[\s*(/?)\s*untrusted\s*\]", re.IGNORECASE)
+# Подделка рамки внутри самого текста ищется не в нём самом, а в его «скелете» (см. _defang):
+# там любые скобки уже стали «[» и «]», любая косая черта — «/», буквы приведены к простой латинице.
+# Между знаками маркера допускается до двух посторонних знаков: пробелы, дефисы, точки, диакритика.
+_GAP = r"[^\w\[\]/]{0,2}"
+_FAKE_FRAME = re.compile(
+    r"\[" + _GAP + "(/?)" + _GAP + _GAP.join("untrusted") + _GAP + r"\]")
+# Скобки, которые есть в обычной латинице: их наличие — повод строить скелет.
+_ASCII_BRACKETS = frozenset("[]{}<>")
+# Косая черта и всё, что на неё похоже.
+_SLASHES = frozenset("/\\\u2044\u2215\u2571\u29f8\u27cb\u2afd\u3033")
+# Буквы других алфавитов, неотличимые на вид от букв слова untrusted (после casefold).
+_LOOKALIKES = {
+    "\u03c5": "u", "\u057d": "u", "\u1d1c": "u", "\u0446": "u",      # υ ս ᴜ ц
+    "\u0578": "n", "\u043f": "n", "\u0274": "n",                     # ո п ɴ
+    "\u0442": "t", "\u03c4": "t", "\u1d1b": "t",                     # т τ ᴛ
+    "\u0433": "r", "\u0280": "r",                                    # г ʀ
+    "\u0455": "s", "\ua731": "s",                                    # ѕ ꜱ
+    "\u0435": "e", "\u0451": "e", "\u03b5": "e", "\u1d07": "e",      # е ё ε ᴇ
+    "\u0501": "d", "\u1d05": "d",                                    # ԁ ᴅ
+}
 _NOT_USERNAME = re.compile(r"[^A-Za-z0-9_]")
 _PLAIN = re.compile(r"[\n\t\x20-\x7e]*")
 
@@ -102,6 +120,58 @@ def _strip_hidden(text: str) -> str:
     return "".join(out)
 
 
+def _is_bracket(ch: str) -> bool:
+    """Любая открывающая или закрывающая скобка, кроме круглых: ими пишется обезвреженный маркер."""
+    if ch in "()":
+        return False
+    return ch in _ASCII_BRACKETS or unicodedata.category(ch) in ("Ps", "Pe")
+
+
+def _defang(text: str) -> str:
+    """Обезвреживает подделку рамки: «[untrusted]» и «[/untrusted]» в любом написании.
+
+    Сравнивать сам текст с маркером мало: его можно набрать полноширинными, «малыми» или
+    математическими скобками, полноширинными или математическими буквами, похожими буквами
+    кириллицы и греческого, вставить между знаками пробелы или диакритику. Поэтому строится
+    скелет текста: каждый знак приводится к совместимой форме (NFKC) и нижнему регистру, скобки
+    и косые черты — к одному виду, похожие буквы — к латинице. Маркер ищется в скелете, а
+    заменяется соответствующий ему отрезок исходного текста.
+
+    Сам текст NFKC не нормализуется: это изменило бы обычное содержимое («25 м²» стало бы
+    «25 м2», «½» — «1⁄2»). Меняется только найденный поддельный маркер — на «(untrusted)» или
+    «(/untrusted)» в круглых скобках, которые рамкой не являются.
+    """
+    if not any(_is_bracket(ch) for ch in text):
+        return text
+    skeleton: list[str] = []
+    origin: list[int] = []      # для каждого знака скелета — место исходного знака
+    for index, ch in enumerate(text):
+        for part in unicodedata.normalize("NFKC", ch).casefold():
+            if part in "()":
+                mapped = part
+            elif _is_bracket(part):
+                mapped = "[" if part in "[{<" or unicodedata.category(part) == "Ps" else "]"
+            elif part in _SLASHES:
+                mapped = "/"
+            else:
+                mapped = _LOOKALIKES.get(part, part)
+            skeleton.append(mapped)
+            origin.append(index)
+    out: list[str] = []
+    done = 0
+    for match in _FAKE_FRAME.finditer("".join(skeleton)):
+        start, end = origin[match.start()], origin[match.end() - 1] + 1
+        if start < done:
+            continue
+        out.append(text[done:start])
+        out.append(f"({match.group(1)}untrusted)")
+        done = end
+    if not out:
+        return text
+    out.append(text[done:])
+    return "".join(out)
+
+
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -115,8 +185,7 @@ def _clean(text: str) -> str:
     result = _MANY_NEWLINES.sub("\n\n", result)
     result = _MANY_SPACES.sub("  ", result)
     result = _LONG_RUN.sub(lambda m: m.group(1) * _MAX_RUN, result)
-    result = _FAKE_FRAME.sub(r"(\1untrusted)", result)
-    return result.strip()
+    return _defang(result).strip()
 
 
 def clean_text(text: str | None, limit: int = MAX_TEXT) -> str:

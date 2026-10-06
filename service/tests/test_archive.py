@@ -142,7 +142,9 @@ async def test_chats_are_listed_by_recent_activity_with_kind_and_counts(conn):
     ]
     assert chats[0]["last_message_at"] == T0 + timedelta(days=2)
     assert chats[0]["name"] == "Иван Петров" and chats[0]["username"] == "ivan_p"
-    assert set(chats[0]) == {"id", "kind", "name", "username", "last_message_at", "message_count"}
+    assert set(chats[0]) == {"id", "kind", "name", "username", "account_label", "account_role",
+                             "last_message_at", "message_count"}
+    assert (chats[0]["account_label"], chats[0]["account_role"]) == ("Владелец", "owner")
 
 
 async def test_chat_list_filters_by_kind_and_name(conn):
@@ -449,3 +451,51 @@ async def test_queries_run_inside_a_read_only_transaction(conn):
         assert (await archive.resolve_chat(conn, "Семья")).status == "ok"
         assert len(await archive.find_people(conn, "Иван")) == 2
         assert await archive.context(conn, s.ids[(s.ivan, 3)]) is not None
+
+
+# --- аккаунты и индексы ---
+
+async def test_chats_carry_their_account_and_can_be_filtered_by_it(conn):
+    s = await seed(conn)
+    helper = await store.ensure_account(conn, 9000, "Помощник", role="assistant")
+    twin, _ = await store.ensure_chat(conn, helper, ChatRecord("user", 2001, "personal_chat", "Иван Петров"))
+    await put(conn, twin, [rec(900, "Пишу помощнику", at=T0 + timedelta(days=3))])
+    assert await archive.accounts(conn) == [
+        {"label": "Владелец", "role": "owner"}, {"label": "Помощник", "role": "assistant"}]
+    chats = await archive.list_chats(conn)
+    assert [(c["id"], c["account_role"], c["message_count"]) for c in chats[:2]] == [
+        (twin, "assistant", 1), (s.ivan, "owner", 7)]
+    assert [c["id"] for c in await archive.list_chats(conn, account="assistant")] == [twin]
+    assert [c["id"] for c in await archive.list_chats(conn, account="ПОМОЩНИК")] == [twin]
+    assert twin not in {c["id"] for c in await archive.list_chats(conn, account="owner")}
+    assert len(await archive.list_chats(conn, account="owner")) == 5
+    assert await archive.list_chats(conn, account="никто") == []
+    # одно имя в двух аккаунтах — два кандидата, различимых по аккаунту
+    found = await archive.resolve_chat(conn, "Иван Петров")
+    assert found.status == "ambiguous"
+    assert {(c["id"], c["account_role"]) for c in found.candidates} == {(s.ivan, "owner"), (twin, "assistant")}
+    message = await archive.get_message(conn, s.ids[(s.ivan, 1)])
+    assert (message["account_label"], message["account_role"]) == ("Владелец", "owner")
+
+
+async def test_chat_page_is_the_same_whatever_the_limit(conn):
+    """Счётчики считаются только для выданной страницы; порядок и числа от этого не меняются."""
+    await seed(conn)
+    everything = await archive.list_chats(conn, limit=500)
+    for limit in (1, 2, 3, 4):
+        assert await archive.list_chats(conn, limit=limit) == everything[:limit]
+
+
+async def test_unfiltered_history_has_an_index_to_walk(conn):
+    await seed(conn)
+    assert await conn.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'messages_time'") \
+        == "CREATE INDEX messages_time ON public.messages USING btree (sent_at, id)"
+    for order in ("desc", "asc"):
+        async with conn.transaction():
+            await conn.execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_sort = off")
+            plan = await conn.fetch("EXPLAIN " + archive._HISTORY[order],
+                                    None, None, None, None, None, None, None, 51)
+        text = "\n".join(r[0] for r in plan)
+        assert "messages_time" in text and "Sort" not in text, text
+
