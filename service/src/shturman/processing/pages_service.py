@@ -301,7 +301,7 @@ async def get_person_page(
                     "get_person_page), an entity id like person:12, an @username, or the person's "
                     "name in any case form (\"Ивану Петрову\")")] = None,
     sender_id: Annotated[int | None, Field(
-        description="Alternative to `person`: the person_id returned by find_person, or the sender_id "
+        description="Alternative to `person`: the peer_id returned by find_person, or the sender_id "
                     "of a message")] = None,
 ) -> Annotated[CallToolResult, PersonPageResult]:
     """Read the curated memory page about one person: a short summary, the owner's own notes, the
