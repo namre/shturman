@@ -6,8 +6,9 @@
 нельзя строить то, что обязано произойти (для этого — очередь заданий и обходы по базе).
 
 Темы:
-  message.live     {account_id, chat_id, message_id, source, outgoing, edited}
-                   message_id — идентификатор строки архива (messages.id)
+  message.live     {account_id, chat_id, message_id, source, outgoing, edited, via_bot}
+                   message_id — идентификатор строки архива (messages.id);
+                   source — "session" или "business"; via_bot — сообщение отправлено через бота
   messages.deleted {message_ids: [...]}
 """
 
