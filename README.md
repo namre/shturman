@@ -44,7 +44,7 @@ git clone <адрес репозитория> shturman && cd shturman
 ## Что понадобится
 
 - Чистый сервер Linux: от 4 ГБ памяти (8 ГБ — с локальными эмбеддингами и распознаванием голосовых), от 40 ГБ диска.
-- Бот от @BotFather.
+- Бот от @BotFather. Его токен, как и остальные ключи, вы вводите в браузере, а не в терминале.
 - Доступ к модели: ключ OpenAI API или другой совместимый провайдер.
 - Для дополнительного аккаунта: отдельный номер и собственное приложение Telegram (`api_id`, `api_hash` с my.telegram.org).
 - Если с сервера нет прямого доступа к Telegram или провайдеру модели — исходящий прокси.
@@ -58,7 +58,7 @@ git clone <адрес репозитория> shturman && cd shturman
 
 ## Документы
 
-`docs/architecture.md` · `docs/deployment.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `AGENTS.md`
+`docs/architecture.md` · `docs/deployment.md` · `docs/setup.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `AGENTS.md`
 
 ## Лицензия
 
