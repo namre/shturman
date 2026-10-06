@@ -7,7 +7,7 @@
 #   ./ops/state.sh done STEP       — отметить шаг выполненным (с отметкой времени)
 #   ./ops/state.sh log "текст"     — дописать строку в журнал
 set -eu
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 dir="local"; file="$dir/state"; journal="$dir/journal.log"
 mkdir -p "$dir"; touch "$file" "$journal"
 

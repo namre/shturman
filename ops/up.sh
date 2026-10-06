@@ -3,14 +3,16 @@
 #   ./ops/up.sh          — скачать образы при необходимости и запустить
 #   ./ops/up.sh --pull   — сначала обновить образы указанных версий
 set -eu
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 
 # Каталог данных принадлежит тому, кто запускает стек; Hermes в контейнере работает под ним же.
 mkdir -p data/hermes
 chmod 700 data
-export HERMES_UID="$(id -u)" HERMES_GID="$(id -g)"
+HERMES_UID="$(id -u)"
+HERMES_GID="$(id -g)"
+export HERMES_UID HERMES_GID
 
 [ "${1:-}" = "--pull" ] && docker compose pull --quiet
 
