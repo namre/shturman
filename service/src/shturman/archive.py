@@ -61,31 +61,49 @@ _CHAT_NAME = """COALESCE(NULLIF(c.title, ''), NULLIF(cp.name, ''),
                          CASE WHEN c.type = 'saved_messages' THEN 'Saved Messages' END)"""
 
 # Видимые чаты. Псевдонимы c (чат) и cp (собеседник чата) используются и в других запросах.
+# a — аккаунт, с точки зрения которого виден чат (владелец или помощник).
 _VISIBLE_CHATS = f"""
 SELECT c.id, {_KIND} AS kind, {_CHAT_NAME} AS name, cp.username,
+       a.label AS account_label, a.role AS account_role,
        cp.class AS peer_class, cp.tg_id AS peer_tg_id
 FROM chats c
 JOIN peers cp ON cp.id = c.peer_id
+JOIN accounts a ON a.id = c.account_id
 WHERE NOT c.excluded AND {_peer_ok('cp')}
 """
 
+# Видимые сообщения одного чата — для времени последнего сообщения и счётчика. Служебные
+# отправители здесь отсекаются по списку их идентификаторов: он вычисляется один раз на запрос,
+# и соединять каждое сообщение с таблицей собеседников не приходится.
+_BLOCKED_PEER_IDS = f"ARRAY(SELECT bp.id FROM peers bp WHERE NOT ({_peer_ok('bp')}))"
+_VISIBLE_MESSAGE_OF_CHAT = f"""
+        FROM messages m
+        WHERE m.chat_id = {{chat}} AND m.deleted_at IS NULL
+          AND (m.sender_peer_id IS NULL OR m.sender_peer_id <> ALL ({_BLOCKED_PEER_IDS}))"""
+
+# Сначала выбирается страница чатов по времени последнего сообщения (один шаг по индексу на чат),
+# и только для неё считаются сообщения: подсчёт по всему архиву на каждый вызов не нужен.
 _LIST_CHATS = f"""
-WITH stats AS (
-    SELECT m.chat_id, max(m.sent_at) AS last_message_at, count(*) AS message_count
-    FROM messages m
-    LEFT JOIN peers sp ON sp.id = m.sender_peer_id
-    WHERE m.deleted_at IS NULL AND {_peer_ok('sp', optional=True)}
-    GROUP BY m.chat_id
-), visible AS ({_VISIBLE_CHATS})
-SELECT v.*, s.last_message_at, COALESCE(s.message_count, 0) AS message_count
-FROM visible v
-LEFT JOIN stats s ON s.chat_id = v.id
-WHERE ($1::text[] IS NULL OR v.kind = ANY($1))
-  AND ($2::text[] IS NULL OR v.kind <> ALL($2))
-  AND ($3::text IS NULL OR v.name ILIKE $4 OR v.username ILIKE $4 OR $3 <% v.name)
-ORDER BY s.last_message_at DESC NULLS LAST, v.id DESC
-LIMIT $5
+WITH visible AS ({_VISIBLE_CHATS}), page AS (
+    SELECT v.*, last.sent_at AS last_message_at
+    FROM visible v
+    LEFT JOIN LATERAL (
+        SELECT m.sent_at {_VISIBLE_MESSAGE_OF_CHAT.format(chat='v.id')}
+        ORDER BY m.sent_at DESC LIMIT 1
+    ) last ON true
+    WHERE ($1::text[] IS NULL OR v.kind = ANY($1))
+      AND ($2::text[] IS NULL OR v.kind <> ALL($2))
+      AND ($3::text IS NULL OR v.name ILIKE $4 OR v.username ILIKE $4 OR $3 <% v.name)
+      AND ($6::text IS NULL OR v.account_role = $6 OR lower(v.account_label) = lower($6))
+    ORDER BY last.sent_at DESC NULLS LAST, v.id DESC
+    LIMIT $5
+)
+SELECT page.*, (SELECT count(*) {_VISIBLE_MESSAGE_OF_CHAT.format(chat='page.id')}) AS message_count
+FROM page
+ORDER BY page.last_message_at DESC NULLS LAST, page.id DESC
 """
+
+_ACCOUNTS = "SELECT label, role FROM accounts ORDER BY (role = 'owner') DESC, id"
 
 _CHAT_BY_ID = f"SELECT v.* FROM ({_VISIBLE_CHATS}) v WHERE v.id = $1"
 
@@ -164,11 +182,13 @@ SELECT m.id, m.chat_id, m.tg_message_id, m.sent_at, m.kind, m.sender_peer_id,
        m.forwarded_from, m.edited_at, m.media_type, m.service_action,
        CASE WHEN r.id IS NOT NULL AND {_peer_ok('rp', optional=True)} THEN r.id END AS reply_to_id,
        {_CHAT_NAME} AS chat_title, {_KIND} AS chat_kind, cp.username AS chat_username,
+       a.label AS account_label, a.role AS account_role,
        cp.class AS peer_class, cp.tg_id AS peer_tg_id,
        sp.class AS sender_class, sp.tg_id AS sender_tg_id, sp.username AS sender_username
 FROM messages m
 JOIN chats c ON c.id = m.chat_id
 JOIN peers cp ON cp.id = c.peer_id
+JOIN accounts a ON a.id = c.account_id
 LEFT JOIN peers sp ON sp.id = m.sender_peer_id
 LEFT JOIN messages r ON r.chat_id = m.chat_id AND r.tg_message_id = m.reply_to_tg_id
                     AND r.deleted_at IS NULL
@@ -311,17 +331,24 @@ async def _similar(conn: asyncpg.Connection, sql: str, *args: Any) -> list[async
 
 # --- чаты ---
 
+async def accounts(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """Аккаунты архива: название и роль (owner — владелец, assistant — помощник)."""
+    return [dict(r) for r in await conn.fetch(_ACCOUNTS)]
+
+
 async def list_chats(
     conn: asyncpg.Connection, *, limit: int = 50, kinds: Sequence[str] | None = None,
     exclude_kinds: Sequence[str] | None = None, query: str | None = None,
+    account: str | None = None,
 ) -> list[dict[str, Any]]:
     """Видимые чаты, сначала с самой свежей перепиской. Строка: id, kind, name, username,
-    last_message_at, message_count. Счётчик и время — только по видимым сообщениям."""
+    account_label, account_role, last_message_at, message_count. Счётчик и время — только по
+    видимым сообщениям. `account` — роль (owner, assistant) или название аккаунта."""
     query = (query or "").strip() or None
     rows = await _similar(
         conn, _LIST_CHATS, list(kinds) if kinds else None,
         list(exclude_kinds) if exclude_kinds else None, query, _like(query) if query else None,
-        limit,
+        limit, (account or "").strip() or None,
     )
     return _chat_rows(rows)
 
