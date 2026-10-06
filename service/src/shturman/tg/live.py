@@ -8,8 +8,9 @@
   * новый чат включается сам только настройкой аккаунта «брать новые личные чаты / группы»,
     и только если сервис этот чат раньше не видел и владелец его не выключал;
   * направление сообщения берётся из его флага `out`, а не из сравнения отправителя;
-  * изменение без смены текста (реакция, кнопки) историю правок не пополняет — это решает
-    общий слой записи; событие о правке тогда тоже не рассылается;
+  * «скрытая правка» (реакция, кнопки: Telegram меняет время правки, но ставит `edit_hide`)
+    не трогает ни текст, ни отметку «изменено» и события не порождает. Настоящая правка
+    после неё применяется как обычно;
   * удаление в личном чате и обычной группе приходит без чата — сообщение ищется по номеру
     среди таких чатов аккаунта и помечается только при единственном совпадении;
   * событие `message.live` рассылается только отсюда и из шлюза отправки — загрузка истории
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -108,16 +110,28 @@ class LiveIngest:
             return
         await self.save(key, state.chat_id, record, entities,
                         outgoing=normalize.is_outgoing(message, self_id=self.self_id),
-                        edited=edited, via_bot=bool(message.via_bot_id))
+                        edited=edited, via_bot=bool(message.via_bot_id),
+                        hidden_edit=normalize.hidden_edit_at(message))
 
     async def save(
         self, key: PeerKey, chat_id: int, record: MessageRecord, entities: normalize.Entities, *,
-        outgoing: bool, edited: bool, via_bot: bool,
+        outgoing: bool, edited: bool, via_bot: bool, hidden_edit: datetime | None = None,
     ) -> None:
+        state = self.index.get(key)
+        if state is None or not state.enabled:
+            return  # чат выключили или исключили, пока сообщение готовилось к записи
+        real_edit = True
         async with self.pool.acquire() as conn:
             await self._refresh_chat(conn, key, entities)
-            result = await store.upsert_messages(
-                conn, [(chat_id, record, outgoing)], source="session", owner_tg_id=self.self_id)
+            async with conn.transaction():
+                if hidden_edit is not None:
+                    rows = [(chat_id, record)]
+                    real_edit = bool(await sync.promote_hidden_edits(
+                        conn, rows, {(chat_id, record.tg_message_id): hidden_edit}))
+                result = await store.upsert_messages(
+                    conn, [(chat_id, record, outgoing)], source="session", owner_tg_id=self.self_id)
+        if edited and not real_edit:
+            return  # реакция или смена кнопок: для остальных модулей ничего не произошло
         if edited:
             # Правка без смены текста (реакция) никому не интересна; правка сообщения,
             # которого в архиве не было, приходит как новая запись с пометкой «изменено».
@@ -165,6 +179,12 @@ class LiveIngest:
             logger.info("аккаунт %s: новый чат %s%s включён настройкой аккаунта", self.account_id, *key)
             self.wake.set()  # историю нового чата догрузит фоновая работа
         return state
+
+    def drop_chat(self, key: PeerKey) -> None:
+        """Чат исключён из архива: с этого мгновения его обновления отбрасываются."""
+        state = self.index.get(key)
+        if state is not None:
+            state.enabled = False
 
     # --- удалённые ---
 

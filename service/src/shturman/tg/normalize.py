@@ -83,7 +83,6 @@ _ACTIONS = {
     "MessageActionPhoneCall": "phone_call",
     "MessageActionScreenshotTaken": "take_screenshot",
     "MessageActionCustomAction": "custom_action",
-    "MessageActionBotAllowed": "allow_sending_messages",
     "MessageActionSecureValuesSent": "send_passport_values",
     "MessageActionContactSignUp": "joined_telegram",
     "MessageActionGeoProximityReached": "proximity_reached",
@@ -92,7 +91,12 @@ _ACTIONS = {
     "MessageActionSetMessagesTTL": "set_messages_ttl",
     "MessageActionGroupCallScheduled": "group_call_scheduled",
     "MessageActionSetChatTheme": "edit_chat_theme",
-    "MessageActionWebViewDataSent": "send_webapp_data",
+    "MessageActionWebViewDataSent": "send_webview_data",
+    "MessageActionWebViewDataSentMe": "send_webview_data",
+    "MessageActionPaymentRefunded": "refunded_payment",
+    "MessageActionStarGift": "send_star_gift",
+    "MessageActionStarGiftUnique": "send_star_gift",
+    "MessageActionPaidMessagesPrice": "paid_messages_price_change",
     "MessageActionGiftPremium": "send_premium_gift",
     "MessageActionTopicCreate": "topic_created",
     "MessageActionTopicEdit": "topic_edit",
@@ -229,17 +233,24 @@ def text_entities(text: str, entities: Iterable[Any] | None) -> list[dict[str, A
     """Разметка в виде фрагментов `text_entities` экспорта — без фрагментов типа plain.
 
     Экспорт режет текст на куски подряд; архив хранит только размеченные куски (так же делает
-    разбор экспорта), поэтому порядок — по смещению в тексте.
+    разбор экспорта). Куски экспорта не пересекаются: фрагмент, который начинается внутри уже
+    взятого, пропускается — вложенная разметка превращается в один внешний фрагмент. То же
+    правило у разбора сообщений бизнес-бота (`botapi_normalize.text_entities`).
     """
     if not text or not entities:
         return None
     units = text.encode("utf-16-le", errors="surrogatepass")
     out: list[dict[str, Any]] = []
-    for ent in sorted(entities, key=lambda e: (getattr(e, "offset", 0), -getattr(e, "length", 0))):
+    taken = 0
+    for ent in entities:
         name = type(ent).__name__
-        fragment = _utf16_slice(units, int(getattr(ent, "offset", -1)), int(getattr(ent, "length", 0)))
+        start, length = int(getattr(ent, "offset", -1)), int(getattr(ent, "length", 0))
+        if start < taken:
+            continue
+        fragment = _utf16_slice(units, start, length)
         if fragment is None:
             continue
+        taken = start + length
         item: dict[str, Any] = {"type": _ENTITY_TYPES.get(name) or _snake(name, "MessageEntity"),
                                 "text": fragment}
         if name == "MessageEntityTextUrl" and ent.url:
@@ -252,8 +263,8 @@ def text_entities(text: str, entities: Iterable[Any] | None) -> list[dict[str, A
             item["language"] = ent.language or ""
         elif name == "MessageEntityCustomEmoji":
             item["document_id"] = str(ent.document_id)
-        elif name == "MessageEntityBlockquote" and ent.collapsed:
-            item["collapsed"] = True
+        elif name == "MessageEntityBlockquote":
+            item["collapsed"] = bool(ent.collapsed)
         out.append(item)
     return out or None
 
@@ -296,6 +307,13 @@ def service_action(action: Any) -> str | None:
     if action is None or isinstance(action, types.MessageActionEmpty):
         return None
     name = type(action).__name__
+    if name == "MessageActionBotAllowed":
+        # Экспорт различает три случая одного действия.
+        if action.attach_menu:
+            return "attach_menu_bot_allowed"
+        if action.from_request:
+            return "web_app_bot_allowed"
+        return "allow_sending_messages"
     return _ACTIONS.get(name) or _snake(name, "MessageAction")
 
 
@@ -375,13 +393,27 @@ def message_record(message: Any, entities: Entities, *, self_id: int) -> Message
         sender_name=display_name(sender_entity) if sender_entity is not None else None,
         text=text,
         entities=None if service else text_entities(text, message.entities),
-        reply_to_tg_id=_reply_to(message),
+        # У служебного сообщения «ответ» — это ссылка на предмет действия (что закрепили, за что
+        # заплатили); экспорт и бизнес-бот пишут её отдельными полями, а не как ответ.
+        reply_to_tg_id=None if service else _reply_to(message),
         forwarded_from=_forwarded_from(message, entities),
-        edited_at=_aware(message.edit_date),
+        # Скрытая правка (реакция, кнопки) правкой не считается — см. hidden_edit_at().
+        edited_at=None if message.edit_hide else _aware(message.edit_date),
         media_type=None if service else media_type(message.media),
         media_path=None,  # файлы в этом срезе не скачиваются
         service_action=service_action(message.action) if service else None,
     )
+
+
+def hidden_edit_at(message: Any) -> datetime | None:
+    """Время «скрытой правки»: Telegram меняет `edit_date` и ставит `edit_hide`, когда у
+    сообщения сменились реакции или кнопки, а текст остался прежним. Отметку «изменено» такое
+    сообщение не получает. Но если его текст при этом отличается от сохранённого, значит,
+    настоящую правку сервис пропустил, и время скрытой правки — лучшее, что о ней известно;
+    сравнение с архивом делает тот, кто пишет (`sync.promote_hidden_edits`)."""
+    if isinstance(message, types.Message) and message.edit_hide:
+        return _aware(message.edit_date)
+    return None
 
 
 def message_from_update(update: Any, *, self_id: int) -> Any:

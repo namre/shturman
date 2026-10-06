@@ -8,9 +8,17 @@
     отправки, а `send_text` отказывает до любого обращения к клиенту;
   * assistant — аккаунт-помощник. Может отправлять, но только через `send_text` шлюза.
 
-Аккаунт владельца нельзя подключить как помощника: вход отклоняется, если аккаунт уже
-известен архиву в другой роли или совпадает с владельцем управляющего чата, а только что
-созданная сессия сразу завершается.
+Аккаунт владельца нельзя подключить как помощника:
+  * вход помощника не начинается, пока сервис не знает владельца (не привязан управляющий чат
+    и в архиве нет основного аккаунта) — иначе аккаунты не отличить;
+  * после входа аккаунт сверяется с владельцем управляющего чата и с основными аккаунтами
+    архива; при совпадении только что созданная сессия завершается;
+  * та же сверка — при каждом запуске сессии с диска;
+  * если владельцем управляющего чата становится аккаунт, уже подключённый как помощник,
+    сессия останавливается и ставится на паузу, а владелец получает уведомление.
+
+Отправка, кроме роли, требует главного выключателя `config.sending` (только из окружения
+сервиса): пока он выключен, `can_send` — ложь, `send_text` отказывает, «печатает…» не шлётся.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from telethon import errors
 from telethon.tl import functions, types
 
 from .. import bridge, store
+from .. import events as ev
 from ..config import Config
 from ..events import Events
 from ..records import ChatRecord
@@ -52,6 +61,9 @@ PAUSED, UNAUTHORIZED, LOCKED, FAILED, NO_SESSION = "paused", "unauthorized", "lo
 ACTIVE = (STARTING, RUNNING, DISCONNECTED, ERROR)
 
 ROLE_NAMES = {"owner": "основной аккаунт владельца", "assistant": "аккаунт-помощник"}
+
+
+KEEP: Any = object()   # «настройку не трогать»
 
 
 class TgError(Exception):
@@ -150,6 +162,8 @@ class TgManager:
         self.flows: dict[str, LoginFlow] = {}
         self._flow_done_at: dict[str, float] = {}
         self._retry_first = RETRY_FIRST
+        self._background: set[asyncio.Task] = set()
+        events.subscribe(ev.CHAT_EXCLUDED, self.on_chat_excluded)
 
     # ------------------------------------------------------------------ общее
 
@@ -200,6 +214,57 @@ class TgManager:
         for rt in list(self.runtimes.values()):
             await self._shutdown(rt)
         self.runtimes.clear()
+        if self._background:
+            await asyncio.gather(*list(self._background), return_exceptions=True)
+
+    def _spawn(self, coro: Any, name: str) -> None:
+        task = asyncio.get_running_loop().create_task(coro, name=name)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    # ------------------------------------------------------------------ события сервиса
+
+    async def on_chat_excluded(self, payload: dict[str, Any]) -> None:
+        """Владелец исключил чат из архива: синхронизация чата прекращается немедленно, не
+        дожидаясь, пока очередная запись в него будет отвергнута. Страница истории, которая в
+        этот момент уже запрошена, при записи отбрасывается."""
+        async with self.pool.acquire() as conn:
+            hit = await sync.chat_excluded(conn, int(payload["chat_id"]), purged=bool(payload.get("purged")))
+        if hit is None:
+            return
+        account_id, key = hit
+        rt = self._by_account(account_id)
+        if rt is not None and rt.live is not None:
+            rt.live.drop_chat(key)
+        logger.info("аккаунт %s: чат %s%s исключён из архива, синхронизация выключена", account_id, *key)
+
+    async def owner_changed(self, conn: asyncpg.Connection, new_user_id: int) -> None:
+        """Сменился владелец управляющего чата (вызывается внутри транзакции смены).
+
+        Если новым владельцем оказался аккаунт, подключённый как помощник, это основной аккаунт
+        владельца с правом отправки — так быть не должно. Сессия останавливается и ставится на
+        паузу; снять паузу не выйдет (запуск такую сессию отвергнет), остаётся выйти из неё.
+        """
+        if not new_user_id:
+            return
+        account_id = await conn.fetchval(
+            """SELECT s.account_id FROM tg_sessions s JOIN accounts a ON a.id = s.account_id
+               WHERE s.slot = 'assistant' AND a.tg_user_id = $1""", int(new_user_id))
+        if account_id is None:
+            return
+        reason = "Аккаунт владельца подключён как помощник: сессия остановлена."
+        await conn.execute("UPDATE tg_sessions SET paused = true, last_error = $2 WHERE account_id = $1",
+                           account_id, reason)
+        rt = self.runtimes.pop("assistant", None)   # с этого мгновения can_send — ложь
+        if rt is not None:
+            rt.stop.set()
+            self._spawn(self._shutdown(rt), "tg-assistant-owner-stop")
+        await bridge.notify_owner(
+            conn,
+            "Аккаунт, подключённый к сервису как помощник, оказался вашим основным аккаунтом. "
+            "Помощнику разрешена отправка сообщений, поэтому его сессия остановлена и поставлена "
+            "на паузу. Выйдите из неё в разделе аккаунтов и подключите помощником другой аккаунт.")
+        logger.warning("аккаунт %s: владелец управляющего чата совпал с помощником, сессия остановлена", account_id)
 
     async def _open(self, slot: str, rt: AccountRuntime, *, login: bool) -> None:
         """Берёт блокировки и создаёт клиента. Блокировка — до любого подключения."""
@@ -207,7 +272,7 @@ class TgManager:
         lock = SessionLock(path, self.config.dsn, on_lost=lambda: self._lock_lost(rt))
         await lock.acquire(f"slot:{slot}")
         try:
-            policy = RequestPolicy(slot, login=login)
+            policy = RequestPolicy(slot, login=login, sending=self.config.sending)
             client = self.client_factory(slot, path, policy, rt.on_reconnect)
         except BaseException:
             await lock.release()
@@ -310,8 +375,8 @@ class TgManager:
             await self._save_error(rt)
 
     async def _save_error(self, rt: AccountRuntime) -> None:
-        if rt.account_id is None or rt.logout:
-            return
+        if rt.account_id is None or rt.logout or rt.stop.is_set():
+            return  # остановка по команде причину прежней остановки не стирает
         with contextlib.suppress(Exception):
             async with self.pool.acquire() as conn:
                 await conn.execute("UPDATE tg_sessions SET last_error = $2 WHERE account_id = $1",
@@ -422,6 +487,15 @@ class TgManager:
                 "Подключение основного аккаунта нужно подтвердить (confirm_owner: true): на сервере "
                 "появится сессия вашего основного аккаунта. Сервис будет только читать, но риск "
                 "ограничений со стороны Telegram ложится на основной номер.")
+        if role == "assistant":
+            async with self.pool.acquire() as conn:
+                owner_known = await bridge.get_owner(conn) is not None or await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM accounts WHERE role = 'owner')")
+            if not owner_known:
+                raise TgError(
+                    "Сначала привяжите к сервису своего бота (управляющий чат). Пока сервис не знает, "
+                    "какой аккаунт — ваш основной, он не сможет отличить его от помощника, а помощнику "
+                    "разрешена отправка сообщений. После привязки подключите помощника снова.", 409)
         self._sweep_flows()
         for flow in list(self.flows.values()):
             if flow.role == role and not flow.done:
@@ -449,7 +523,7 @@ class TgManager:
         except SessionLocked as exc:
             raise TgError(f"Сессия занята другим процессом: {exc}.", 409) from None
         try:
-            rt.lock, rt.policy = lock, RequestPolicy(role, login=True)
+            rt.lock, rt.policy = lock, RequestPolicy(role, login=True, sending=self.config.sending)
             rt.pacer = sync.Pacer(self.pacing)
             rt.client = self.client_factory(role, path, rt.policy, rt.on_reconnect)
         except NotConfigured as exc:
@@ -522,7 +596,7 @@ class TgManager:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT a.id, a.tg_user_id, a.label, s.slot, s.paused, s.auto_personal, s.auto_groups,
-                          s.logged_in_at, s.last_error
+                          s.backfill_months, s.logged_in_at, s.last_error
                    FROM tg_sessions s JOIN accounts a ON a.id = s.account_id ORDER BY s.slot""")
         out, seen = [], set()
         for row in rows:
@@ -532,7 +606,7 @@ class TgManager:
             if rt is not None:
                 status, error = rt.status, rt.error
             elif row["paused"]:
-                status, error = PAUSED, None
+                status, error = PAUSED, row["last_error"]
             elif not session_path(self.config, slot).exists():
                 status, error = NO_SESSION, "Файла сессии нет: войдите в аккаунт заново."
             else:
@@ -542,13 +616,15 @@ class TgManager:
                 "label": row["label"], "status": status, "error": error, "paused": row["paused"],
                 "can_send": self.can_send(row["id"]),
                 "auto_personal": row["auto_personal"], "auto_groups": row["auto_groups"],
+                "backfill_months": row["backfill_months"],
                 "logged_in_at": row["logged_in_at"].isoformat(),
             })
         for slot, rt in self.runtimes.items():
             if slot not in seen:  # сессия не дошла до записи в базу: занята или недействительна
                 out.append({"role": slot, "account_id": None, "tg_user_id": None, "label": None,
                             "status": rt.status, "error": rt.error, "paused": False, "can_send": False,
-                            "auto_personal": False, "auto_groups": False, "logged_in_at": None})
+                            "auto_personal": False, "auto_groups": False, "backfill_months": None,
+                            "logged_in_at": None})
         return out
 
     async def logout(self, account_id: int) -> dict[str, Any]:
@@ -618,9 +694,16 @@ class TgManager:
             raise TgError("Файла сессии нет: войдите в аккаунт заново.", 409)
         await self._launch(slot)
 
-    async def set_options(self, account_id: int, *, auto_personal: bool | None, auto_groups: bool | None) -> None:
-        """Настройка «брать новые личные чаты / группы». При включении все нынешние диалоги
-        запоминаются как уже существующие — настройка касается только чатов, появившихся позже."""
+    async def set_options(
+        self, account_id: int, *, auto_personal: bool | None, auto_groups: bool | None,
+        backfill_months: Any = KEEP,
+    ) -> None:
+        """Настройки аккаунта.
+
+        «Брать новые личные чаты / группы»: при включении все нынешние диалоги запоминаются как
+        уже существующие — настройка касается только чатов, появившихся позже.
+        `backfill_months` — глубина истории для чатов, которые включат после этого: число месяцев
+        или None (вся история). Уже включённых чатов не касается."""
         await self._slot_of(account_id)
         rt = self._by_account(account_id)
         if auto_personal or auto_groups:
@@ -632,8 +715,11 @@ class TgManager:
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """UPDATE tg_sessions SET auto_personal = COALESCE($2, auto_personal),
-                                          auto_groups = COALESCE($3, auto_groups)
-                   WHERE account_id = $1""", account_id, auto_personal, auto_groups)
+                                          auto_groups = COALESCE($3, auto_groups),
+                                          backfill_months = CASE WHEN $4 THEN $5 ELSE backfill_months END
+                   WHERE account_id = $1""",
+                account_id, auto_personal, auto_groups, backfill_months is not KEEP,
+                None if backfill_months is KEEP else backfill_months)
         if rt is not None and rt.live is not None:
             await rt.live.reload()
 
@@ -713,8 +799,12 @@ class TgManager:
     async def set_sync(
         self, account_id: int, *, enabled: bool,
         chats: list[PeerKey] | None = None, chat_types: list[str] | None = None,
+        since: Any = sync.ACCOUNT_DEFAULT,
     ) -> list[dict[str, Any]]:
-        """Включает или выключает синхронизацию чатов — поштучно или всех чатов заданных видов."""
+        """Включает или выключает синхронизацию чатов — поштучно или всех чатов заданных видов.
+
+        `since` — граница загрузки истории вглубь для включаемых чатов: дата, None (вся история)
+        или не названа (глубина по умолчанию из настроек аккаунта)."""
         await self._slot_of(account_id)
         rt = self._by_account(account_id)
         by_key: dict[PeerKey, DialogInfo] = {}
@@ -735,7 +825,7 @@ class TgManager:
                     out.append({"peer_class": key[0], "tg_id": key[1], "enabled": False,
                                 "error": "Чат не найден среди диалогов аккаунта."})
                     continue
-                _, on = await sync.enable_chat(conn, account_id, dialog.chat)
+                _, on = await sync.enable_chat(conn, account_id, dialog.chat, since=since)
                 item = {"peer_class": key[0], "tg_id": key[1], "enabled": on}
                 if not on:
                     item["excluded"] = True
@@ -752,7 +842,7 @@ class TgManager:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT s.peer_class, s.tg_id, s.chat_id, s.enabled, s.auto_enabled, s.backfill_before,
-                          s.backfill_done, s.forward_id, s.gap_checked_at, s.reconciled_at,
+                          s.backfill_done, s.backfill_since, s.forward_id, s.gap_checked_at, s.reconciled_at,
                           s.access_lost_at, s.access_lost_reason, s.last_error,
                           (SELECT count(*) FROM messages m WHERE m.chat_id = s.chat_id) AS messages
                    FROM tg_sync_chats s WHERE s.account_id = $1 AND s.chat_id IS NOT NULL
@@ -766,6 +856,7 @@ class TgManager:
             "peer_class": r["peer_class"], "tg_id": r["tg_id"], "chat_id": r["chat_id"],
             "enabled": r["enabled"], "auto_enabled": r["auto_enabled"], "messages": r["messages"],
             "backfill_before": r["backfill_before"], "backfill_done": r["backfill_done"],
+            "backfill_since": iso(r["backfill_since"]),
             "forward_id": r["forward_id"], "gap_checked_at": iso(r["gap_checked_at"]),
             "reconciled_at": iso(r["reconciled_at"]), "access_lost_at": iso(r["access_lost_at"]),
             "access_lost_reason": r["access_lost_reason"], "last_error": r["last_error"],
@@ -791,8 +882,9 @@ class TgManager:
 
     def can_send(self, account_id: int) -> bool:
         rt = self._by_account(account_id)
-        return bool(rt is not None and rt.role == "assistant" and rt.status == RUNNING
-                    and rt.client is not None and rt.policy is not None and rt.policy.can_send)
+        return bool(self.config.sending and rt is not None and rt.role == "assistant"
+                    and rt.status == RUNNING and rt.client is not None
+                    and rt.policy is not None and rt.policy.can_send)
 
     async def _role_of(self, account_id: int) -> str | None:
         rt = self._by_account(account_id)
@@ -811,10 +903,14 @@ class TgManager:
         if role != "assistant":
             raise gateway.SendForbidden(
                 "отправка от этого аккаунта запрещена: это не аккаунт-помощник")
+        # Главный выключатель — тоже до любого обращения к клиенту.
+        if not self.config.sending:
+            raise gateway.SendForbidden(
+                "отправка выключена в настройках сервиса (SHTURMAN_SENDING): сервис ничего не отправляет")
         rt = self._running(account_id)
         if rt.policy is None or not rt.policy.can_send:
             raise gateway.SendForbidden("отправка от этого аккаунта запрещена")
-        if not isinstance(text, str) or not text.strip() or len(text) > TEXT_LIMIT:
+        if not isinstance(text, str) or not text.strip() or bridge.utf16_len(text) > TEXT_LIMIT:
             raise ValueError(f"текст сообщения должен быть непустым и не длиннее {TEXT_LIMIT} знаков")
         key: PeerKey = (peer_class, int(tg_id))
         peer = await rt.client.get_input_entity(normalize.to_peer(key))

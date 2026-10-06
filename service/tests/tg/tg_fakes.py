@@ -343,8 +343,11 @@ async def pool(conn):
         await p.close()
 
 
-def tg_config(config: Any) -> Any:
-    return dataclasses.replace(config, tg_api_id=12345, tg_api_hash="0123456789abcdef0123456789abcdef")
+def tg_config(config: Any, *, sending: bool = True) -> Any:
+    """Настройки с ключами приложения. Главный выключатель отправки в тестах включён,
+    кроме тех, что проверяют его самого."""
+    return dataclasses.replace(config, tg_api_id=12345, tg_api_hash="0123456789abcdef0123456789abcdef",
+                               sending=sending)
 
 
 async def start_account(manager: TgManager, world: World, slot: str) -> Any:

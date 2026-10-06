@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 
 from telethon import errors
 
@@ -9,14 +10,16 @@ from shturman import bridge, store
 from shturman.tg.client import session_path
 from shturman.tg.manager import TgManager
 
-from tg_fakes import (C_NEWS, C_SUPER, G_FAMILY, GROUP, HELPER, IVAN, ME, PASSWORD, SELF_ID, U_BOT, U_IVAN,
-                      U_MARIA, U_TELEGRAM, World, msg, tg_config, wait_for)
+from tg_fakes import (C_NEWS, C_SUPER, G_FAMILY, GROUP, HELPER, HELPER_ID, IVAN, ME, PASSWORD, SELF_ID, U_BOT,
+                      U_IVAN, U_MARIA, U_TELEGRAM, World, msg, tg_config, wait_for)
 
 MODULES = ("shturman.api_core", "shturman.tg.service")
 
 
-async def service(make_client, config, world):
-    client, state = await make_client(*MODULES, cfg=tg_config(config))
+async def service(make_client, config, world, *, owner=SELF_ID, sending=True):
+    client, state = await make_client(*MODULES, cfg=tg_config(config, sending=sending))
+    if owner is not None:      # управляющий чат привязан: сервис знает, кто владелец
+        assert (await client.put("/api/owner", json={"user_id": owner, "chat_id": owner})).status_code == 200
     manager = state.extras["tg"]
     assert isinstance(manager, TgManager)
     assert manager.runtimes == {}          # на диске сессий нет — настоящий клиент не создавался
@@ -80,7 +83,8 @@ async def test_qr_login_over_http_then_account_is_listed(make_client, config):
            ("assistant", "running", True, False)
     assert account["account_id"] == done["account_id"] and account["label"] == "Помощник"
     assert set(account) == {"role", "account_id", "tg_user_id", "label", "status", "error", "paused",
-                            "can_send", "auto_personal", "auto_groups", "logged_in_at"}
+                            "can_send", "auto_personal", "auto_groups", "backfill_months", "logged_in_at"}
+    assert account["backfill_months"] == 12
     assert session_path(manager.config, "assistant").exists()
     # второй вход в занятую роль — отказ
     busy = await client.post("/api/tg/login", json={"role": "assistant"})
@@ -155,7 +159,7 @@ async def test_owner_account_is_rejected_as_assistant_and_its_session_is_termina
     await bridge.set_owner(conn, SELF_ID, SELF_ID)          # владелец управляющего чата известен
     world = World(ME)                                       # код отсканировали основным аккаунтом
     world.authorized = False
-    client, state, manager = await service(make_client, config, world)
+    client, state, manager = await service(make_client, config, world, owner=None)
     _, status = await login(client, world, "assistant")
     assert status["status"] == "failed" and "основной аккаунт" in status["error"]
     assert world.last.logged_out is True                    # сессия не осталась висеть в Telegram
@@ -219,6 +223,8 @@ async def test_dialogs_selection_sync_and_status(make_client, config):
                                 "errors": 0, "messages": 155}
     ivan = next(c for c in status["chats"] if c["tg_id"] == IVAN)
     assert (ivan["backfill_before"], ivan["backfill_done"], ivan["forward_id"], ivan["messages"]) == (1, True, 120, 120)
+    since = datetime.fromisoformat(ivan["backfill_since"])      # глубина по умолчанию — 12 месяцев
+    assert timedelta(days=360) < datetime.now(timezone.utc) - since < timedelta(days=370)
     assert "title" not in ivan and "личное" not in json.dumps(status, ensure_ascii=False)   # только счётчики и курсоры
     listed = (await client.get(f"{base}/dialogs")).json()["items"]
     assert [i["tg_id"] for i in listed if i["enabled"]] == [IVAN, GROUP, 4001]
@@ -322,3 +328,162 @@ async def test_service_shutdown_disconnects_sessions(make_client, config):
     assert not running.connected and flow.status == "cancelled"
     assert session_path(manager.config, "assistant").exists()        # сессия помощника цела
     assert not session_path(manager.config, "owner").exists()        # недоделанный вход убран
+
+
+# --- основной аккаунт не становится помощником; главный выключатель; глубина истории ---
+
+async def test_assistant_login_is_refused_until_owner_is_known(make_client, config, conn):
+    """Пока сервис не знает владельца, он не отличит его аккаунт от помощника — вход не начинается."""
+    world = World(ME)
+    world.authorized = False
+    client, state, manager = await service(make_client, config, world, owner=None)
+    refused = await client.post("/api/tg/login", json={"role": "assistant"})
+    assert refused.status_code == 409 and "привяжите" in refused.json()["error"]
+    assert world.clients == [] and manager.flows == {}       # ни клиента, ни кода
+    assert not session_path(manager.config, "assistant").exists()
+    # вход основного аккаунта (только чтение) от этого не зависит
+    assert (await client.post("/api/tg/login", json={"role": "owner", "confirm_owner": True})).status_code == 200
+    await manager.cancel_login(next(iter(manager.flows)))
+    # владелец известен по архиву (экспорт загружен) — этого достаточно
+    await store.ensure_account(conn, SELF_ID, "Владелец", "owner")
+    world.me = HELPER
+    _, status = await login(client, world, "assistant")
+    assert status["status"] == "completed"
+
+
+async def test_owner_becoming_known_stops_assistant_session_of_the_same_account(make_client, config, conn):
+    """Владельцем управляющего чата стал аккаунт, уже подключённый как помощник."""
+    world = World(HELPER)
+    world.authorized = False
+    client, state, manager = await service(make_client, config, world)       # владелец — другой аккаунт
+    _, status = await login(client, world, "assistant")
+    account_id = status["account_id"]
+    await wait_for(lambda: manager.runtimes["assistant"].status == "running")
+    assert manager.can_send(account_id) is True
+    session = world.last
+
+    # тот же владелец привязан повторно — ничего не происходит
+    await client.put("/api/owner", json={"user_id": SELF_ID, "chat_id": SELF_ID})
+    assert manager.can_send(account_id) is True
+
+    await client.put("/api/owner", json={"user_id": HELPER_ID, "chat_id": HELPER_ID})
+    assert manager.can_send(account_id) is False             # сразу, не дожидаясь отключения
+    await wait_for(lambda: not session.connected)
+    account = (await client.get("/api/tg/accounts")).json()["accounts"][0]
+    assert (account["status"], account["paused"], account["can_send"]) == ("paused", True, False)
+    assert "помощник" in account["error"]
+    jobs = (await client.post("/api/jobs/claim", json={"kinds": ["notify.owner"]})).json()["jobs"]
+    assert len(jobs) == 1 and "основным аккаунтом" in jobs[0]["payload"]["text"]
+
+    # снять паузу нельзя: запуск с диска сверяет аккаунт с владельцем и отвергает сессию
+    world.authorized = True
+    assert (await client.post(f"/api/tg/accounts/{account_id}/resume")).status_code == 200
+    rt = manager.runtimes["assistant"]
+    await wait_for(lambda: rt.task.done())
+    assert rt.status == "failed" and "основной аккаунт" in rt.error.lower()
+    assert manager.can_send(account_id) is False
+    from shturman.tg import gateway
+    import pytest
+    with pytest.raises((gateway.AccountUnavailable, gateway.SendForbidden)):
+        await manager.send_text(account_id, "user", IVAN, "не должно уйти")
+    assert not any(type(r).__name__ == "SendMessageRequest" for c in world.clients for r in c.requests)
+    # остаётся выйти
+    assert (await client.post(f"/api/tg/accounts/{account_id}/logout")).json()["ok"] is True
+
+
+async def test_master_switch_off_means_nobody_sends(make_client, config):
+    import pytest
+    from telethon.tl import functions, types
+    from shturman.tg import gateway
+    from shturman.tg.client import RequestNotAllowed
+
+    world = World(HELPER)
+    world.authorized = False
+    client, state, manager = await service(make_client, config, world, sending=False)
+    _, status = await login(client, world, "assistant")
+    account_id = status["account_id"]
+    await wait_for(lambda: manager.runtimes["assistant"].status == "running")
+    account = (await client.get("/api/tg/accounts")).json()["accounts"][0]
+    assert (account["role"], account["status"], account["can_send"]) == ("assistant", "running", False)
+    assert manager.can_send(account_id) is False
+    before = list(world.last.requests)
+    with pytest.raises(gateway.SendForbidden, match="SHTURMAN_SENDING"):
+        await manager.send_text(account_id, "user", IVAN, "привет")
+    await manager.set_typing(account_id, "user", IVAN, True)
+    assert world.last.requests == before                      # к клиенту не обращались вовсе
+    # и сам клиент отправку не пропустит, если до него кто-то доберётся
+    with pytest.raises(RequestNotAllowed):
+        await world.last(functions.messages.SendMessageRequest(types.InputPeerUser(IVAN, 1), "в обход"))
+    with pytest.raises(RequestNotAllowed):
+        await world.last(functions.messages.SetTypingRequest(types.InputPeerUser(IVAN, 1),
+                                                             types.SendMessageTypingAction()))
+
+
+async def test_backfill_depth_per_chat_and_account_default(make_client, config):
+    world = World(ME)
+    world.authorized = False
+    world.dialogs = [U_IVAN, G_FAMILY, C_NEWS]
+    now = datetime.now(timezone.utc)
+    # канал: по сообщению в день за 500 дней, №500 — сегодняшнее
+    world.add(*[msg(i, ("channel", 4001), f"пост {i}", post=True, at=now - timedelta(days=500 - i))
+                for i in range(1, 501)])
+    world.add(*[msg(i, ("user", IVAN), f"личное {i}", at=now - timedelta(days=800 - i)) for i in range(1, 11)])
+    world.add(*[msg(100 + i, ("chat", GROUP), f"семья {i}", sender=2002, at=now - timedelta(days=900 - i))
+                for i in range(1, 6)])
+    client, state, manager = await service(make_client, config, world)
+    _, status = await login(client, world, "owner", confirm_owner=True)
+    base = f"/api/tg/accounts/{status['account_id']}"
+    await wait_for(lambda: manager.runtimes["owner"].status == "running")
+    rt = manager.runtimes["owner"]
+
+    async def settled():
+        await wait_for(lambda: rt.history.idle and not rt.wake.is_set())
+        chats = (await client.get(f"{base}/sync")).json()["chats"]
+        return {c["tg_id"]: c for c in chats}
+
+    channel = [{"peer_class": "channel", "tg_id": 4001}]
+    # 1) глубина не названа — по настройке аккаунта: 12 месяцев
+    await client.post(f"{base}/sync", json={"enabled": True, "chats": channel})
+    chats = await settled()
+    assert 360 <= chats[4001]["messages"] <= 370 and chats[4001]["backfill_done"] is True
+    oldest = chats[4001]["backfill_before"]
+    assert oldest == 500 - chats[4001]["messages"] + 1        # курсор — на самом старом из взятого
+    history = [r for r in world.last.requests if type(r).__name__ == "GetHistoryRequest"]
+    assert len(history) == 4                                  # 400 сообщений просмотрено, не все 500
+
+    # 2) явная дата ближе прежней — уже загруженное остаётся, новых запросов нет
+    recent = (now - timedelta(days=30)).date().isoformat()
+    await client.post(f"{base}/sync", json={"enabled": True, "chats": channel, "since": recent})
+    chats = await settled()
+    assert chats[4001]["backfill_since"].startswith(recent) and chats[4001]["backfill_before"] == oldest
+    assert len([r for r in world.last.requests if type(r).__name__ == "GetHistoryRequest"]) == 4
+
+    # 3) null — вся история: загрузка продолжается ровно с курсора
+    await client.post(f"{base}/sync", json={"enabled": True, "chats": channel, "since": None})
+    chats = await settled()
+    assert chats[4001]["backfill_since"] is None and chats[4001]["messages"] == 500
+    assert chats[4001]["backfill_before"] == 1 and chats[4001]["backfill_done"] is True
+    deeper = [r for r in world.last.requests if type(r).__name__ == "GetHistoryRequest"][4:]
+    assert deeper[0].offset_id == oldest and len(deeper) == 2
+
+    # 4) чат целиком старше границы: ничего не взято, но чат включён и новые сообщения идут
+    await client.post(f"{base}/sync", json={"enabled": True, "chats": [{"peer_class": "user", "tg_id": IVAN}]})
+    chats = await settled()
+    assert (chats[IVAN]["messages"], chats[IVAN]["backfill_done"], chats[IVAN]["enabled"]) == (0, True, True)
+
+    # 5) настройка аккаунта: «вся история» для чатов, включаемых после этого
+    assert (await client.put(f"{base}/options", json={"backfill_months": 0})).status_code == 400
+    assert (await client.put(f"{base}/options", json={"backfill_months": "год"})).status_code == 400
+    assert (await client.put(f"{base}/options", json={"backfill_months": None})).status_code == 200
+    assert (await client.get("/api/tg/accounts")).json()["accounts"][0]["backfill_months"] is None
+    await client.post(f"{base}/sync", json={"enabled": True, "types": ["private_group"]})
+    chats = await settled()
+    assert chats[GROUP]["backfill_since"] is None and chats[GROUP]["messages"] == 5
+    assert chats[IVAN]["messages"] == 0                       # уже включённых настройка не касается
+    assert (await client.put(f"{base}/options", json={"backfill_months": 6})).status_code == 200
+    assert (await client.put(f"{base}/options", json={"auto_groups": False})).status_code == 200
+    assert (await client.get("/api/tg/accounts")).json()["accounts"][0]["backfill_months"] == 6
+
+    for bad in ("вчера", 5, "2090-01-01", "1999-01-01"):
+        response = await client.post(f"{base}/sync", json={"enabled": True, "chats": channel, "since": bad})
+        assert response.status_code == 400

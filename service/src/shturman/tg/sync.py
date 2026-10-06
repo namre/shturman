@@ -148,28 +148,110 @@ async def load_index(conn: asyncpg.Connection, account_id: int) -> dict[PeerKey,
     return {(r["peer_class"], r["tg_id"]): ChatState(r["chat_id"], r["enabled"]) for r in rows}
 
 
+class _AccountDefault:
+    """Глубина истории не названа: берётся настройка аккаунта."""
+
+
+ACCOUNT_DEFAULT: Any = _AccountDefault()
+
+
 async def enable_chat(
-    conn: asyncpg.Connection, account_id: int, chat: ChatRecord, *, auto: bool = False
+    conn: asyncpg.Connection, account_id: int, chat: ChatRecord, *, auto: bool = False,
+    since: datetime | None | _AccountDefault = ACCOUNT_DEFAULT,
 ) -> tuple[int, bool]:
     """Включает синхронизацию чата. Возвращает (идентификатор чата в архиве, включён ли).
 
     Чат, исключённый в архиве (в том числе служебные чаты Telegram), не включается.
     Повторное включение снимает отметку о потерянном доступе и продолжает с прежних курсоров.
+
+    `since` — граница загрузки истории вглубь: сообщения старше неё не загружаются, None — вся
+    история. Не названа — у чата, который включают впервые, берётся глубина по умолчанию из
+    настроек аккаунта, а у уже включавшегося остаётся прежняя. Названная граница глубже прежней
+    возобновляет загрузку с места, где она остановилась.
     """
+    explicit = not isinstance(since, _AccountDefault)
     async with conn.transaction():
         chat_id, excluded = await store.ensure_chat(conn, account_id, chat, refresh=True)
+        if not explicit:
+            since = await conn.fetchval(
+                """SELECT now() - make_interval(months => backfill_months) FROM tg_sessions
+                   WHERE account_id = $1""", account_id)
         await conn.execute(
-            """INSERT INTO tg_sync_chats (account_id, peer_class, tg_id, chat_id, enabled, auto_enabled, enabled_at)
-               VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $5 THEN now() END)
+            """INSERT INTO tg_sync_chats AS t (account_id, peer_class, tg_id, chat_id, enabled, auto_enabled,
+                                               enabled_at, backfill_since)
+               VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $5 THEN now() END, $7)
                ON CONFLICT (account_id, peer_class, tg_id) DO UPDATE
                SET chat_id = EXCLUDED.chat_id, enabled = EXCLUDED.enabled,
                    auto_enabled = EXCLUDED.auto_enabled,
-                   enabled_at = COALESCE(tg_sync_chats.enabled_at, EXCLUDED.enabled_at),
+                   enabled_at = COALESCE(t.enabled_at, EXCLUDED.enabled_at),
+                   backfill_since = CASE WHEN $8 OR t.enabled_at IS NULL
+                                         THEN EXCLUDED.backfill_since ELSE t.backfill_since END,
+                   backfill_done = CASE
+                       WHEN ($8 OR t.enabled_at IS NULL) AND t.backfill_before IS NOT NULL
+                            AND ((EXCLUDED.backfill_since IS NULL AND t.backfill_since IS NOT NULL)
+                                 OR EXCLUDED.backfill_since < t.backfill_since)
+                       THEN false ELSE t.backfill_done END,
                    access_lost_at = NULL, access_lost_reason = NULL, last_error = NULL,
                    updated_at = now()""",
             account_id, chat.peer_class, chat.tg_id, chat_id, not excluded, auto and not excluded,
+            since, explicit,
         )
     return chat_id, not excluded
+
+
+async def chat_excluded(conn: asyncpg.Connection, chat_id: int, *, purged: bool) -> tuple[int, PeerKey] | None:
+    """Владелец исключил чат из архива: синхронизация чата выключается сразу, у всех аккаунтов.
+
+    Если сообщения стёрты, сбрасываются и курсоры: иначе после возврата чата сервис считал бы
+    его историю уже загруженной. Возвращает (аккаунт, собеседник) затронутой строки.
+    """
+    row = await conn.fetchrow(
+        """UPDATE tg_sync_chats
+           SET enabled = false, updated_at = now(),
+               backfill_before = CASE WHEN $2 THEN NULL ELSE backfill_before END,
+               backfill_done = CASE WHEN $2 THEN false ELSE backfill_done END,
+               forward_id = CASE WHEN $2 THEN NULL ELSE forward_id END
+           WHERE chat_id = $1 RETURNING account_id, peer_class, tg_id""",
+        chat_id, purged)
+    if row is None:
+        return None
+    return row["account_id"], (row["peer_class"], row["tg_id"])
+
+
+async def promote_hidden_edits(
+    conn: asyncpg.Connection, rows: Iterable[tuple], hidden: dict[tuple[int, int], datetime]
+) -> set[tuple[int, int]]:
+    """Разбирает «скрытые правки» (см. `normalize.hidden_edit_at`) перед записью.
+
+    Обычно скрытая правка — это реакция: текст тот же, и запись в архиве не меняется, отметка
+    «изменено» не появляется. Но если текст сообщения отличается от сохранённого, сервис
+    пропустил настоящую правку; тогда время скрытой правки становится временем правки, чтобы
+    общий слой записи принял новый текст, а прежний убрал в историю. Возвращает ключи
+    (чат, номер сообщения), для которых так и вышло.
+    """
+    if not hidden:
+        return set()
+    by_chat: dict[int, list[int]] = {}
+    for chat_id, tg_message_id in hidden:
+        by_chat.setdefault(chat_id, []).append(tg_message_id)
+    stored: dict[tuple[int, int], asyncpg.Record] = {}
+    for chat_id, ids in by_chat.items():
+        for r in await conn.fetch(
+                "SELECT tg_message_id, text, edited_at FROM messages WHERE chat_id = $1 AND tg_message_id = ANY($2::bigint[])",
+                chat_id, ids):
+            stored[(chat_id, r["tg_message_id"])] = r
+    promoted: set[tuple[int, int]] = set()
+    for item in rows:
+        chat_id, record = item[0], item[1]
+        key = (chat_id, record.tg_message_id)
+        at, known = hidden.get(key), stored.get(key)
+        if at is None or known is None:
+            continue
+        if known["text"] != record.text.replace("\x00", "") and \
+                (known["edited_at"] is None or at > known["edited_at"]):
+            record.edited_at = at
+            promoted.add(key)
+    return promoted
 
 
 async def disable_chat(conn: asyncpg.Connection, account_id: int, key: PeerKey) -> None:
@@ -198,7 +280,8 @@ async def mark_seen(conn: asyncpg.Connection, account_id: int, keys: Iterable[Pe
 
 
 _WORK = """
-SELECT s.peer_class, s.tg_id, s.chat_id, s.backfill_before, s.backfill_done, s.forward_id
+SELECT s.peer_class, s.tg_id, s.chat_id, s.backfill_before, s.backfill_done, s.forward_id,
+       s.backfill_since
 FROM tg_sync_chats s JOIN chats c ON c.id = s.chat_id
 WHERE s.account_id = $1 AND s.enabled AND NOT c.excluded AND s.access_lost_at IS NULL
 """
@@ -239,7 +322,11 @@ class HistorySync:
             limit=PAGE, max_id=0, min_id=0, hash=0,
         ))
 
-    def _rows(self, key: PeerKey, chat_id: int, response: Any, *, newer_than: int = 0) -> list[tuple]:
+    def _rows(
+        self, key: PeerKey, chat_id: int, response: Any, *, newer_than: int = 0,
+        since: datetime | None = None,
+    ) -> list[tuple]:
+        """Строки для записи: (чат, запись, исходящее ли, время скрытой правки или None)."""
         entities = normalize.index_entities(getattr(response, "users", None), getattr(response, "chats", None))
         rows = []
         for message in getattr(response, "messages", None) or ():
@@ -248,7 +335,10 @@ class HistorySync:
             record = normalize.message_record(message, entities, self_id=self.self_id)
             if record is None or record.tg_message_id <= newer_than:
                 continue
-            rows.append((chat_id, record, normalize.is_outgoing(message, self_id=self.self_id)))
+            if since is not None and record.sent_at < since:
+                continue  # старше границы загрузки
+            rows.append((chat_id, record, normalize.is_outgoing(message, self_id=self.self_id),
+                         normalize.hidden_edit_at(message)))
         return rows
 
     async def _store_page(self, key: PeerKey, rows: list[tuple], update_sql: str, *args: Any) -> bool:
@@ -261,7 +351,10 @@ class HistorySync:
             if not live:
                 return False
             if rows:
-                await store.upsert_messages(conn, rows, source="session", owner_tg_id=self.self_id)
+                hidden = {(r[0], r[1].tg_message_id): r[3] for r in rows if r[3] is not None}
+                await promote_hidden_edits(conn, rows, hidden)
+                await store.upsert_messages(conn, [r[:3] for r in rows], source="session",
+                                            owner_tg_id=self.self_id)
             await conn.execute(
                 f"UPDATE tg_sync_chats SET {update_sql}, last_error = NULL, updated_at = now() "
                 "WHERE account_id = $1 AND peer_class = $2 AND tg_id = $3",
@@ -319,8 +412,18 @@ class HistorySync:
             raise CursorStuck()
         # Полный список (не «срез») означает, что старше ничего нет.
         done = isinstance(response, types.messages.Messages) or lowest <= 1
+        since = row["backfill_since"]
+        rows = self._rows(key, row["chat_id"], response, since=since)
+        if since is not None:
+            # Граница глубины: что старше — не берём, и дальше вглубь не идём. Курсор встаёт на
+            # самое старое из взятого, чтобы при сдвиге границы продолжить ровно отсюда.
+            dates = [m.date for m in raw if getattr(m, "date", None) is not None]
+            if dates and min(dates) < since:
+                done = True
+                kept = [r[1].tg_message_id for r in rows]
+                lowest = min(kept) if kept else (cursor or max(ids) + 1)
         stored = await self._store_page(
-            key, self._rows(key, row["chat_id"], response),
+            key, rows,
             "backfill_before = $4, backfill_done = $5, forward_id = COALESCE(forward_id, $6)",
             lowest, done, max(ids))
         return stored and not done
