@@ -23,7 +23,9 @@
 | `compose.yaml` со стоковым Hermes | Работает: Hermes 0.21.5 поднят на эталонном сервере |
 | Runbook развёртывания базового экземпляра | Черновик; шаги 1–5 пройдены на живом сервере |
 | Схема развёртывания (`docs/deployment.md`) | Принята, на сервере не собрана |
-| Расширения Hermes, сервис переписки | Запланированы |
+| Сервис переписки: архив, импорт экспорта, поиск | Написано, покрыто тестами; на эталонном сервере не развёрнуто |
+| Сервис переписки: сессии Telegram, MCP, шлюз отправки | Запланированы |
+| Расширения Hermes | Запланированы |
 | Резервное копирование, обновление, диагностика | Запланированы |
 
 ## Как развернуть
@@ -59,7 +61,7 @@ git clone <адрес репозитория> shturman && cd shturman
 
 ## Документы
 
-`docs/architecture.md` · `docs/deployment.md` · `docs/setup.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `AGENTS.md`
+`docs/architecture.md` · `docs/deployment.md` · `docs/service.md` · `docs/setup.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `AGENTS.md`
 
 ## Лицензия
 
