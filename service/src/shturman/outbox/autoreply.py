@@ -12,6 +12,14 @@
 Ответ готовится БЕЗ инструментов: сервис сам собирает справку (последние сообщения этого чата и
 найденное в архиве), помечает её как чужой текст и просит у модели только текст. Адресат берётся
 из события и архива и никогда — из ответа модели. Запоздавший ответ не отправляется.
+
+Пока главный выключатель отправки (`config.sending`, только из окружения сервиса) выключен,
+автоответ не начинается вовсе: модель не спрашивается.
+
+Чего здесь нет: распознавания ответа, оборванного на полуслове пределом токенов. Плагин не
+сообщает, почему модель остановилась, а гадать по последнему знаку ненадёжно. Вместо этого запас
+токенов считается от предела длины ответа с запасом (`max_tokens_for`), а сам предел ограничен
+так, чтобы запаса хватало. Пустой ответ считается сбоем («no_answer»), а не решением молчать.
 """
 
 # Сбор «пачки» сообщений (отмена прежнего таймера и взвод нового) основан на
@@ -48,11 +56,20 @@ NUMBERS: dict[str, tuple[float, float, float]] = {
     "typing_seconds": (60, 0, 300),      # дольше этого «печатает…» не показываем, даже если ответа ещё нет
     "context_messages": (12, 0, 50),     # сколько последних сообщений чата дать модели
     "search_hits": (5, 0, 20),           # сколько найденных в архиве сообщений дать модели
-    "max_reply_chars": (3000, 200, 10000),
+    "max_reply_chars": (3000, 200, 7000),
 }
 INTEGER_KEYS = frozenset(NUMBERS) - {"pause_seconds", "debounce_seconds"}
-# Где искать справку для ответа: chat — только в этом же чате; account — во всех чатах аккаунта.
+# Где искать справку для ответа: chat — только в этом же чате; account — ещё и собственные
+# (исходящие) сообщения владельца или помощника в других чатах аккаунта. Чужие сообщения из
+# других чатов в запрос не попадают никогда: это и чужая тайна, и путь для внедрённых указаний.
 SEARCH_SCOPES = ("chat", "account")
+EMPTY_STREAK = 5   # столько пустых ответов модели подряд — и владелец получает одно сообщение
+
+
+def max_tokens_for(max_reply_chars: int) -> int:
+    """Запас токенов под ответ нужной длины: русский текст — примерно два знака на токен.
+    Предел длины ответа (7000 знаков) подобран так, чтобы запас не упирался в потолок."""
+    return max(400, min(4000, int(max_reply_chars) // 2 + 300))
 
 REFUSALS = {
     "disabled": "Автоответ для этого аккаунта выключен.",
@@ -219,8 +236,8 @@ def build_messages(
         for r in recent
     ]
     found = [
-        f"[{textlib.one_line(h.get('chat_title'), 40) or 'чат'} · {stamp(h)} · "
-        f"{textlib.one_line(h.get('sender_name'), 40) or '—'}] {textlib.for_prompt(h['text'], 500)}"
+        f"[{'этот чат' if h['chat_id'] == tgt.chat_id else 'другой чат'} · {stamp(h)} · "
+        f"{me if h['is_outgoing'] else 'собеседник'}] {textlib.for_prompt(h['text'], 500)}"
         for h in hits
     ]
     user = "\n\n".join([
@@ -236,6 +253,8 @@ def build_messages(
 async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
     """Собирает справку и просит у модели текст ответа. Ничего не отправляет."""
     state = mod.state
+    if state.config.sending is not True:
+        return   # отправка выключена на сервере: модель даже не спрашиваем
     async with state.pool.acquire() as conn, conn.transaction():
         settings = await load(conn)
         tgt = await policy.target(conn, chat_id)
@@ -252,11 +271,12 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
         if not (await _trigger_state(conn, settings, tgt, message_id)).ok:
             return
         # Нет смысла спрашивать модель, если отправить всё равно нельзя.
-        rules = await policy.load(conn)
+        rules = await policy.load(conn, state.config)
         channel, decision = policy.pick_channel(tgt, None)
         if channel is None:
             return
         for decision in (
+            policy.check_switch(rules),
             await policy.check_target(conn, rules, tgt),
             await policy.check_channel(conn, mod.tg, rules, tgt, channel),
             await policy.check_limits(conn, rules, tgt, "", origin="autoreply",
@@ -275,11 +295,17 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
         hits: list[dict[str, Any]] = []
         query = _search_query(msg["text"])
         if query and settings["search_hits"]:
-            scope = {"chat_id": chat_id} if settings["search_scope"] == "chat" else {"account_id": tgt.account_id}
+            wide = settings["search_scope"] == "account"
+            scope = {"account_id": tgt.account_id} if wide else {"chat_id": chat_id}
             try:
                 async with conn.transaction():   # сбой поиска не должен срывать сам ответ
-                    found = await retrieval.find(state, conn, query, limit=settings["search_hits"] + 1, **scope)
-                hits = [h for h in found if h["id"] != message_id][: settings["search_hits"]]
+                    found = await retrieval.find(
+                        state, conn, query, limit=settings["search_hits"] * (6 if wide else 1) + 1, **scope)
+                # Из других чатов — только собственные исходящие. Сообщения третьих лиц из чужих
+                # чатов в запрос не попадают: ни их содержание, ни спрятанные в них указания.
+                hits = [h for h in found
+                        if h["id"] != message_id and (h["chat_id"] == chat_id or h["is_outgoing"] is True)
+                        ][: settings["search_hits"]]
             except asyncpg.PostgresError:
                 logger.warning("автоответ в чат %s: поиск по архиву не удался, отвечаем без него", chat_id)
         try:
@@ -289,6 +315,7 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
         job_id = await bridge.request_text(
             conn, handler=HANDLER,
             messages=build_messages(settings, tgt, channel, msg["text"], list(recent), hits, tz),
+            max_tokens=max_tokens_for(settings["max_reply_chars"]),
             context={"chat_id": chat_id, "message_id": message_id},
             dedup_key=f"autoreply:{message_id}")
     if job_id is not None and channel == "session":
@@ -312,6 +339,8 @@ async def on_message(mod: runtime.Outbox, payload: dict[str, Any]) -> None:
     chat_id, message_id = payload.get("chat_id"), payload.get("message_id")
     if not isinstance(chat_id, int) or not isinstance(message_id, int):
         return
+    if mod.state.config.sending is not True:
+        return   # главный выключатель: автоответ не начинается вовсе
     async with mod.state.pool.acquire() as conn:
         tgt = await policy.target(conn, chat_id)
         if tgt is None or tgt.account_id != payload.get("account_id") or not (await eligible(conn, tgt)).ok:
@@ -330,6 +359,39 @@ async def on_message(mod: runtime.Outbox, payload: dict[str, Any]) -> None:
 
 # --- ответ модели ---
 
+async def log_outcome(conn: asyncpg.Connection, tgt: Target, outcome: str, reason: str | None = None) -> None:
+    """Записывает исход запроса автоответа. Без текста: только что произошло."""
+    await conn.execute(
+        "INSERT INTO outbox_autoreply_log (account_id, chat_id, outcome, reason) VALUES ($1, $2, $3, $4)",
+        tgt.account_id, tgt.chat_id, outcome, reason)
+
+
+async def outcomes(conn: asyncpg.Connection) -> dict[str, int]:
+    """Сколько каких исходов за последние сутки — для экрана владельца."""
+    rows = await conn.fetch(
+        """SELECT outcome, count(*) AS n FROM outbox_autoreply_log
+           WHERE created_at > now() - interval '24 hours' GROUP BY outcome""")
+    out = {key: 0 for key in ("replied", "declined", "no_answer", "dropped", "failed")}
+    out.update({r["outcome"]: r["n"] for r in rows})
+    return out
+
+
+async def _warn_if_model_is_silent(conn: asyncpg.Connection) -> None:
+    """Несколько пустых ответов подряд — сбой, о котором владелец должен узнать (один раз)."""
+    last = await conn.fetch(
+        """SELECT id, outcome FROM outbox_autoreply_log WHERE outcome IN ('replied', 'declined', 'no_answer')
+           ORDER BY id DESC LIMIT $1""", EMPTY_STREAK)
+    if len(last) == EMPTY_STREAK and all(r["outcome"] == "no_answer" for r in last):
+        # Ключ — номер первой записи серии: пока серия длится, сообщение не повторяется.
+        streak_start = await conn.fetchval(
+            """SELECT COALESCE(max(id), 0) FROM outbox_autoreply_log
+               WHERE outcome IN ('replied', 'declined')""")
+        await bridge.notify_owner(
+            conn, "Автоответ доверенным не получает ответ модели: несколько раз подряд пришла пустота. "
+                  "Собеседники остаются без ответа. Проверьте модель в настройках Hermes.",
+            dedup_key=f"autoreply:silent:{streak_start}")
+
+
 @bridge.on_result(HANDLER)
 async def _reply_ready(conn: asyncpg.Connection, job: dict[str, Any], result: dict[str, Any]) -> None:
     """Модель вернула текст. Здесь только запись согласованного автоответа; отправляет отправщик."""
@@ -343,16 +405,29 @@ async def _reply_ready(conn: asyncpg.Connection, job: dict[str, Any], result: di
     reply = result.get("text")
     cleaned = textlib.clean_outgoing(reply) if isinstance(reply, str) else ""
     draft_id = None
-    if cleaned and "БЕЗ_ОТВЕТА" not in cleaned.upper():
-        settings, rules = await load(conn), await policy.load(conn)
+    if not cleaned:
+        # Пустой ответ — не решение «не отвечать», а сбой: считается отдельно.
+        await log_outcome(conn, tgt, "no_answer")
+        await _warn_if_model_is_silent(conn)
+    elif "БЕЗ_ОТВЕТА" in cleaned.upper():
+        await log_outcome(conn, tgt, "declined")
+    else:
+        settings, rules = await load(conn), await policy.load(conn, mod.state.config)
         channel, _ = policy.pick_channel(tgt, None)
-        ok = (channel is not None
-              and len(cleaned) <= settings["max_reply_chars"] + 500
-              and policy.check_text(rules, channel, cleaned).ok
-              and (await still_allowed(conn, mod, settings, tgt, {"trigger_message_id": message_id})).ok)
-        if ok:
+        decision = policy.check_switch(rules)
+        if decision.ok and channel is None:
+            decision = _no("not_private")
+        if decision.ok and len(cleaned) > settings["max_reply_chars"] + 500:
+            decision = policy.deny("text_too_long", parts=rules["max_parts"])
+        if decision.ok:
+            decision = policy.check_text(rules, channel, cleaned)
+        if decision.ok:
+            decision = await still_allowed(conn, mod, settings, tgt, {"trigger_message_id": message_id})
+        if decision.ok:
             draft_id = await drafts.create_autoreply(
                 conn, tgt, channel=channel, text=cleaned, trigger_message_id=message_id)
+        await log_outcome(conn, tgt, "replied" if draft_id is not None else "dropped",
+                          None if draft_id is not None else (decision.code if not decision.ok else "repeat"))
     if draft_id is None:
         mod.stop_typing(tgt.account_id, chat_id)   # ответа не будет
     else:
@@ -364,8 +439,11 @@ async def _reply_failed(conn: asyncpg.Connection, job: dict[str, Any], error: st
     """Модель или плагин недоступны: входящее остаётся без ответа, с опозданием не отвечаем."""
     mod = runtime.current()
     chat_id = job["context"].get("chat_id")
-    if mod is None or not isinstance(chat_id, int):
+    if not isinstance(chat_id, int):
         return
     tgt = await policy.target(conn, chat_id)
-    if tgt is not None:
+    if tgt is None:
+        return
+    await log_outcome(conn, tgt, "failed")
+    if mod is not None:
         mod.stop_typing(tgt.account_id, chat_id)
