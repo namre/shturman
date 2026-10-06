@@ -32,6 +32,9 @@ def message(text, user=OWNER, mid=1):
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.setenv("SHTURMAN_STATE_DIR", str(tmp_path / "state"))
+    for name in shturman_telegram._ALLOWLIST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    shturman_telegram._unbound_replied.clear()
     monkeypatch.setattr(shturman_telegram, "business_plugin_active", lambda: False)
     replies = []
 
@@ -65,7 +68,30 @@ def dispatch(bundle, payload):
     return handled
 
 
+def core_group(handled):
+    """Только группа 0 — та, где работают обработчики ядра Hermes."""
+    return [h for h in handled if h[0] == 0]
+
+
+def test_unbound_bot_answers_strangers_with_a_hint_and_hides_them_from_hermes(app):
+    """Пока владельца нет, стоковый ответ Hermes с кодом привязки никому не уходит."""
+    handled = dispatch(app, {"update_id": 20, "message": message("/start", user=STRANGER)})
+    assert core_group(handled) == [(0, "on_unbound_message")]
+    assert app[1] == [shturman_telegram.REPLIES["unbound"]]
+    # повторное сообщение из того же чата тоже не доходит до Hermes, но подсказка не повторяется
+    handled = dispatch(app, {"update_id": 21, "message": message("эй", user=STRANGER, mid=2)})
+    assert core_group(handled) == [(0, "on_unbound_message")]
+    assert len(app[1]) == 1
+
+
+def test_manual_allowlist_means_we_do_not_interfere(app, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "42")
+    handled = dispatch(app, {"update_id": 22, "message": message("привет")})
+    assert [h for h in handled if h[0] == 0] == [] and app[1] == []
+
+
 def test_ordinary_message_is_left_to_hermes(app):
+    Store().write("owner", {"user_id": 42, "chat_id": 42, "name": "Иван"})
     handled = dispatch(app, {"update_id": 1, "message": message("привет")})
     assert [h for h in handled if h[0] == 0] == []       # в группе ядра мы ничего не перехватили
     assert app[1] == []
@@ -80,8 +106,11 @@ def test_start_with_token_makes_a_candidate_not_an_owner(app):
     assert (candidate["user_id"], candidate["chat_id"], candidate["name"], candidate["username"]) == \
         (42, 42, "Иван Иванов", "ivan")
     assert app[1] == [shturman_telegram.REPLIES["accepted"]]
-    # значение принято — следующее сообщение снова идёт в Hermes
-    assert [h for h in dispatch(app, {"update_id": 3, "message": message("привет", mid=2)}) if h[0] == 0] == []
+    # значение принято; до подтверждения в мастере бот для всех остаётся «не настроен»
+    assert core_group(dispatch(app, {"update_id": 3, "message": message("привет", mid=2)})) == [(0, "on_unbound_message")]
+    # после подтверждения сообщения владельца идут в Hermes
+    Pairing(Store()).confirm()
+    assert [h for h in dispatch(app, {"update_id": 30, "message": message("привет", mid=3)}) if h[0] == 0] == []
 
 
 def test_bare_start_during_pairing_gets_a_hint_not_the_stock_reply(app):

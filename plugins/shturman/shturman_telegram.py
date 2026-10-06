@@ -7,11 +7,15 @@ Hermes подключает их раньше собственных, а Telegra
   2. Защита бизнес-режима — пока плагин бизнес-режима не загружен: без него ядро Hermes
      приняло бы сообщения собеседников владельца за его команды (issue hermes-agent #127430).
   3. Наблюдение за подключением бизнес-режима — отдельная группа, сообщений не перехватывает.
+  4. Молчание до привязки — пока у бота нет владельца и не задан список разрешённых
+     пользователей. Без этого стоковый Hermes отвечает любому написавшему английским
+     сообщением с кодом привязки и командой для терминала.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from shturman_core.pairing import Pairing
@@ -29,7 +33,37 @@ REPLIES = {
             "или отправьте сюда код из мастера.",
     "expired": "Время привязки вышло. Начните привязку в мастере настройки заново.",
     "cancelled": "Слишком много неверных кодов. Начните привязку в мастере настройки заново.",
+    "unbound": "Этот бот ещё не настроен. Если вы его владелец, откройте мастер настройки "
+               "и нажмите там «Открыть бота».",
 }
+
+UNBOUND_REPLY_INTERVAL = 3600      # одному чату подсказку не чаще раза в час
+_ALLOWLIST_ENV = (
+    "TELEGRAM_ALLOWED_USERS", "TELEGRAM_ALLOW_ALL_USERS",
+    "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
+)
+_unbound_replied: dict[int, float] = {}
+
+
+def instance_unbound(store: Store) -> bool:
+    """У бота нет владельца, и никто не задал список разрешённых пользователей вручную.
+
+    Если список задан (например, экземпляр настраивали до появления мастера), не вмешиваемся:
+    кому отвечать, решает Hermes.
+    """
+    if store.read("owner").get("chat_id"):
+        return False
+    return not any((os.environ.get(name) or "").strip() for name in _ALLOWLIST_ENV)
+
+
+def should_reply_unbound(chat_id: int, now: float) -> bool:
+    last = _unbound_replied.get(chat_id)
+    if last is not None and now - last < UNBOUND_REPLY_INTERVAL:
+        return False
+    if len(_unbound_replied) > 1000:
+        _unbound_replied.clear()
+    _unbound_replied[chat_id] = now
+    return True
 
 _ACTIVE_CACHE_SECONDS = 5.0
 _active_cache: tuple[float, bool] = (0.0, False)
@@ -150,4 +184,25 @@ def _wire_pairing(application, store, MessageHandler, filters) -> None:
     application.add_handler(MessageHandler(
         filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE & filters.TEXT & _PairingOpen(),
         on_pairing_message,
+    ))
+
+    # --- молчание до привязки ---
+
+    class _Unbound(filters.MessageFilter):
+        def filter(self, message) -> bool:
+            return instance_unbound(store)
+
+    async def on_unbound_message(update, context) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+        if should_reply_unbound(chat.id, time.time()):
+            try:
+                await message.reply_text(REPLIES["unbound"])
+            except Exception:
+                logger.warning("shturman: не удалось ответить непривязанному чату", exc_info=True)
+
+    application.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE & _Unbound(), on_unbound_message,
     ))
