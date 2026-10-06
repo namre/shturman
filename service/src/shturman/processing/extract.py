@@ -32,7 +32,7 @@ from typing import Any, Sequence
 
 from .dates import find_due_expression
 
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"
 
 OWNER_LABEL = "ВЛАДЕЛЕЦ"
 EPISODE_GAP = timedelta(minutes=45)   # пауза, после которой начинается новый эпизод
@@ -56,6 +56,14 @@ class Msg:
     is_outgoing: bool
     text: str
     forwarded: bool = False
+    tg_id: int | None = None   # messages.tg_message_id
+    # сообщение от имени владельца отправил сам сервис (автоответ): это не обещание владельца
+    by_service: bool = False
+
+    @property
+    def is_source(self) -> bool:
+        """Можно ли выводить из сообщения обязательства и изменения статуса."""
+        return not self.forwarded and not self.by_service
 
     @property
     def speaker_key(self) -> tuple:
@@ -176,7 +184,7 @@ def has_promise_signal(episode: Episode) -> bool:
     чем пропустить, поэтому правила широкие."""
     previous: list[Msg] = list(episode.context)
     for message in episode.messages:
-        if not message.forwarded and message.text.strip():
+        if message.is_source and message.text.strip():
             if promise_sentences(message.text):
                 return True
             # короткое согласие в ответ на чужое сообщение со сроком: «пришлите до пятницы» — «хорошо»
@@ -233,6 +241,12 @@ def speaker_labels(episode: Episode) -> dict[tuple, str]:
     return labels
 
 
+def _mark(message: Msg) -> str:
+    if message.by_service:
+        return " (написано ассистентом)"
+    return " (переслано)" if message.forwarded else ""
+
+
 def _stamp(moment: datetime, tz: tzinfo | None) -> str:
     local = moment.astimezone(tz) if tz is not None and moment.tzinfo is not None else moment
     return local.strftime("%d.%m %H:%M")
@@ -252,13 +266,11 @@ def render_conversation(
     if episode.context:
         lines.append("Ранее (только для понимания; обязательства отсюда не извлекать):")
         for message in episode.context:
-            mark = " (переслано)" if message.forwarded else ""
-            lines.append(f"(-) {_stamp(message.sent_at, tz)} {labels[message.speaker_key]}{mark}: "
+            lines.append(f"(-) {_stamp(message.sent_at, tz)} {labels[message.speaker_key]}{_mark(message)}: "
                          f"{clean_text(message.text) or '(без текста)'}")
     lines.append("Сообщения:")
     for n, message in enumerate(episode.messages, start=1):
-        mark = " (переслано)" if message.forwarded else ""
-        lines.append(f"[{n}] {_stamp(message.sent_at, tz)} {labels[message.speaker_key]}{mark}: "
+        lines.append(f"[{n}] {_stamp(message.sent_at, tz)} {labels[message.speaker_key]}{_mark(message)}: "
                      f"{clean_text(message.text) or '(без текста)'}")
     return "\n".join(lines)
 
@@ -283,7 +295,8 @@ EXTRACT_INSTRUCTIONS = f"""\
 высказывания с оговорками («постараюсь», «попробую», «если получится», «возможно», «наверное») — \
 НЕ обязательства.
 2. Обязательство принадлежит автору сообщения. Пересказ чужих обещаний («Иван обещал прислать») \
-не извлекай. Пересланные сообщения (помечены «переслано») не извлекай.
+не извлекай. Пересланные сообщения (помечены «переслано») и сообщения, написанные ассистентом \
+за владельца (помечены «написано ассистентом»), не извлекай.
 3. message — номер сообщения в квадратных скобках, в котором дано обещание. Сообщения из блока \
 «Ранее» номеров не имеют: из них ничего не извлекай.
 4. source_quote — фрагмент этого сообщения, скопированный ДОСЛОВНО, без пересказа и исправлений.
@@ -298,32 +311,21 @@ EXTRACT_INSTRUCTIONS = f"""\
 9. duplicate_of — если это то же обязательство, что уже есть в списке «Уже записано», укажи его \
 номер; иначе null.
 10. Если обязательств нет, верни пустой список.
+
+Ответ — один JSON-объект: {{"commitments": [{{"message": 1, "source_quote": "…", "what": "…", \
+"due_expression": "…" или null, "due_message": номер или null, "recipient": "У1" или null, \
+"duplicate_of": номер или null}}]}}
 """
 
+# Схема намеренно нестрогая. Исполнитель сверяет ответ модели со схемой и при любом расхождении
+# считает запрос неудавшимся — эпизод тогда теряется. Поэтому в схеме только вид ответа и
+# обязательный ключ, а всё остальное (типы, номера, дословность) проверяет validate_extraction.
 EXTRACT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "additionalProperties": False,
     "required": ["commitments"],
-    "properties": {
-        "commitments": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["message", "source_quote", "what", "due_expression", "due_message",
-                             "recipient", "duplicate_of"],
-                "properties": {
-                    "message": {"type": "integer"},
-                    "source_quote": {"type": "string"},
-                    "what": {"type": "string"},
-                    "due_expression": {"type": ["string", "null"]},
-                    "due_message": {"type": ["integer", "null"]},
-                    "recipient": {"type": ["string", "null"]},
-                    "duplicate_of": {"type": ["integer", "null"]},
-                },
-            },
-        },
-    },
+    "description": "commitments: array of objects {message: integer, source_quote: string, what: string, "
+                   "due_expression: string or null, due_message: integer or null, "
+                   "recipient: string or null, duplicate_of: integer or null}",
 }
 
 RESOLVE_INSTRUCTIONS = f"""\
@@ -345,29 +347,16 @@ RESOLVE_INSTRUCTIONS = f"""\
 4. Обещание сделать («пришлю завтра») — не выполнение. Напоминание или вопрос («где смета?») — \
 не изменение.
 5. Если изменений нет, верни пустой список.
+
+Ответ — один JSON-объект: {{"updates": [{{"commitment": 1, "status": "fulfilled", "message": 2, \
+"quote": "…", "new_due_expression": "…" или null}}]}}
 """
 
 RESOLVE_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "additionalProperties": False,
     "required": ["updates"],
-    "properties": {
-        "updates": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["commitment", "status", "message", "quote", "new_due_expression"],
-                "properties": {
-                    "commitment": {"type": "integer"},
-                    "status": {"type": "string", "enum": ["fulfilled", "cancelled", "rescheduled"]},
-                    "message": {"type": "integer"},
-                    "quote": {"type": "string"},
-                    "new_due_expression": {"type": ["string", "null"]},
-                },
-            },
-        },
-    },
+    "description": "updates: array of objects {commitment: integer, status: fulfilled | cancelled | "
+                   "rescheduled, message: integer, quote: string, new_due_expression: string or null}",
 }
 
 
@@ -458,6 +447,11 @@ class Candidate:
     duplicate_of: int | None        # номер в списке «Уже записано»
 
 
+def well_formed(parsed: Any, key: str) -> bool:
+    """Ответ вообще похож на то, что просили: объект со списком под нужным ключом."""
+    return isinstance(parsed, dict) and isinstance(parsed.get(key), list)
+
+
 def validate_extraction(
     parsed: Any, episode: Episode, labels: dict[tuple, str],
 ) -> tuple[list[Candidate], dict[str, int]]:
@@ -466,7 +460,7 @@ def validate_extraction(
     Схему ответа поставщик модели строго не проверяет, поэтому здесь проверяется всё: типы,
     номера, дословность цитаты и срока. Автор обязательства берётся из сообщения, а не из ответа.
     """
-    dropped = {"malformed": 0, "bad_index": 0, "forwarded": 0, "ungrounded_quote": 0,
+    dropped = {"malformed": 0, "bad_index": 0, "forwarded": 0, "by_service": 0, "ungrounded_quote": 0,
                "hedged": 0, "question": 0, "empty": 0, "ungrounded_due": 0, "over_limit": 0}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("commitments"), list):
         dropped["malformed"] += 1
@@ -489,8 +483,8 @@ def validate_extraction(
             dropped["bad_index"] += 1
             continue
         message = episode.messages[index - 1]
-        if message.forwarded:
-            dropped["forwarded"] += 1
+        if not message.is_source:
+            dropped["by_service" if message.by_service else "forwarded"] += 1
             continue
         quote = quote.strip()[:QUOTE_LIMIT]
         if not grounded(quote, message.text):
@@ -525,9 +519,9 @@ def validate_extraction(
             else:
                 # срок из просьбы, на которую согласились: только из сообщения не позже обещания
                 hinted = _int(item.get("due_message"))
-                pool = [m for m in [*episode.context, *episode.messages[:index]] if not m.forwarded]
+                pool = [m for m in [*episode.context, *episode.messages[:index]] if m.is_source]
                 hinted_message = episode.messages[hinted - 1] if hinted and 1 <= hinted <= index else None
-                if hinted_message is not None and not hinted_message.forwarded and grounded(due, hinted_message.text):
+                if hinted_message is not None and hinted_message.is_source and grounded(due, hinted_message.text):
                     due_message = hinted_message
                 else:
                     due_message = next((m for m in reversed(pool) if grounded(due, m.text)), None)
@@ -562,7 +556,7 @@ class Update:
 def validate_resolution(
     parsed: Any, episode: Episode, commitments_count: int,
 ) -> tuple[list[Update], dict[str, int]]:
-    dropped = {"malformed": 0, "bad_index": 0, "bad_status": 0, "forwarded": 0,
+    dropped = {"malformed": 0, "bad_index": 0, "bad_status": 0, "forwarded": 0, "by_service": 0,
                "ungrounded_quote": 0, "ungrounded_due": 0, "over_limit": 0}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("updates"), list):
         dropped["malformed"] += 1
@@ -588,8 +582,8 @@ def validate_resolution(
             dropped["bad_index"] += 1
             continue
         message = episode.messages[index - 1]
-        if message.forwarded:
-            dropped["forwarded"] += 1
+        if not message.is_source:
+            dropped["by_service" if message.by_service else "forwarded"] += 1
             continue
         quote = quote.strip()[:QUOTE_LIMIT]
         if not grounded(quote, message.text):

@@ -46,6 +46,10 @@ async def extract_once(conn, items, **plan_kw):
     return out
 
 
+async def run_stats(conn, run_id):
+    return pipeline._loads(await conn.fetchval("SELECT stats FROM processing_runs WHERE id = $1", run_id))
+
+
 async def digest_jobs(conn):
     # исполнитель забирает задания по одному, в порядке постановки; здесь — пачкой, поэтому сортируем
     return sorted(await claim(conn, bridge.NOTIFY_OWNER), key=lambda job: job["id"])
@@ -290,7 +294,7 @@ async def test_error_while_applying_answer_does_not_break_the_queue(conn, monkey
     monkeypatch.setattr(commitments, "propose", broken)
     assert await answer(conn, job, {"commitments": [SMETA_ITEM]}) is True      # задание закрыто, очередь жива
     assert await rows(conn) == []
-    assert await conn.fetchval("SELECT state FROM processing_requests") == "failed"
+    assert await conn.fetchval("SELECT state FROM processing_requests") == "retry"       # и будет поставлен заново
     assert await conn.fetchval("SELECT status FROM processing_runs") == "done"
     assert "RuntimeError" in caplog.text and "смету" not in caplog.text       # в журнале только вид ошибки
 
@@ -303,18 +307,70 @@ async def test_failed_or_lost_request_does_not_block_next_runs(conn):
     job, = await claim(conn)
     assert (await plan(conn)) == {"status": "already_running", "run_id": first["run_id"], "pending": 1,
                                   "planned": 0, "resolve_planned": 0}
-    # окончательная неудача задания закрывает прогон
-    assert await bridge.deliver_failure(conn, job["id"], "модель недоступна", retry_in=None) == "failed"
+    # окончательная неудача задания закрывает прогон; эпизод не потерян — он ждёт повтора
+    assert await bridge.deliver_failure(conn, job["id"], "ответ не прошёл проверку схемы", retry_in=None) == "failed"
     assert await conn.fetchval("SELECT status FROM processing_runs WHERE id = $1", first["run_id"]) == "done"
-    assert await conn.fetchval("SELECT state FROM processing_requests") == "failed"
+    assert await conn.fetchval("SELECT state FROM processing_requests") == "retry"
+    assert (await run_stats(conn, first["run_id"]))["results"] == {"failed_requests": 1, "requests_to_retry": 1}
 
-    # исполнитель пропал совсем: задание закрыто чисткой очереди, без обработчика
-    await say(conn, ivan_chat, [(IVAN, "Иван Петров", "Договор подпишу завтра")], first_id=5, start=T0 + timedelta(hours=2))
+    # следующий прогон ставит те же сообщения заново: прежний ключ защиты от повторов не мешает
     second = await plan(conn, now=T0 + timedelta(hours=3))
-    await conn.execute("UPDATE jobs SET status = 'failed' WHERE status = 'queued'")
+    assert (second["status"], second["retried"], second["planned"], second["messages"]["new"]) == ("planned", 1, 0, 0)
+    job, = await claim(conn)
+    assert "Пришлю смету по фасадам к пятнице" in job["payload"]["input"]
+    # задание никто не забрал за сутки: очередь снимает его и сообщает обработчику
+    await conn.execute("UPDATE jobs SET status = 'queued', created_at = now() - interval '25 hours' WHERE id = $1", job["id"])
+    assert await bridge.reap_lost(conn) == 1
+    assert [tuple(r) for r in await conn.fetch("SELECT attempt, state FROM processing_requests ORDER BY job_id")] == \
+        [(0, "failed"), (1, "retry")]
+
+    # второй повтор; на этот раз задание закрыто без обработчика, а его содержимое уже стёрто
+    third = await plan(conn, now=T0 + timedelta(hours=30))
+    assert third["retried"] == 1
+    await conn.execute("UPDATE jobs SET status = 'failed', payload = '{}', context = '{}' WHERE status = 'queued'")
     assert await pipeline.finish_stale_runs(conn) == 1
-    assert await conn.fetchval("SELECT status FROM processing_runs WHERE id = $1", second["run_id"]) == "done"
-    assert (await plan(conn, now=T0 + timedelta(hours=4)))["status"] == "nothing_to_do"
+    assert await conn.fetchval("SELECT status FROM processing_runs WHERE id = $1", third["run_id"]) == "done"
+    # повторы исчерпаны: эпизод записан как пропущенный, и это видно в итогах
+    assert (await run_stats(conn, third["run_id"]))["results"] == {"failed_requests": 1, "requests_given_up": 1}
+    last = await plan(conn, now=T0 + timedelta(hours=31))
+    assert (last["status"], last["retried"], last["given_up"], last["retry_waiting"]) == ("nothing_to_do", 0, 1, 0)
+    assert await claim(conn) == []
+
+
+async def test_retried_request_succeeds_and_malformed_answer_is_retried_too(conn):
+    _, ivan_chat = await scene(conn)
+    await say(conn, ivan_chat, [SMETA])
+    await plan(conn)
+    job, = await claim(conn)
+    # ответ пришёл, но это не JSON: эпизод не теряется
+    await bridge.deliver_result(conn, job["id"], {"parsed": None, "text": "Вот обязательства: …", "model": "m"})
+    assert await conn.fetchval("SELECT state FROM processing_requests") == "retry"
+    out = await plan(conn, now=T0 + timedelta(hours=3))
+    assert out["retried"] == 1
+    job, = await claim(conn)
+    await answer(conn, job, {"commitments": [SMETA_ITEM]})
+    row, = await rows(conn)
+    assert (row["what"], row["status"]) == ("прислать смету по фасадам", "proposed")
+    assert [r["state"] for r in await conn.fetch("SELECT state FROM processing_requests ORDER BY job_id")] == ["failed", "done"]
+    # сообщение, которое за это время удалили, повторно не ставится
+    await say(conn, ivan_chat, [(IVAN, "Иван Петров", "Договор подпишу завтра")], first_id=5, start=T0 + timedelta(hours=4))
+    await plan(conn, now=T0 + timedelta(hours=5))
+    for job in await claim(conn):
+        await bridge.deliver_failure(conn, job["id"], "сбой", retry_in=None)
+    await store.mark_deleted(conn, ivan_chat, [5])
+    out = await plan(conn, now=T0 + timedelta(hours=6))
+    assert (out["retried"], out["retry_dropped"]) == (0, 1)
+
+
+def test_request_schemas_are_permissive():
+    """Исполнитель отвергает ответ при любом расхождении со схемой, поэтому в схеме только вид
+    ответа и обязательный ключ; всё остальное проверяет код."""
+    from shturman.processing import extract
+
+    for schema, key in ((extract.EXTRACT_SCHEMA, "commitments"), (extract.RESOLVE_SCHEMA, "updates")):
+        assert {k: v for k, v in schema.items() if k != "description"} == {"type": "object", "required": [key]}
+        assert key in schema["description"]
+    assert '{"commitments": [' in extract.EXTRACT_INSTRUCTIONS and '{"updates": [' in extract.RESOLVE_INSTRUCTIONS
 
 
 async def test_rerun_does_not_duplicate_and_rejected_does_not_come_back(conn):
@@ -469,7 +525,7 @@ async def test_what_is_skipped_and_watermark_moves_once(conn):
     out = await plan(conn)
     assert out["messages"] == {"new": 9, "eligible": 1, "skipped_old": 1, "skipped_excluded": 1,
                                "skipped_chat_type": 2, "skipped_bot": 1, "skipped_service": 1,
-                               "skipped_deleted": 1, "skipped_empty": 1, "deferred": 0}
+                               "skipped_deleted": 1, "skipped_empty": 1, "assistant": 0, "deferred": 0}
     assert (out["planned"], out["episodes"], out["cap_reached"], out["more"]) == (1, 1, False, False)
     job, = await claim(conn)
     assert job["payload"]["input"].count("Пришлю отчёт завтра") == 1

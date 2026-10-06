@@ -40,7 +40,23 @@ SIMILAR_QUOTE = 95         # или почти дословно совпали �
 SIMILAR_WITH_HINT = 75     # порог ниже, если на дубль указала ещё и модель
 SIMILAR_SAME_MESSAGE = 70  # для двух пунктов из одного и того же сообщения
 
-VIEWS = ("open", "overdue", "today", "week", "proposed", "closed", "all")
+DIGEST_BUDGET = bridge.MESSAGE_LIMIT - 200   # единиц UTF-16 на сообщение-сводку; запас — на шапку и хвост
+DIGEST_MAX_SENDS = 3       # сколько раз пункт уходит владельцу, если сводка не доставляется
+
+VIEWS = ("open", "overdue", "today", "week", "next_week", "proposed", "closed", "all")
+
+# Поля словаря обязательства, взятые из чужого текста (сообщения, имена, названия чатов).
+# Тот, кто показывает словарь агенту, обязан подавать их как данные, а не как указания.
+UNTRUSTED_FIELDS = ["what", "source_quote", "due_expression", "debtor.name", "creditor.name", "chat.title"]
+
+# Видимость. Обязательство не показывается никому — ни владельцу в сводке, ни агенту, ни
+# маршрутам, — если его чат исключён из архива или удалено сообщение, из которого оно выведено
+# (с обещанием или со сроком). Строки при этом могут ещё лежать в базе: их убирает подписчик
+# события и обход `purge_orphans`, но показывать их нельзя уже сейчас.
+# Псевдонимы: c — commitments, ch — chats, m — сообщение-источник.
+VISIBLE = """NOT ch.excluded AND m.deleted_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM messages dm
+                             WHERE dm.id = c.due_message_id AND dm.deleted_at IS NOT NULL)"""
 
 _SELECT = """
 SELECT c.*, ch.title AS chat_title, ch.type AS chat_type,
@@ -56,7 +72,13 @@ LEFT JOIN people dpe ON dpe.id = dpp.person_id
 LEFT JOIN peers cp ON cp.id = c.creditor_peer_id
 LEFT JOIN person_peers cpp ON cpp.peer_id = c.creditor_peer_id
 LEFT JOIN people cpe ON cpe.id = cpp.person_id
-"""
+WHERE """ + VISIBLE + "\n"
+
+
+async def is_visible(conn: asyncpg.Connection, commitment_id: int) -> bool:
+    return bool(await conn.fetchval(
+        f"""SELECT 1 FROM commitments c JOIN chats ch ON ch.id = c.chat_id
+            JOIN messages m ON m.id = c.source_message_id WHERE c.id = $1 AND {VISIBLE}""", commitment_id))
 
 
 # --- представление ---------------------------------------------------------------------------
@@ -93,13 +115,15 @@ def to_dict(row: asyncpg.Record, today: date | None = None) -> dict[str, Any]:
         "created_at": row["created_at"].isoformat(),
         "decided_at": row["decided_at"].isoformat() if row["decided_at"] else None,
         "closed_at": row["closed_at"].isoformat() if row["closed_at"] else None,
+        "untrusted_fields": list(UNTRUSTED_FIELDS),
     }
 
 
 async def get_commitment(
     conn: asyncpg.Connection, commitment_id: int, *, today: date | None = None, with_events: bool = False,
 ) -> dict[str, Any] | None:
-    row = await conn.fetchrow(_SELECT + " WHERE c.id = $1", commitment_id)
+    """Одно обязательство; None — если его нет или оно не видно (чат исключён, источник удалён)."""
+    row = await conn.fetchrow(_SELECT + " AND c.id = $1", commitment_id)
     if row is None:
         return None
     out = to_dict(row, today)
@@ -116,14 +140,16 @@ async def get_commitment(
 
 async def list_commitments(
     conn: asyncpg.Connection, *, view: str = "open", today: date, person_id: int | None = None,
-    chat_id: int | None = None, direction: str | None = None, limit: int = 100,
+    peer_id: int | None = None, chat_id: int | None = None, direction: str | None = None, limit: int = 100,
 ) -> list[dict[str, Any]]:
     """Выборка обязательств.
 
     view: open — принятые и не закрытые; overdue — просроченные; today — срок сегодня;
-    week — срок с сегодня до конца недели; proposed — ждут решения владельца;
-    closed — выполненные и отменённые; all — все.
-    `person_id` — обязательства, где человек должен или ему должны (по всем его учётным записям).
+    week — срок с сегодня до конца недели; next_week — срок с понедельника по воскресенье
+    следующей недели; proposed — ждут решения владельца; closed — выполненные и отменённые; all — все.
+    `person_id` — обязательства, где человек должен или ему должны (по всем его учётным записям);
+    `peer_id` — то же по одной учётной записи Telegram (peers.id).
+    Обязательства исключённых чатов и удалённых сообщений не возвращаются.
     """
     if view not in VIEWS:
         raise ValueError(f"неизвестная выборка: {view}")
@@ -133,7 +159,7 @@ async def list_commitments(
         args.append(value)
         return f"${len(args)}"
 
-    if view in ("open", "overdue", "today", "week"):
+    if view in ("open", "overdue", "today", "week", "next_week"):
         where.append("c.status = 'open'")
     elif view == "proposed":
         where.append("c.status = 'proposed'")
@@ -146,6 +172,12 @@ async def list_commitments(
     elif view == "week":
         sunday = today + timedelta(days=6 - today.weekday())
         where.append(f"c.due_date BETWEEN {arg(today)} AND {arg(sunday)}")
+    elif view == "next_week":
+        monday = today + timedelta(days=7 - today.weekday())
+        where.append(f"c.due_date BETWEEN {arg(monday)} AND {arg(monday + timedelta(days=6))}")
+    if peer_id is not None:
+        p = arg(peer_id)
+        where.append(f"(c.debtor_peer_id = {p} OR c.creditor_peer_id = {p})")
     if person_id is not None:
         p = arg(person_id)
         where.append(
@@ -157,7 +189,7 @@ async def list_commitments(
         where.append(f"c.chat_id = {arg(chat_id)}")
     if direction is not None:
         where.append(f"c.direction = {arg(direction)}")
-    sql = _SELECT + (" WHERE " + " AND ".join(where) if where else "")
+    sql = _SELECT + "".join(f" AND {condition}" for condition in where)
     sql += f" ORDER BY c.due_date NULLS LAST, c.due_time NULLS LAST, c.id LIMIT {arg(max(1, min(int(limit), 500)))}"
     return [to_dict(r, today) for r in await conn.fetch(sql, *args)]
 
@@ -273,7 +305,7 @@ async def _move(
 ) -> dict[str, Any]:
     async with conn.transaction():
         row = await _locked(conn, commitment_id)
-        if row is None:
+        if row is None or not await is_visible(conn, commitment_id):
             return _result(False, error="Такого обязательства нет.", code="not_found")
         if row["status"] == to:
             return _result(True, changed=False, commitment=await get_commitment(conn, commitment_id, today=today))
@@ -356,7 +388,7 @@ async def reschedule(
         return _result(False, error=dates.REASON_TEXT[due.reason], code=due.reason.value)
     async with conn.transaction():
         row = await _locked(conn, commitment_id)
-        if row is None:
+        if row is None or not await is_visible(conn, commitment_id):
             return _result(False, error="Такого обязательства нет.", code="not_found")
         if row["status"] not in ("open", "proposed"):
             return _result(False, error=f"Нельзя: обязательство в статусе «{STATUS_TEXT[row['status']]}».",
@@ -403,7 +435,7 @@ async def apply_change(conn: asyncpg.Connection, change_id: int, *, actor: str =
     """Владелец согласился с предложенным изменением: оно применяется."""
     async with conn.transaction():
         change = await conn.fetchrow("SELECT * FROM commitment_changes WHERE id = $1 FOR UPDATE", change_id)
-        if change is None:
+        if change is None or not await is_visible(conn, change["commitment_id"]):
             return _result(False, error="Предложение уже неактуально.", code="not_found")
         if change["status"] != "proposed":
             return _result(True, changed=False, status=change["status"])
@@ -434,7 +466,7 @@ async def apply_change(conn: asyncpg.Connection, change_id: int, *, actor: str =
 async def reject_change(conn: asyncpg.Connection, change_id: int, *, actor: str = "owner") -> dict[str, Any]:
     async with conn.transaction():
         change = await conn.fetchrow("SELECT * FROM commitment_changes WHERE id = $1 FOR UPDATE", change_id)
-        if change is None:
+        if change is None or not await is_visible(conn, change["commitment_id"]):
             return _result(False, error="Предложение уже неактуально.", code="not_found")
         if change["status"] != "proposed":
             return _result(True, changed=False, status=change["status"])
@@ -526,91 +558,122 @@ _MARK = {"open": "✓ принято", "rejected": "✗ отклонено", "ex
          "cancelled": "✓ отменено", "accepted": "✓ применено", "proposed": "… ждёт"}
 
 
-def _render_commitment(pos: int, item: dict[str, Any], today: date | None) -> str:
-    return (f"{pos}. {who_line(item)}: {_short(item['what'], 200)}\n"
+def _render_commitment(item: dict[str, Any], today: date | None) -> str:
+    return (f"{who_line(item)}: {_short(item['what'], 200)}\n"
             f"{due_line(item, today)}\n«{_short(item['source_quote'], 160)}»")
 
 
-def _render_change(pos: int, change: asyncpg.Record, item: dict[str, Any], today: date | None) -> str:
+def _render_change(change: asyncpg.Record, item: dict[str, Any], today: date | None) -> str:
     head = _CHANGE_TEXT[change["kind"]]
     if change["kind"] == "rescheduled":
         head += f" на {dates.format_due(change['new_due_date'], change['new_due_time'], today=today)}"
-    return (f"{pos}. {head}: {who_line(item)} — {_short(item['what'], 200)}\n"
+    return (f"{head}: {who_line(item)} — {_short(item['what'], 200)}\n"
             f"«{_short(change['evidence_quote'], 160)}»")
 
 
 async def build_digests(
-    conn: asyncpg.Connection, *, run_id: int, today: date,
-    max_items: int = DIGEST_MAX_ITEMS, per_message: int = DIGEST_PER_MESSAGE,
+    conn: asyncpg.Connection, *, run_id: int, today: date, max_items: int = DIGEST_MAX_ITEMS,
+    per_message: int = DIGEST_PER_MESSAGE, budget: int = DIGEST_BUDGET,
 ) -> list[dict[str, Any]]:
     """Собирает сводку для владельца: несколько пронумерованных пунктов на сообщение, под каждым
-    пунктом кнопки ✓ и ✗. Помечает показанное. Возвращает [{"text", "buttons", "batch"}]."""
+    пунктом кнопки ✓ и ✗. Помечает показанное. Возвращает [{"text", "buttons", "batch"}].
+
+    Длина считается так, как её считает Telegram, — в единицах UTF-16 (эмодзи занимает две):
+    сообщение, не влезающее в предел, делится на несколько, а пункт, который не влезает даже
+    один, обрезается. Пункт, уже уходивший `DIGEST_MAX_SENDS` раз, больше не отправляется.
+    """
     new = await conn.fetch(
-        _SELECT + """ WHERE c.status = 'proposed' AND c.digest_batch IS NULL
+        _SELECT + """ AND c.status = 'proposed' AND c.digest_batch IS NULL AND c.digest_attempts < $2
                       ORDER BY (c.direction = 'owner_owes') DESC, c.due_date NULLS LAST, c.id LIMIT $1""",
-        max_items)
+        max_items, DIGEST_MAX_SENDS)
+    waiting_changes = f"""FROM commitment_changes x JOIN commitments c ON c.id = x.commitment_id
+           JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+           WHERE x.status = 'proposed' AND x.digest_batch IS NULL AND x.digest_attempts < {DIGEST_MAX_SENDS}
+             AND c.status = 'open' AND {VISIBLE}"""
     changes = await conn.fetch(
-        """SELECT x.* FROM commitment_changes x JOIN commitments c ON c.id = x.commitment_id
-           WHERE x.status = 'proposed' AND x.digest_batch IS NULL AND c.status = 'open'
-           ORDER BY x.id LIMIT $1""",
-        max(0, max_items - len(new)))
-    items: list[tuple[str, Any]] = [("c", row) for row in new] + [("x", row) for row in changes]
-    if not items:
+        f"SELECT x.* {waiting_changes} ORDER BY x.id LIMIT $1", max(0, max_items - len(new)))
+    entries: list[tuple[str, int, str]] = [("c", row["id"], _render_commitment(to_dict(row, today), today))
+                                           for row in new]
+    for row in changes:
+        item = await get_commitment(conn, row["commitment_id"], today=today)
+        if item is not None:
+            entries.append(("x", row["id"], _render_change(row, item, today)))
+    if not entries:
         return []
     waiting = await conn.fetchval(
-        """SELECT (SELECT count(*) FROM commitments WHERE status = 'proposed' AND digest_batch IS NULL)
-                + (SELECT count(*) FROM commitment_changes x JOIN commitments c ON c.id = x.commitment_id
-                   WHERE x.status = 'proposed' AND x.digest_batch IS NULL AND c.status = 'open')""") - len(items)
+        f"""SELECT (SELECT count(*) FROM commitments c JOIN chats ch ON ch.id = c.chat_id
+                    JOIN messages m ON m.id = c.source_message_id
+                    WHERE c.status = 'proposed' AND c.digest_batch IS NULL
+                      AND c.digest_attempts < {DIGEST_MAX_SENDS} AND {VISIBLE})
+                 + (SELECT count(*) {waiting_changes})""") - len(entries)
+
+    # раскладка по сообщениям: не больше per_message пунктов и не больше budget единиц UTF-16
+    numbering = 8   # «N. » и пустая строка между пунктами
+    chunks: list[list[tuple[str, int, str]]] = [[]]
+    size = 0
+    for kind, target, body in entries:
+        body = bridge.fit_message(body, budget - numbering)
+        cost = bridge.utf16_len(body) + numbering
+        if chunks[-1] and (len(chunks[-1]) >= per_message or size + cost > budget):
+            chunks.append([])
+            size = 0
+        chunks[-1].append((kind, target, body))
+        size += cost
+
     out = []
-    chunks = [items[i: i + per_message] for i in range(0, len(items), per_message)]
     for n, chunk in enumerate(chunks, start=1):
         batch = f"{run_id}.{n}"
         lines, buttons = [], []
-        for pos, (kind, row) in enumerate(chunk, start=1):
-            if kind == "c":
-                lines.append(_render_commitment(pos, to_dict(row, today), today))
-                buttons.append([bridge.button(f"{pos} ✓", CALLBACK_MODULE, f"a:{row['id']}"),
-                                bridge.button(f"{pos} ✗", CALLBACK_MODULE, f"r:{row['id']}")])
-                await conn.execute(
-                    "UPDATE commitments SET digest_batch = $2, digest_pos = $3, notified_at = now() WHERE id = $1",
-                    row["id"], batch, pos)
-            else:
-                item = await get_commitment(conn, row["commitment_id"], today=today)
-                lines.append(_render_change(pos, row, item, today))
-                buttons.append([bridge.button(f"{pos} ✓", CALLBACK_MODULE, f"ca:{row['id']}"),
-                                bridge.button(f"{pos} ✗", CALLBACK_MODULE, f"cr:{row['id']}")])
-                await conn.execute(
-                    "UPDATE commitment_changes SET digest_batch = $2, digest_pos = $3, notified_at = now() WHERE id = $1",
-                    row["id"], batch, pos)
+        for pos, (kind, target, body) in enumerate(chunk, start=1):
+            lines.append(f"{pos}. {body}")
+            accept_data, reject_data = (f"a:{target}", f"r:{target}") if kind == "c" else (f"ca:{target}", f"cr:{target}")
+            buttons.append([bridge.button(f"{pos} ✓", CALLBACK_MODULE, accept_data),
+                            bridge.button(f"{pos} ✗", CALLBACK_MODULE, reject_data)])
+            table = "commitments" if kind == "c" else "commitment_changes"
+            await conn.execute(
+                f"""UPDATE {table} SET digest_batch = $2, digest_pos = $3, notified_at = now(),
+                           digest_attempts = digest_attempts + 1 WHERE id = $1""",
+                target, batch, pos)
         head = "Обязательства из переписки. ✓ — верно, ✗ — нет."
         if len(chunks) > 1:
             head += f" ({n} из {len(chunks)})"
         text = head + "\n\n" + "\n\n".join(lines)
         if n == len(chunks) and waiting > 0:
             text += f"\n\nЕщё ждут решения: {waiting}. Придут в следующей сводке."
-        out.append({"text": text, "buttons": buttons, "batch": batch})
+        out.append({"text": bridge.fit_message(text), "buttons": buttons, "batch": batch})
     return out
 
 
-async def unmark_batch(conn: asyncpg.Connection, batch: str) -> int:
-    """Сообщение-сводка не доставлено: его нерешённые пункты снова ждут показа."""
-    a = await conn.execute(
-        """UPDATE commitments SET digest_batch = NULL, digest_pos = NULL, notified_at = NULL
-           WHERE digest_batch = $1 AND status = 'proposed'""", batch)
-    b = await conn.execute(
-        """UPDATE commitment_changes SET digest_batch = NULL, digest_pos = NULL, notified_at = NULL
-           WHERE digest_batch = $1 AND status = 'proposed'""", batch)
-    return int(a.split()[-1]) + int(b.split()[-1])
+async def unmark_batch(conn: asyncpg.Connection, batch: str) -> dict[str, int]:
+    """Сообщение-сводка не доставлено. Его нерешённые пункты снова ждут показа — но не бесконечно:
+    пункт, уходивший уже `DIGEST_MAX_SENDS` раз, остаётся помеченным и больше не отправляется
+    (он виден в выборке «ждут решения» и тихо устареет). Возвращает, сколько пунктов вернулось
+    в очередь показа и сколько снято с отправки."""
+    counts = {"requeued": 0, "dropped": 0}
+    for table in ("commitments", "commitment_changes"):
+        back = await conn.execute(
+            f"""UPDATE {table} SET digest_batch = NULL, digest_pos = NULL, notified_at = NULL
+                WHERE digest_batch = $1 AND status = 'proposed' AND digest_attempts < $2""",
+            batch, DIGEST_MAX_SENDS)
+        left = await conn.fetchval(
+            f"SELECT count(*) FROM {table} WHERE digest_batch = $1 AND status = 'proposed'", batch)
+        counts["requeued"] += int(back.split()[-1])
+        counts["dropped"] += left
+    return counts
 
 
 async def batch_summary(conn: asyncpg.Connection, batch: str) -> tuple[bool, str]:
     """Состояние одного сообщения-сводки: все ли пункты решены и итоговый текст."""
     rows = await conn.fetch(
-        """SELECT digest_pos AS pos, status, what, NULL::text AS kind FROM commitments WHERE digest_batch = $1
-           UNION ALL
-           SELECT x.digest_pos, x.status, c.what, x.kind FROM commitment_changes x
-           JOIN commitments c ON c.id = x.commitment_id WHERE x.digest_batch = $1
-           ORDER BY pos""", batch)
+        f"""SELECT c.digest_pos AS pos, c.status, c.what, NULL::text AS kind
+            FROM commitments c JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+            WHERE c.digest_batch = $1 AND {VISIBLE}
+            UNION ALL
+            SELECT x.digest_pos, x.status, c.what, x.kind FROM commitment_changes x
+            JOIN commitments c ON c.id = x.commitment_id
+            JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+            WHERE x.digest_batch = $1 AND {VISIBLE}
+            ORDER BY pos""", batch)
     lines = []
     for r in rows:
         prefix = f"{_CHANGE_TEXT[r['kind']].lower()}: " if r["kind"] else ""
@@ -619,7 +682,7 @@ async def batch_summary(conn: asyncpg.Connection, batch: str) -> tuple[bool, str
             mark = "✓ принято"
         lines.append(f"{r['pos']}. {prefix}{_short(r['what'], 120)} — {mark}")
     done = bool(rows) and all(r["status"] != "proposed" for r in rows)
-    return done, "Обязательства из переписки — решено:\n" + "\n".join(lines)
+    return done, bridge.fit_message("Обязательства из переписки — решено:\n" + "\n".join(lines))
 
 
 async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]:
@@ -631,7 +694,7 @@ async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]
     target = int(raw)
     if action in ("a", "r"):
         row = await conn.fetchrow("SELECT status, digest_batch FROM commitments WHERE id = $1", target)
-        if row is None:
+        if row is None or not await is_visible(conn, target):
             return {"answer": "Это обязательство уже удалено.", "edit_text": None, "remove_buttons": False}
         if row["status"] != "proposed":
             answer = f"Уже решено: {STATUS_TEXT[row['status']]}."

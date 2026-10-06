@@ -13,15 +13,23 @@
 
 Стоимость ограничена: у прогона есть нижняя граница по времени сообщения (`floor`: при первом
 прогоне — последние 30 дней) и предел числа запросов к модели. Что пропущено, видно в итогах.
+Сообщения старше границы прогонов не занимают: окно прогона набирается только из годных
+сообщений, а отметка переходит через всё остальное одним запросом.
+
+Неудавшийся запрос (исполнитель отказал, задание не забрали, ответ не разобрался) не теряет
+эпизод: его сообщения ставятся заново следующим прогоном, не больше `MAX_REPLANS` раз, после
+чего эпизод считается пропущенным и попадает в счётчик итогов. Сообщения запроса хранятся
+в `processing_requests`, а не в задании: содержимое закрытых заданий очередь стирает.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -35,8 +43,9 @@ logger = logging.getLogger("shturman.processing")
 HANDLER_EXTRACT = "commitments.extract"
 HANDLER_RESOLVE = "commitments.resolve"
 HANDLER_DIGEST = "commitments.digest"
-STATE_KEY = "processing.state"       # {"watermark": messages.id, "floor": ISO-время}
-NIGHTLY_KEY = "processing.nightly"   # {"night": "ГГГГ-ММ-ДД"} — за какую ночь прогон уже запущен
+STATE_KEY = "processing.state"       # {"watermark": messages.id, "floor": ISO-время, "more": bool}
+NIGHTLY_KEY = "processing.nightly"   # {"night": "ГГГГ-ММ-ДД", "runs": N} — прогоны, запущенные за эту ночь
+MAX_REPLANS = 2                      # сколько раз неудавшийся запрос ставится заново
 
 # Кому сообщить, что прогон закончен (сборка страниц памяти). Обработчик вызывается внутри
 # транзакции завершения прогона, поэтому должен быть коротким: поставить отметку, разбудить
@@ -58,13 +67,14 @@ SKIP_CHAT_TYPES = frozenset({"private_channel", "public_channel", "bot_chat", "s
 @dataclass(frozen=True)
 class Options:
     limit: int = 200              # предел запросов на извлечение за прогон
-    window: int = 20_000          # сколько новых сообщений просматривается за прогон
+    window: int = 20_000          # сколько годных новых сообщений берётся за прогон
     first_run_days: int = 30      # при первом прогоне история старше не разбирается
     context_messages: int = 4     # сколько предыдущих сообщений показывается для понимания
     context_hours: int = 12
     known_limit: int = 15         # сколько уже записанных обязательств показывается для отметки дублей
     resolve_messages: int = 40    # сколько новых сообщений чата идёт в проверку статусов
     resolve_commitments: int = 20
+    nightly_runs: int = 12        # сколько прогонов подряд можно запустить за одну ночь, пока есть что разбирать
 
 
 def _loads(value: Any) -> Any:
@@ -83,14 +93,65 @@ async def _save_setting(conn: asyncpg.Connection, key: str, value: dict[str, Any
     )
 
 
+async def _add_run_stats(conn: asyncpg.Connection, run_id: int, stats: dict[str, int]) -> None:
+    """Прибавляет счётчики к итогам прогона (ключ results). Только числа, без текста переписки."""
+    row = await conn.fetchrow("SELECT stats FROM processing_runs WHERE id = $1 FOR UPDATE", run_id)
+    if row is None or not stats:
+        return
+    totals = (_loads(row["stats"]) or {}).get("results") or {}
+    for key, value in stats.items():
+        totals[key] = int(totals.get(key, 0)) + int(value)
+    await conn.execute("UPDATE processing_runs SET stats = stats || $2::jsonb WHERE id = $1",
+                       run_id, json.dumps({"results": totals}))
+
+
 def _msg(row: asyncpg.Record) -> Msg:
     return Msg(id=row["id"], chat_id=row["chat_id"], sent_at=row["sent_at"],
                sender_peer_id=row["sender_peer_id"], sender_name=row["sender_name"],
-               is_outgoing=bool(row["is_outgoing"]), text=row["text"] or "", forwarded=row["forwarded"])
+               is_outgoing=bool(row["is_outgoing"]), text=row["text"] or "", forwarded=row["forwarded"],
+               tg_id=row["tg_message_id"])
 
 
-_MSG_COLUMNS = """m.id, m.chat_id, m.sent_at, m.sender_peer_id, m.sender_name, m.is_outgoing, m.text,
-                  m.forwarded_from IS NOT NULL AS forwarded"""
+_MSG_COLUMNS = """m.id, m.chat_id, m.tg_message_id, m.sent_at, m.sender_peer_id, m.sender_name, m.is_outgoing,
+                  m.text, m.forwarded_from IS NOT NULL AS forwarded"""
+
+# Что делать с сообщением при планировании. $2 — нижняя граница по времени сообщения.
+_FROM = "FROM messages m JOIN chats c ON c.id = m.chat_id LEFT JOIN peers sp ON sp.id = m.sender_peer_id"
+_SKIP_TYPES_SQL = ", ".join(f"'{name}'" for name in sorted(SKIP_CHAT_TYPES))   # свои константы, не ввод
+_VERDICT = f"""CASE WHEN c.excluded THEN 'skipped_excluded'
+                    WHEN c.type IN ({_SKIP_TYPES_SQL}) THEN 'skipped_chat_type'
+                    WHEN sp.is_bot IS TRUE THEN 'skipped_bot'
+                    WHEN m.deleted_at IS NOT NULL THEN 'skipped_deleted'
+                    WHEN m.kind <> 'message' THEN 'skipped_service'
+                    WHEN m.sent_at < $2 THEN 'skipped_old'
+                    WHEN btrim(m.text) = '' THEN 'skipped_empty'
+                    ELSE 'eligible' END"""
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _sent_by_service() -> Callable[..., Awaitable[set[int]]] | None:
+    """`outbox.sent_by_service(conn, chat_id, tg_message_ids) -> set[int]`, если шлюз отправки её даёт."""
+    try:
+        from .. import outbox
+    except Exception:   # шлюза отправки в сборке может не быть
+        return None
+    return getattr(outbox, "sent_by_service", None)
+
+
+async def _mark_service_sent(conn: asyncpg.Connection, messages: Sequence[Msg]) -> list[Msg]:
+    """Помечает исходящие, которые за владельца отправил сам сервис (автоответ доверенным):
+    они остаются в разговоре для понимания, но обещаниями владельца не считаются."""
+    check = _sent_by_service()
+    if check is None:
+        return list(messages)
+    by_chat: dict[int, list[int]] = {}
+    for message in messages:
+        if message.is_outgoing and message.tg_id is not None:
+            by_chat.setdefault(message.chat_id, []).append(message.tg_id)
+    sent: set[tuple[int, int]] = set()
+    for chat_id, tg_ids in by_chat.items():
+        sent.update((chat_id, int(tg_id)) for tg_id in await check(conn, chat_id, tg_ids))
+    return [dataclasses.replace(m, by_service=True) if (m.chat_id, m.tg_id) in sent else m for m in messages]
 
 
 def _chat_kind(chat_type: str) -> str:
@@ -127,13 +188,126 @@ async def _context_for(conn: asyncpg.Connection, first: Msg, options: Options) -
               AND m.deleted_at IS NULL AND m.kind = 'message' AND m.text <> ''
             ORDER BY m.sent_at DESC, m.id DESC LIMIT $5""",
         first.chat_id, first.sent_at, first.id, options.context_hours, options.context_messages)
-    return [_msg(r) for r in reversed(rows)]
+    return await _mark_service_sent(conn, [_msg(r) for r in reversed(rows)])
 
 
 def _who(peer_id: int | None, direction: str, labels: dict[tuple, str]) -> str:
     if direction == "owner_owes":
         return extract.OWNER_LABEL
     return labels.get(("peer", peer_id), "другой участник")
+
+
+async def _enqueue_extract(
+    conn: asyncpg.Connection, run_id: int, episode: Episode, chat_type: str, tz: str,
+    options: Options, attempt: int = 0,
+) -> int | None:
+    """Ставит запрос на извлечение по эпизоду. None — такой запрос уже ставился."""
+    episode.context = await _context_for(conn, episode.messages[0], options)
+    labels = extract.speaker_labels(episode)
+    known_rows = [r for r in await commitments.existing_in_chat(conn, episode.chat_id, options.known_limit * 4)
+                  if r["status"] in ("proposed", "open")][: options.known_limit]
+    known = [{"who": _who(r["debtor_peer_id"], r["direction"], labels), "what": r["what"],
+              "due_expression": r["due_expression"]} for r in known_rows]
+    key = f"cm-x{extract.PROMPT_VERSION}:{episode.chat_id}:{episode.first_id}-{episode.last_id}"
+    job_id = await bridge.request_structured(
+        conn, handler=HANDLER_EXTRACT, instructions=extract.EXTRACT_INSTRUCTIONS,
+        input=extract.build_extract_input(episode, labels, ZoneInfo(tz), chat_kind=_chat_kind(chat_type), known=known),
+        json_schema=extract.EXTRACT_SCHEMA, schema_name="commitments",
+        context={"run_id": run_id, "chat_id": episode.chat_id, "tz": tz,
+                 "message_ids": [m.id for m in episode.messages],
+                 "context_ids": [m.id for m in episode.context],
+                 "known_ids": [r["id"] for r in known_rows],
+                 "labels": _labels_to_context(labels)},
+        # повтор неудавшегося запроса — другое задание: прежний ключ его не блокирует
+        dedup_key=key if attempt == 0 else f"{key}:r{attempt}",
+    )
+    if job_id is not None:
+        await conn.execute(
+            """INSERT INTO processing_requests (job_id, run_id, kind, chat_id, message_ids, attempt)
+               VALUES ($1, $2, 'extract', $3, $4::bigint[], $5)""",
+            job_id, run_id, episode.chat_id, [m.id for m in episode.messages], attempt)
+    return job_id
+
+
+async def _enqueue_resolve(
+    conn: asyncpg.Connection, run_id: int, chat_id: int, messages: list[Msg], chat_type: str, tz: str,
+    options: Options, attempt: int = 0,
+) -> int | None:
+    """Для чата с открытыми обязательствами и новыми сообщениями — запрос «что с ними стало»."""
+    messages = sorted(messages, key=lambda m: (m.sent_at, m.id))[-options.resolve_messages:]
+    open_rows = await conn.fetch(
+        f"""SELECT c.id, c.what, c.due_expression, c.debtor_peer_id, c.direction, c.source_message_id
+            FROM commitments c JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+            WHERE c.status = 'open' AND c.chat_id = $1 AND {commitments.VISIBLE} ORDER BY c.id""", chat_id)
+    # сообщение, в котором дано само обещание, его же выполнением не считается
+    items = [r for r in open_rows
+             if any(m.id != r["source_message_id"] for m in messages)][: options.resolve_commitments]
+    if not items or not messages:
+        return None
+    episode = Episode(chat_id, messages)
+    labels = extract.speaker_labels(episode)
+    key = f"cm-r{extract.PROMPT_VERSION}:{chat_id}:{messages[0].id}-{messages[-1].id}"
+    job_id = await bridge.request_structured(
+        conn, handler=HANDLER_RESOLVE, instructions=extract.RESOLVE_INSTRUCTIONS,
+        input=extract.build_resolve_input(
+            episode, labels, ZoneInfo(tz), chat_kind=_chat_kind(chat_type),
+            commitments=[{"who": _who(r["debtor_peer_id"], r["direction"], labels), "what": r["what"],
+                          "due_expression": r["due_expression"]} for r in items]),
+        json_schema=extract.RESOLVE_SCHEMA, schema_name="commitment_updates", max_tokens=1200,
+        context={"run_id": run_id, "chat_id": chat_id, "tz": tz,
+                 "message_ids": [m.id for m in messages], "context_ids": [],
+                 "commitment_ids": [r["id"] for r in items], "labels": _labels_to_context(labels)},
+        dedup_key=key if attempt == 0 else f"{key}:r{attempt}",
+    )
+    if job_id is not None:
+        await conn.execute(
+            """INSERT INTO processing_requests (job_id, run_id, kind, chat_id, message_ids, attempt)
+               VALUES ($1, $2, 'resolve', $3, $4::bigint[], $5)""",
+            job_id, run_id, chat_id, [m.id for m in messages], attempt)
+    return job_id
+
+
+async def _recover_lost(conn: asyncpg.Connection) -> None:
+    """Запросы, чьи задания закрыты как неудачные без нашего обработчика (сняты, пропали):
+    их сообщения тоже должны быть разобраны заново."""
+    rows = await conn.fetch(
+        """UPDATE processing_requests r
+           SET state = CASE WHEN r.attempt < $1 THEN 'retry' ELSE 'given_up' END
+           FROM jobs j WHERE j.id = r.job_id AND r.state = 'pending' AND j.status = 'failed'
+           RETURNING r.run_id, r.state""", MAX_REPLANS)
+    for row in rows:
+        key = "requests_to_retry" if row["state"] == "retry" else "requests_given_up"
+        await _add_run_stats(conn, row["run_id"], {"failed_requests": 1, key: 1})
+
+
+async def _replan_failed(
+    conn: asyncpg.Connection, run_id: int, tz: str, options: Options, limit: int,
+) -> dict[str, int]:
+    """Ставит заново запросы, которые не удались в прошлых прогонах."""
+    out = {"retried": 0, "retry_dropped": 0}
+    rows = await conn.fetch(
+        """SELECT job_id, kind, chat_id, message_ids, attempt FROM processing_requests
+           WHERE state = 'retry' ORDER BY job_id LIMIT $1 FOR UPDATE""", limit)
+    for row in rows:
+        # берём только то, что всё ещё годится: чат не исключён, сообщения не удалены
+        found = await conn.fetch(
+            f"""SELECT {_MSG_COLUMNS}, c.type AS chat_type {_FROM}
+                WHERE m.id = ANY($1::bigint[]) AND m.chat_id = $3 AND ({_VERDICT}) = 'eligible' ORDER BY m.id""",
+            list(row["message_ids"]), _EPOCH, row["chat_id"])
+        job_id = None
+        if found:
+            messages = await _mark_service_sent(conn, [_msg(r) for r in found])
+            messages.sort(key=lambda m: (m.sent_at, m.id))
+            chat_type = found[0]["chat_type"]
+            if row["kind"] == "extract":
+                job_id = await _enqueue_extract(conn, run_id, Episode(row["chat_id"], messages), chat_type, tz,
+                                                options, attempt=row["attempt"] + 1)
+            else:
+                job_id = await _enqueue_resolve(conn, run_id, row["chat_id"], messages, chat_type, tz,
+                                                options, attempt=row["attempt"] + 1)
+        await conn.execute("UPDATE processing_requests SET state = 'failed' WHERE job_id = $1", row["job_id"])
+        out["retried" if job_id is not None else "retry_dropped"] += 1
+    return out
 
 
 async def plan_run(
@@ -147,12 +321,18 @@ async def plan_run(
     limit  — предел запросов на извлечение за этот прогон;
     rescan — начать просмотр архива заново (вместе с since: разобрать более старую историю).
              Уже разобранное повторно не предлагается: совпадения отсекаются при записи.
+
+    В итогах: planned / resolve_planned / retried — поставленные запросы; already_planned — эпизоды,
+    запрос по которым уже ставился; messages — что сделано с сообщениями до отметки (new, eligible,
+    skipped_*, assistant — написанные сервисом, deferred — отложенные за отметкой); cap_reached,
+    more — осталось ли что разбирать; retry_waiting, given_up — неудавшиеся запросы.
     """
     now = now or datetime.now(timezone.utc)
     zone = ZoneInfo(tz)
     limit = max(1, min(int(limit or options.limit), 1000))
     async with conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.processing'))")
+        await _recover_lost(conn)
         running = await conn.fetchval("SELECT id FROM processing_runs WHERE status = 'running'")
         if running is not None:
             pending = await _pending(conn, running)
@@ -175,100 +355,92 @@ async def plan_run(
             floor = now - timedelta(days=options.first_run_days)
         watermark = 0 if rescan else int(state.get("watermark") or 0)
 
-        rows = await conn.fetch(
-            f"""SELECT {_MSG_COLUMNS}, m.kind, m.deleted_at IS NOT NULL AS deleted,
-                       c.type AS chat_type, c.excluded, sp.is_bot IS TRUE AS from_bot
-                FROM messages m JOIN chats c ON c.id = m.chat_id
-                LEFT JOIN peers sp ON sp.id = m.sender_peer_id
-                WHERE m.id > $1 ORDER BY m.id LIMIT $2""",
-            watermark, options.window)
-        eligible: list[Msg] = []
-        chat_types: dict[int, str] = {}
-        verdicts: list[tuple[int, str]] = []    # (messages.id, что с сообщением сделано)
-        for row in rows:
-            if row["excluded"]:
-                verdict = "skipped_excluded"
-            elif row["chat_type"] in SKIP_CHAT_TYPES:
-                verdict = "skipped_chat_type"
-            elif row["from_bot"]:
-                verdict = "skipped_bot"         # бот в группе: его «отправлю отчёт» — не обещание человека
-            elif row["deleted"]:
-                verdict = "skipped_deleted"
-            elif row["kind"] != "message":
-                verdict = "skipped_service"
-            elif row["sent_at"] < floor:
-                verdict = "skipped_old"
-            elif not (row["text"] or "").strip():
-                verdict = "skipped_empty"
-            else:
-                verdict = "eligible"
-                eligible.append(_msg(row))
-                chat_types[row["chat_id"]] = row["chat_type"]
-            verdicts.append((row["id"], verdict))
-        new_watermark = rows[-1]["id"] if rows else watermark
-        more = len(rows) == options.window
-
-        # Предел запросов: окно сужается до сообщений, эпизоды которых помещаются в предел.
-        # Отметка ставится на границу окна, поэтому отложенное разберёт следующий прогон.
-        cap_reached = False
-        while True:
-            episodes = extract.build_episodes(eligible)
-            signal = [e for e in episodes if extract.has_promise_signal(e)]
-            if len(signal) <= limit:
-                break
-            cap_reached = more = True
-            new_watermark = signal[limit - 1].last_id
-            eligible = [m for m in eligible if m.id <= new_watermark]
-
-        # итоги — только по сообщениям до отметки; остальное отложено до следующего прогона
-        counts = {"new": 0, "eligible": 0, "skipped_old": 0, "skipped_excluded": 0, "skipped_chat_type": 0,
-                  "skipped_bot": 0, "skipped_service": 0, "skipped_deleted": 0, "skipped_empty": 0, "deferred": 0}
-        for message_id, verdict in verdicts:
-            if message_id > new_watermark:
-                counts["deferred"] += 1
-            else:
-                counts["new"] += 1
-                counts[verdict] += 1
-
         run_id = await conn.fetchval(
             "INSERT INTO processing_runs (trigger, stats) VALUES ($1, $2::jsonb) RETURNING id",
             trigger, json.dumps({"tz": tz}))
 
+        # сначала — долги прошлых прогонов; они тоже входят в предел запросов
+        replanned = await _replan_failed(conn, run_id, tz, options, limit)
+        budget = limit - replanned["retried"]
+
+        eligible: list[Msg] = []
+        chat_types: dict[int, str] = {}
+        new_watermark, more, cap_reached = watermark, False, False
+        episodes: list[Episode] = []
+        signal: list[Episode] = []
+        if budget <= 0:
+            more = cap_reached = True      # новые сообщения подождут: предел ушёл на повторы
+        else:
+            # Окно набирается только из годных сообщений: старая история после большого импорта,
+            # каналы и исключённые чаты его не занимают.
+            rows = await conn.fetch(
+                f"""SELECT {_MSG_COLUMNS}, c.type AS chat_type {_FROM}
+                    WHERE m.id > $1 AND m.sent_at >= $2 AND ({_VERDICT}) = 'eligible'
+                    ORDER BY m.id LIMIT $3""",
+                watermark, floor, options.window)
+            for row in rows:
+                chat_types[row["chat_id"]] = row["chat_type"]
+            eligible = await _mark_service_sent(conn, [_msg(row) for row in rows])
+            more = len(rows) == options.window
+            if more:
+                new_watermark = rows[-1]["id"]
+            else:   # годное кончилось: отметка переходит через весь остаток архива
+                new_watermark = max(watermark, await conn.fetchval("SELECT COALESCE(max(id), 0) FROM messages"))
+
+            # Предел запросов: окно сужается до сообщений, эпизоды которых помещаются в предел.
+            # Отметка ставится на границу окна, поэтому отложенное разберёт следующий прогон.
+            while True:
+                episodes = extract.build_episodes(eligible)
+                signal = [e for e in episodes if extract.has_promise_signal(e)]
+                if len(signal) <= budget:
+                    break
+                cap_reached = more = True
+                new_watermark = signal[budget - 1].last_id
+                eligible = [m for m in eligible if m.id <= new_watermark]
+
+        # итоги — только по сообщениям до отметки; остальное отложено до следующего прогона
+        counts = {"new": 0, "eligible": 0, "skipped_old": 0, "skipped_excluded": 0, "skipped_chat_type": 0,
+                  "skipped_bot": 0, "skipped_service": 0, "skipped_deleted": 0, "skipped_empty": 0}
+        for row in await conn.fetch(
+                f"SELECT ({_VERDICT}) AS verdict, count(*) AS n {_FROM} WHERE m.id > $1 AND m.id <= $3 GROUP BY 1",
+                watermark, floor, new_watermark):
+            counts[row["verdict"]] = row["n"]
+            counts["new"] += row["n"]
+        counts["assistant"] = sum(1 for m in eligible if m.by_service)
+        counts["deferred"] = await conn.fetchval("SELECT count(*) FROM messages WHERE id > $1", new_watermark)
+
         planned = already = 0
         for episode in signal:
-            episode.context = await _context_for(conn, episode.messages[0], options)
-            labels = extract.speaker_labels(episode)
-            known_rows = [r for r in await commitments.existing_in_chat(conn, episode.chat_id, options.known_limit * 4)
-                          if r["status"] in ("proposed", "open")][: options.known_limit]
-            known = [{"who": _who(r["debtor_peer_id"], r["direction"], labels), "what": r["what"],
-                      "due_expression": r["due_expression"]} for r in known_rows]
-            job_id = await bridge.request_structured(
-                conn, handler=HANDLER_EXTRACT, instructions=extract.EXTRACT_INSTRUCTIONS,
-                input=extract.build_extract_input(
-                    episode, labels, zone, chat_kind=_chat_kind(chat_types[episode.chat_id]), known=known),
-                json_schema=extract.EXTRACT_SCHEMA, schema_name="commitments",
-                context={"run_id": run_id, "chat_id": episode.chat_id, "tz": tz,
-                         "message_ids": [m.id for m in episode.messages],
-                         "context_ids": [m.id for m in episode.context],
-                         "known_ids": [r["id"] for r in known_rows],
-                         "labels": _labels_to_context(labels)},
-                dedup_key=f"cm-x{extract.PROMPT_VERSION}:{episode.chat_id}:{episode.first_id}-{episode.last_id}",
-            )
+            job_id = await _enqueue_extract(conn, run_id, episode, chat_types[episode.chat_id], tz, options)
             if job_id is None:
                 already += 1
-                continue
-            planned += 1
-            await conn.execute(
-                "INSERT INTO processing_requests (job_id, run_id, kind, chat_id) VALUES ($1, $2, 'extract', $3)",
-                job_id, run_id, episode.chat_id)
+            else:
+                planned += 1
 
-        resolve_planned = await _plan_resolve(conn, run_id, eligible, chat_types, tz, options)
+        resolve_planned = 0
+        by_chat: dict[int, list[Msg]] = {}
+        for message in eligible:
+            by_chat.setdefault(message.chat_id, []).append(message)
+        if by_chat:
+            with_open = await conn.fetch(
+                "SELECT DISTINCT chat_id FROM commitments WHERE status = 'open' AND chat_id = ANY($1::bigint[])",
+                list(by_chat))
+            for chat_id in sorted(r["chat_id"] for r in with_open):
+                job_id = await _enqueue_resolve(conn, run_id, chat_id, by_chat[chat_id], chat_types[chat_id], tz, options)
+                resolve_planned += int(job_id is not None)
 
-        new_state = {"watermark": max(new_watermark, 0), "floor": floor.isoformat()}
+        waiting = await conn.fetchrow(
+            """SELECT count(*) FILTER (WHERE state = 'retry') AS retry,
+                      count(*) FILTER (WHERE state = 'given_up') AS given_up FROM processing_requests""")
+        more = more or waiting["retry"] > 0
+        new_state = {"watermark": max(new_watermark, 0), "floor": floor.isoformat(), "more": more}
         await _save_setting(conn, STATE_KEY, new_state)
+        anything = planned or resolve_planned or replanned["retried"]
         result = {
-            "status": "planned" if planned or resolve_planned else "nothing_to_do",
+            "status": "planned" if anything else "nothing_to_do",
             "run_id": run_id, "planned": planned, "resolve_planned": resolve_planned,
+            "retried": replanned["retried"], "retry_dropped": replanned["retry_dropped"],
+            "retry_waiting": waiting["retry"], "given_up": waiting["given_up"],
             "already_planned": already, "episodes": len(episodes),
             "episodes_without_signal": len(episodes) - len(signal),
             "messages": counts, "cap_reached": cap_reached, "more": more,
@@ -278,56 +450,11 @@ async def plan_run(
         await conn.execute(
             "UPDATE processing_runs SET stats = stats || $2::jsonb WHERE id = $1",
             run_id, json.dumps({"plan": {k: v for k, v in result.items() if k != "run_id"}}, ensure_ascii=False))
-        if not planned and not resolve_planned:
+        if not anything:
             await finish_run(conn, run_id)
-    logger.info("прогон %s: запросов %s, проверок статуса %s, новых сообщений %s",
-                run_id, planned, resolve_planned, counts["new"])
+    logger.info("прогон %s: запросов %s, повторов %s, проверок статуса %s, новых сообщений %s",
+                run_id, planned, replanned["retried"], resolve_planned, counts["new"])
     return result
-
-
-async def _plan_resolve(
-    conn: asyncpg.Connection, run_id: int, eligible: list[Msg], chat_types: dict[int, str],
-    tz: str, options: Options,
-) -> int:
-    """Для чатов с открытыми обязательствами и новыми сообщениями — запрос «что с ними стало»."""
-    by_chat: dict[int, list[Msg]] = {}
-    for message in eligible:
-        by_chat.setdefault(message.chat_id, []).append(message)
-    if not by_chat:
-        return 0
-    open_rows = await conn.fetch(
-        """SELECT c.id, c.chat_id, c.what, c.due_expression, c.debtor_peer_id, c.direction, c.source_message_id
-           FROM commitments c WHERE c.status = 'open' AND c.chat_id = ANY($1::bigint[]) ORDER BY c.id""",
-        list(by_chat))
-    planned = 0
-    for chat_id in sorted({r["chat_id"] for r in open_rows}):
-        messages = sorted(by_chat[chat_id], key=lambda m: (m.sent_at, m.id))[-options.resolve_messages:]
-        # сообщение, в котором дано само обещание, его же выполнением не считается
-        items = [r for r in open_rows if r["chat_id"] == chat_id
-                 and any(m.id != r["source_message_id"] for m in messages)][: options.resolve_commitments]
-        if not items:
-            continue
-        episode = Episode(chat_id, messages)
-        labels = extract.speaker_labels(episode)
-        job_id = await bridge.request_structured(
-            conn, handler=HANDLER_RESOLVE, instructions=extract.RESOLVE_INSTRUCTIONS,
-            input=extract.build_resolve_input(
-                episode, labels, ZoneInfo(tz), chat_kind=_chat_kind(chat_types[chat_id]),
-                commitments=[{"who": _who(r["debtor_peer_id"], r["direction"], labels), "what": r["what"],
-                              "due_expression": r["due_expression"]} for r in items]),
-            json_schema=extract.RESOLVE_SCHEMA, schema_name="commitment_updates", max_tokens=1200,
-            context={"run_id": run_id, "chat_id": chat_id, "tz": tz,
-                     "message_ids": [m.id for m in messages], "context_ids": [],
-                     "commitment_ids": [r["id"] for r in items], "labels": _labels_to_context(labels)},
-            dedup_key=f"cm-r{extract.PROMPT_VERSION}:{chat_id}:{messages[0].id}-{messages[-1].id}",
-        )
-        if job_id is None:
-            continue
-        planned += 1
-        await conn.execute(
-            "INSERT INTO processing_requests (job_id, run_id, kind, chat_id) VALUES ($1, $2, 'resolve', $3)",
-            job_id, run_id, chat_id)
-    return planned
 
 
 # --- завершение прогона и сводка ------------------------------------------------------------------
@@ -355,22 +482,31 @@ async def finish_run(conn: asyncpg.Connection, run_id: int) -> int:
     return len(digests)
 
 
-async def _settle(conn: asyncpg.Connection, job: dict[str, Any], state: str, stats: dict[str, int]) -> None:
-    """Отмечает запрос разобранным; если он последний в прогоне — завершает прогон."""
+async def _settle(conn: asyncpg.Connection, job: dict[str, Any], ok: bool, stats: dict[str, int]) -> None:
+    """Отмечает запрос разобранным; если он последний в прогоне — завершает прогон.
+
+    Неудавшийся запрос помечается к повтору (или пропущенным, если повторы исчерпаны). Прогон
+    находится по `processing_requests`, а не по контексту задания: контекст может быть уже стёрт.
+    """
     await _scrub_job(conn, job["id"])
-    run_id = (job.get("context") or {}).get("run_id")
-    if not isinstance(run_id, int):
+    request = await conn.fetchrow(
+        "SELECT run_id, attempt FROM processing_requests WHERE job_id = $1 FOR UPDATE", job["id"])
+    if request is None:
         return
+    run_id = request["run_id"]
     # строка прогона блокируется: два последних ответа, пришедшие одновременно, разберутся по очереди
-    row = await conn.fetchrow("SELECT status, stats FROM processing_runs WHERE id = $1 FOR UPDATE", run_id)
+    row = await conn.fetchrow("SELECT status FROM processing_runs WHERE id = $1 FOR UPDATE", run_id)
     if row is None:
         return
+    stats = dict(stats)
+    if ok:
+        state = "done"
+    else:
+        state = "retry" if request["attempt"] < MAX_REPLANS else "given_up"
+        stats["failed_requests"] = stats.get("failed_requests", 0) + 1
+        stats["requests_to_retry" if state == "retry" else "requests_given_up"] = 1
     await conn.execute("UPDATE processing_requests SET state = $2 WHERE job_id = $1", job["id"], state)
-    totals = (_loads(row["stats"]) or {}).get("results") or {}
-    for key, value in stats.items():
-        totals[key] = int(totals.get(key, 0)) + int(value)
-    await conn.execute("UPDATE processing_runs SET stats = stats || $2::jsonb WHERE id = $1",
-                       run_id, json.dumps({"results": totals}))
+    await _add_run_stats(conn, run_id, stats)
     if row["status"] == "running" and await _pending(conn, run_id) == 0:
         await finish_run(conn, run_id)
 
@@ -395,6 +531,7 @@ async def finish_stale_runs(conn: asyncpg.Connection) -> int:
     """Закрывает прогон, запросы которого уже не вернутся (исполнитель пропал, попытки вышли)."""
     async with conn.transaction():
         await scrub_closed_jobs(conn)
+        await _recover_lost(conn)
         running = await conn.fetchval("SELECT id FROM processing_runs WHERE status = 'running'")
         if running is None or await _pending(conn, running):
             return 0
@@ -403,6 +540,10 @@ async def finish_stale_runs(conn: asyncpg.Connection) -> int:
 
 
 # --- разбор ответов модели ---------------------------------------------------------------------------
+
+class _BadAnswer(Exception):
+    """Ответ модели не похож на то, что просили (не JSON, не тот вид): запрос будет повторён."""
+
 
 async def _load_episode(conn: asyncpg.Connection, ctx: dict[str, Any]) -> tuple[Episode, asyncpg.Record] | None:
     """Восстанавливает эпизод по идентификаторам из контекста задания. Текст берётся из архива
@@ -431,8 +572,9 @@ async def _load_episode(conn: asyncpg.Connection, ctx: dict[str, Any]) -> tuple[
                        sender_name=None, is_outgoing=False, text="", forwarded=True)
         return _msg(row)
 
-    return Episode(chat_id, [restore(i) for i in ids],
-                   [restore(i) for i in context_ids if isinstance(i, int)]), chat
+    messages = await _mark_service_sent(conn, [restore(i) for i in ids])
+    context = await _mark_service_sent(conn, [restore(i) for i in context_ids if isinstance(i, int)])
+    return Episode(chat_id, messages, context), chat
 
 
 def _parties(candidate: extract.Candidate, chat: asyncpg.Record) -> tuple[int | None, int | None, str]:
@@ -454,6 +596,8 @@ async def _apply_extraction(conn: asyncpg.Connection, ctx: dict[str, Any], resul
     loaded = await _load_episode(conn, ctx)
     if loaded is None:
         return {"skipped_requests": 1}
+    if not extract.well_formed(result.get("parsed"), "commitments"):
+        raise _BadAnswer()
     episode, chat = loaded
     candidates, dropped = extract.validate_extraction(
         result.get("parsed"), episode, _labels_from_context(ctx.get("labels")))
@@ -491,14 +635,17 @@ async def _apply_resolution(conn: asyncpg.Connection, ctx: dict[str, Any], resul
     ids = [i for i in ctx.get("commitment_ids") or [] if isinstance(i, int)]
     if loaded is None or not ids:
         return {"skipped_requests": 1}
+    if not extract.well_formed(result.get("parsed"), "updates"):
+        raise _BadAnswer()
     episode, _ = loaded
     updates, dropped = extract.validate_resolution(result.get("parsed"), episode, len(ids))
     stats = {f"dropped_{k}": v for k, v in dropped.items() if v}
     tz = ctx.get("tz") or "UTC"
     for update in updates:
         row = await conn.fetchrow(
-            """SELECT c.id, c.status, c.source_message_id, m.sent_at FROM commitments c
-               JOIN messages m ON m.id = c.source_message_id WHERE c.id = $1 AND c.chat_id = $2""",
+            f"""SELECT c.id, c.status, c.source_message_id, m.sent_at FROM commitments c
+                JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+                WHERE c.id = $1 AND c.chat_id = $2 AND {commitments.VISIBLE}""",
             ids[update.commitment_index], episode.chat_id)
         # основание — только более позднее сообщение, чем само обещание
         if row is None or row["status"] != "open" or update.message.id == row["source_message_id"] \
@@ -525,13 +672,15 @@ async def _handle(conn: asyncpg.Connection, job: dict[str, Any], result: Any, ap
     try:
         async with conn.transaction():
             stats = await apply(conn, ctx, result if isinstance(result, dict) else {})
-        state = "done"
+        ok = True
+    except _BadAnswer:
+        stats, ok = {"dropped_malformed": 1}, False
     except Exception as exc:
         # Ответ модели не должен ронять очередь: запрос отмечается неудачным, прогон идёт дальше.
         # В журнал идёт только вид ошибки: в её тексте и в трассировке может оказаться переписка.
         logger.error("не удалось разобрать ответ на задание %s: %s", job.get("id"), type(exc).__name__)
-        stats, state = {"handler_errors": 1}, "failed"
-    await _settle(conn, job, state, stats)
+        stats, ok = {"handler_errors": 1}, False
+    await _settle(conn, job, ok, stats)
 
 
 @bridge.on_result(HANDLER_EXTRACT)
@@ -547,7 +696,8 @@ async def on_resolve_result(conn: asyncpg.Connection, job: dict[str, Any], resul
 @bridge.on_failure(HANDLER_EXTRACT)
 @bridge.on_failure(HANDLER_RESOLVE)
 async def on_request_failed(conn: asyncpg.Connection, job: dict[str, Any], error: str) -> None:
-    await _settle(conn, job, "failed", {"failed_requests": 1})
+    """Исполнитель окончательно отказал или задание не забрали вовремя."""
+    await _settle(conn, job, False, {})
 
 
 @bridge.on_result(HANDLER_DIGEST)
@@ -557,11 +707,18 @@ async def on_digest_sent(conn: asyncpg.Connection, job: dict[str, Any], result: 
 
 @bridge.on_failure(HANDLER_DIGEST)
 async def on_digest_failed(conn: asyncpg.Connection, job: dict[str, Any], error: str) -> None:
-    """Сводка до владельца не дошла: её пункты снова считаются непоказанными и уйдут со следующей."""
+    """Сводка до владельца не дошла: её пункты снова считаются непоказанными и уйдут со следующей —
+    но не больше `commitments.DIGEST_MAX_SENDS` раз. Счётчики — в итогах прогона."""
     await _scrub_job(conn, job["id"])
     batch = (job.get("context") or {}).get("batch")
-    if isinstance(batch, str):
-        await commitments.unmark_batch(conn, batch)
+    if not isinstance(batch, str):
+        return
+    counts = await commitments.unmark_batch(conn, batch)
+    run_id = batch.partition(".")[0]
+    if run_id.isdigit():
+        await _add_run_stats(conn, int(run_id), {
+            "digest_failures": 1, "digest_items_requeued": counts["requeued"],
+            "digest_items_dropped": counts["dropped"]})
 
 
 @bridge.on_callback(commitments.CALLBACK_MODULE)
@@ -580,6 +737,10 @@ async def nightly_tick(
     Отметка о ночи пишется в базу в одной транзакции с планированием, поэтому перезапуск сервиса
     второй прогон за ту же ночь не вызовет. Если сервис не работал в назначенное время, прогон
     запускается при первой возможности в пределах `catch_up`, позже — ждёт следующей ночи.
+
+    Продолжение. Если прогон закончился, а разбирать ещё есть что (`more` в отметке — большой
+    импорт, предел запросов), следующий запускается сразу после него, не дожидаясь следующей
+    ночи; за одну ночь — не больше `options.nightly_runs` прогонов.
     """
     zone = ZoneInfo(tz)
     local = (now or datetime.now(timezone.utc)).astimezone(zone)
@@ -589,15 +750,18 @@ async def nightly_tick(
         if scheduled <= local < scheduled + catch_up:
             night = day.isoformat()
             break
-    if night is None:
-        return None
     async with conn.transaction():
-        claimed = await conn.fetchval(
-            """INSERT INTO settings (key, value) VALUES ($1, $2::jsonb)
-               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-               WHERE settings.value IS DISTINCT FROM EXCLUDED.value
-               RETURNING 1""",
-            NIGHTLY_KEY, json.dumps({"night": night}))
-        if not claimed:
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.processing.nightly'))")
+        record = _loads(await conn.fetchval("SELECT value FROM settings WHERE key = $1", NIGHTLY_KEY)) or {}
+        if night is not None and record.get("night") != night:
+            await _save_setting(conn, NIGHTLY_KEY, {"night": night, "runs": 1})
+            return await plan_run(conn, tz=tz, trigger="nightly", now=now, options=options)
+        runs = int(record.get("runs") or 1)
+        if not record.get("night") or runs >= options.nightly_runs:
             return None
+        if not (await load_state(conn)).get("more"):
+            return None
+        if await conn.fetchval("SELECT 1 FROM processing_runs WHERE status = 'running'"):
+            return None     # предыдущий прогон ещё ждёт ответов модели
+        await _save_setting(conn, NIGHTLY_KEY, {"night": record["night"], "runs": runs + 1})
         return await plan_run(conn, tz=tz, trigger="nightly", now=now, options=options)

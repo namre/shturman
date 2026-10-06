@@ -18,6 +18,22 @@
 
 Изменения обязательств и реестра людей через эти маршруты — действия владельца: плагин вызывает
 их по его команде или нажатию.
+
+Видимость. Обязательства исключённых чатов и удалённых сообщений не отдаются ни одним маршрутом
+(404 — как будто их нет). Человек отдаётся, только если у него есть видимый след: неисключённый
+личный чат или неудалённое сообщение в неисключённом чате; иначе — 404 и отсутствие в поиске.
+
+Чужой текст. Ответы читает агент через инструменты плагина. В каждом словаре обязательства,
+человека и предложения слияния есть ключ `untrusted_fields` — список полей (пути через точку,
+`[]` — элементы списка), значения которых взяты из сообщений третьих лиц, их имён и названий
+чатов: `what`, `source_quote`, `due_expression`, `debtor.name`, `creditor.name`, `chat.title`;
+`display_name`, `first_name`, `middle_name`, `last_name`, `aliases[].alias`, `peers[].name`,
+`peers[].username`. Плагин обязан подавать эти значения агенту как данные (в рамке «недоверенный
+текст»), а не как указания: в них может быть написано что угодно.
+
+view для /api/commitments: open, overdue, today, week (с сегодня до воскресенья), next_week
+(с понедельника по воскресенье следующей недели), proposed, closed, all. Кроме person_id
+(people.id) принимается peer_id (peers.id — учётная запись Telegram).
 """
 
 from __future__ import annotations
@@ -136,11 +152,12 @@ async def list_commitments(request: Request) -> JSONResponse:
     async with state.ro_pool.acquire() as conn:
         person_id = _query_int(request, "person_id")
         if person_id is not None:
-            person_id = await people.active_id(conn, person_id)
+            person_id = await people.visible_id(conn, person_id)
             if person_id is None:
                 raise BadRequest("такого человека нет в реестре", status=404)
         items = await commitments.list_commitments(
             conn, view=view, today=_today(request), person_id=person_id,
+            peer_id=_query_int(request, "peer_id"),
             chat_id=_query_int(request, "chat_id"), direction=direction,
             limit=_query_int(request, "limit") or 100)
     return JSONResponse({"view": view, "commitments": items})
@@ -181,6 +198,12 @@ def _people_error(exc: people.PeopleError) -> BadRequest:
     return BadRequest(str(exc), status=409)
 
 
+async def _need_visible(conn, person_id: int) -> None:
+    """Человек без видимого следа для маршрутов не существует — в том числе для правок."""
+    if await people.visible_id(conn, person_id) is None:
+        raise BadRequest("такого человека нет в реестре", status=404)
+
+
 @handler
 async def list_people(request: Request) -> JSONResponse:
     async with state_of(request).ro_pool.acquire() as conn:
@@ -204,6 +227,7 @@ async def person_aliases(request: Request) -> JSONResponse:
     data = await body(request)
     alias = need_str(data, "alias", limit=120)
     async with state_of(request).pool.acquire() as conn:
+        await _need_visible(conn, request.path_params["person_id"])
         try:
             if request.method == "DELETE":
                 result = await people.remove_alias(conn, request.path_params["person_id"], alias)
@@ -223,7 +247,10 @@ async def merge_people(request: Request) -> JSONResponse:
             if data.get("proposal_id") is not None:
                 result = await people.decide_proposal(conn, need_int(data, "proposal_id"), accept=True)
             else:
-                result = await people.merge_people(conn, need_int(data, "source_id"), need_int(data, "target_id"))
+                source_id, target_id = need_int(data, "source_id"), need_int(data, "target_id")
+                await _need_visible(conn, source_id)
+                await _need_visible(conn, target_id)
+                result = await people.merge_people(conn, source_id, target_id)
         except people.PeopleError as exc:
             raise _people_error(exc) from None
         person = await people.get_person(conn, result["person_id"]) if result.get("person_id") else None
@@ -234,6 +261,7 @@ async def merge_people(request: Request) -> JSONResponse:
 async def split_person(request: Request) -> JSONResponse:
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
+        await _need_visible(conn, request.path_params["person_id"])
         try:
             result = await people.split_person(conn, request.path_params["person_id"], need_int(data, "peer_id"))
         except people.PeopleError as exc:
@@ -300,6 +328,13 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
                 # только вид ошибки: в тексте ошибки базы может оказаться фрагмент переписки
                 logger.error("ночной прогон обработки не запустился: %s", type(exc).__name__)
 
+    async def on_chat_excluded(payload: dict[str, Any]) -> None:
+        """Владелец исключил чат: выведенные из него обязательства убираются сразу, не дожидаясь ночи.
+        (Показывать их перестают ещё раньше — исключённый чат отсекается в каждом запросе чтения.)"""
+        async with state.pool.acquire() as conn:
+            await commitments.purge_orphans(conn)
+
     state.events.subscribe(events.MESSAGES_DELETED, on_deleted)
+    state.events.subscribe(events.CHAT_EXCLUDED, on_chat_excluded)
     state.spawn(nightly(), name="processing-nightly")
     yield
