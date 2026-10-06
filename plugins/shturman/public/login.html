@@ -29,6 +29,14 @@
       <p class="lead">Проверяю ссылку активации…</p>
     </div>
 
+    <!-- код ещё не запрошен -->
+    <div id="view-start" hidden>
+      <div class="panel">
+        <p class="lead">Ваш бот пришлёт одноразовый код в Telegram. Пароль не нужен.</p>
+        <div><button class="btn" id="send" type="button">Получить код в Telegram</button></div>
+      </div>
+    </div>
+
     <!-- код отправлен -->
     <div id="view-code" hidden>
       <div class="panel">
@@ -47,10 +55,10 @@
           <p class="note warn" id="code-error" role="alert" hidden></p>
           <div class="row actions">
             <button class="btn" id="code-submit" type="submit">Войти</button>
-            <a class="link" id="resend" href="../auth/login?provider=shturman">Отправить код ещё раз</a>
+            <button class="link" id="resend" type="button">Код не пришёл</button>
           </div>
         </form>
-        <p class="small">Новый код можно запросить раз в минуту. После пяти неверных попыток вход на время закрывается.</p>
+        <p class="small">Пока код действует, новый не отправляется. После пяти неверных попыток вход на время закрывается.</p>
       </div>
     </div>
 

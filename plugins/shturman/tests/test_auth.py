@@ -2,7 +2,7 @@ import pytest
 
 from shturman_core.auth import (
     ACCESS_TTL, ACTIVATION_TTL, LOCK_STEPS, LOGIN_CODE_TTL, LOGIN_MAX_ATTEMPTS,
-    LOGIN_RESEND_INTERVAL, REFRESH_TTL, Auth,
+    LOGIN_RETRY_INTERVAL, SESSION_MAX_AGE, Auth,
 )
 
 
@@ -88,16 +88,32 @@ def test_code_is_sent_and_accepted_once(auth, store, outbox):
     assert auth.verify_login_code(code) == "none"
 
 
-def test_resend_is_throttled(auth, store, clock, outbox):
+def test_valid_code_is_never_replaced(auth, store, clock, outbox):
+    """Посторонний, запрашивая коды, не должен обесценивать тот, что владелец сейчас вводит."""
     bind(store)
     assert auth.request_login_code() == "sent"
-    assert auth.request_login_code() == "reused"
+    for _ in range(4):
+        clock.tick(60)
+        assert auth.request_login_code() == "reused"
     assert len(outbox.codes) == 1
-    clock.tick(LOGIN_RESEND_INTERVAL)
+    assert auth.verify_login_code(outbox.codes[0][1]) == "ok"
+
+
+def test_new_code_after_expiry(auth, store, clock, outbox):
+    bind(store)
+    auth.request_login_code()
+    clock.tick(LOGIN_CODE_TTL)
     assert auth.request_login_code() == "sent"
     assert len(outbox.codes) == 2
-    assert auth.verify_login_code(outbox.codes[0][1]) == "wrong"       # старый код заменён
+    assert auth.verify_login_code(outbox.codes[0][1]) == "wrong"
     assert auth.verify_login_code(outbox.codes[1][1]) == "ok"
+
+
+def test_send_request_goes_through_complete(auth, store, outbox):
+    bind(store)
+    assert auth.complete("send") == (False, "sent")
+    assert auth.complete("send") == (False, "reused")
+    assert auth.complete(outbox.codes[-1][1]) == (True, "ok")
 
 
 def test_code_expires(auth, store, clock, outbox):
@@ -107,11 +123,16 @@ def test_code_expires(auth, store, clock, outbox):
     assert auth.verify_login_code(outbox.codes[-1][1]) == "expired"
 
 
-def test_send_failure_keeps_no_code(auth, store, outbox):
+def test_failed_send_is_throttled_and_leaves_no_code(auth, store, clock, outbox):
     bind(store)
     outbox.fail = True
     assert auth.request_login_code() == "send_failed"
     assert auth.verify_login_code("00000000") == "none"
+    assert auth.request_login_code() == "wait"          # повторно в Telegram не стучимся
+    outbox.fail = False
+    assert auth.request_login_code() == "wait"
+    clock.tick(LOGIN_RETRY_INTERVAL)
+    assert auth.request_login_code() == "sent"
 
 
 def test_lock_after_repeated_wrong_codes(auth, store, clock, outbox):
@@ -125,7 +146,7 @@ def test_lock_after_repeated_wrong_codes(auth, store, clock, outbox):
     assert len(outbox.notices) == 1
     assert auth.verify_login_code(code) == "locked"            # даже верный код не принимается
     assert auth.request_login_code() == "locked"
-    assert auth.login_lock_remaining() == LOCK_STEPS[0]
+    assert store.read("login")["lock_until"] == int(clock()) + LOCK_STEPS[0]
     clock.tick(LOCK_STEPS[0])
     assert auth.request_login_code() == "sent"
 
@@ -136,7 +157,7 @@ def test_fresh_code_does_not_reset_wrong_attempts(auth, store, clock, outbox):
     auth.request_login_code()
     for _ in range(LOGIN_MAX_ATTEMPTS - 1):
         assert auth.verify_login_code("00000000") in ("wrong", "ok")
-    clock.tick(LOGIN_RESEND_INTERVAL)
+    clock.tick(LOGIN_CODE_TTL)
     assert auth.request_login_code() == "sent"
     assert auth.verify_login_code("00000001") == "locked"
 
@@ -148,7 +169,7 @@ def test_locks_escalate_and_reset_on_success(auth, store, clock, outbox):
         auth.request_login_code()
         for _ in range(LOGIN_MAX_ATTEMPTS):
             auth.verify_login_code("99999999" if outbox.codes[-1][1] != "99999999" else "11111111")
-        assert auth.login_lock_remaining() == LOCK_STEPS[level]
+        assert store.read("login")["lock_until"] == int(clock()) + LOCK_STEPS[level]
     clock.tick(LOCK_STEPS[-1])
     auth.request_login_code()
     assert auth.verify_login_code(outbox.codes[-1][1]) == "ok"
@@ -162,7 +183,30 @@ def test_activation_clears_login_lock(auth, store, clock, outbox):
         auth.verify_login_code("00000000" if outbox.codes[-1][1] != "00000000" else "1" * 8)
     assert auth.request_login_code() == "locked"
     assert auth.redeem_activation(auth.issue_activation()) is True
+    assert store.read("login") == {}                     # блокировка снята
+    bind(store)                                          # владелец привязал бота заново
     assert auth.request_login_code() == "sent"
+
+
+def test_recovery_link_unbinds_owner_and_ends_sessions(auth, store):
+    """Ссылка восстановления — на случай потерянного или захваченного Telegram."""
+    bind(store)
+    session = auth.mint_session()
+    value = auth.issue_activation()
+    assert store.read("activation")["kind"] == "recovery"
+    assert auth.redeem_activation(value) is True
+    assert auth.owner() is None                          # прежнему аккаунту коды больше не уходят
+    assert auth.request_login_code() == "no_owner"
+    assert auth.verify_access(session.access_token) is None
+    assert auth.refresh(session.refresh_token) is None
+
+
+def test_first_activation_keeps_nothing_to_unbind(auth, store):
+    value = auth.issue_activation()
+    assert store.read("activation")["kind"] == "activation"
+    session_before = auth.mint_session()
+    assert auth.redeem_activation(value) is True
+    assert auth.verify_access(session_before.access_token) is not None
 
 
 # --- сессии ---
@@ -177,15 +221,27 @@ def test_session_tokens_verify_and_expire(auth, store, clock):
     assert auth.verify_access(s.access_token) is None
     renewed = auth.refresh(s.refresh_token)
     assert renewed is not None and auth.verify_access(renewed.access_token)
-    clock.tick(REFRESH_TTL)
-    assert auth.refresh(s.refresh_token) is None
+
+
+def test_session_has_absolute_lifetime(auth, clock):
+    """Продление не сдвигает срок: через 30 дней после входа нужно войти заново."""
+    current = auth.mint_session()
+    for _ in range(SESSION_MAX_AGE // ACCESS_TTL - 1):
+        clock.tick(ACCESS_TTL)
+        current = auth.refresh(current.refresh_token)
+        assert current is not None
+    clock.tick(ACCESS_TTL)
+    assert auth.refresh(current.refresh_token) is None
+    assert auth.verify_access(current.access_token) is None
 
 
 def test_logout_all_invalidates_sessions(auth):
     s = auth.mint_session()
+    assert auth.refresh_is_valid(s.refresh_token) is True
     auth.revoke_all_sessions()
     assert auth.verify_access(s.access_token) is None
     assert auth.refresh(s.refresh_token) is None
+    assert auth.refresh_is_valid(s.refresh_token) is False
     assert auth.verify_access(auth.mint_session().access_token)
 
 

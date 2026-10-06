@@ -56,5 +56,6 @@ def get_me(token: str) -> dict[str, Any]:
     return result if isinstance(result, dict) else {}
 
 
-def send_message(token: str, chat_id: int, text: str) -> None:
-    call(token, "sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+def send_message(token: str, chat_id: int, text: str, *, timeout: float = 10) -> None:
+    call(token, "sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+         timeout=timeout)

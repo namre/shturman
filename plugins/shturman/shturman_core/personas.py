@@ -29,10 +29,14 @@ def catalog() -> dict[str, Any]:
 
 
 def _clean(value: Any, limit: int) -> str:
-    """Одна строка без управляющих символов и без маркеров блока."""
-    text = " ".join(str(value or "").split())
-    text = text.replace("<!--", "").replace("-->", "")
-    return text[:limit].strip()
+    """Одна строка без управляющих и невидимых символов и без угловых скобок.
+
+    Без «<» и «>» из введённого нельзя собрать маркер блока, как бы его ни вкладывали.
+    """
+    text = "".join(ch for ch in str(value or "") if ch.isprintable() or ch.isspace())
+    text = text.replace("<", "").replace(">", "")
+    text = "".join(ch for ch in text if ch not in "\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff")
+    return " ".join(text.split())[:limit].strip()
 
 
 def normalize(raw: dict[str, Any]) -> dict[str, Any]:
@@ -119,7 +123,7 @@ def apply_to_soul(existing: str, choice: dict[str, Any]) -> str:
     block = soul_block(choice)
     existing = existing or ""
     start = existing.find(BLOCK_START)
-    end = existing.find(BLOCK_END)
+    end = existing.rfind(BLOCK_END)
     if start != -1 and end != -1 and end > start:
         return existing[:start] + block + existing[end + len(BLOCK_END):]
     # Блок ставится в конец: в файле личности более позднее указание уточняет более раннее,

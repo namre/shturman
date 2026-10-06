@@ -40,15 +40,23 @@ class Store:
     # --- служебное ---
 
     def _ensure_root(self) -> None:
-        if not self.root.is_dir():
-            self.root.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(self.root, 0o700)
-            except OSError:
-                pass
-            self._fix_owner(self.root)
+        if self.root.is_dir():
+            return
+        # Владельца берём у ближайшего уже существующего каталога: сами созданные каталоги
+        # при запуске от root принадлежали бы root.
+        anchor = self.root
+        while not anchor.exists() and anchor != anchor.parent:
+            anchor = anchor.parent
+        missing = [p for p in [self.root, *self.root.parents] if not p.exists()]
+        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.root, 0o700)
+        except OSError:
+            pass
+        for created in reversed(missing):
+            self._fix_owner(created, anchor)
 
-    def _fix_owner(self, path: Path) -> None:
+    def _fix_owner(self, path: Path, anchor: Path | None = None) -> None:
         """Запущено от root (например, через docker exec) — отдать файл владельцу данных Hermes.
 
         Иначе процесс Hermes, работающий под обычным пользователем, не прочитает файл с правами 600.
@@ -56,8 +64,7 @@ class Store:
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
             return
         try:
-            anchor = self.root.parent if path == self.root else self.root
-            st = anchor.stat()
+            st = (anchor or self.root).stat()
             os.chown(path, st.st_uid, st.st_gid)
         except OSError:
             pass
@@ -84,6 +91,8 @@ class Store:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.chmod(tmp, 0o600)
             self._fix_owner(Path(tmp))
             os.replace(tmp, path)
@@ -137,6 +146,7 @@ class Store:
             pass
         lock_path = self.root / ".secret.lock"
         with open(lock_path, "a+") as lock:
+            self._fix_owner(lock_path)
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
                 try:
@@ -149,6 +159,8 @@ class Store:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 self._fix_owner(path)
                 return data
             finally:

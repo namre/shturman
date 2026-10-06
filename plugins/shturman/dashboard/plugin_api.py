@@ -139,10 +139,20 @@ async def get_pairing() -> dict[str, Any]:
     return Pairing(_store()).status()
 
 
-@router.post("/pairing/cancel")
-async def post_pairing_cancel() -> dict[str, Any]:
+@router.post("/pairing/confirm")
+async def post_pairing_confirm() -> dict[str, Any]:
+    """Владелец в мастере подтвердил, что аккаунт, написавший боту, — его."""
     pairing = Pairing(_store())
-    pairing.cancel()
+    owner = pairing.confirm()
+    if owner is None:
+        raise HTTPException(status_code=409, detail="Подтверждать нечего: время привязки вышло. Получите новую ссылку.")
+    return pairing.status()
+
+
+@router.post("/pairing/reject")
+async def post_pairing_reject() -> dict[str, Any]:
+    pairing = Pairing(_store())
+    pairing.reject()
     return pairing.status()
 
 
@@ -165,6 +175,7 @@ async def post_model_probe() -> dict[str, Any]:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=PROBE_TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()
         return {"ok": False, "error": "Модель не ответила за полторы минуты."}
     result = wizard.parse_probe_output(proc.returncode or 0, out.decode("utf-8", "replace"))
     if result["ok"]:

@@ -97,7 +97,12 @@ check('ссылка на бота правильного вида', /^https:\/\/
 await shot(page, '3-bot-pair');
 const token = link.split('start=')[1];
 const res = py(`from shturman_core.pairing import Pairing; from shturman_core.state import Store; print(Pairing(Store()).try_bind('/start ${token}', user_id=777, chat_id=777, name='Иван Иванов', username='ivan'))`);
-check('нажатие «Запустить» привязывает владельца', res === 'bound', res);
+check('нажатие «Запустить» даёт кандидата, а не владельца', res === 'accepted', res);
+await page.waitForSelector('text=Это вы?', { timeout: 30000 });
+check('мастер показывает, кто написал боту', await page.isVisible('text=Иван Иванов') && await page.isVisible('text=@ivan · номер аккаунта 777'));
+check('до подтверждения в Hermes ничего не записано', !puts.some(p => p.env?.TELEGRAM_ALLOWED_USERS));
+await shot(page, '3-bot-confirm');
+await page.click('button:has-text("Да, это я")');
 await page.waitForSelector('text=Владелец привязан: Иван Иванов', { timeout: 30000 });
 check('в Hermes записан только владелец', puts.some(p => p.env?.TELEGRAM_ALLOWED_USERS === '777'));
 const envText = execSync(`grep -c '^TELEGRAM_HOME_CHANNEL=' ${HOME}/.env || true`, {encoding:'utf8'}).trim();

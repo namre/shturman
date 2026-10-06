@@ -32,7 +32,7 @@ def message(text, user=OWNER, mid=1):
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.setenv("SHTURMAN_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr(shturman_telegram, "business_plugin_enabled", lambda: False)
+    monkeypatch.setattr(shturman_telegram, "business_plugin_active", lambda: False)
     replies = []
 
     async def fake_reply(self, text, *args, **kwargs):
@@ -71,15 +71,16 @@ def test_ordinary_message_is_left_to_hermes(app):
     assert app[1] == []
 
 
-def test_start_with_token_binds_owner(app):
+def test_start_with_token_makes_a_candidate_not_an_owner(app):
     started = Pairing(Store()).start()
     handled = dispatch(app, {"update_id": 2, "message": message(f"/start {started['token']}")})
     assert (0, "on_pairing_message") in handled
-    owner = Store().read("owner")
-    assert (owner["user_id"], owner["chat_id"], owner["name"], owner["username"]) == \
+    assert Store().read("owner") == {}                     # владельцем делает только подтверждение в мастере
+    candidate = Pairing(Store()).status()["candidate"]
+    assert (candidate["user_id"], candidate["chat_id"], candidate["name"], candidate["username"]) == \
         (42, 42, "Иван Иванов", "ivan")
-    assert app[1] == [shturman_telegram.REPLIES["bound"]]
-    # окно закрылось — следующее сообщение снова идёт в Hermes
+    assert app[1] == [shturman_telegram.REPLIES["accepted"]]
+    # значение принято — следующее сообщение снова идёт в Hermes
     assert [h for h in dispatch(app, {"update_id": 3, "message": message("привет", mid=2)}) if h[0] == 0] == []
 
 
@@ -94,7 +95,7 @@ def test_bare_start_during_pairing_gets_a_hint_not_the_stock_reply(app):
 def test_typed_code_binds(app):
     started = Pairing(Store()).start()
     dispatch(app, {"update_id": 5, "message": message(started["code"])})
-    assert Store().read("owner")["user_id"] == 42
+    assert Pairing(Store()).confirm()["user_id"] == 42
 
 
 def test_business_message_never_reaches_core_without_business_plugin(app):
@@ -114,21 +115,44 @@ def test_business_message_is_not_treated_as_pairing(app):
     assert Store().read("owner") == {}
 
 
-def test_guard_is_off_when_business_plugin_is_enabled(tmp_path, monkeypatch):
-    monkeypatch.setenv("SHTURMAN_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr(shturman_telegram, "business_plugin_enabled", lambda: True)
-    application = Application.builder().token("1234567890:" + "A" * 35).updater(None).build()
-    shturman_telegram.wire(application, None)
-    names = [h.callback.__name__ for h in application.handlers.get(0, [])]
-    assert "drop_business_message" not in names and "on_pairing_message" in names
+def test_guard_steps_aside_only_while_business_plugin_is_really_loaded(app, monkeypatch):
+    payload = {"update_id": 9, "business_message": dict(message("здравствуйте", user=STRANGER),
+                                                        business_connection_id="bc1")}
+    monkeypatch.setattr(shturman_telegram, "business_plugin_active", lambda: True)
+    assert (0, "drop_business_message") not in dispatch(app, payload)
+    # плагин выключили или он упал — защита возвращается без перезапуска
+    monkeypatch.setattr(shturman_telegram, "business_plugin_active", lambda: False)
+    assert (0, "drop_business_message") in dispatch(app, dict(payload, update_id=10))
 
 
-def test_business_connection_is_recorded(app):
-    payload = {"update_id": 8, "business_connection": {
-        "id": "bc1", "user": OWNER, "user_chat_id": 42, "date": int(time.time()),
+def test_plugin_listed_but_failed_to_load_counts_as_not_loaded(monkeypatch):
+    import types
+    listing = [{"name": "telegram-business", "enabled": True, "error": "ImportError: нет модуля"}]
+    fake = types.SimpleNamespace(get_plugin_manager=lambda: types.SimpleNamespace(list_plugins=lambda: listing))
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake)
+    monkeypatch.setattr(shturman_telegram, "_active_cache", (0.0, False))
+    assert shturman_telegram.business_plugin_active() is False
+    listing[0]["error"] = None
+    monkeypatch.setattr(shturman_telegram, "_active_cache", (0.0, False))
+    assert shturman_telegram.business_plugin_active() is True
+
+
+def business_connection(user, update_id):
+    return {"update_id": update_id, "business_connection": {
+        "id": "bc1", "user": user, "user_chat_id": user["id"], "date": int(time.time()),
         "is_enabled": True, "rights": {"can_reply": True},
     }}
-    handled = dispatch(app, payload)
+
+
+def test_owner_business_connection_is_recorded(app):
+    Store().write("owner", {"user_id": 42, "chat_id": 42, "name": "Иван"})
+    handled = dispatch(app, business_connection(OWNER, 8))
     assert (shturman_telegram.OBSERVER_GROUP, "observe") in handled
     state = Store().read("business")
     assert state["connected"] is True and state["can_reply"] is True and state["user_id"] == 42
+
+
+def test_strangers_business_connection_is_ignored(app):
+    Store().write("owner", {"user_id": 42, "chat_id": 42, "name": "Иван"})
+    dispatch(app, business_connection(STRANGER, 11))
+    assert Store().read("business") == {}

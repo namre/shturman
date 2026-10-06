@@ -134,7 +134,7 @@
     h(Shot, { title: "Telegram · @" + (bot || "ваш_бот"), legend: [
       "Нажмите «Открыть бота» слева — откроется чат с вашим ботом.",
       "Внизу чата нажмите «Запустить» (в английской версии — Start).",
-      "Бот ответит «Готово», и мастер продолжит сам.",
+      "Бот ответит «Принято». Вернитесь сюда и подтвердите, что это вы.",
     ] },
       h(In, null, "Здесь будет ваш разговор с ассистентом."),
       h("div", { className: "shturman-startbar" }, h(Key, { n: 2 }, "ЗАПУСТИТЬ")));
@@ -564,10 +564,11 @@
     });
   }
 
-  /* Владелец нажал «Запустить»: записываем его в Hermes как единственного разрешённого
-   * пользователя и как чат для сообщений ассистента, затем перезапускаем бота. */
-  function applyOwner(owner) {
+  /* Владелец подтвердил, что боту написал он: закрепляем привязку, записываем его в Hermes как
+   * единственного разрешённого пользователя и как чат для сообщений ассистента, перезапускаем бота. */
+  function confirmOwner() {
     return run("bot.apply", async () => {
+      const owner = (await post("/pairing/confirm")).owner;
       patch("bot", { pair: null, rebind: false });
       await api.updateMessagingPlatform("telegram", { env: { TELEGRAM_ALLOWED_USERS: String(owner.user_id) } });
       await api.setEnvVar("TELEGRAM_HOME_CHANNEL", String(owner.chat_id));
@@ -579,17 +580,26 @@
     });
   }
 
+  function rejectCandidate() {
+    return run("bot.pair", async () => {
+      await post("/pairing/reject");
+      patch("bot", { pair: null });
+      await loadState();
+      return "";
+    });
+  }
+
   function BotStep({ st, next }) {
     const b = mem.bot;
     const [token, setToken] = useState("");
     const owner = st.pairing.owner;
-    const pair = b.pair || null;
+    const candidate = st.pairing.candidate || null;
+    const pair = candidate ? null : (b.pair || null);
     const botName = (st.bot && st.bot.username) || (pair && pair.bot_username) || "";
 
     useEffect(() => { loadTelegramPlatform().catch(() => {}); }, []);
 
     // Пока окно привязки открыто, ждём, когда владелец нажмёт «Запустить» в Telegram.
-    const knownBinding = owner ? owner.bound_at : 0;
     useEffect(() => {
       if (!pair) return undefined;
       let stop = false;
@@ -600,7 +610,7 @@
           let status;
           try { status = await get("/pairing"); } catch (e) { continue; }
           if (stop) return;
-          if (status.owner && status.owner.bound_at !== knownBinding) { applyOwner(status.owner); return; }
+          if (status.candidate) { patch("bot", { pair: null }); loadState().catch(() => {}); return; }
           if (!status.pending) {
             patch("bot", { pair: null });
             jobs["bot.pair"] = { status: "error", error: "Время привязки вышло. Получите новую ссылку." };
@@ -665,6 +675,17 @@
                       ". Ассистент слушается только вас, а вход сюда теперь идёт по коду от этого бота."),
                     h("div", null, h(Btn, { kind: "ghost", onClick: () => patch("bot", { rebind: true, pair: null }) },
                       "Привязать другой аккаунт")))
+                : candidate
+                  ? h("div", { className: "shturman-stack" },
+                      h("p", null, "Боту написал этот аккаунт Telegram:"),
+                      h("div", { className: "shturman-preview" },
+                        h("strong", null, candidate.name || "Без имени"),
+                        h("span", { className: "shturman-muted" },
+                          (candidate.username ? "@" + candidate.username + " · " : "") + "номер аккаунта " + candidate.user_id)),
+                      h("p", null, "Это вы? После подтверждения ассистент будет слушаться только этот аккаунт, и коды для входа будут приходить ему."),
+                      h("div", { className: "shturman-actions" },
+                        h(Btn, { onClick: confirmOwner }, "Да, это я"),
+                        h(Btn, { kind: "ghost", busy: running("bot.pair"), onClick: rejectCandidate }, "Нет, это не я")))
                 : pair
                   ? h("div", { className: "shturman-stack" },
                       h("p", null, "Откройте бота и нажмите в Telegram «Запустить». Так ассистент узнает ваш аккаунт и будет слушаться только вас."),

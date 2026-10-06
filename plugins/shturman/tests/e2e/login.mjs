@@ -8,13 +8,24 @@ const check = (n, ok, extra='') => out.push(`${ok?'PASS':'FAIL'}  ${n}${extra?' 
 { // владелец привязан, но бот написать не может (в стенде нет токена): честное сообщение, без поля кода
   const ctx = await browser.newContext(); const page = await ctx.newPage();
   await page.goto(BASE + '/sessions');
+  await page.waitForSelector('#send');
+  await page.screenshot({ path: `${OUT}/shot-login-start.png` });
+  await page.click('#send');
   await page.waitForSelector('#view-message:not([hidden])');
-  check('сбой отправки кода показан понятно', (await page.textContent('#message-text')).includes('Не удалось отправить код'), new URL(page.url()).searchParams.get('m'));
+  check('сбой отправки кода показан понятно', (await page.textContent('#message-text')).includes('Не удалось отправить код'));
+  await page.click('a:has-text("Попробовать ещё раз")');
+  await page.waitForSelector('#send');
+  await page.click('#send');
+  await page.waitForSelector('#view-message:not([hidden])');
+  check('повторная отправка сразу после сбоя придержана', (await page.textContent('#message-text')).includes('через минуту'));
   await ctx.close();
 }
 { // вид страницы с полем кода и реакция на неверный код (state поддельный → «страница устарела»)
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 860 } }); const page = await ctx.newPage();
-  await page.goto(BASE + '/shturman-auth/login.html?state=abc&m=sent');
+  // поле кода показываем через подмену ответа: настоящего бота на стенде нет
+  await page.route('**/auth/callback?code=send*', r => r.fulfill({ status: 400, json: { detail: 'Invalid code: sent' } }));
+  await page.goto(BASE + '/shturman-auth/login.html?state=abc');
+  await page.click('#send');
   await page.waitForSelector('#code');
   await page.fill('#code', '12345678');
   check('код форматируется при вводе', (await page.inputValue('#code')) === '1234 5678');
@@ -26,7 +37,7 @@ const check = (n, ok, extra='') => out.push(`${ok?'PASS':'FAIL'}  ${n}${extra?' 
 }
 { // телефон
   const ctx = await browser.newContext({ viewport: { width: 390, height: 800 } }); const page = await ctx.newPage();
-  await page.goto(BASE + '/shturman-auth/login.html?state=abc&m=sent');
+  await page.goto(BASE + '/shturman-auth/login.html?state=abc');
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   check('страница входа на телефоне без горизонтальной прокрутки', overflow <= 1, String(overflow));
   await page.screenshot({ path: `${OUT}/shot-login-phone.png`, fullPage: true });

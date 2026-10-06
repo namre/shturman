@@ -11,7 +11,6 @@ fail() { printf 'FAIL  %s: %s\n' "$1" "$2"; fails=$((fails + 1)); }
 
 c=shturman-hermes
 # Под тем же пользователем, под которым работает Hermes: файлы, созданные от root, он не прочитает.
-hx() { docker exec -u "$(id -u):$(id -g)" "$c" hermes "$@" 2>&1; }
 hpy() { docker exec -u "$(id -u):$(id -g)" "$c" /opt/hermes/.venv/bin/python "$@" 2>/dev/null; }
 
 # --- контейнер ---
@@ -86,16 +85,21 @@ if [ "$wizard_done" = "yes" ]; then pass wizard "мастер настройки
 else warn wizard "мастер настройки не завершён"; fi
 
 # --- плагин бизнес-режима ---
-plugins="$(hx plugins list)"
-if printf '%s' "$plugins" | grep -qi 'telegram-business'; then
-  if printf '%s' "$plugins" | grep -i 'telegram-business' | grep -Eqi 'enabled|✓|on'; then
-    pass business-plugin "установлен и включён"
-  else
-    fail business-plugin "установлен, но не включён — бизнес-режим в Telegram подключать нельзя"
-  fi
-else
-  warn business-plugin "не установлен — бота в бизнес-режиме в Telegram НЕ подключать (issue #127430)"
-fi
+# Состояние берём из настроек и каталога плагинов, а не из таблицы `hermes plugins list`:
+# в ней статус «not enabled» содержит слово «enabled».
+biz="$(hpy -c '
+import os
+from hermes_cli.config import load_config
+p = (load_config() or {}).get("plugins") or {}
+name = "telegram-business"
+installed = os.path.isdir(os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "plugins", name))
+enabled = name in (p.get("enabled") or []) and name not in (p.get("disabled") or [])
+print("enabled" if installed and enabled else "installed" if installed else "absent")' | tail -n 1)"
+case "$biz" in
+  enabled)   pass business-plugin "установлен и включён" ;;
+  installed) fail business-plugin "установлен, но не включён — бизнес-режим в Telegram подключать нельзя" ;;
+  *)         warn business-plugin "не установлен — бота в бизнес-режиме в Telegram НЕ подключать (issue #127430)" ;;
+esac
 
 echo
 if [ "$fails" -gt 0 ]; then echo "ИТОГ: FAIL ($fails)"; exit 1; fi

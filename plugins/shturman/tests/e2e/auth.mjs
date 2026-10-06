@@ -17,9 +17,14 @@ const check = (name, ok, extra='') => { out.push(`${ok ? 'PASS' : 'FAIL'}  ${nam
   const ctx = await browser.newContext(); const page = await ctx.newPage();
   const errors = []; page.on('console', m => { if (m.type()==='error') errors.push(m.text()); });
   await page.goto(BASE + '/');
+  await page.waitForSelector('#send');
+  check('страница входа ничего не раскрывает до нажатия', !new URL(page.url()).search.includes('m='), new URL(page.url()).search.replace(/state=[^&]+/, 'state=…'));
+  await page.click('#send');
   await page.waitForSelector('#view-message:not([hidden])');
   check('без владельца — сообщение вместо поля кода', (await page.textContent('#message-text')).includes('ссылке активации'), page.url().split('?')[0]);
-  check('страница входа без ошибок консоли (CSP)', errors.length === 0, errors.join(' | '));
+  // Отказ 400 на просьбу прислать код — штатный ответ, браузер пишет его в консоль; ищем только нарушения политики содержимого.
+  const csp = errors.filter(e => /Content Security Policy|Refused to/i.test(e));
+  check('страница входа не нарушает политику содержимого', csp.length === 0, csp.join(' | '));
   await page.screenshot({ path: `${OUT}/shot-login-noowner.png` });
   await ctx.close();
 }

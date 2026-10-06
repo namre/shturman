@@ -3,7 +3,9 @@
 Мастер выдаёт одноразовую ссылку вида t.me/<бот>?start=<значение> и короткий код на случай,
 если ссылка не открылась. Владелец нажимает «Запустить» в Telegram (или отправляет код),
 обработчик в процессе шлюза вызывает `try_bind`, и аккаунт, с которого пришло сообщение,
-становится владельцем.
+становится кандидатом. Владельцем он становится только после подтверждения в мастере
+(`confirm`), то есть из уже выполненного входа: случайно или намеренно угадавший код
+посторонний сам себя владельцем сделать не может.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from .state import Store
 
 PAIRING_TTL = 15 * 60
 PAIRING_CODE_DIGITS = 6
-PAIRING_MAX_WRONG = 20      # неверных сообщений от кого угодно, после которых привязка отменяется
+PAIRING_MAX_WRONG = 5       # неверных значений от кого угодно, после которых привязка отменяется
 
 
 def extract_candidate(text: str) -> Optional[str]:
@@ -61,41 +63,49 @@ class Pairing:
         self.store.delete("pairing")
 
     def is_pending(self) -> bool:
-        """Идёт ли привязка прямо сейчас. Вызывается на каждое сообщение, поэтому с кешем."""
+        """Ждём ли сообщение с кодом прямо сейчас. Вызывается на каждое сообщение, поэтому с кешем."""
         mtime = self.store.mtime("pairing")
         if mtime == 0.0:
             return False
         if self._pending_cache[0] != mtime:
             data = self.store.read("pairing")
-            self._pending_cache = (
-                mtime, bool(data.get("token_digest")), int(data.get("expires_at", 0)))
+            waiting = bool(data.get("token_digest")) and not data.get("candidate")
+            self._pending_cache = (mtime, waiting, int(data.get("expires_at", 0)))
         _, pending, expires_at = self._pending_cache
         return pending and expires_at > int(self.now())
 
+    @staticmethod
+    def _public(person: dict[str, Any]) -> Optional[dict[str, Any]]:
+        if not person.get("chat_id"):
+            return None
+        return {
+            "name": person.get("name", ""),
+            "username": person.get("username", ""),
+            "user_id": person.get("user_id"),
+            "chat_id": person.get("chat_id"),
+            "bound_at": person.get("bound_at"),
+        }
+
     def status(self) -> dict[str, Any]:
         data = self.store.read("pairing")
-        owner = self.store.read("owner")
-        pending = bool(data.get("token_digest")) and int(data.get("expires_at", 0)) > int(self.now())
+        alive = int(data.get("expires_at", 0)) > int(self.now())
+        candidate = self._public(data.get("candidate") or {}) if alive else None
+        pending = alive and bool(data.get("token_digest")) and candidate is None
         return {
             "pending": pending,
-            "expires_at": int(data.get("expires_at", 0)) if pending else 0,
-            "owner": {
-                "name": owner.get("name", ""),
-                "username": owner.get("username", ""),
-                "user_id": owner.get("user_id"),
-                "chat_id": owner.get("chat_id"),
-                "bound_at": owner.get("bound_at"),
-            } if owner.get("chat_id") else None,
+            "expires_at": int(data.get("expires_at", 0)) if alive else 0,
+            "candidate": candidate,
+            "owner": self._public(self.store.read("owner")),
         }
 
     def try_bind(
         self, text: str, *, user_id: int, chat_id: int, name: str = "", username: str = ""
     ) -> str:
-        """bound | wrong | expired | not_pending | cancelled (слишком много неверных)."""
+        """accepted | wrong | expired | not_pending | cancelled (слишком много неверных)."""
         secret = self.store.secret()
         now = int(self.now())
         with self.store.locked("pairing") as data:
-            if not data.get("token_digest"):
+            if not data.get("token_digest") or data.get("candidate"):
                 return "not_pending"
             if int(data.get("expires_at", 0)) <= now:
                 data.clear()
@@ -113,12 +123,30 @@ class Pairing:
                     data.clear()
                     return "cancelled"
                 return "wrong"
+            # Значение использовано; ждём подтверждения в мастере.
+            data.pop("token_digest", None)
+            data.pop("code_digest", None)
+            data["candidate"] = {
+                "user_id": int(user_id),
+                "chat_id": int(chat_id),
+                "name": (name or "").strip()[:120],
+                "username": (username or "").strip()[:64],
+                "bound_at": now,
+            }
+        return "accepted"
+
+    def confirm(self) -> Optional[dict[str, Any]]:
+        """Кандидат становится владельцем. Вызывается только из мастера, после входа."""
+        now = int(self.now())
+        with self.store.locked("pairing") as data:
+            candidate = data.get("candidate")
+            if not candidate or int(data.get("expires_at", 0)) <= now:
+                data.clear()
+                return None
             data.clear()
-        self.store.write("owner", {
-            "user_id": int(user_id),
-            "chat_id": int(chat_id),
-            "name": (name or "").strip()[:120],
-            "username": (username or "").strip()[:64],
-            "bound_at": now,
-        })
-        return "bound"
+        self.store.write("owner", candidate)
+        return self._public(candidate)
+
+    def reject(self) -> None:
+        """Кандидат — не владелец: привязка отменяется, прежний владелец остаётся."""
+        self.store.delete("pairing")

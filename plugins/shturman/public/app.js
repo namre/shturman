@@ -46,30 +46,30 @@
   var REASONS = {
     wrong: "Код не подошёл. Проверьте цифры и попробуйте ещё раз.",
     expired: "Срок действия кода вышел. Запросите новый.",
-    none: "Этот код уже использован или заменён новым. Запросите код ещё раз.",
-    locked: "Слишком много неверных попыток. Вход временно закрыт, попробуйте позже.",
-    stale: "Страница входа устарела. Запросите код ещё раз.",
+    none: "Этот код уже использован. Запросите новый.",
+    locked: "Слишком много неверных попыток. Вход временно закрыт, попробуйте позже. Если это были не вы, ничего делать не нужно.",
+    stale: "Страница входа устарела. Начните вход заново.",
     network: "Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.",
     error: "Не получилось войти. Попробуйте ещё раз.",
+    no_owner: "Бот ещё не привязан к владельцу, поэтому код прислать некому. Войти можно только по ссылке активации.",
+    wait: "Недавняя отправка не удалась. Попробуйте ещё раз через минуту.",
+    send_failed: "Не удалось отправить код: бот сейчас не может написать вам в Telegram. Попробуйте через минуту.",
     activation_invalid: "Ссылка активации уже использована или устарела. Попросите ИИ-агента на сервере выдать новую."
   };
 
+  var LEAD_SENT = "Ваш бот отправил вам код в Telegram. Он действует 5 минут.";
+  var LEAD_REUSED = "Код уже был отправлен и ещё действует. Возьмите последний код из чата с ботом.";
+
   function message(text, withRetry) {
-    hide("view-activating"); hide("view-code");
+    hide("view-activating"); hide("view-code"); hide("view-start");
     $("message-text").textContent = text;
     $("message-retry").hidden = !withRetry;
     show("view-message");
   }
 
-  function minutes(seconds) {
-    var m = Math.max(1, Math.ceil(Number(seconds || 0) / 60));
-    return m + " мин.";
-  }
-
   function loginPage() {
     var params = new URLSearchParams(location.search);
     var state = params.get("state") || "";
-    var mode = params.get("m") || "";
     var activation = takeActivation();
 
     if (!state) { location.replace(loginUrl("")); return; }
@@ -83,28 +83,34 @@
       return;
     }
 
-    if (mode === "no_owner") {
-      message("Бот ещё не привязан к владельцу, поэтому код прислать некому. Войти можно только по ссылке активации.", false);
-      return;
-    }
-    if (mode === "locked") {
-      message("Слишком много неверных попыток. Вход закрыт ещё на " + minutes(params.get("wait")) +
-              " Если это были не вы, ничего делать не нужно.", false);
-      return;
-    }
-    if (mode === "send_failed") {
-      message("Не удалось отправить код: бот сейчас не может написать вам в Telegram. Попробуйте через минуту.", true);
-      return;
-    }
-
-    if (mode === "reused") {
-      $("code-lead").textContent = "Код уже отправлен в Telegram меньше минуты назад — используйте его. Он действует 5 минут.";
-    }
-    show("view-code");
     var input = $("code");
     var error = $("code-error");
     var button = $("code-submit");
-    input.focus();
+    var sendButton = $("send");
+    var resend = $("resend");
+
+    /* Просит сервер прислать код. Сервер отвечает отказом входа с причиной — это и есть итог отправки. */
+    function requestCode(from) {
+      from.disabled = true;
+      complete("send", state).then(function (r) {
+        from.disabled = false;
+        if (r.reason === "sent" || r.reason === "reused") {
+          hide("view-start"); hide("view-message");
+          $("code-lead").textContent = r.reason === "sent" ? LEAD_SENT : LEAD_REUSED;
+          error.hidden = true;
+          show("view-code");
+          input.focus();
+          return;
+        }
+        var retry = r.reason === "wait" || r.reason === "send_failed" || r.reason === "stale" || r.reason === "network";
+        message(REASONS[r.reason] || REASONS.error, retry);
+      });
+    }
+
+    show("view-start");
+    sendButton.addEventListener("click", function () { requestCode(sendButton); });
+    resend.addEventListener("click", function () { requestCode(resend); });
+
     input.addEventListener("input", function () {
       var digits = input.value.replace(/\D/g, "").slice(0, 8);
       input.value = digits.length > 4 ? digits.slice(0, 4) + " " + digits.slice(4) : digits;

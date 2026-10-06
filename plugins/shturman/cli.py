@@ -32,12 +32,15 @@ def main(argv: list[str]) -> int:
         if not base.startswith(("https://", "http://")):
             print("нужен адрес дашборда, например https://assistant.example.com", file=sys.stderr)
             return 2
-        owner = auth.owner()
-        value = auth.issue_activation(kind="recovery" if owner else "activation")
-        # Значение стоит после «#»: браузер не отправляет эту часть адреса на сервер,
-        # поэтому она не попадает в журналы прокси.
+        recovery = auth.owner() is not None
+        value = auth.issue_activation()
+        # Значение стоит после «#»: при открытии ссылки браузер эту часть на сервер не отправляет.
+        # Серверу оно передаётся один раз, при самом входе, и сразу перестаёт действовать.
         print(f"{base.rstrip('/')}{_pages_prefix()}/activate.html#{value}")
         print(f"Действует {ACTIVATION_TTL // 60} минут и срабатывает один раз.", file=sys.stderr)
+        if recovery:
+            print("Это ссылка восстановления: при входе по ней прежняя привязка бота и все открытые "
+                  "сессии сбрасываются, бота нужно будет привязать заново.", file=sys.stderr)
         return 0
 
     if command == "status":

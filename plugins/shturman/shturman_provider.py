@@ -4,7 +4,12 @@ Hermes ведёт вход по схеме «ушёл на страницу вх
   /auth/login  -> start_login()    -> страница входа «Штурмана» (статическая, отдаёт прокси)
   /auth/callback?code=…&state=…    -> complete_login() -> сессия
 
-Код от бота отправляется в start_login: к моменту, когда страница открылась, сообщение уже ушло.
+Код от бота отправляется не при открытии страницы, а по кнопке на ней: страница передаёт
+на /auth/callback служебное значение «send». Иначе код уходил бы владельцу от любого
+случайного захода на адрес — от поисковых роботов до проверок доступности.
+
+Hermes вызывает методы входа прямо в цикле обработки запросов, поэтому обращение к Telegram
+ограничено коротким таймаутом, а частота отправок — правилами в shturman_core.auth.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from shturman_core.state import Store
 logger = logging.getLogger("shturman.auth")
 
 _CALLBACK_SUFFIX = "/auth/callback"
+SEND_TIMEOUT = 4      # секунд на обращение к Telegram: дольше держать цикл запросов нельзя
 
 
 def _bot_token() -> str:
@@ -47,11 +53,12 @@ def _send_code(owner: dict, code: str) -> None:
         f"Код входа в Штурман: {pretty}\n\n"
         "Действует 5 минут. Никому его не пересылайте. "
         "Если вы сейчас не входите, ничего делать не нужно.",
+        timeout=SEND_TIMEOUT,
     )
 
 
 def _notify(owner: dict, text: str) -> None:
-    botapi.send_message(_bot_token(), int(owner["chat_id"]), text)
+    botapi.send_message(_bot_token(), int(owner["chat_id"]), text, timeout=SEND_TIMEOUT)
 
 
 def pages_prefix() -> str:
@@ -73,22 +80,19 @@ class ShturmanAuthProvider(DashboardAuthProvider):
     # --- вход ---
 
     def start_login(self, *, redirect_uri: str) -> LoginStart:
+        # Ничего не отправляет и ничего не сообщает о состоянии: только переводит на страницу входа.
         state = secrets.token_urlsafe(24)
-        status = self.auth.request_login_code()
-        if status == "send_failed":
-            logger.warning("shturman: код входа не отправлен — Telegram не принял сообщение")
         base = redirect_uri[: -len(_CALLBACK_SUFFIX)] if redirect_uri.endswith(_CALLBACK_SUFFIX) else ""
-        query = {"state": state, "m": status}
-        if status == "locked":
-            query["wait"] = str(self.auth.login_lock_remaining())
         return LoginStart(
-            redirect_url=f"{base}{pages_prefix()}/login.html?{urlencode(query)}",
+            redirect_url=f"{base}{pages_prefix()}/login.html?{urlencode({'state': state})}",
             cookie_payload={"hermes_session_pkce": f"state={state};verifier=-"},
         )
 
     def complete_login(self, *, code: str, state: str, code_verifier: str, redirect_uri: str) -> Session:
         ok, reason = self.auth.complete(code)
         if not ok:
+            if reason == "send_failed":
+                logger.warning("shturman: код входа не отправлен — Telegram не принял сообщение")
             raise InvalidCodeError(reason)
         return self._to_session(self.auth.mint_session())
 
@@ -112,7 +116,12 @@ class ShturmanAuthProvider(DashboardAuthProvider):
         return self._to_session(minted)
 
     def revoke_session(self, *, refresh_token: str) -> None:
-        return None
+        # Владелец один, поэтому «выйти» значит выйти везде: скопированные куки тоже гаснут.
+        try:
+            if refresh_token and self.auth.refresh_is_valid(refresh_token):
+                self.auth.revoke_all_sessions()
+        except Exception:
+            logger.warning("shturman: не удалось завершить сессии при выходе", exc_info=True)
 
     def _to_session(self, minted) -> Session:
         return Session(
