@@ -12,3 +12,5 @@ node_modules/
 
 # Рабочие каталоги ИИ-агента
 .claude/worktrees/
+build/
+*.egg-info/
