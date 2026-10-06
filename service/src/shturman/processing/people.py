@@ -356,6 +356,32 @@ def _display_variants(name: ParsedName) -> set[str]:
     return out
 
 
+# --- видимость --------------------------------------------------------------------------
+# То же правило, что у архива (archive._PEOPLE): человек показывается, только если у него есть
+# видимый след — неисключённый личный чат или хотя бы одно неудалённое сообщение в неисключённом
+# чате. Иначе по имени, алиасу или адресу можно было бы узнать о существовании исключённого чата.
+# Сам владелец и люди, заведённые владельцем без учётной записи Telegram, видны всегда.
+
+def _peer_trace(peer: str) -> str:
+    """Условие «у учётной записи есть видимый след»; peer — выражение с peers.id."""
+    return f"""(EXISTS (SELECT 1 FROM chats vc WHERE vc.peer_id = {peer} AND NOT vc.excluded)
+                OR EXISTS (SELECT 1 FROM messages vm JOIN chats vc ON vc.id = vm.chat_id
+                           WHERE vm.sender_peer_id = {peer} AND vm.deleted_at IS NULL AND NOT vc.excluded))"""
+
+
+def visible_person(alias: str = "p") -> str:
+    """Условие SQL «человек виден»; alias — псевдоним таблицы people."""
+    return f"""({alias}.is_owner
+                OR NOT EXISTS (SELECT 1 FROM person_peers vp WHERE vp.person_id = {alias}.id)
+                OR EXISTS (SELECT 1 FROM person_peers vp
+                           WHERE vp.person_id = {alias}.id AND {_peer_trace('vp.peer_id')}))"""
+
+
+# Поля словаря человека, взятые из чужого текста (имена и адреса из Telegram, алиасы).
+UNTRUSTED_FIELDS = ["display_name", "first_name", "middle_name", "last_name",
+                    "aliases[].alias", "peers[].name", "peers[].username"]
+
+
 # --- чтение ----------------------------------------------------------------------------
 
 def _person_dict(row: asyncpg.Record) -> dict[str, Any]:
@@ -363,7 +389,7 @@ def _person_dict(row: asyncpg.Record) -> dict[str, Any]:
         "id": row["id"], "display_name": row["display_name"], "first_name": row["first_name"],
         "middle_name": row["middle_name"], "last_name": row["last_name"], "gender": row["gender"],
         "is_owner": row["is_owner"], "origin": row["origin"], "confirmed": row["confirmed"],
-        "merged_into": row["merged_into"],
+        "merged_into": row["merged_into"], "untrusted_fields": list(UNTRUSTED_FIELDS),
     }
 
 
@@ -382,22 +408,37 @@ async def active_id(conn: asyncpg.Connection, person_id: int) -> int | None:
     return None
 
 
-async def get_person(conn: asyncpg.Connection, person_id: int) -> dict[str, Any] | None:
-    """Человек с алиасами и учётными записями. Для влитой записи возвращается та, в которую влили."""
+async def visible_id(conn: asyncpg.Connection, person_id: int) -> int | None:
+    """Идентификатор действующей записи, если человек виден (см. «видимость»); иначе None."""
     current = await active_id(conn, person_id)
+    if current is None:
+        return None
+    return await conn.fetchval(f"SELECT p.id FROM people p WHERE p.id = $1 AND {visible_person('p')}", current)
+
+
+async def get_person(conn: asyncpg.Connection, person_id: int) -> dict[str, Any] | None:
+    """Человек с алиасами и учётными записями. Для влитой записи возвращается та, в которую влили.
+
+    Человек без видимого следа (его единственный чат исключён) не возвращается. У видимого
+    человека не показываются учётные записи без видимого следа и имена, взятые из них.
+    """
+    current = await visible_id(conn, person_id)
     if current is None:
         return None
     row = await conn.fetchrow("SELECT * FROM people WHERE id = $1", current)
     out = _person_dict(row)
     out["aliases"] = [
         {"alias": r["alias"], "origin": r["origin"]} for r in await conn.fetch(
-            "SELECT alias, origin FROM person_aliases WHERE person_id = $1 ORDER BY id", current)
+            f"""SELECT a.alias, a.origin FROM person_aliases a
+                WHERE a.person_id = $1 AND (a.peer_id IS NULL OR {_peer_trace('a.peer_id')})
+                ORDER BY a.id""", current)
     ]
     out["peers"] = [
         {"peer_id": r["id"], "tg_id": r["tg_id"], "name": r["name"], "username": r["username"]}
         for r in await conn.fetch(
-            """SELECT p.id, p.tg_id, p.name, p.username FROM person_peers pp
-               JOIN peers p ON p.id = pp.peer_id WHERE pp.person_id = $1 ORDER BY pp.linked_at, p.id""",
+            f"""SELECT p.id, p.tg_id, p.name, p.username FROM person_peers pp
+                JOIN peers p ON p.id = pp.peer_id
+                WHERE pp.person_id = $1 AND {_peer_trace('pp.peer_id')} ORDER BY pp.linked_at, p.id""",
             current)
     ]
     return out
@@ -494,9 +535,9 @@ async def resolve_mention(
     whole = fold(mention)
     keys = set().union(*direct.values(), *extra.values()) | ({whole} if whole else set())
     rows = await conn.fetch(
-        """SELECT f.form, f.person_id, f.slot FROM person_forms f
-           JOIN people p ON p.id = f.person_id AND p.merged_into IS NULL
-           WHERE f.form = ANY($1::text[])""",
+        f"""SELECT f.form, f.person_id, f.slot FROM person_forms f
+            JOIN people p ON p.id = f.person_id AND p.merged_into IS NULL AND {visible_person('p')}
+            WHERE f.form = ANY($1::text[])""",
         sorted(keys),
     )
     by_form: dict[str, set[tuple[int, str]]] = {}
@@ -576,8 +617,8 @@ async def match_display_name(
     parsed = parse_name(display)
     probe = {query, *q_words} | {form for form, _ in name_forms(parsed)}
     rows = await conn.fetch(
-        """SELECT DISTINCT p.id FROM people p
-           WHERE p.merged_into IS NULL AND p.id IS DISTINCT FROM $3::bigint
+        f"""SELECT DISTINCT p.id FROM people p
+           WHERE p.merged_into IS NULL AND p.id IS DISTINCT FROM $3::bigint AND {visible_person('p')}
              AND (p.id IN (SELECT person_id FROM person_forms WHERE form = ANY($1::text[]) AND slot <> 'username')
                   OR p.id IN (SELECT person_id FROM person_aliases WHERE alias_norm % $2::text))
            LIMIT 200""",
@@ -630,7 +671,8 @@ async def search_people(
     limit = max(1, min(int(limit), 200))
     if not query or not query.strip():
         rows = await conn.fetch(
-            "SELECT * FROM people WHERE merged_into IS NULL ORDER BY is_owner DESC, display_name, id LIMIT $1", limit)
+            f"""SELECT p.* FROM people p WHERE p.merged_into IS NULL AND {visible_person('p')}
+                ORDER BY p.is_owner DESC, p.display_name, p.id LIMIT $1""", limit)
         return [_person_dict(r) for r in rows]
     found: dict[int, dict[str, Any]] = {}
     mention = await resolve_mention(conn, query, chat_id=chat_id)
@@ -845,7 +887,7 @@ async def merge_people(conn: asyncpg.Connection, source_id: int, target_id: int)
     async with conn.transaction():
         await _lock(conn)
         source = await _require_active(conn, source_id)
-        target = await _require_active(conn, target_id)
+        await _require_active(conn, target_id)
         await conn.execute("UPDATE person_peers SET person_id = $2 WHERE person_id = $1", source_id, target_id)
         await conn.execute(
             """INSERT INTO person_aliases (person_id, alias, alias_norm, origin, peer_id)
@@ -877,7 +919,7 @@ async def merge_people(conn: asyncpg.Connection, source_id: int, target_id: int)
             "DELETE FROM person_proposals WHERE status = 'pending' AND (person_id = $1 OR other_person_id = $1)",
             source_id)
         await rebuild_forms(conn, target_id)
-    return {"ok": True, "person_id": target_id, "merged": source_id, "target_was": target["display_name"]}
+    return {"ok": True, "person_id": target_id, "merged": source_id}
 
 
 async def split_person(conn: asyncpg.Connection, person_id: int, peer_id: int) -> dict[str, Any]:
@@ -918,14 +960,16 @@ async def list_proposals(conn: asyncpg.Connection, *, status: str = "pending", l
                   a.id AS a_id, a.display_name AS a_name, b.id AS b_id, b.display_name AS b_name
            FROM person_proposals pr
            JOIN people a ON a.id = pr.person_id JOIN people b ON b.id = pr.other_person_id
-           WHERE pr.status = $1 ORDER BY pr.score DESC, pr.id LIMIT $2""",
+           WHERE pr.status = $1 AND """ + visible_person("a") + " AND " + visible_person("b") + """
+           ORDER BY pr.score DESC, pr.id LIMIT $2""",
         status, max(1, min(int(limit), 200)),
     )
     return [
         {"id": r["id"], "kind": r["kind"], "score": r["score"], "status": r["status"],
          "created_at": r["created_at"].isoformat(),
          "person": {"id": r["a_id"], "display_name": r["a_name"]},
-         "other": {"id": r["b_id"], "display_name": r["b_name"]}}
+         "other": {"id": r["b_id"], "display_name": r["b_name"]},
+         "untrusted_fields": ["person.display_name", "other.display_name"]}
         for r in rows
     ]
 

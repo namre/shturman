@@ -121,7 +121,7 @@ async def test_people_routes(make_client, conn):
     added = await client.post(f"/api/people/{first}/aliases", json={"alias": "Иван Иванович"})
     assert added.status_code == 200 and added.json()["person"]["confirmed"] is True
     assert (await client.post(f"/api/people/{first}/aliases", json={"alias": "  "})).status_code == 400
-    assert (await client.post("/api/people/999/aliases", json={"alias": "Кто-то"})).status_code == 409
+    assert (await client.post("/api/people/999/aliases", json={"alias": "Кто-то"})).status_code == 404
     found = (await client.get("/api/people", params={"query": "Иванычу"})).json()["people"]
     assert [p["id"] for p in found] == [first]
     removed = await client.request("DELETE", f"/api/people/{first}/aliases", json={"alias": "Иван Иванович"})

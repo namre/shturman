@@ -153,7 +153,7 @@ def test_hedges_questions_forwards_and_bad_indices_are_dropped():
         "строка вместо объекта", None, 5,
     ])
     assert accepted == []
-    assert dropped == {"malformed": 5, "bad_index": 3, "forwarded": 1, "ungrounded_quote": 0, "hedged": 1,
+    assert dropped == {"malformed": 5, "bad_index": 3, "forwarded": 1, "by_service": 0, "ungrounded_quote": 0, "hedged": 1,
                        "question": 1, "empty": 1, "ungrounded_due": 0, "over_limit": 0}
 
 
@@ -221,5 +221,5 @@ def test_resolution_updates_are_validated_by_text():
     ]}, episode, 2)
     assert [(u.commitment_index, u.kind, u.message.id, u.new_due_expression) for u in updates] == \
         [(0, "fulfilled", 1, None), (1, "rescheduled", 2, "на понедельник")]
-    assert dropped == {"malformed": 1, "bad_index": 2, "bad_status": 1, "forwarded": 0,
+    assert dropped == {"malformed": 1, "bad_index": 2, "bad_status": 1, "forwarded": 0, "by_service": 0,
                        "ungrounded_quote": 1, "ungrounded_due": 1, "over_limit": 0}
