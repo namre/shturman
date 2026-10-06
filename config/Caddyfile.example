@@ -1,0 +1,27 @@
+# Пример настройки Caddy для экземпляра «Штурмана».
+# Замените assistant.example.com своим адресом и /opt/shturman — путём к репозиторию на сервере.
+#
+# Наружу видны две вещи:
+#   /shturman-auth/*  — статические страницы входа (каталог plugins/shturman/public, данных в них нет);
+#   всё остальное     — дашборд Hermes, который сам требует входа.
+#
+# Заголовок Host не подменяется: Hermes сверяет его с адресом из SHTURMAN_PUBLIC_URL.
+
+assistant.example.com {
+	encode gzip
+
+	handle_path /shturman-auth/* {
+		root * /opt/shturman/plugins/shturman/public
+		header {
+			Cache-Control "no-store"
+			X-Content-Type-Options "nosniff"
+			Referrer-Policy "no-referrer"
+			Content-Security-Policy "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+		}
+		file_server
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:9119
+	}
+}

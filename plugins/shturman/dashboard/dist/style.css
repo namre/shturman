@@ -1,0 +1,226 @@
+/* Штурман — мастер настройки. Цвета берутся из темы дашборда Hermes. */
+
+.shturman {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 8px 4px 48px;
+  color: var(--color-foreground);
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  line-height: 1.5;
+}
+
+.shturman h2 { margin: 0; font-size: 28px; line-height: 1.2; font-weight: 600; }
+.shturman h3 { margin: 0; font-size: 18px; font-weight: 600; }
+.shturman p { margin: 0; }
+.shturman a { color: var(--color-primary); text-decoration: underline; }
+.shturman-lead { font-size: 17px; color: var(--color-muted-foreground); }
+.shturman-muted { color: var(--color-muted-foreground); font-size: 14px; }
+.shturman-eyebrow {
+  font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--color-muted-foreground);
+}
+
+/* --- шаги --- */
+
+.shturman-head { display: flex; flex-direction: column; gap: 12px; }
+.shturman-stepper { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.shturman-stepbtn {
+  display: inline-flex; align-items: center; gap: 8px;
+  min-height: 44px; padding: 6px 14px 6px 6px;
+  border: 1px solid var(--color-border); border-radius: 999px;
+  background: transparent; color: var(--color-muted-foreground);
+  font: inherit; font-size: 14px; cursor: pointer;
+}
+.shturman-stepnum {
+  width: 30px; height: 30px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--color-border); font-weight: 600;
+}
+.shturman-stepbtn.is-done .shturman-stepnum { color: var(--color-success); border-color: var(--color-success); }
+.shturman-stepbtn.is-active { color: var(--color-foreground); border-color: var(--color-primary); }
+.shturman-stepbtn.is-active .shturman-stepnum {
+  background: var(--color-primary); color: var(--color-primary-foreground); border-color: var(--color-primary);
+}
+
+.shturman-step { display: flex; flex-direction: column; gap: 20px; }
+.shturman-stack { display: flex; flex-direction: column; gap: 12px; }
+.shturman-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.shturman-back { border-top: 1px solid var(--color-border); padding-top: 16px; }
+
+/* --- карточки выбора --- */
+
+.shturman-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.shturman-card {
+  display: flex; flex-direction: column; gap: 8px; text-align: left;
+  padding: 16px; border: 2px solid var(--color-border); border-radius: var(--radius, 10px);
+  background: var(--color-card); color: var(--color-foreground);
+  font: inherit; font-size: 14px; cursor: pointer;
+}
+.shturman-card.is-selected { border-color: var(--color-primary); }
+.shturman-card-name { font-size: 18px; font-weight: 600; }
+.shturman-card-sample {
+  color: var(--color-muted-foreground); font-size: 13px;
+  border-top: 1px dashed var(--color-border); padding-top: 8px;
+}
+
+.shturman-pills { display: flex; flex-wrap: wrap; gap: 8px; }
+.shturman-pill {
+  min-height: 44px; padding: 8px 16px; border-radius: 999px;
+  border: 2px solid var(--color-border); background: transparent; color: var(--color-foreground);
+  font: inherit; font-weight: 600; cursor: pointer;
+}
+.shturman-pill.is-selected {
+  background: var(--color-primary); color: var(--color-primary-foreground); border-color: var(--color-primary);
+}
+
+/* --- блоки и поля --- */
+
+.shturman-section {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 20px; border: 1px solid var(--color-border); border-radius: var(--radius, 10px);
+  background: var(--color-card);
+}
+.shturman-section.is-locked { opacity: 0.7; }
+
+.shturman-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.shturman-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.shturman-field label, .shturman-label { font-weight: 600; font-size: 14px; }
+.shturman-hint { font-size: 13px; color: var(--color-muted-foreground); }
+.shturman input[type="text"], .shturman input[type="password"] {
+  min-height: 44px; width: 100%; box-sizing: border-box; padding: 8px 12px;
+  border: 1px solid var(--color-border); border-radius: var(--radius-sm, 6px);
+  background: transparent; color: var(--color-foreground); font: inherit;
+}
+.shturman input:focus-visible, .shturman button:focus-visible, .shturman a:focus-visible, .shturman summary:focus-visible {
+  outline: 2px solid var(--color-ring); outline-offset: 2px;
+}
+
+.shturman-preview {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 12px 16px; border: 1px dashed var(--color-border); border-radius: var(--radius-sm, 6px);
+  font-size: 16px;
+}
+
+.shturman-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 44px; padding: 8px 20px; border-radius: var(--radius-sm, 6px);
+  font: inherit; font-weight: 600; cursor: pointer; text-decoration: none !important;
+  border: 1px solid var(--color-primary);
+}
+.shturman-btn-primary { background: var(--color-primary); color: var(--color-primary-foreground) !important; }
+.shturman-btn-ghost { background: transparent; color: var(--color-foreground); border-color: var(--color-border); }
+.shturman-btn[disabled] { opacity: 0.6; cursor: default; }
+
+.shturman-note {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 14px; border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--color-border); font-size: 14px;
+}
+.shturman-note svg { flex: none; margin-top: 3px; }
+.shturman-note-ok { border-color: var(--color-success); }
+.shturman-note-ok svg { color: var(--color-success); }
+.shturman-note-warn { border-color: var(--color-warning); }
+.shturman-note-error { border-color: var(--color-destructive); }
+
+.shturman-bigcode {
+  align-self: flex-start;
+  font-family: var(--font-mono, monospace); font-size: 30px; letter-spacing: 0.12em; font-weight: 600;
+  padding: 10px 20px; border: 2px solid var(--color-primary); border-radius: var(--radius-sm, 6px);
+}
+
+.shturman details summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; color: var(--color-primary); }
+.shturman details[open] { display: flex; flex-direction: column; gap: 10px; }
+
+/* --- две колонки: действия слева, схема справа --- */
+
+.shturman-split { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+.shturman-col { flex: 999 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.shturman-col-aside { flex: 1 1 300px; max-width: 380px; }
+
+/* --- схемы «куда нажать и что ввести» --- */
+
+.shturman-shot {
+  margin: 0; border: 1px solid var(--color-border); border-radius: var(--radius, 10px);
+  overflow: hidden; background: var(--color-card);
+}
+.shturman-shot-bar {
+  padding: 8px 12px; font-size: 13px; font-weight: 600;
+  border-bottom: 1px solid var(--color-border); color: var(--color-muted-foreground);
+}
+.shturman-shot-body { padding: 14px 14px 14px 22px; display: flex; flex-direction: column; gap: 8px; }
+.shturman-shot figcaption { border-top: 1px solid var(--color-border); padding: 12px 14px; font-size: 13px; }
+.shturman-shot ol { margin: 0; padding-left: 22px; list-style: decimal outside; display: flex; flex-direction: column; gap: 4px; }
+.shturman-shot ol li { display: list-item; }
+.shturman-shot-foot { margin-top: 8px; color: var(--color-muted-foreground); font-size: 12px; }
+
+.shturman-mark {
+  position: absolute; left: -12px; top: -8px;
+  width: 22px; height: 22px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--color-warning); color: #1a1300;
+  font-size: 12px; font-weight: 700; font-family: system-ui, sans-serif; letter-spacing: 0;
+}
+
+.shturman-msg {
+  position: relative; max-width: 88%; padding: 6px 10px; font-size: 13px;
+  border: 1px solid var(--color-border); border-radius: 12px;
+}
+.shturman-msg-in { align-self: flex-start; border-bottom-left-radius: 4px; }
+.shturman-msg-out { align-self: flex-end; border-bottom-right-radius: 4px; border-style: dashed; }
+.shturman-msg.is-marked, .shturman-key.is-marked, .shturman-row.is-marked { border-color: var(--color-warning); border-style: solid; }
+
+.shturman-hl {
+  position: relative; display: inline-block; margin-top: 4px; padding: 2px 8px;
+  border: 2px solid var(--color-warning); border-radius: 6px;
+  font-family: var(--font-mono, monospace); font-size: 13px;
+}
+
+.shturman-key {
+  position: relative; text-align: center; padding: 8px 10px; font-size: 13px; font-weight: 600;
+  border: 1px solid var(--color-border); border-radius: 8px;
+}
+.shturman-row {
+  position: relative; display: flex; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; font-size: 13px; border: 1px solid var(--color-border); border-radius: 8px;
+}
+.shturman-row-arrow { color: var(--color-muted-foreground); }
+.shturman-addr {
+  padding: 6px 10px; font-size: 12px; font-family: var(--font-mono, monospace);
+  border: 1px solid var(--color-border); border-radius: 999px; color: var(--color-muted-foreground);
+}
+.shturman-secret { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.shturman-copy { font-size: 12px; padding: 4px 10px; border: 1px solid var(--color-border); border-radius: 6px; }
+.shturman-input-fake { padding: 6px 8px; border: 1px solid var(--color-border); border-radius: 8px; }
+.shturman-startbar { margin-top: 12px; }
+
+/* --- «скоро» и итог --- */
+
+.shturman-soon {
+  display: flex; flex-direction: column; gap: 8px; padding: 20px;
+  border: 1px dashed var(--color-border); border-radius: var(--radius, 10px);
+}
+.shturman-tag {
+  align-self: flex-start; font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 2px 8px; border: 1px solid var(--color-border); border-radius: 6px; color: var(--color-muted-foreground);
+}
+
+.shturman-summary { border: 1px solid var(--color-border); border-radius: var(--radius, 10px); background: var(--color-card); }
+.shturman-sumrow {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+.shturman-sumrow:last-child { border-bottom: 0; }
+.shturman-sumlabel { font-weight: 600; }
+.shturman-sumrow .is-ok { color: var(--color-success); font-weight: 600; }
+.shturman-sumrow .is-warn { color: var(--color-warning); font-weight: 600; }
+
+/* --- напоминание на других страницах --- */
+
+.shturman-banner {
+  display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: center;
+  padding: 8px 16px; font-size: 14px;
+  border-bottom: 1px solid var(--color-warning); color: var(--color-foreground);
+}
+.shturman-banner a { color: var(--color-primary); font-weight: 600; text-decoration: underline; }

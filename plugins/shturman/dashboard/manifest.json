@@ -1,0 +1,12 @@
+{
+  "name": "shturman",
+  "label": "Штурман",
+  "description": "Мастер первой настройки: помощник, модель, бот в Telegram, бизнес-режим.",
+  "icon": "Sparkles",
+  "version": "0.0.2",
+  "tab": { "path": "/shturman", "position": "before:sessions" },
+  "slots": ["header-banner"],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
