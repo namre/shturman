@@ -1,5 +1,5 @@
-# «Штурман» — эталонный стек. Сейчас в нём только стоковый Hermes;
-# сервис переписки и база добавятся, когда появятся (см. docs/deployment.md).
+# «Штурман» — эталонный стек: стоковый Hermes, сервис переписки и его база (docs/deployment.md).
+# Локальные эмбеддинги — отдельным профилем, включаются командой ./ops/embeddings.sh on.
 #
 # Запускать через ./ops/up.sh — он подставляет владельца каталога данных.
 # Локальные изменения — в compose.override.yaml и .env, этот файл на сервере не править.
@@ -25,12 +25,88 @@ services:
       # Адрес, по которому владелец открывает ассистента. Задан — Hermes включает вход
       # и принимает запросы с этим именем; пуст — дашборд доступен только с самого сервера.
       HERMES_DASHBOARD_PUBLIC_URL: ${SHTURMAN_PUBLIC_URL:-}
+      # Связь с сервисом переписки. Токены генерирует ./ops/init-env.sh --auto.
+      # Первый — для плагина «Штурмана» (внутренний API), второй — для агента (архив, только чтение).
+      SHTURMAN_SERVICE_URL: http://127.0.0.1:8765
+      SHTURMAN_API_TOKEN: ${SHTURMAN_API_TOKEN:-}
+      MCP_SHTURMAN_API_KEY: ${SHTURMAN_MCP_TOKEN:-}
     volumes:
       - ./data/hermes:/opt/data
       # Плагин «Штурмана» подключается из репозитория только для чтения: обновляется вместе с git pull.
       - ./plugins/shturman:/opt/data/plugins/shturman:ro
-    logging:
+    logging: &logging
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+  postgres:
+    # Postgres 16 с расширением pgvector; образ назван по версии расширения и базы.
+    image: pgvector/pgvector:0.8.7-pg16-bookworm
+    container_name: shturman-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shturman
+      POSTGRES_DB: shturman
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?не задан POSTGRES_PASSWORD — запустите ./ops/init-env.sh --auto}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    # Порт наружу не публикуется: к базе ходит только сервис переписки по внутренней сети.
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shturman -d shturman"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  shturman:
+    # Сервис переписки: архив, сессии Telegram, MCP-сервер для агента. Собирается из ./service.
+    build: ./service
+    image: shturman-service:local
+    container_name: shturman-service
+    restart: unless-stopped
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SHTURMAN_DSN: postgresql://shturman@postgres:5432/shturman
+      PGPASSWORD: ${POSTGRES_PASSWORD:?не задан POSTGRES_PASSWORD — запустите ./ops/init-env.sh --auto}
+      SHTURMAN_API_TOKEN: ${SHTURMAN_API_TOKEN:?не задан SHTURMAN_API_TOKEN — запустите ./ops/init-env.sh --auto}
+      SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
+      SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
+      SHTURMAN_EMBEDDINGS_URL: ${SHTURMAN_EMBEDDINGS_URL:-}
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}
+    volumes:
+      # Сессии Telegram, страницы памяти, загруженные выгрузки. Контейнеру Hermes этот каталог не подключён.
+      - ./data/shturman:/data
+    # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста.
+    ports:
+      - "127.0.0.1:8765:8765"
+    networks: [internal]
+    logging: *logging
+
+  embeddings:
+    # Локальные эмбеддинги для поиска по смыслу. Занимает около 1,2 ГБ памяти, поэтому выключено,
+    # пока владелец не включит: ./ops/embeddings.sh on. Текст переписки наружу не уходит;
+    # в сеть контейнер ходит один раз — скачать модель.
+    profiles: ["embeddings"]
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
+    container_name: shturman-embeddings
+    restart: unless-stopped
+    command: ["--model-id", "intfloat/multilingual-e5-small", "--revision", "614241f622f53c4eeff9890bdc4f31cfecc418b3"]
+    volumes:
+      - ./data/embeddings:/data
+    networks: [internal]
+    deploy:
+      resources:
+        limits:
+          memory: 1536m
+    logging: *logging
+
+networks:
+  internal:
+    driver: bridge

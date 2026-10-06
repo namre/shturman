@@ -281,7 +281,9 @@ async def test_deletion_event_scrubs_the_page_in_the_background(make_client, con
     assert "Про монтаж" in text and f"msg:{m1})" not in text and "обязательство (" not in text
     assert blocks_of(text).commitments == pages.NO_COMMITMENTS
     assert (await client.get("/api/pages/search", params={"query": "смету"})).json()["pages"] == []
-    assert log(config)[0][1] == "Обновление страниц: создано 0, обновлено 1"
+    async def committed():     # запись в историю идёт следом за записью файла
+        return log(config)[0][1] == "Обновление страниц: создано 0, обновлено 1"
+    await until(committed)
 
 
 async def test_build_follows_a_finished_processing_run(make_client, conn, config, monkeypatch):
