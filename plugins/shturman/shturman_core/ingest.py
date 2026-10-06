@@ -12,7 +12,20 @@ Hermes не ждёт сервис и не страдает от его отка�
 Остальные отказы (чужое подключение, неразборчивое сообщение) окончательны: обновление
 отбрасывается и считается в `rejected`.
 
+Сервис может принять запрос, но сообщение не записать (ответ 200, `stored: false`). Такие
+сообщения переданными не считаются, у каждой причины свой счётчик:
+  * connection_disabled — подключение у сервиса выключено. Один раз настоящее подключение
+    запрашивается у Telegram, передаётся сервису, и сообщение отправляется снова. Не помогло —
+    на странице состояния поднимается признак `business_disabled`;
+  * excluded — чат исключён владельцем; прочее (например, у сообщения нет номера) — отдельно.
+
 Здесь же сервису сообщается владелец: при запуске шлюза и при каждой смене привязки.
+Сообщение «владелец отвязан» (DELETE /api/owner) необратимо для сервиса — он отклоняет ждущие
+черновики и очищает список доверенных, — поэтому уходит только в двух случаях:
+  * есть отметка, что привязку сбросил сам плагин (вход по ссылке восстановления);
+  * этот процесс уже передавал владельца, а теперь его запись достоверно отсутствует.
+Свежий процесс с пустым состоянием (первая установка, потерянный каталог состояния) владельца
+сервиса не трогает. Не удалось прочитать файл — ничего не делается, попытка повторится.
 """
 
 from __future__ import annotations
@@ -57,8 +70,10 @@ class Ingest:
     """Очередь и её разбор.
 
     call             — обращение к сервису (бросает `ServiceError`);
-    owner            — привязанный владелец ({user_id, chat_id}) или {};
+    owner            — привязанный владелец ({user_id, chat_id}); {} — записи достоверно нет;
+                       исключение — прочитать не удалось (тогда ничего не решается);
     owner_version    — значение, меняющееся при смене привязки (время изменения файла);
+    unbound_marker   — есть ли отметка «привязку сбросил сам плагин»; clear_marker её снимает;
     fetch_connection — запрос подключения у Telegram: словарь, None (такого нет) либо исключение.
     """
 
@@ -66,6 +81,7 @@ class Ingest:
         self, call: ServiceCall, *, owner: Callable[[], Mapping[str, Any]],
         owner_version: Callable[[], Any] = lambda: 0,
         fetch_connection: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+        unbound_marker: Callable[[], bool] = lambda: False, clear_marker: Callable[[], None] = lambda: None,
         stats: Stats | None = None, capacity: int = CAPACITY, idle: float = IDLE_SECONDS,
         now: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -79,8 +95,13 @@ class Ingest:
         self._now = now
         self._queue: deque[Item] = deque()
         self._wake: asyncio.Event | None = None
+        self.unbound_marker = unbound_marker
+        self.clear_marker = clear_marker
         self._pushed_version: Any = object()        # ни с чем не равно: при запуске владелец передаётся
+        self._owner_known = False                   # этот процесс передал сервису владельца
+        self._read_failed = False
         self._refused: dict[str, float] = {}
+        self._disabled: dict[str, float] = {}       # подключения, которые сервис держит выключенными
 
     # --- приём от обработчиков Telegram: мгновенно и без исключений ---
 
@@ -158,15 +179,26 @@ class Ingest:
         """Сообщает сервису владельца, если привязка изменилась. True — сервис знает владельца."""
         version = self.owner_version()
         if not force and version == self._pushed_version:
-            return True
+            return self._owner_known
+        try:
+            unbound = bool(self.unbound_marker())
+            owner = self.owner() or {}
+        except Exception as exc:  # noqa: BLE001 — не прочитали: это не значит «владельца нет»
+            if not self._read_failed:      # проверка повторяется каждые несколько секунд — пишем один раз
+                logger.warning("shturman: состояние привязки не прочитано (%s), повторим позже", type(exc).__name__)
+            self._read_failed = True
+            return self._owner_known
+        self._read_failed = False
         if version != self._pushed_version:
-            self._refused.clear()       # с новым владельцем прежние отказы подключениям не действуют
-        owner = self.owner() or {}
+            # с новым владельцем прежние отказы подключениям не действуют
+            self._refused.clear()
+            self._disabled.clear()
         user_id, chat_id = owner.get("user_id"), owner.get("chat_id")
-        if not _is_id(user_id) or not _is_id(chat_id):
-            # Владельца нет (ещё не привязан или привязка сброшена ссылкой восстановления).
-            # Сервис должен об этом узнать: он останавливает бизнес-подключения, отклоняет
-            # ждущие черновики и выключает автоответ, пока не привяжется новый владелец.
+        bound = _is_id(user_id) and _is_id(chat_id)
+        if unbound or (not bound and self._owner_known):
+            # Привязку сбросил сам плагин (отметка) либо владелец, которого этот процесс передавал,
+            # достоверно исчез. Сервис останавливает бизнес-подключения, отклоняет ждущие черновики
+            # и выключает автоответ, пока не привяжется новый владелец.
             try:
                 await self.call("DELETE", "/api/owner", None)
             except ServiceUnavailable:
@@ -174,6 +206,12 @@ class Ingest:
                 raise _Later() from None
             except ServiceError:
                 pass
+            self._owner_known = False
+            try:
+                self.clear_marker()
+            except Exception:  # noqa: BLE001 — отметка останется: DELETE повторится, это безвредно
+                pass
+        if not bound:
             self._pushed_version = version
             return False
         try:
@@ -185,6 +223,7 @@ class Ingest:
             return False
         self.stats.seen(True)
         self._pushed_version = version
+        self._owner_known = True
         return True
 
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -204,17 +243,58 @@ class Ingest:
             return
         for attempt in (1, 2):
             try:
-                await self._post(item.path, item.body)
+                out = await self._post(item.path, item.body)
             except ServiceError as exc:
                 if attempt == 1 and exc.code == "unknown_connection" and cid and await self._resend_connection(cid):
                     continue
                 if attempt == 1 and exc.code == "owner_unknown" and await self.sync_owner(force=True):
                     continue
                 break
-            else:
+            reason = self._not_stored(item, out)
+            if reason is None:
                 self.stats.bump(_COUNTER[item.path])
+                if item.path == MESSAGE:
+                    self._disabled.pop(cid or "", None)
+                    self.stats.set_flag("business_disabled", False)
                 return
+            if reason == "connection_disabled":
+                # Сервис держит подключение выключенным. Один раз сверяемся с Telegram: если там
+                # оно включено и принадлежит владельцу, сервис включит его и примет сообщение.
+                if (attempt == 1 and item.path == MESSAGE and cid and not self._is_disabled(cid)
+                        and await self._resend_connection(cid)):
+                    continue
+                if cid:
+                    self._mark_disabled(cid)
+                self.stats.bump("not_stored_disabled")
+                self.stats.set_flag("business_disabled", True)
+            else:
+                self.stats.bump("not_stored_excluded" if reason == "excluded" else "not_stored_other")
+            return
         self.stats.bump("rejected")
+
+    @staticmethod
+    def _not_stored(item: Item, out: Mapping[str, Any]) -> str | None:
+        """Причина, по которой сервис принял запрос, но ничего не записал; None — записал."""
+        reason = out.get("reason") if isinstance(out.get("reason"), str) else None
+        if item.path == MESSAGE and out.get("stored") is False:
+            return reason or "unknown"
+        if item.path == DELETED and reason == "connection_disabled":
+            return reason
+        return None
+
+    def _is_disabled(self, connection_id: str) -> bool:
+        until = self._disabled.get(connection_id)
+        if until is None:
+            return False
+        if until <= self._now():
+            del self._disabled[connection_id]
+            return False
+        return True
+
+    def _mark_disabled(self, connection_id: str) -> None:
+        if len(self._disabled) > 500:
+            self._disabled.clear()
+        self._disabled.setdefault(connection_id, self._now() + REFUSED_TTL)
 
     def _is_refused(self, connection_id: str) -> bool:
         until = self._refused.get(connection_id)

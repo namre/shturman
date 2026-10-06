@@ -22,6 +22,9 @@ COUNTERS = (
     "forwarded_messages",      # бизнес-сообщений (новых и изменённых) принято сервисом
     "forwarded_connections",   # подключений бизнес-режима передано
     "forwarded_deleted",       # уведомлений об удалении передано
+    "not_stored_disabled",     # сервис не записал: бизнес-подключение у него выключено
+    "not_stored_excluded",     # сервис не записал: чат исключён владельцем
+    "not_stored_other",        # сервис не записал по другой причине (например, у сообщения нет номера)
     "dropped",                 # потеряно: очередь пересылки была полна, сервис долго не отвечал
     "rejected",                # сервис отказался принять (чужое подключение, неразборчивое сообщение)
     "jobs_done",
@@ -42,6 +45,10 @@ class Stats:
         self.reachable: bool | None = None       # None — к сервису ещё не обращались
         self.checked_at: int | None = None
         self.queue = 0
+        # Сервис отвечает «подключение выключено» на сообщения бизнес-режима (None — неизвестно).
+        self.business_disabled: bool | None = None
+        # Главный выключатель отправки в сервисе (None — узнать не удалось).
+        self.sending: bool | None = None
         self.version = 0                          # растёт при любом изменении
 
     def bump(self, name: str, amount: int = 1) -> None:
@@ -59,6 +66,11 @@ class Stats:
         self.reachable = reachable
         self.checked_at = int(self._now())
 
+    def set_flag(self, name: str, value: bool | None) -> None:
+        if getattr(self, name) is not value:
+            setattr(self, name, value)
+            self.version += 1
+
     def set_queue(self, size: int) -> None:
         if size != self.queue:
             self.queue = size
@@ -72,6 +84,8 @@ class Stats:
             "checked_at": self.checked_at,
             "last_job_at": self.last_job_at,
             "queue": self.queue,
+            "business_disabled": self.business_disabled,
+            "sending": self.sending,
             "counters": dict(self.counters),
         }
 
@@ -107,6 +121,9 @@ def status(store: Store, *, configured: bool, now: Callable[[], float] = time.ti
     heartbeat = _int(data.get("heartbeat_at"))
     running = bool(configured and heartbeat is not None and now() - heartbeat <= STALE_AFTER)
     raw = data.get("counters") if isinstance(data.get("counters"), dict) else {}
+    def flag(name: str) -> bool | None:
+        return data.get(name) if running and isinstance(data.get(name), bool) else None
+
     reachable = data.get("reachable") if isinstance(data.get("reachable"), bool) else None
     return {
         "configured": bool(configured),
@@ -117,5 +134,9 @@ def status(store: Store, *, configured: bool, now: Callable[[], float] = time.ti
         "started_at": _int(data.get("started_at")),
         "last_job_at": _int(data.get("last_job_at")),
         "queue": _int(data.get("queue")) or 0,
+        # Сервис не принимает сообщения бизнес-режима: подключение у него выключено.
+        "business_disabled": flag("business_disabled"),
+        # Главный выключатель отправки в сервисе: false — «отправка выключена».
+        "sending": flag("sending"),
         "counters": {name: _int(raw.get(name)) or 0 for name in COUNTERS},
     }

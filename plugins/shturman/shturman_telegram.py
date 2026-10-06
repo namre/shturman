@@ -37,6 +37,7 @@ import time
 
 from shturman_core.pairing import Pairing
 from shturman_core.state import Store
+from shturman_core.textlimits import cut_utf16
 
 logger = logging.getLogger("shturman.telegram")
 
@@ -247,7 +248,7 @@ def _wire_service(application, store) -> None:
                 # Обычным текстом: в карточке есть чужой текст. Кнопки при правке текста Telegram
                 # снимает сам, поэтому «оставить» значит передать их заново.
                 await query.edit_message_text(
-                    text=new_text[:4096], parse_mode=None,
+                    text=cut_utf16(new_text), parse_mode=None,
                     reply_markup=None if remove else getattr(message, "reply_markup", None))
             elif remove:
                 await query.edit_message_reply_markup(reply_markup=None)

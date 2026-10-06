@@ -38,12 +38,13 @@ from shturman_core.bridge_stats import Heartbeat, Stats
 from shturman_core.executor import AUX_TASKS, Buttons, Executor, NotSent
 from shturman_core.ingest import Ingest
 from shturman_core.service_client import ServiceClient, ServiceUnavailable
-from shturman_core.state import Store
+from shturman_core.state import OWNER_UNBOUND, Store, StoreReadError
 
 logger = logging.getLogger("shturman.bridge")
 
 CONFIG_RECHECK_SECONDS = 30       # как часто перепроверять настройки, пока сервис не подключён
 HEARTBEAT_TICK = 10
+POLICY_EVERY = 60                 # как часто узнавать у сервиса, включена ли отправка
 CALLBACK_TIMEOUT = 5.0
 
 # Причины, при которых запрос не покинул сервер: соединение не установлено либо не нашлось
@@ -254,9 +255,14 @@ class Runtime:
             bot = PtbBot(self)
             self.executor = Executor(self.call, llm=self._llm(), bot=bot, stats=self.stats,
                                      owner=lambda: store.read("owner"), tasks=tuple(AUX_TASKS))
-            self.ingest = Ingest(self.call, owner=lambda: store.read("owner"),
-                                 owner_version=lambda: store.mtime("owner"),
-                                 fetch_connection=bot.business_connection, stats=self.stats)
+            self.ingest = Ingest(
+                self.call,
+                # Строгое чтение: «не удалось прочитать» не должно выглядеть как «владельца нет».
+                owner=lambda: store.read_strict("owner") or {},
+                owner_version=lambda: (store.mtime("owner"), store.mtime(OWNER_UNBOUND)),
+                unbound_marker=lambda: store.read_strict(OWNER_UNBOUND) is not None,
+                clear_marker=lambda: store.delete(OWNER_UNBOUND),
+                fetch_connection=bot.business_connection, stats=self.stats)
         self._loop = self._home_loop = loop
         jobs = {
             "shturman:jobs-bot": lambda: self.executor.run_lane("bot"),
@@ -315,8 +321,12 @@ class Runtime:
 
     async def _heartbeat(self) -> None:
         heartbeat = Heartbeat(self.store or Store(), self.stats)
+        asked_at = None
         try:
             while True:
+                if asked_at is None or time.monotonic() - asked_at >= POLICY_EVERY:
+                    asked_at = time.monotonic()
+                    await self._refresh_sending()
                 try:
                     # Запись на диск — в потоке: цикл шлюза её не ждёт.
                     await asyncio.get_running_loop().run_in_executor(self._threads(), heartbeat.tick)
@@ -331,6 +341,18 @@ class Runtime:
             except Exception:
                 pass
 
+    async def _refresh_sending(self) -> None:
+        """Включена ли в сервисе отправка сообщений — для страницы состояния. Только признак."""
+        try:
+            out = await self.call("GET", "/api/outbox/policy", timeout=CALLBACK_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — сервис недоступен или старой версии: признак неизвестен
+            self.stats.set_flag("sending", None)
+            return
+        value = out.get("sending")
+        self.stats.set_flag("sending", value if isinstance(value, bool) else None)
+
     # --- обновления бизнес-режима: только положить в очередь ---
 
     def forward(self, update: Any) -> None:
@@ -338,10 +360,13 @@ class Runtime:
         try:
             if not self.ensure_started() or self.ingest is None:
                 return
-            if not (self.store or Store()).read("owner").get("user_id"):
+            try:
+                bound = bool(((self.store or Store()).read_strict("owner") or {}).get("user_id"))
+            except StoreReadError:
+                bound = True           # не прочитали — не повод терять сообщение: решит сервис
+            if not bound:
                 # Владельца нет (ещё не привязан либо привязка сброшена ссылкой восстановления):
-                # ничью переписку в архив не отправляем. Сервис помнит прежнего владельца,
-                # пока не получит нового, и сам бы это не остановил.
+                # ничью переписку в архив не отправляем.
                 self.stats.bump("rejected")
                 return
             connection = getattr(update, "business_connection", None)

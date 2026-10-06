@@ -25,7 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import shturman_bridge  # noqa: E402
 import shturman_telegram  # noqa: E402
-from shturman_core.executor import BUSINESS_SEND, NOTIFY_EDIT, NOTIFY_OWNER, Executor, NotSent  # noqa: E402
+from shturman_core.executor import (  # noqa: E402
+    BUSINESS_SEND, LLM_STRUCTURED, NOTIFY_EDIT, NOTIFY_OWNER, Executor, NotSent,
+)
 from shturman_core.state import Store  # noqa: E402
 
 BOT_TOKEN = "1234567890:" + "A" * 35
@@ -606,3 +608,180 @@ def test_heartbeat_file_appears_while_running_and_disappears_on_stop(runtime, se
     seen = asyncio.run(scenario())
     assert isinstance(seen.get("heartbeat_at"), int) and set(seen["counters"]) >= {"dropped", "jobs_done"}
     assert store.read("bridge") == {}
+
+
+# --- второй круг: швы между плагином, Hermes и сервисом ---
+
+@pytest.mark.parametrize("mode, retry_in", [("400", None), ("403", None), ("401", None), ("429", 8), ("500", 30)])
+def test_notify_refused_by_telegram_is_final_only_when_telegram_said_no(tg, mode, retry_in):
+    """«Текст слишком длинный», «бот заблокирован» — повтор дал бы тот же отказ. Повторяем,
+    когда Telegram просит подождать или его ответ неясен."""
+    tg.mode = mode
+    outcome = with_bot(tg, lambda bot: executor_for(bot).execute(NOTIFY_OWNER, {"text": "карточка"}))
+    assert not outcome.ok and outcome.retry_in == retry_in
+    assert [m for m, _ in tg.calls].count("sendMessage") == 1
+
+
+def test_long_card_with_emoji_fits_telegram_limit_on_the_wire(tg):
+    from shturman_core.textlimits import utf16_len
+
+    outcome = with_bot(tg, lambda bot: executor_for(bot).execute(NOTIFY_OWNER, {"text": "😀" * 3000}))
+    assert outcome.ok and utf16_len(tg.calls[-1][1]["text"]) <= 4096
+
+
+def test_schema_violation_through_the_real_hermes_llm_facade(monkeypatch):
+    """Шов с Hermes: настоящий `PluginLlm`, подставлен только провайдер. Ответ модели, который
+    не подходит под схему, доходит до сервиса целиком и без повторов."""
+    plugin_llm = pytest.importorskip("agent.plugin_llm")
+    import types
+
+    monkeypatch.setattr(plugin_llm, "_resolve_task_ownership",
+                        lambda plugin_id: (frozenset({"shturman_extract", "shturman_reply", "shturman_watch"}), frozenset()))
+    seen = []
+    answers = ['{"commitments": [{"message": "1", "what": "прислать смету", "лишнее": true}]}', "не JSON вовсе",
+               '```json\n{"commitments": []}\n```']
+
+    async def provider(**kw):
+        seen.append(kw)
+        message = types.SimpleNamespace(content=answers[len(seen) - 1])
+        return "stub", "stub-model", types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)],
+                                                           model="stub-model", usage=None)
+
+    llm = plugin_llm.make_plugin_llm_for_test(
+        plugin_id="shturman", policy=plugin_llm._TrustPolicy(plugin_id="shturman"), async_caller=provider)
+    schema = {"type": "object", "additionalProperties": False, "required": ["commitments"], "properties": {
+        "commitments": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                                                    "required": ["message", "what"],
+                                                    "properties": {"message": {"type": "integer"}, "what": {"type": "string"}}}}}}
+    payload = {"instructions": "Найди обязательства", "input": "Пришлю смету", "json_schema": schema,
+               "schema_name": "commitments", "task": "shturman_extract", "max_tokens": 500}
+
+    async def no_service(*args, **kwargs):
+        return {}
+
+    executor = Executor(no_service, llm=llm, bot=None, owner=lambda: {})
+    violating = asyncio.run(executor.execute(LLM_STRUCTURED, payload))
+    garbage = asyncio.run(executor.execute(LLM_STRUCTURED, payload))
+    fenced = asyncio.run(executor.execute(LLM_STRUCTURED, payload))
+    assert violating.ok and violating.result["schema_valid"] is False
+    assert violating.result["parsed"] == {"commitments": [{"message": "1", "what": "прислать смету", "лишнее": True}]}
+    assert violating.result["text"] == answers[0] and violating.result["model"] == "stub-model"
+    assert garbage.ok and garbage.result["parsed"] is None and garbage.result["text"] == "не JSON вовсе"
+    assert garbage.result["schema_valid"] is False
+    assert fenced.ok and fenced.result == {"parsed": {"commitments": []}, "text": answers[2], "model": "stub-model",
+                                           "schema_valid": True}
+    assert len(seen) == 3                                      # по одному вызову модели на задание
+    first = seen[0]
+    assert first["task"] == "shturman_extract" and first["extra_body"] == {"response_format": {"type": "json_object"}}
+    header = first["messages"][-1]["content"][0]["text"]
+    assert "JSON schema:" in header and '"commitments"' in header and "Schema name: commitments" in header
+
+
+def test_sending_switch_reaches_the_status_block(runtime, service_env):
+    from shturman_core import bridge_stats
+
+    service_env.replies[("GET", "/api/outbox/policy")] = (200, {"sending": False, "hard_daily_cap": 0, "policy": {}})
+    application = Application.builder().token(BOT_TOKEN).updater(None).build()
+    store = Store()
+
+    async def scenario():
+        runtime.attach(application, store)
+        for _ in range(300):
+            if store.read("bridge").get("sending") is False:
+                break
+            await asyncio.sleep(0.01)
+        status = bridge_stats.status(store, configured=True)
+        await runtime.stop()
+        return status
+
+    status = asyncio.run(scenario())
+    assert status["sending"] is False and status["executor_running"] is True
+    assert service_env.calls("PUT", "/api/outbox/policy") == []            # только чтение
+
+
+def test_old_service_without_the_switch_leaves_the_flag_unknown(runtime, service_env):
+    service_env.replies[("GET", "/api/outbox/policy")] = (200, {"policy": {"daily_cap": 400}})
+    application = Application.builder().token(BOT_TOKEN).updater(None).build()
+
+    async def scenario():
+        runtime.attach(application, Store())
+        for _ in range(200):
+            if service_env.calls("GET", "/api/outbox/policy"):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        await runtime.stop()
+
+    asyncio.run(scenario())
+    assert runtime.stats.sending is None
+
+
+def owner_requests(service):
+    return [(r["method"], r["json"]) for r in service.requests if r["path"] == "/api/owner"]
+
+
+def test_recovery_link_reaches_the_service_through_the_real_state_files(runtime, service_env):
+    """Вход по ссылке восстановления (процесс дашборда) → отметка на диске → шлюз говорит сервису."""
+    from shturman_core.auth import Auth
+    from shturman_core.state import OWNER_UNBOUND
+
+    application = Application.builder().token(BOT_TOKEN).updater(None).build()
+    store = Store()
+
+    async def scenario():
+        runtime.attach(application, store)
+        runtime.ingest.idle = 0.02
+        for _ in range(300):
+            if service_env.calls("PUT", "/api/owner"):
+                break
+            await asyncio.sleep(0.01)
+        auth = Auth(Store())
+        assert auth.redeem_activation(auth.issue_activation()) is True
+        runtime.ingest._wake.set()
+        for _ in range(300):
+            if service_env.calls("DELETE", "/api/owner"):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        await runtime.stop()
+
+    asyncio.run(scenario())
+    assert owner_requests(service_env) == [("PUT", {"user_id": 42, "chat_id": 42}), ("DELETE", None)]
+    assert store.read_strict(OWNER_UNBOUND) is None
+
+
+def test_fresh_gateway_with_empty_state_does_not_unbind_the_services_owner(runtime, service_env):
+    """Первая установка или потерянный каталог состояния: сервис своего владельца не теряет."""
+    Store().delete("owner")
+    application = Application.builder().token(BOT_TOKEN).updater(None).build()
+
+    async def scenario():
+        runtime.attach(application, Store())
+        runtime.ingest.idle = 0.02
+        await asyncio.sleep(0.3)
+        await runtime.stop()
+
+    asyncio.run(scenario())
+    assert owner_requests(service_env) == []
+
+
+def test_unreadable_owner_file_neither_unbinds_nor_loses_messages(app, runtime, service_env):
+    """Сбой чтения файла владельца: сервису не говорят «владелец отвязан», сообщение не теряется."""
+    owner_file = Path(Store().root) / "owner.json"
+    owner_file.write_text("{ оборванная запись", encoding="utf-8")
+    dispatch(app, runtime, {"update_id": 70, "business_message": business_message()},
+             until=lambda: service_env.calls("POST", MESSAGE))
+    assert len(service_env.calls("POST", MESSAGE)) == 1 and owner_requests(service_env) == []
+
+
+def test_three_auxiliary_tasks_are_registered_with_hermes():
+    import shturman_tools
+
+    registered = []
+
+    class Ctx:
+        def register_auxiliary_task(self, key, **kwargs):
+            registered.append((key, kwargs["display_name"], kwargs["defaults"]))
+
+    assert shturman_tools.register_auxiliary_tasks(Ctx()) == ["shturman_extract", "shturman_reply", "shturman_watch"]
+    assert all(name.startswith("Штурман") for _, name, _ in registered)

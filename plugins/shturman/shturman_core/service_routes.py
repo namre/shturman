@@ -38,6 +38,7 @@ def allowed(routes: Routes, method: str, path: str) -> bool:
 
 BRIDGE: Routes = _compile([
     ("GET", r"/api/status"),
+    ("GET", r"/api/outbox/policy"),          # только чтение: включена ли отправка — для страницы состояния
     ("PUT", r"/api/owner"),
     ("DELETE", r"/api/owner"),
     ("POST", r"/api/jobs/claim"),

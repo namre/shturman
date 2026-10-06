@@ -125,11 +125,14 @@ def test_structured_request_goes_to_the_model_as_text_block_and_result_is_report
     assert run(executor.poll("llm")) == 1
     _, _, kwargs = llm.calls[0]
     assert kwargs["input"] == [{"type": "text", "text": SECRET_TEXT}]      # список блоков, не строка
-    assert kwargs["instructions"] == "Найди обязательства" and kwargs["json_schema"] == {"type": "object"}
+    # Схема уходит модели текстом в указаниях; параметра json_schema нет — иначе Hermes сам
+    # сверял бы ответ и при расхождении не отдал бы его вовсе.
+    assert "json_schema" not in kwargs and kwargs["json_mode"] is True
+    assert kwargs["instructions"] == 'Найди обязательства\n\nJSON schema:\n{"type": "object"}'
     assert kwargs["schema_name"] == "commitments" and kwargs["task"] == "shturman_extract"
-    assert kwargs["max_tokens"] == 1200 and kwargs["json_mode"] is False and kwargs["timeout"] == executor.llm_timeout
+    assert kwargs["max_tokens"] == 1200 and kwargs["timeout"] == executor.llm_timeout
     assert service.reports() == [("/api/jobs/1/complete", {"result": {
-        "parsed": {"commitments": []}, "text": '{"commitments": []}', "model": "cheap-1"}})]
+        "parsed": {"commitments": []}, "text": '{"commitments": []}', "model": "cheap-1", "schema_valid": True}})]
     assert stats.counters["jobs_done"] == 1 and stats.last_job_at is not None
 
 
@@ -149,8 +152,11 @@ def test_invalid_model_output_is_reported_as_parsed_null():
     executor, service, _, llm, _ = make([job(LLM_STRUCTURED, {"instructions": "и", "input": "т"})])
     llm.parsed = None
     run(executor.poll("llm"))
-    assert service.reports()[0][1]["result"]["parsed"] is None
-    assert llm.calls[0][2]["json_mode"] is True         # схемы нет — просим хотя бы JSON
+    path, body = service.reports()[0]
+    assert path == "/api/jobs/1/complete"               # неразборчивый ответ — не сбой: сервис решит сам
+    assert body["result"]["parsed"] is None and body["result"]["schema_valid"] is False
+    assert body["result"]["text"] == '{"commitments": []}'
+    assert llm.calls[0][2]["json_mode"] is True and llm.calls[0][2]["instructions"] == "и"
 
 
 def test_model_failure_is_reported_with_growing_retry(caplog):
@@ -162,6 +168,8 @@ def test_model_failure_is_reported_with_growing_retry(caplog):
         run(executor.handle(job(LLM_STRUCTURED, {"instructions": "и", "input": SECRET_TEXT})))
     assert not first.ok and first.retry_in == 30 and third.retry_in == 120
     assert service.reports()[0][0] == "/api/jobs/1/fail" and service.reports()[0][1]["retry_in"] == 30
+    # В строку ошибки (она хранится в очереди заданий сервиса) попадает только вид ошибки.
+    assert first.error == "ValueError" and SECRET_TEXT not in service.reports()[0][1]["error"]
     assert stats.counters["jobs_failed"] == 1
     assert SECRET_TEXT not in caplog.text                # в журнал — только вид задания
 
@@ -247,11 +255,18 @@ def test_notify_owner_refused_by_telegram_is_retried_later():
     executor, _, bot, _, _ = make()
     bot.error = NotSent("Forbidden: bot was blocked by the user")
     blocked = run(executor.execute(NOTIFY_OWNER, {"text": "привет"}, 1))
+    bot.error = NotSent("BadRequest: Message is too long")
+    too_long = run(executor.execute(NOTIFY_OWNER, {"text": "привет"}, 1))
     bot.error = NotSent("flood", retry_after=17)
     flood = run(executor.execute(NOTIFY_OWNER, {"text": "привет"}, 1))
+    bot.error = NotSent("нет связи с Telegram (ConnectError)", replied=False)
+    never_left = run(executor.execute(NOTIFY_OWNER, {"text": "привет"}, 1))
     bot.error = ConnectionError("обрыв")
     network = run(executor.execute(NOTIFY_OWNER, {"text": "привет"}, 2))
-    assert (blocked.retry_in, flood.retry_in, network.retry_in) == (300, 18, 60)
+    # Точный отказ Telegram окончателен: повтор дал бы тот же ответ. Повторяем только по просьбе
+    # подождать и когда запрос до Telegram не дошёл либо исход неясен.
+    assert (blocked.retry_in, too_long.retry_in) == (None, None)
+    assert (flood.retry_in, never_left.retry_in, network.retry_in) == (18, 30, 60)
 
 
 def test_notify_owner_waits_while_bot_is_not_connected():
@@ -439,3 +454,66 @@ def test_wake_makes_the_lane_poll_now():
 
     run(scenario())
     assert len(bot.sent) == 1
+
+
+# --- расхождение со схемой — не сбой задания ---
+
+SCHEMA = {"type": "object", "required": ["commitments"], "additionalProperties": False,
+          "properties": {"commitments": {"type": "array", "items": {
+              "type": "object", "required": ["message", "what"],
+              "properties": {"message": {"type": "integer"}, "what": {"type": "string"}}}}}}
+
+
+@pytest.mark.parametrize("parsed", [
+    {"commitments": [{"message": "1", "what": "прислать смету"}]},      # номер строкой
+    {"commitments": [{"what": "прислать смету"}], "note": "лишнее"},     # нет поля, есть лишнее
+    [{"message": 1, "what": "x"}],                                       # список вместо объекта
+])
+def test_schema_violation_is_a_successful_result_for_the_service_to_judge(parsed):
+    payload = {"instructions": "Найди", "input": "текст", "json_schema": SCHEMA, "schema_name": "commitments"}
+    executor, service, _, llm, stats = make([job(LLM_STRUCTURED, payload, job_id=8)])
+    llm.parsed = parsed
+    for _ in range(3):
+        run(executor.poll("llm"))
+    assert len(llm.calls) == 1                           # один вызов модели, без повторов
+    path, body = service.reports()[0]
+    assert path == "/api/jobs/8/complete" and len(service.reports()) == 1
+    assert body["result"]["parsed"] == parsed and body["result"]["schema_valid"] is False
+    assert body["result"]["text"] and stats.counters["jobs_failed"] == 0
+
+
+def test_valid_answer_is_marked_valid():
+    payload = {"instructions": "Найди", "input": "текст", "json_schema": SCHEMA}
+    executor, service, _, llm, _ = make([job(LLM_STRUCTURED, payload)])
+    llm.parsed = {"commitments": [{"message": 3, "what": "прислать смету"}]}
+    run(executor.poll("llm"))
+    assert service.reports()[0][1]["result"]["schema_valid"] is True
+
+
+def test_watch_task_is_registered_and_routed():
+    from shturman_core.executor import AUX_TASKS
+
+    assert set(AUX_TASKS) == {"shturman_extract", "shturman_reply", "shturman_watch"}
+    executor, _, _, llm, _ = make([job(LLM_STRUCTURED, {"instructions": "и", "input": "т", "task": "shturman_watch"})])
+    run(executor.poll("llm"))
+    assert llm.calls[0][2]["task"] == "shturman_watch"
+
+
+# --- длина по счёту Telegram ---
+
+def test_owner_messages_are_cut_by_utf16_units():
+    from shturman_core.textlimits import utf16_len
+
+    executor, _, bot, _, _ = make()
+    run(executor.execute(NOTIFY_OWNER, {"text": "😀" * 3000}, 1))         # 3000 знаков, 6000 единиц
+    run(executor.execute(NOTIFY_EDIT, {"message_id": 5, "text": "я" * 4000 + "😀" * 200}, 1))
+    assert utf16_len(bot.sent[0][1]) <= 4096 and utf16_len(bot.edits[0][2]) <= 4096
+    assert bot.sent[0][1].endswith("…")
+
+
+def test_send_on_owners_behalf_is_never_cut_only_refused():
+    executor, _, bot, _, _ = make()
+    fits = run(executor.execute(BUSINESS_SEND, {**SEND, "text": "😀" * 2048}, 1))
+    too_long = run(executor.execute(BUSINESS_SEND, {**SEND, "text": "😀" * 2049}, 1))   # 2049 знаков, 4098 единиц
+    assert fits.ok and bot.business[0][2] == "😀" * 2048
+    assert too_long.error.startswith("not_sent:") and len(bot.business) == 1

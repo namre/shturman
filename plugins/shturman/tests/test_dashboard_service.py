@@ -147,6 +147,9 @@ def test_state_reports_the_bridge_in_numbers(web, service_env):
     state = web.get(f"{PREFIX}/state").json()
     assert state["service"]["configured"] is True and state["service"]["executor_running"] is False
     assert state["service"]["counters"]["forwarded_messages"] == 0
+    assert state["service"]["counters"]["not_stored_disabled"] == 0
+    # признаки для страницы: «отправка выключена» и «бизнес-подключение выключено»; пока неизвестны
+    assert state["service"]["sending"] is None and state["service"]["business_disabled"] is None
     assert "persona" in state and "pairing" in state     # прежнее содержимое на месте
     assert service_env.requests == []                    # состояние не ходит в сервис
 
