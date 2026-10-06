@@ -1,7 +1,10 @@
 .env
 compose.override.yaml
 local/
+data/
 *.session
 *.session-journal
 __pycache__/
+*.egg-info/
+.pytest_cache/
 .venv/
