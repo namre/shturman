@@ -17,6 +17,7 @@ dependencies = [
   "pytrovich>=0.2",       # MIT
   "rapidfuzz>=3.9",       # MIT
   "dateparser>=1.2",      # BSD-3-Clause
+  "tzdata>=2025.1",        # Apache-2.0 — часовые пояса: в урезанном образе системных может не быть
   "regex>=2024.4",        # Apache-2.0 — выражения наблюдателя с пределом времени
   "python-socks[asyncio]>=2.4",  # Apache-2.0 — исходящий прокси для Telegram
 ]

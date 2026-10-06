@@ -25,6 +25,8 @@ services:
       # Адрес, по которому владелец открывает ассистента. Задан — Hermes включает вход
       # и принимает запросы с этим именем; пуст — дашборд доступен только с самого сервера.
       HERMES_DASHBOARD_PUBLIC_URL: ${SHTURMAN_PUBLIC_URL:-}
+      # Часовой пояс владельца — один на Hermes (расписание сводок) и сервис переписки (сроки).
+      HERMES_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
       # Связь с сервисом переписки. Токены генерирует ./ops/init-env.sh --auto.
       # Первый — для плагина «Штурмана» (внутренний API), второй — для агента (архив, только чтение).
       SHTURMAN_SERVICE_URL: http://127.0.0.1:8765
@@ -51,8 +53,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?не задан POSTGRES_PASSWORD — запустите ./ops/init-env.sh --auto}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
-    # Порт наружу не публикуется: к базе ходит только сервис переписки по внутренней сети.
-    networks: [internal]
+    # Порт наружу не публикуется, выхода в интернет у базы нет: сеть backend закрытая.
+    networks: [backend]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U shturman -d shturman"]
       interval: 10s
@@ -76,6 +78,11 @@ services:
       SHTURMAN_API_TOKEN: ${SHTURMAN_API_TOKEN:?не задан SHTURMAN_API_TOKEN — запустите ./ops/init-env.sh --auto}
       SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
       SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
+      SHTURMAN_NIGHTLY_AT: ${SHTURMAN_NIGHTLY_AT:-03:30}
+      # Отправка сообщений выключена, пока владелец не включит её сам в .env (docs/service.md).
+      # Через API это значение не меняется.
+      SHTURMAN_SENDING: ${SHTURMAN_SENDING:-off}
+      SHTURMAN_SEND_DAILY_CAP: ${SHTURMAN_SEND_DAILY_CAP:-50}
       SHTURMAN_EMBEDDINGS_URL: ${SHTURMAN_EMBEDDINGS_URL:-}
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
@@ -86,21 +93,28 @@ services:
     # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста.
     ports:
       - "127.0.0.1:8765:8765"
-    networks: [internal]
+    # backend — к базе и эмбеддингам; egress — выход к Telegram (сессии аккаунтов).
+    networks: [backend, egress]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     logging: *logging
 
   embeddings:
     # Локальные эмбеддинги для поиска по смыслу. Занимает около 1,2 ГБ памяти, поэтому выключено,
-    # пока владелец не включит: ./ops/embeddings.sh on. Текст переписки наружу не уходит;
-    # в сеть контейнер ходит один раз — скачать модель.
+    # пока владелец не включит: ./ops/embeddings.sh on. Через контейнер проходит текст всех
+    # сообщений, поэтому выхода в интернет у него нет вовсе (сеть backend закрытая), а модель
+    # заранее скачивает и сверяет по контрольной сумме ./ops/embeddings.sh.
     profiles: ["embeddings"]
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
     container_name: shturman-embeddings
     restart: unless-stopped
-    command: ["--model-id", "intfloat/multilingual-e5-small", "--revision", "614241f622f53c4eeff9890bdc4f31cfecc418b3"]
+    command: ["--model-id", "/data/model", "--served-model-name", "intfloat/multilingual-e5-small"]
     volumes:
-      - ./data/embeddings:/data
-    networks: [internal]
+      - ./data/embeddings:/data:ro
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
     deploy:
       resources:
         limits:
@@ -108,5 +122,9 @@ services:
     logging: *logging
 
 networks:
-  internal:
+  # Закрытая сеть: контейнеры видят друг друга, но не интернет.
+  backend:
+    driver: bridge
+    internal: true
+  egress:
     driver: bridge

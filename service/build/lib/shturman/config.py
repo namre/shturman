@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -27,11 +27,11 @@ def _int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Config:
-    dsn: str = field(repr=False)
+    dsn: str
     # Токен внутреннего API: им пользуется плагин «Штурмана» в Hermes.
-    api_token: str = field(repr=False)
+    api_token: str
     # Токен MCP-сервера архива: им пользуется агент Hermes. Даёт только чтение.
-    mcp_token: str = field(repr=False)
+    mcp_token: str
     host: str = "127.0.0.1"
     port: int = 8765
     # Каталог данных сервиса: сессии Telegram, загруженные выгрузки. Hermes его не видит.
@@ -47,13 +47,6 @@ class Config:
     timezone: str = "Europe/Moscow"
     # Время ночной обработки по часам владельца, «ЧЧ:ММ».
     nightly_at: str = "03:30"
-    # Главный выключатель отправки. Задаётся ТОЛЬКО окружением сервиса (на сервере — в .env),
-    # через API его изменить нельзя: тот, кто завладел токеном API, не может включить отправку сам.
-    # Пока выключено, сервис не отправляет ничего и никому: ни согласованных черновиков, ни автоответов.
-    sending: bool = False
-    # Жёсткий потолок отправок на аккаунт в сутки. Тоже только из окружения; настройки шлюза
-    # отправки могут его уменьшить, но не превысить.
-    send_daily_hard_cap: int = 50
 
     @property
     def sessions_dir(self) -> Path:
@@ -95,6 +88,4 @@ class Config:
             embeddings_dim=_int("SHTURMAN_EMBEDDINGS_DIM", 384),
             timezone=_env("SHTURMAN_TIMEZONE", "Europe/Moscow"),
             nightly_at=_env("SHTURMAN_NIGHTLY_AT", "03:30"),
-            sending=_env("SHTURMAN_SENDING", "off").lower() in ("on", "1", "true", "yes"),
-            send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )

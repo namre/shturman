@@ -451,8 +451,6 @@ async def put_chat_excluded(request: Request) -> JSONResponse:
             if purge:
                 status = await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
                 purged = int(status.split()[-1])
-    if excluded:
-        state.events.publish(events.CHAT_EXCLUDED, {"chat_id": chat_id, "purged": bool(purge)})
     logger.info("чат %s: исключён=%s, стёрто сообщений=%s", chat_id, excluded, purged)
     return JSONResponse({"id": chat_id, "excluded": excluded, "purged": purged})
 

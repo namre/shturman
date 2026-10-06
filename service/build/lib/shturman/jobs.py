@@ -130,42 +130,6 @@ async def reap(conn: asyncpg.Connection) -> list[dict[str, Any]]:
     return out
 
 
-# Сколько задание может ждать исполнителя. Позже оно теряет смысл: уведомление устарело,
-# ответ модели никому не нужен. Отправка через бизнес-бота здесь не значится — её срок ведёт шлюз.
-QUEUE_TTL = {"notify.owner": 24 * 3600, "notify.edit": 3600, "llm.structured": 24 * 3600, "llm.text": 3600}
-SCRUB_AFTER = 600  # секунд после закрытия задания
-
-
-async def expire_queued(conn: asyncpg.Connection) -> list[dict[str, Any]]:
-    """Закрывает как неудачные задания, которых исполнитель не забрал за отведённый срок."""
-    out: list[dict[str, Any]] = []
-    for kind, ttl in QUEUE_TTL.items():
-        rows = await conn.fetch(
-            """UPDATE jobs SET status = 'failed', error = 'исполнитель не забрал вовремя', finished_at = now()
-               WHERE status = 'queued' AND kind = $1 AND created_at < now() - make_interval(secs => $2)
-               RETURNING *""",
-            kind, float(ttl),
-        )
-        for row in rows:
-            job = dict(row)
-            for key in ("payload", "context", "result"):
-                job[key] = _loads(job[key])
-            out.append(job)
-    return out
-
-
-async def scrub_finished(conn: asyncpg.Connection, *, after: int = SCRUB_AFTER) -> int:
-    """Стирает содержимое закрытых заданий: в нём копии текста сообщений, которые иначе пережили
-    бы удаление и исключение чата. Сама строка остаётся — она защищает от повторной постановки."""
-    done = await conn.execute(
-        """UPDATE jobs SET payload = '{}', context = '{}', result = NULL, error = left(error, 80)
-           WHERE status IN ('done', 'failed') AND finished_at < now() - make_interval(secs => $1)
-             AND (payload <> '{}' OR context <> '{}' OR result IS NOT NULL)""",
-        float(after),
-    )
-    return int(done.split()[-1])
-
-
 async def cancel(conn: asyncpg.Connection, job_id: int, reason: str) -> bool:
     """Снимает задание, которое ещё никто не забрал. Забранное снять нельзя: оно уже выполняется."""
     done = await conn.execute(

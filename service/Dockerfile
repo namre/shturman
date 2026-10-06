@@ -13,9 +13,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# Зависимости ставятся по списку с точными версиями и контрольными суммами (requirements.lock);
+# сам сервис — поверх, без подтягивания чего-либо ещё. Список обновляется командой из его шапки.
+COPY requirements.lock ./
+RUN pip install --require-hashes -r requirements.lock
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install .
+RUN pip install --no-deps .
 
 # Работает под пользователем, которого задаёт Compose (владелец каталога данных на сервере),
 # поэтому домашний каталог и каталог данных должны быть доступны любому идентификатору.

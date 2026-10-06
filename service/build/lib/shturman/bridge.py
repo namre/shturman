@@ -44,21 +44,6 @@ NOT_SENT_PREFIX = "not_sent:"
 # (ea: sc: cl: cp: mp: mm: mc: gt: update_prompt:) и плагина бизнес-режима (bd:).
 CALLBACK_PREFIX = "sh:"
 CALLBACK_DATA_LIMIT = 64  # байт — предел Telegram
-MESSAGE_LIMIT = 4096      # предел сообщения Telegram — в единицах UTF-16, а не в знаках
-
-
-def utf16_len(text: str) -> int:
-    return len(text.encode("utf-16-le")) // 2
-
-
-def fit_message(text: str, limit: int = MESSAGE_LIMIT) -> str:
-    """Обрезает текст до предела Telegram (эмодзи и редкие знаки считаются за два)."""
-    if utf16_len(text) <= limit:
-        return text
-    cut = text[: limit - 1]
-    while utf16_len(cut) > limit - 1:
-        cut = cut[:-1]
-    return cut + "…"
 
 ResultHandler = Callable[[asyncpg.Connection, dict[str, Any], dict[str, Any]], Awaitable[None]]
 FailureHandler = Callable[[asyncpg.Connection, dict[str, Any], str], Awaitable[None]]
@@ -147,14 +132,6 @@ async def set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> Non
         await _set_owner(conn, user_id, chat_id)
         if previous is not None and int(previous["user_id"]) != int(user_id):
             await _owner_changed(conn, int(user_id))
-        if previous is None or int(previous["user_id"]) != int(user_id):
-            # Владелец привязан (заново): его собственные бизнес-подключения снова принимают
-            # сообщения. Если Telegram подключение отключил, отправка через него всё равно откажет.
-            await conn.execute(
-                """UPDATE business_connections SET enabled = true, updated_at = now()
-                   WHERE NOT enabled AND account_id IN (SELECT id FROM accounts WHERE tg_user_id = $1)""",
-                int(user_id),
-            )
 
 
 async def _set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
@@ -181,7 +158,7 @@ async def notify_owner(
 ) -> int | None:
     """Сообщение владельцу в управляющий чат. Текст — без разметки, не длиннее 4096 знаков."""
     return await jobs.enqueue(
-        conn, NOTIFY_OWNER, {"text": fit_message(text), "buttons": buttons, "silent": silent},
+        conn, NOTIFY_OWNER, {"text": text[:4096], "buttons": buttons, "silent": silent},
         handler=handler, context=context, dedup_key=dedup_key,
     )
 
@@ -192,7 +169,7 @@ async def edit_owner_message(
     """Меняет текст ранее отправленного владельцу сообщения (например, карточку устаревшего черновика)."""
     return await jobs.enqueue(
         conn, NOTIFY_EDIT,
-        {"message_id": int(message_id), "text": fit_message(text), "remove_buttons": remove_buttons},
+        {"message_id": int(message_id), "text": text[:4096], "remove_buttons": remove_buttons},
         max_attempts=2,
     )
 
@@ -264,7 +241,7 @@ async def deliver_failure(conn: asyncpg.Connection, job_id: int, error: str, *, 
 async def reap_lost(conn: asyncpg.Connection) -> int:
     """Закрывает задания, на которые исполнитель так и не ответил, и сообщает модулям-владельцам."""
     async with conn.transaction():
-        lost = await jobs.reap(conn) + await jobs.expire_queued(conn)
+        lost = await jobs.reap(conn)
         for job in lost:
             fn = _failure_handlers.get(job.get("handler") or "")
             if fn is not None:

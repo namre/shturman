@@ -10,9 +10,6 @@
                    message_id — идентификатор строки архива (messages.id);
                    source — "session" или "business"; via_bot — сообщение отправлено через бота
   messages.deleted {message_ids: [...]}
-  chat.excluded    {chat_id, purged}
-                   владелец исключил чат из архива (purged — сообщения стёрты). Модули убирают
-                   всё, что вывели из этого чата: обязательства, строки страниц, черновики, векторы.
 """
 
 from __future__ import annotations
@@ -26,7 +23,6 @@ logger = logging.getLogger("shturman.events")
 
 MESSAGE_LIVE = "message.live"
 MESSAGES_DELETED = "messages.deleted"
-CHAT_EXCLUDED = "chat.excluded"
 
 Subscriber = Callable[[dict[str, Any]], Awaitable[None]]
 

@@ -21,23 +21,9 @@ class BadRequest(Exception):
         self.message, self.status = message, status
 
 
-MAX_BODY = 1024 * 1024  # байт: JSON-запросы внутреннего API заведомо меньше
-
-
 async def body(request: Request) -> dict[str, Any]:
-    declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_BODY:
-        raise BadRequest("тело запроса слишком большое", 413)
-    chunks, size = [], 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > MAX_BODY:
-            raise BadRequest("тело запроса слишком большое", 413)
-        chunks.append(chunk)
     try:
-        import json as _json
-
-        data = _json.loads(b"".join(chunks) or b"null")
+        data = await request.json()
     except Exception:
         raise BadRequest("тело запроса должно быть JSON-объектом") from None
     if not isinstance(data, dict):
@@ -66,9 +52,6 @@ def handler(fn):
             return await fn(request)
         except BadRequest as exc:
             return JSONResponse({"error": exc.message}, status_code=exc.status)
-        except (ValueError, TypeError):
-            # число не того вида в запросе — это ошибка запроса, а не сервиса
-            return JSONResponse({"error": "неверное значение в запросе"}, status_code=400)
     wrapped.__name__ = fn.__name__
     return wrapped
 
@@ -174,7 +157,6 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
             await asyncio.sleep(REAP_EVERY)
             async with state.pool.acquire() as conn:
                 await bridge.reap_lost(conn)
-                await jobs.scrub_finished(conn)
 
     state.spawn(reaper(), name="jobs-reaper")
     yield

@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 # Каталог данных принадлежит тому, кто запускает стек; Hermes и сервис переписки в контейнерах
 # работают под ним же. Точки подключения создаём сами: иначе Docker создаст их от имени root.
-mkdir -p data/hermes/plugins/shturman data/shturman data/embeddings
+mkdir -p data/hermes/plugins/shturman data/shturman data/embeddings/model
 chmod 700 data data/shturman
 HERMES_UID="$(id -u)"
 HERMES_GID="$(id -g)"

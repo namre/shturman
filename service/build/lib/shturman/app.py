@@ -89,13 +89,8 @@ class Gate:
         }
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "lifespan":
-            await self.app(scope, receive, send)
-            return
         if scope["type"] != "http":
-            # Других видов соединений у сервиса нет: без проверки токена их не пропускаем.
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close", "code": 1008})
+            await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
         if path == "/health":
