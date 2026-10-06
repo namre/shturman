@@ -1,0 +1,8 @@
+name: shturman
+version: 0.0.2
+description: >
+  Штурман: вход в дашборд по одноразовому коду от собственного бота владельца,
+  привязка владельца к боту и мастер первой настройки (вкладка «Штурман»).
+author: "Evgenii Erman"
+homepage: https://github.com/namre/shturman
+kind: standalone

@@ -27,6 +27,19 @@ jobs:
       - run: pytest -q
         working-directory: service
 
+  plugin:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      # Тест обработчиков Telegram пропускается сам: библиотека приходит только вместе с Hermes.
+      - run: pytest -q plugins/shturman/tests
+      - run: node --check plugins/shturman/dashboard/dist/index.js && node --check plugins/shturman/public/app.js
+      - run: python -m json.tool plugins/shturman/dashboard/manifest.json > /dev/null && python -m json.tool plugins/shturman/personas.json > /dev/null
+
   ops:
     runs-on: ubuntu-24.04
     steps:

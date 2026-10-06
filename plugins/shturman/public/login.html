@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>Вход в Штурман</title>
+<link rel="stylesheet" href="shturman.css">
+</head>
+<body data-page="login">
+<div class="side">
+  <div class="brand">
+    <svg width="36" height="36" viewBox="0 0 36 36" fill="none" aria-hidden="true"><circle cx="18" cy="18" r="16" stroke="#E8EEF3" stroke-width="1.5"/><path d="M18 5l4 13-4 13-4-13z" fill="#F2B441"/><circle cx="18" cy="18" r="2" fill="#0F1D2E"/></svg>
+    Штурман
+  </div>
+  <div class="motto">
+    <strong>Вы ведёте. Он читает дорогу.</strong>
+    <span>Личный ассистент на вашем сервере. Переписка и ключи не покидают его.</span>
+  </div>
+</div>
+
+<main>
+  <div class="panel">
+    <h1>Вход в Штурман</h1>
+
+    <!-- идёт вход по ссылке активации -->
+    <div id="view-activating" hidden>
+      <p class="lead">Проверяю ссылку активации…</p>
+    </div>
+
+    <!-- код ещё не запрошен -->
+    <div id="view-start" hidden>
+      <div class="panel">
+        <p class="lead">Ваш бот пришлёт одноразовый код в Telegram. Пароль не нужен.</p>
+        <div><button class="btn" id="send" type="button">Получить код в Telegram</button></div>
+      </div>
+    </div>
+
+    <!-- код отправлен -->
+    <div id="view-code" hidden>
+      <div class="panel">
+        <p class="lead" id="code-lead">Ваш бот отправил вам код в Telegram. Он действует 5 минут.</p>
+        <div class="shot" aria-hidden="true">
+          <div class="shot-bar">Telegram · ваш бот</div>
+          <div class="shot-body">
+            <div class="bubble">Код входа в Штурман: <span class="hl">1234 5678</span><br>Действует 5 минут.</div>
+          </div>
+          <div class="shot-caption">Откройте чат со своим ботом. Нужны восемь цифр из последнего сообщения.</div>
+        </div>
+        <form id="code-form" autocomplete="off">
+          <label for="code">Код из Telegram</label>
+          <input class="code" id="code" name="code" type="text" inputmode="numeric"
+                 autocomplete="one-time-code" maxlength="9" placeholder="0000 0000" required>
+          <p class="note warn" id="code-error" role="alert" hidden></p>
+          <div class="row actions">
+            <button class="btn" id="code-submit" type="submit">Войти</button>
+            <button class="link" id="resend" type="button">Код не пришёл</button>
+          </div>
+        </form>
+        <p class="small">Пока код действует, новый не отправляется. После пяти неверных попыток вход на время закрывается.</p>
+      </div>
+    </div>
+
+    <!-- состояния без поля кода -->
+    <div id="view-message" hidden>
+      <div class="panel">
+        <p class="note warn" id="message-text" role="alert"></p>
+        <div class="row" id="message-retry">
+          <a class="btn" href="../auth/login?provider=shturman">Попробовать ещё раз</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="foot">
+      <b>Нет доступа к Telegram?</b>
+      <p class="small">Попросите ИИ-агента на сервере выдать ссылку восстановления. По ней можно войти один раз и привязать бота заново.</p>
+    </div>
+
+    <noscript><p class="note warn">Для входа нужен включённый JavaScript.</p></noscript>
+  </div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

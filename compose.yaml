@@ -22,8 +22,13 @@ services:
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: 127.0.0.1
       HERMES_DASHBOARD_PORT: "9119"
+      # Адрес, по которому владелец открывает ассистента. Задан — Hermes включает вход
+      # и принимает запросы с этим именем; пуст — дашборд доступен только с самого сервера.
+      HERMES_DASHBOARD_PUBLIC_URL: ${SHTURMAN_PUBLIC_URL:-}
     volumes:
       - ./data/hermes:/opt/data
+      # Плагин «Штурмана» подключается из репозитория только для чтения: обновляется вместе с git pull.
+      - ./plugins/shturman:/opt/data/plugins/shturman:ro
     logging:
       driver: json-file
       options:
