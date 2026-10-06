@@ -19,7 +19,7 @@ fi
 
 mem_mb="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
 if [ "$mem_mb" -ge 7500 ]; then pass memory "${mem_mb} МБ"
-elif [ "$mem_mb" -ge 3500 ]; then warn memory "${mem_mb} МБ — хватит без локальных эмбеддингов и распознавания голосовых (EMBEDDINGS_MODE/STT_MODE не local)"
+elif [ "$mem_mb" -ge 3500 ]; then warn memory "${mem_mb} МБ — хватит на базовый набор и распознавание голосовых; тяжёлые локальные модели эмбеддингов не поместятся"
 else fail memory "${mem_mb} МБ — нужно не меньше 4 ГБ"; fi
 
 disk_gb="$(df -Pk . 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}')"
