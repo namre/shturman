@@ -81,6 +81,23 @@ async def _search(query: str, limit: int) -> None:
         print("ничего не найдено")
 
 
+def _serve() -> None:
+    import logging
+
+    import uvicorn
+
+    from .app import build_app
+    from .config import Config, ConfigError
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        config = Config.from_env()
+    except ConfigError as exc:
+        sys.exit(str(exc))
+    # access_log выключен: в адресах запросов нет секретов, но журнал не должен расти от опроса очереди
+    uvicorn.run(build_app(config), host=config.host, port=config.port, log_level="warning", access_log=False)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="shturman", description="Сервис переписки «Штурмана»")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -95,6 +112,7 @@ def main() -> None:
     q = sub.add_parser("search", help="поиск по архиву")
     q.add_argument("query")
     q.add_argument("--limit", type=int, default=10)
+    sub.add_parser("serve", help="запустить сервис: внутренний API и MCP-сервер архива")
     a = p.parse_args()
 
     if a.cmd == "migrate":
@@ -105,6 +123,8 @@ def main() -> None:
         asyncio.run(_import(a.path, a.owner_id, _parse_exclude(a.exclude)))
     elif a.cmd == "search":
         asyncio.run(_search(a.query, a.limit))
+    elif a.cmd == "serve":
+        _serve()
 
 
 if __name__ == "__main__":

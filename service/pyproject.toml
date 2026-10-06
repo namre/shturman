@@ -1,12 +1,22 @@
 [project]
 name = "shturman-service"
-version = "0.0.1"
+version = "0.0.3"
 description = "Сервис переписки «Штурмана»: архив Telegram, импорт экспорта, поиск"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-  "asyncpg>=0.30",   # Apache-2.0
-  "ijson>=3.3",      # BSD-3-Clause
+  "asyncpg>=0.30",        # Apache-2.0
+  "ijson>=3.3",           # BSD-3-Clause
+  "starlette>=0.47",      # BSD-3-Clause
+  "uvicorn>=0.35",        # BSD-3-Clause
+  "httpx>=0.28",          # BSD-3-Clause
+  "mcp>=2.2,<3",          # MIT
+  "telethon>=1.45,<2",    # MIT
+  "segno>=1.6",           # BSD-3-Clause — QR-код для входа
+  "pymorphy3>=2.0",       # MIT
+  "pytrovich>=0.2",       # MIT
+  "rapidfuzz>=3.9",       # MIT
+  "dateparser>=1.2",      # BSD-3-Clause
 ]
 
 [project.optional-dependencies]
