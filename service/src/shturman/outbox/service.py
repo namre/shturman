@@ -20,7 +20,7 @@ from starlette.routing import BaseRoute, Route
 from .. import bridge, store
 from ..api_core import BadRequest, body, handler, need_int
 from ..app import AppState, state_of
-from ..events import MESSAGE_LIVE
+from ..events import CHAT_EXCLUDED, MESSAGE_LIVE
 from . import autoreply, drafts, policy, runtime, watcher
 from . import text as textlib
 
@@ -82,7 +82,7 @@ async def create_draft(request: Request) -> JSONResponse:
     async with state.pool.acquire() as conn:
         try:
             out = await drafts.create(
-                conn, state.extras.get("tg"), chat_id=need_int(data, "chat_id"), text=text,
+                conn, state, chat_id=need_int(data, "chat_id"), text=text,
                 channel=None if channel == "auto" else channel,
                 reply_to_message_id=reply_to, idempotency_key=key)
         except drafts.Refused as exc:
@@ -120,13 +120,18 @@ async def cancel_draft(request: Request) -> JSONResponse:
 
 # --- правила отправки ---
 
-async def _policy_view(conn: asyncpg.Connection) -> dict[str, Any]:
+async def _policy_view(conn: asyncpg.Connection, config: Any) -> dict[str, Any]:
     accounts = await conn.fetch(
         """SELECT a.id AS account_id, a.label, a.role, o.drafting_default
            FROM accounts a LEFT JOIN outbox_accounts o ON o.account_id = a.id ORDER BY a.id""")
     chats = await conn.fetch("SELECT chat_id, drafting FROM outbox_chats ORDER BY chat_id")
+    rules = await policy.load(conn, config)
     return {
-        "policy": await policy.load(conn),
+        # Эти два значения задаются только окружением сервиса и через API не меняются.
+        "sending": rules.pop("sending"),
+        "hard_daily_cap": rules.pop("hard_daily_cap"),
+        # daily_cap — действующий предел (не выше потолка сервера); daily_cap_stored — сохранённая настройка
+        "policy": rules,
         "limits": {k: {"default": v[0], "min": v[1], "max": v[2]} for k, v in policy.NUMBERS.items()},
         "accounts": [dict(r) for r in accounts],
         "chats": [dict(r) for r in chats],
@@ -136,7 +141,7 @@ async def _policy_view(conn: asyncpg.Connection) -> dict[str, Any]:
 @handler
 async def get_policy(request: Request) -> JSONResponse:
     async with _pool(request).acquire() as conn:
-        return JSONResponse(await _policy_view(conn))
+        return JSONResponse(await _policy_view(conn, state_of(request).config))
 
 
 @handler
@@ -159,12 +164,12 @@ async def put_policy(request: Request) -> JSONResponse:
             note = f"аккаунт «{textlib.one_line(label, 40)}»: черновики по умолчанию — {value or 'как в общих правилах'}"
         else:
             changes = _checked(policy.validate_update, data)
-            before = await policy.load(conn)
+            before = await policy.stored(conn)
             await policy.update(conn, changes)
             note = _changes(before, changes)
         if note:
             await bridge.notify_owner(conn, f"Изменены правила отправки сообщений. {note}", silent=True)
-        return JSONResponse(await _policy_view(conn))
+        return JSONResponse(await _policy_view(conn, state_of(request).config))
 
 
 @handler
@@ -188,18 +193,21 @@ async def put_chat(request: Request) -> JSONResponse:
         words = {"allow": "разрешены", "deny": "запрещены", "default": "как в общих правилах"}
         await bridge.notify_owner(
             conn, f"Черновики сообщений в чат «{tgt.display_name}»: {words[value]}.", silent=True)
-        decision = await policy.check_target(conn, await policy.load(conn), tgt)
+        decision = await policy.check_target(conn, await policy.load(conn, state_of(request).config), tgt)
     return JSONResponse({"chat_id": chat_id, "drafting": value, "can_draft": decision.ok,
                          "reason": None if decision.ok else decision.code})
 
 
 # --- автоответ и доверенные ---
 
-async def _autoreply_view(conn: asyncpg.Connection) -> dict[str, Any]:
+async def _autoreply_view(conn: asyncpg.Connection, config: Any) -> dict[str, Any]:
     accounts = await conn.fetch(
         """SELECT a.id AS account_id, a.label, a.role, COALESCE(o.autoreply_enabled, false) AS enabled
            FROM accounts a LEFT JOIN outbox_accounts o ON o.account_id = a.id ORDER BY a.id""")
     return {
+        # Главный выключатель отправки: только из окружения сервиса. Пока он выключен, автоответ не работает.
+        "sending": getattr(config, "sending", False) is True,
+        "outcomes_24h": await autoreply.outcomes(conn),
         "settings": await autoreply.load(conn),
         "limits": {k: {"default": v[0], "min": v[1], "max": v[2]} for k, v in autoreply.NUMBERS.items()},
         "accounts": [dict(r) for r in accounts],
@@ -210,7 +218,7 @@ async def _autoreply_view(conn: asyncpg.Connection) -> dict[str, Any]:
 @handler
 async def get_autoreply(request: Request) -> JSONResponse:
     async with _pool(request).acquire() as conn:
-        return JSONResponse(await _autoreply_view(conn))
+        return JSONResponse(await _autoreply_view(conn, state_of(request).config))
 
 
 @handler
@@ -223,6 +231,9 @@ async def put_autoreply(request: Request) -> JSONResponse:
             account_id = need_int(data, "account_id")
             if not isinstance(data.get("enabled"), bool):
                 raise BadRequest("поле enabled: нужно true или false")
+            if data["enabled"] and state_of(request).config.sending is not True:
+                # Иначе автоответ, включённый заранее, заработал бы сам в момент включения отправки.
+                return JSONResponse(policy.deny("sending_disabled").as_dict(), status_code=409)
             label = await conn.fetchval("SELECT label FROM accounts WHERE id = $1", account_id)
             if label is None:
                 raise BadRequest("такого аккаунта нет", status=404)
@@ -249,7 +260,7 @@ async def put_autoreply(request: Request) -> JSONResponse:
                 notes.append(f"Изменены настройки автоответа. {diff}")
         for note in notes:
             await bridge.notify_owner(conn, note)
-        return JSONResponse(await _autoreply_view(conn))
+        return JSONResponse(await _autoreply_view(conn, state_of(request).config))
 
 
 async def _trusted_view(conn: asyncpg.Connection) -> dict[str, Any]:
@@ -464,6 +475,13 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
                 logger.exception("уборка черновиков завершилась с ошибкой")
             await asyncio.sleep(SWEEP_EVERY)
 
+    async def chat_excluded(payload: dict[str, Any]) -> None:
+        chat_id = payload.get("chat_id")
+        if isinstance(chat_id, int):
+            async with state.pool.acquire() as conn:
+                await drafts.drop_excluded(conn, chat_id)
+
+    state.events.subscribe(CHAT_EXCLUDED, chat_excluded)
     state.events.subscribe(MESSAGE_LIVE, to_autoreply)
     state.events.subscribe(MESSAGE_LIVE, to_watcher)
     state.spawn(drafts.run_sender(mod), name="outbox-sender")

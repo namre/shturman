@@ -6,8 +6,13 @@
        │                                 │                      ├──────► failed
        ├─► rejected  (нажатие «Отклонить» или отмена)           └──────► outcome_unknown
        ├─► expired   (владелец не ответил в срок)               (ответ не пришёл; повтора нет,
-       └─► superseded (для чата подготовлен новый)               позднее подтверждение → sent)
+       ├─► superseded (для чата подготовлен новый)               позднее подтверждение → sent)
+       └─► failed    (карточка не дошла до владельца)
                                          └─► failed (перед отправкой правила уже не разрешают)
+
+Главный выключатель (`config.sending`, задаётся только окружением сервиса): пока он выключен,
+черновики не создаются, нажатие не принимается, отправщик ничего не отправляет.
+После завершения карточка черновика заменяется итогом, кнопки под ней убираются.
 
 Автоответ доверенным рождается сразу в `approved` (правило включил владелец) и дальше идёт
 тем же отправщиком, с теми же проверками и в ту же таблицу.
@@ -31,9 +36,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
+import re
 import secrets
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 import asyncpg
 
@@ -48,11 +56,12 @@ logger = logging.getLogger("shturman.outbox")
 CALLBACK_MODULE = "ob"
 CARD_HANDLER = "outbox.card"
 BUSINESS_HANDLER = "outbox.sent"
+_USERNAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 CARD_LIMIT = 3900          # знаков на одну карточку вместе с шапкой (предел Telegram — 4096)
 POLL_SECONDS = 1.0         # как часто отправщик сам проверяет, нет ли согласованных черновиков
 # Плагин ставит эту приставку в текст ошибки, когда Telegram ответил отказом и сообщение точно
 # не ушло. Любая другая ошибка отправки через бизнес-бота считается исходом «неизвестно».
-NOT_SENT_PREFIX = "not_sent:"
+NOT_SENT_PREFIX = bridge.NOT_SENT_PREFIX
 
 STATUS_WORDS = {
     "pending": "ждёт вашего решения",
@@ -102,7 +111,8 @@ def public(row: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
     out: dict[str, Any] = {
         "draft_id": row["id"], "status": row["status"], "account_id": row["account_id"],
         "chat_id": row["chat_id"], "channel": row["channel"], "origin": row["origin"],
-        "text": row["text"], "reply_to_tg_id": row["reply_to_tg_id"],
+        "text": row["text"], "text_purged": row["text_purged_at"] is not None,
+        "reply_to_tg_id": row["reply_to_tg_id"],
         "parts_total": row["parts_total"], "parts_sent": row["parts_sent"],
         "sent_tg_message_ids": list(row["sent_tg_message_ids"]),
         "error_code": row["error_code"], "error": row["error_text"],
@@ -125,16 +135,64 @@ def _voice(tgt: Target, channel: str) -> str:
     return f"от имени помощника (аккаунт «{textlib.one_line(tgt.account_label, 40)}»)"
 
 
-def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None,
-               note: str | None = None, reply_excerpt: str | None = None) -> list[str]:
+def _timezone() -> ZoneInfo:
+    mod = runtime.current()
+    try:
+        return ZoneInfo(mod.state.config.timezone) if mod is not None else ZoneInfo("UTC")
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _messages_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "сообщение"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "сообщения"
+    return "сообщений"
+
+
+def _who(tgt: Target) -> str:
+    """Кому: имя (его выбирает сам собеседник, поэтому рядом — то, что подделать нельзя)."""
+    line = f"{tgt.display_name} ({_chat_kind(tgt)})"
+    if tgt.username and _USERNAME.match(tgt.username):
+        line += f" · @{tgt.username}"
+    return f"{line} · id {int(tgt.tg_id)}"
+
+
+async def card_context(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Target) -> dict[str, Any]:
+    """Сведения из архива для карточки: давно ли идёт переписка и на что это ответ."""
+    stats = await conn.fetchrow(
+        """SELECT count(*) AS total, min(sent_at) AS first FROM messages
+           WHERE chat_id = $1 AND kind = 'message' AND deleted_at IS NULL""", row["chat_id"])
+    if stats["total"]:
+        first = stats["first"].astimezone(_timezone()).strftime("%d.%m.%Y")
+        facts = f"В архиве: {stats['total']} {_messages_word(stats['total'])}, первое {first}"
+    else:
+        facts = ("Новый собеседник" if tgt.peer_class == "user" else "Новый чат") + ": раньше переписки не было"
+    excerpt = None
+    if row["reply_to_tg_id"] is not None:
+        excerpt = await conn.fetchval(
+            "SELECT text FROM messages WHERE chat_id = $1 AND tg_message_id = $2",
+            row["chat_id"], row["reply_to_tg_id"])
+    return {"facts": facts, "reply_excerpt": excerpt}
+
+
+def _note(row: Mapping[str, Any]) -> str | None:
+    if row["status"] in ("failed", "outcome_unknown") and row["error_text"]:
+        return "Причина: " + row["error_text"]
+    return None
+
+
+def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None, note: str | None = None,
+               reply_excerpt: str | None = None, facts: str | None = None) -> list[str]:
     """Текст карточки. Весь текст сообщения показывается дословно; длинный — в нескольких
     карточках подряд, без сокращений. Текст идёт последним: после него в карточке ничего нет."""
     word = STATUS_WORDS[status or row["status"]]
     sends = len(policy.parts_of(row["channel"], row["text"]))
-    head = [
-        f"Кому: {tgt.display_name} ({_chat_kind(tgt)})",
-        f"От кого: {_voice(tgt, row['channel'])}",
-    ]
+    head = [f"Кому: {_who(tgt)}"]
+    if facts:
+        head.append(textlib.one_line(facts, 120))
+    head.append(f"От кого: {_voice(tgt, row['channel'])}")
     if reply_excerpt:
         head.append(f"В ответ на: «{textlib.one_line(reply_excerpt, 100)}»")
     if sends > 1:
@@ -167,47 +225,95 @@ def _buttons(row: Mapping[str, Any]) -> list[list[dict[str, str]]]:
              bridge.button("Отклонить", CALLBACK_MODULE, f"r:{rest}")]]
 
 
-async def _reply_excerpt(conn: asyncpg.Connection, row: Mapping[str, Any]) -> str | None:
-    if row["reply_to_tg_id"] is None:
-        return None
-    return await conn.fetchval(
-        "SELECT text FROM messages WHERE chat_id = $1 AND tg_message_id = $2",
-        row["chat_id"], row["reply_to_tg_id"])
+def _card_messages(row: Mapping[str, Any]) -> dict[int, int]:
+    """{номер части карточки: идентификатор сообщения владельцу}."""
+    raw = row["card_messages"]
+    data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    return {int(part): int(message_id) for part, message_id in data.items()}
 
 
-async def _last_card(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Target, *,
-                     status: str | None = None, note: str | None = None) -> str:
-    """Карточка с кнопками (последняя) в новом состоянии — ею заменяется текст после нажатия."""
-    return card_parts(row, tgt, status=status, note=note,
-                      reply_excerpt=await _reply_excerpt(conn, row))[-1]
+async def refresh_cards(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Target | None, *,
+                        skip_part: int | None = None, replace_with: str | None = None) -> int:
+    """Заменяет текст уже доставленных карточек черновика на текущее состояние и убирает кнопки.
+
+    Так под завершённым, заменённым или просроченным черновиком не остаётся кнопок, которые
+    выглядят живыми. `replace_with` — показать вместо карточки одну строку (текст стёрт).
+    Возвращает число карточек, поставленных на замену.
+    """
+    delivered = _card_messages(row)
+    if not delivered:
+        return 0
+    if replace_with is None and (tgt is None or row["text"] == ""):
+        replace_with = f"Черновик № {row['id']} — {STATUS_WORDS[row['status']]}. Текст удалён."
+    parts = [] if replace_with is not None else card_parts(
+        row, tgt, note=_note(row), **await card_context(conn, row, tgt))
+    edited = 0
+    for part, message_id in sorted(delivered.items()):
+        if part == skip_part:
+            continue
+        if replace_with is not None:
+            text = replace_with
+        elif 1 <= part <= len(parts):
+            text = parts[part - 1]
+        else:
+            continue
+        await bridge.edit_owner_message(conn, message_id, text, remove_buttons=True)
+        edited += 1
+    return edited
 
 
 @bridge.on_result(CARD_HANDLER)
 async def _card_delivered(conn: asyncpg.Connection, job: dict[str, Any], result: dict[str, Any]) -> None:
     """Запоминает, каким сообщением карточка пришла владельцу."""
-    draft_id, message_id = job["context"].get("draft_id"), result.get("message_id")
-    if isinstance(draft_id, int) and isinstance(message_id, int) and not isinstance(message_id, bool):
-        await conn.execute(
-            "UPDATE outbox_drafts SET card_message_ids = array_append(card_message_ids, $2) WHERE id = $1",
-            draft_id, message_id)
+    draft_id, part, message_id = job["context"].get("draft_id"), job["context"].get("part"), result.get("message_id")
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (draft_id, part, message_id)):
+        return
+    row = await conn.fetchrow(
+        """UPDATE outbox_drafts SET card_message_ids = array_append(card_message_ids, $2),
+                  card_messages = card_messages || jsonb_build_object($3::text, $2::bigint)
+           WHERE id = $1 RETURNING *""",
+        draft_id, message_id, str(part))
+    if row is not None and row["status"] != "pending":
+        # Пока карточка шла, черновик уже решился (заменён, просрочен, отменён): сразу гасим кнопки.
+        await refresh_cards(conn, row, await policy.target(conn, row["chat_id"]))
+
+
+@bridge.on_failure(CARD_HANDLER)
+async def _card_failed(conn: asyncpg.Connection, job: dict[str, Any], error: str) -> None:
+    """Карточка не дошла до владельца. Черновик, который некому согласовать, не остаётся «ждущим»."""
+    draft_id = job["context"].get("draft_id")
+    if not isinstance(draft_id, int):
+        return
+    row = await conn.fetchrow("SELECT * FROM outbox_drafts WHERE id = $1 FOR UPDATE", draft_id)
+    if row is None or row["status"] != "pending":
+        return
+    await finish(conn, row, await policy.target(conn, row["chat_id"]), "failed", code="card_not_delivered",
+                 message=policy.REASONS["card_not_delivered"], tell_owner=False)
 
 
 # --- создание ---
 
 async def create(
-    conn: asyncpg.Connection, tg: Any, *, chat_id: int, text: str, channel: str | None = None,
+    conn: asyncpg.Connection, state: Any, *, chat_id: int, text: str, channel: str | None = None,
     reply_to_message_id: int | None = None, idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Создаёт черновик и ставит карточку владельцу. Отказ — исключение `Refused` с причиной.
 
-    `reply_to_message_id` — идентификатор строки архива (messages.id) в том же чате.
+    `state` — состояние сервиса: из него берутся шлюз сессий и настройки окружения (главный
+    выключатель отправки). `reply_to_message_id` — идентификатор строки архива (messages.id)
+    в том же чате.
     """
     def refuse(decision: Decision) -> Refused:
         return Refused(decision, _status_for(decision))
 
+    tg = state.extras.get("tg")
     cleaned = textlib.clean_outgoing(text)
     text_hash = textlib.content_hash(cleaned)
     async with conn.transaction():
+        rules = await policy.load(conn, state.config)
+        decision = policy.check_switch(rules)
+        if not decision.ok:
+            raise refuse(decision)   # отправка выключена на сервере: черновики не создаются вовсе
         tgt = await policy.target(conn, chat_id)
         if tgt is None:
             raise refuse(policy.deny("chat_not_found"))
@@ -224,13 +330,13 @@ async def create(
                 return public(known, replayed=True)
         if await bridge.get_owner(conn) is None:
             raise refuse(policy.deny("owner_unknown"))
-        rules = await policy.load(conn)
         picked, decision = policy.pick_channel(tgt, channel)
         if picked is None:
             raise refuse(decision)
         for decision in (await policy.check_target(conn, rules, tgt),
                          await policy.check_channel(conn, tg, rules, tgt, picked),
-                         policy.check_text(rules, picked, cleaned)):
+                         policy.check_text(rules, picked, cleaned),
+                         await policy.check_first_contact(conn, rules, tgt, picked)):
             if not decision.ok:
                 raise refuse(decision)
         # Из лимитов при создании важен только повтор: остальные проверяются в момент отправки.
@@ -244,21 +350,22 @@ async def create(
                 reply_to_message_id, chat_id)
             if reply_to_tg_id is None:
                 raise refuse(policy.deny("reply_not_found"))
-        waiting = await conn.fetchrow(
-            "SELECT * FROM outbox_drafts WHERE chat_id = $1 AND status = 'pending' AND expires_at > now()", chat_id)
-        if (waiting is not None and waiting["text_hash"] == text_hash and waiting["channel"] == picked
-                and waiting["reply_to_tg_id"] == reply_to_tg_id and idempotency_key is None):
-            return public(waiting, duplicate=True)
+        waiting = await conn.fetch(
+            "SELECT * FROM outbox_drafts WHERE chat_id = $1 AND status = 'pending' FOR UPDATE", chat_id)
+        for old in waiting:
+            if (old["text_hash"] == text_hash and old["channel"] == picked and idempotency_key is None
+                    and old["reply_to_tg_id"] == reply_to_tg_id
+                    and not await conn.fetchval("SELECT $1::timestamptz <= now()", old["expires_at"])):
+                return public(old, duplicate=True)
         recent = await conn.fetchval(
             """SELECT count(*) FROM outbox_drafts
                WHERE account_id = $1 AND origin = 'agent' AND created_at > now() - interval '1 hour'""",
             tgt.account_id)
         if recent >= rules["drafts_per_hour"]:
             raise refuse(policy.deny("limit_drafts", temporary=True, cap=rules["drafts_per_hour"]))
-        # В чате ждёт решения только один черновик: прежний заменяется, его кнопки перестают работать.
-        await conn.execute(
-            """UPDATE outbox_drafts SET status = 'superseded', finished_at = now()
-               WHERE chat_id = $1 AND status = 'pending'""", chat_id)
+        # В чате ждёт решения только один черновик: прежний заменяется, кнопки под его карточкой гаснут.
+        for old in waiting:
+            await finish(conn, old, tgt, "superseded", tell_owner=False)
         parts = policy.parts_of(picked, cleaned)
         row = await conn.fetchrow(
             """INSERT INTO outbox_drafts (account_id, chat_id, channel, text, text_hash, reply_to_tg_id,
@@ -268,7 +375,7 @@ async def create(
                RETURNING *""",
             tgt.account_id, chat_id, picked, cleaned, text_hash, reply_to_tg_id, idempotency_key,
             secrets.token_urlsafe(16), float(rules["draft_ttl_seconds"]), len(parts))
-        cards = card_parts(row, tgt, reply_excerpt=await _reply_excerpt(conn, row))
+        cards = card_parts(row, tgt, **await card_context(conn, row, tgt))
         for index, card in enumerate(cards, 1):
             await bridge.notify_owner(
                 conn, card, buttons=_buttons(row) if index == len(cards) else None,
@@ -300,10 +407,9 @@ async def cancel(conn: asyncpg.Connection, draft_id: int) -> dict[str, Any] | No
             return None
         if row["status"] != "pending":
             return public(row, cancelled=False)
-        row = await conn.fetchrow(
-            """UPDATE outbox_drafts SET status = 'rejected', error_code = 'cancelled', error_text = $2,
-                      finished_at = now() WHERE id = $1 RETURNING *""",
-            draft_id, policy.REASONS["cancelled"])
+        await finish(conn, row, await policy.target(conn, row["chat_id"]), "rejected", code="cancelled",
+                     message=policy.REASONS["cancelled"], tell_owner=False)
+        row = await conn.fetchrow("SELECT * FROM outbox_drafts WHERE id = $1", draft_id)
         return public(row, cancelled=True)
 
 
@@ -312,8 +418,13 @@ async def cancel(conn: asyncpg.Connection, draft_id: int) -> dict[str, Any] | No
 async def finish(
     conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Target | None, status: str, *,
     code: str | None = None, message: str | None = None, tell_owner: bool = True,
+    skip_part: int | None = None,
 ) -> bool:
-    """Переводит черновик в конечное состояние и сообщает владельцу. Повторный вызов ничего не делает."""
+    """Переводит черновик в конечное состояние, обновляет его карточки (итог вместо кнопок) и,
+    если исход требует внимания, отдельно сообщает владельцу. Повторный вызов ничего не делает.
+
+    `skip_part` — часть карточки, которую обновит сам ответ на нажатие кнопки.
+    """
     done = await conn.fetchrow(
         """UPDATE outbox_drafts SET status = $2, error_code = $3, error_text = $4, finished_at = now()
            WHERE id = $1 AND status <> $2 RETURNING *""",
@@ -323,6 +434,7 @@ async def finish(
     mod = runtime.current()
     if mod is not None:
         mod.stop_typing(done["account_id"], done["chat_id"])
+    edited = await refresh_cards(conn, done, tgt, skip_part=skip_part)
     if not tell_owner:
         return True
     auto = done["origin"] == "autoreply"
@@ -330,8 +442,9 @@ async def finish(
     label = f"{who} ({'автоответ' if auto else 'черновик'} № {done['id']})"
     never_twice = "Само повторно не отправится: так сообщение не уйдёт дважды."
     if status == "sent":
-        if auto:
-            return True  # автоответы видны в списке отправленного, отдельно о каждом не сообщаем
+        if auto or edited:
+            # автоответы видны в списке отправленного; у черновика итог уже стоит в его карточке
+            return True
         count = len(done["sent_tg_message_ids"])
         text = f"Отправлено: {label}." + (f" Сообщений: {count}." if count > 1 else "")
         silent = True
@@ -368,39 +481,48 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
     tgt = await policy.target(conn, row["chat_id"])
     if tgt is None:
         return refused
+    if row["text"] == "":
+        return {"answer": ALREADY[row["status"]] if row["status"] != "pending" else refused["answer"],
+                "remove_buttons": True,
+                "edit_text": f"Черновик № {row['id']} — {STATUS_WORDS[row['status']]}. Текст удалён."}
+    context = await card_context(conn, row, tgt)
+    pressed = len(card_parts(row, tgt, **context))   # кнопки — под последней частью карточки
 
-    async def closed(status: str, answer: str, note: str | None = None) -> dict[str, Any]:
+    async def closed(answer: str) -> dict[str, Any]:
+        fresh = await conn.fetchrow("SELECT * FROM outbox_drafts WHERE id = $1", row["id"])
         return {"answer": answer, "remove_buttons": True,
-                "edit_text": await _last_card(conn, row, tgt, status=status, note=note)}
+                "edit_text": card_parts(fresh, tgt, note=_note(fresh), **context)[-1]}
 
     if row["status"] != "pending":
-        return await closed(row["status"], ALREADY[row["status"]])
+        return await closed(ALREADY[row["status"]])
     if await conn.fetchval("SELECT $1::timestamptz <= now()", row["expires_at"]):
-        await conn.execute("UPDATE outbox_drafts SET status = 'expired', finished_at = now() WHERE id = $1", row["id"])
-        return await closed("expired", "Срок черновика истёк. Попросите подготовить новый.")
+        await finish(conn, row, tgt, "expired", tell_owner=False, skip_part=pressed)
+        return await closed("Срок черновика истёк. Попросите подготовить новый.")
     if action == "r":
-        await conn.execute("UPDATE outbox_drafts SET status = 'rejected', finished_at = now() WHERE id = $1", row["id"])
-        return await closed("rejected", "Отклонено, ничего не отправлено.")
+        await finish(conn, row, tgt, "rejected", tell_owner=False, skip_part=pressed)
+        return await closed("Отклонено, ничего не отправлено.")
 
     mod = runtime.current()
     if mod is None:
         return {"answer": policy.REASONS["service_stopped"] + " Попробуйте позже.",
                 "edit_text": None, "remove_buttons": False}
-    rules = await policy.load(conn)
+    rules = await policy.load(conn, mod.state.config)
     decision = await policy.check_send(
         conn, mod.tg, rules, tgt, channel=row["channel"], text=row["text"], text_hash=row["text_hash"],
         draft_id=row["id"])
     if not decision.ok and decision.temporary:
         # Черновик остаётся ждать: когда препятствие уйдёт, кнопку можно нажать снова.
         return {"answer": "Пока нельзя: " + decision.message, "edit_text": None, "remove_buttons": False}
-    await conn.execute(
-        "UPDATE outbox_drafts SET status = 'approved', approved_at = now() WHERE id = $1 AND status = 'pending'",
-        row["id"])
+    approved = await conn.fetchrow(
+        """UPDATE outbox_drafts SET status = 'approved', approved_at = now()
+           WHERE id = $1 AND status = 'pending' RETURNING *""", row["id"])
     if not decision.ok:
-        await finish(conn, row, tgt, "failed", code=decision.code, message=decision.message, tell_owner=False)
-        return await closed("failed", "Не отправлено: " + decision.message, note="Причина: " + decision.message)
+        await finish(conn, row, tgt, "failed", code=decision.code, message=decision.message,
+                     tell_owner=False, skip_part=pressed)
+        return await closed("Не отправлено: " + decision.message)
+    await refresh_cards(conn, approved, tgt, skip_part=pressed)
     mod.kick()
-    return await closed("approved", "Принято, отправляю.")
+    return await closed("Принято, отправляю.")
 
 
 # --- отправщик ---
@@ -485,7 +607,7 @@ async def deliver(mod: runtime.Outbox, draft_id: int) -> None:
         row = await conn.fetchrow("SELECT * FROM outbox_drafts WHERE id = $1", draft_id)
         if row is None or row["status"] != "approved":
             return
-        rules = await policy.load(conn)
+        rules = await policy.load(conn, mod.state.config)
         pause = float(rules["min_pause_seconds"])
         if row["origin"] == "autoreply":
             from . import autoreply
@@ -505,6 +627,8 @@ async def deliver(mod: runtime.Outbox, draft_id: int) -> None:
             tgt = await policy.target(conn, row["chat_id"])
             if tgt is None:
                 return
+            # Правила читаются заново: пока ждали паузу, их могли изменить, а выключатель — выключить.
+            rules = await policy.load(conn, mod.state.config)
             decision = await _presend(conn, mod, rules, row, tgt)
             if not decision.ok:
                 await finish(conn, row, tgt, "failed", code=decision.code, message=decision.message)
@@ -539,6 +663,10 @@ async def _send_session(mod: runtime.Outbox, row: Mapping[str, Any], tgt: Target
     sent = 0
     for index, part in enumerate(parts):
         tg = mod.tg
+        if mod.state.config.sending is not True:
+            # Последняя проверка выключателя — прямо перед обращением к Telegram.
+            outcome = ("failed", "sending_disabled", policy.REASONS["sending_disabled"])
+            break
         if tg is None:
             outcome = ("failed", "session_not_configured", policy.REASONS["session_not_configured"])
             break
@@ -634,11 +762,17 @@ async def sweep(mod: runtime.Outbox) -> dict[str, int]:
     """Закрывает просроченное и зависшее. Ничего не отправляет и не повторяет."""
     counts = {"expired": 0, "unknown": 0, "not_sent": 0}
     async with mod.state.pool.acquire() as conn:
-        rules = await policy.load(conn)
-        done = await conn.execute(
-            """UPDATE outbox_drafts SET status = 'expired', finished_at = now()
-               WHERE status = 'pending' AND expires_at <= now()""")
-        counts["expired"] = int(done.split()[-1])
+        rules = await policy.load(conn, mod.state.config)
+        async with conn.transaction():
+            overdue = await conn.fetch(
+                """SELECT * FROM outbox_drafts WHERE status = 'pending' AND expires_at <= now()
+                   FOR UPDATE SKIP LOCKED""")
+            for row in overdue:
+                # Кнопки под карточкой просроченного черновика гаснут вместе с ним.
+                await finish(conn, row, await policy.target(conn, row["chat_id"]), "expired", tell_owner=False)
+            counts["expired"] = len(overdue)
+        counts["purged"] = await purge_texts(conn, rules)
+        counts["removed"] = await drop_excluded(conn)
         # Сессия: «отправляется» без живой отправки в этом процессе — след прерванной работы.
         stuck = await conn.fetch(
             "SELECT id FROM outbox_drafts WHERE status = 'sending' AND channel = 'session' AND id <> ALL($1::bigint[])",
@@ -673,6 +807,67 @@ async def sweep(mod: runtime.Outbox) -> dict[str, int]:
                 counts["unknown"] += 1
     await dispatch(mod)
     return counts
+
+
+# --- срок хранения текста ---
+
+FINAL = ("sent", "failed", "outcome_unknown", "rejected", "expired", "superseded")
+
+
+async def purge_texts(conn: asyncpg.Connection, rules: dict[str, Any]) -> int:
+    """Стирает текст давно завершённых черновиков. Остаются состояние, номера сообщений и отпечаток."""
+    done = await conn.execute(
+        """UPDATE outbox_drafts SET text = '', text_purged_at = now()
+           WHERE status = ANY($1::text[]) AND text_purged_at IS NULL
+             AND COALESCE(finished_at, created_at) < now() - make_interval(days => $2)""",
+        list(FINAL), int(rules["text_retention_days"]))
+    return int(done.split()[-1])
+
+
+async def drop_excluded(conn: asyncpg.Connection, chat_id: int | None = None) -> int:
+    """Чат исключён владельцем: его черновики и совпадения наблюдателя удаляются вместе с текстом.
+
+    Черновик, отправка которого уже идёт (`approved`, `sending`), остаётся до завершения — иначе
+    пропал бы след возможной отправки; следующая уборка удалит и его.
+    """
+    async with conn.transaction():
+        rows = await conn.fetch(
+            """SELECT d.* FROM outbox_drafts d JOIN chats c ON c.id = d.chat_id
+               WHERE c.excluded AND d.status NOT IN ('approved', 'sending')
+                 AND ($1::bigint IS NULL OR d.chat_id = $1)
+               FOR UPDATE OF d""", chat_id)
+        for row in rows:
+            # Текст есть ещё в карточках у владельца и в неотправленных заданиях на карточку.
+            await refresh_cards(conn, row, None,
+                                replace_with=f"Черновик № {row['id']}: чат исключён, текст удалён.")
+            queued = await conn.fetch(
+                "SELECT id FROM jobs WHERE kind = $1 AND status = 'queued' AND dedup_key LIKE $2",
+                bridge.NOTIFY_OWNER, f"outbox:card:{row['id']}:%")
+            for job in queued:
+                await jobs.cancel(conn, job["id"], "снято: чат исключён")
+        if rows:
+            await conn.execute("DELETE FROM outbox_drafts WHERE id = ANY($1::bigint[])", [r["id"] for r in rows])
+        await conn.execute(
+            """DELETE FROM watch_hits h USING chats c
+               WHERE c.id = h.chat_id AND c.excluded AND ($1::bigint IS NULL OR h.chat_id = $1)""", chat_id)
+        await conn.execute(
+            """DELETE FROM outbox_autoreply_log l USING chats c
+               WHERE c.id = l.chat_id AND c.excluded AND ($1::bigint IS NULL OR l.chat_id = $1)""", chat_id)
+    return len(rows)
+
+
+async def sent_by_service(conn: asyncpg.Connection, chat_id: int, tg_message_ids: Any) -> set[int]:
+    """Какие из сообщений чата (по идентификаторам Telegram) отправил сам сервис: согласованные
+    черновики агента и автоответы. Нужно другим модулям, чтобы не принять текст ассистента за
+    собственные слова владельца."""
+    wanted = [int(i) for i in tg_message_ids]
+    if not wanted:
+        return set()
+    rows = await conn.fetch(
+        """SELECT DISTINCT sent_id FROM outbox_drafts d, unnest(d.sent_tg_message_ids) AS sent_id
+           WHERE d.chat_id = $1 AND d.sent_tg_message_ids && $2::bigint[] AND sent_id = ANY($2::bigint[])""",
+        chat_id, wanted)
+    return {r["sent_id"] for r in rows}
 
 
 async def run_sender(mod: runtime.Outbox) -> None:

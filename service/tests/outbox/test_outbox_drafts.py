@@ -10,7 +10,7 @@ from shturman.outbox import drafts, policy
 from shturman.tg.gateway import AccountUnavailable, FloodWait, SendForbidden
 
 from outbox_helpers import (  # noqa: F401 - env — фикстура
-    IVAN, MARIA, OWNER, STRANGER, add_chat, add_message, business, button, draft_row, env,
+    IVAN, MARIA, OWNER, STRANGER, add_chat, add_message, business, button, draft_row, edits, env,
     new_draft, owner_messages, press, settle, take, texts,
 )
 
@@ -28,7 +28,7 @@ async def test_session_draft_is_sent_only_after_owner_tap(env):
     chat = await add_chat(env.conn, env.helper_acc)
     draft_id, cards = await approved(env, chat)
     card = texts(cards)
-    assert "Иван Петров (личный чат)" in card and "от имени помощника" in card
+    assert f"Кому: Иван Петров (личный чат) · id {IVAN}" in card and "от имени помощника" in card
     assert card.endswith("Добрый день! Смету пришлю в пятницу.")
     await settle(env)
     assert env.tg.sent == [] and (await draft_row(env.conn, draft_id))["status"] == "pending"
@@ -43,8 +43,11 @@ async def test_session_draft_is_sent_only_after_owner_tap(env):
     row = await draft_row(env.conn, draft_id)
     assert row["status"] == "sent" and list(row["sent_tg_message_ids"]) == [env.tg.sent[0]["id"]]
     assert list(row["card_message_ids"]) != []
-    note = texts(await owner_messages(env.conn))
-    assert "Отправлено: Иван Петров" in note
+    # итог — в самой карточке (кнопок под ней больше нет), отдельного сообщения о каждой отправке нет
+    assert await owner_messages(env.conn) == []
+    final = (await edits(env.conn))[-1]
+    assert final["remove_buttons"] is True and final["text"].startswith(f"Черновик № {draft_id} — отправлен\n")
+    assert final["text"].endswith("Добрый день! Смету пришлю в пятницу.")
 
 
 async def test_business_draft_goes_through_plugin_job_in_owner_voice(env):
@@ -510,7 +513,7 @@ async def test_text_is_cleaned_once_and_the_same_string_is_shown_and_sent(env):
     # имя чата — чужая строка: в шапке оно в одну строку и без невидимых знаков
     assert "Кому: Иван Черновик № 999 — отправлен (личный чат)" in header
     assert "‮" not in card and "​" not in card and "\x07" not in card
-    assert header.count("\n") == 5
+    assert header.count("\n") == 6
     await press(env, button(cards, "Отправить"))
     await settle(env)
     assert [m["text"] for m in env.tg.sent] == [clean]
@@ -571,5 +574,5 @@ async def test_policy_route_clamps_values_and_tells_owner(env):
     # испорченное значение в базе не ломает правила: берётся умолчание
     await env.conn.execute("UPDATE settings SET value = '{\"daily_cap\": \"x\", \"min_pause_seconds\": -5}' "
                            "WHERE key = 'outbox.policy'")
-    rules = await policy.load(env.conn)
+    rules = await policy.stored(env.conn)
     assert rules["daily_cap"] == 400 and rules["min_pause_seconds"] == 0

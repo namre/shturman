@@ -5,6 +5,7 @@ Telegram заменён объектом FakeTg в `state.extras["tg"]`; мод�
 """
 
 import asyncio
+import dataclasses
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -56,8 +57,10 @@ class FakeTg:
 
 
 @pytest_asyncio.fixture
-async def env(make_client, conn):
-    client, state = await make_client("shturman.api_core", "shturman.outbox.service")
+async def env(make_client, conn, config):
+    # Отправка включается только окружением сервиса; в тестах — явной настройкой.
+    cfg = dataclasses.replace(config, sending=True, send_daily_hard_cap=1000)
+    client, state = await make_client("shturman.api_core", "shturman.outbox.service", cfg=cfg)
     tg = FakeTg()
     state.extras["tg"] = tg
     await bridge.set_owner(conn, OWNER, OWNER)
@@ -71,10 +74,20 @@ async def env(make_client, conn):
                            owner_acc=owner_acc, helper_acc=helper_acc)
 
 
+SEEDED = 900001   # идентификатор «давнего» исходящего сообщения, которым засеивается личный чат
+
+
 async def add_chat(conn, account_id, tg_id=IVAN, *, cls="user", type_="personal_chat", name="Иван Петров",
-                   username=None, is_bot=None, exclude=False) -> int:
-    chat_id, _ = await store.ensure_chat(
+                   username=None, is_bot=None, exclude=False, history=None) -> int:
+    """Чат в архиве. Личный чат по умолчанию «знакомый»: в нём есть давнее исходящее сообщение
+    (агент не пишет первым). history=False — чат без единого своего сообщения."""
+    chat_id, excluded = await store.ensure_chat(
         conn, account_id, ChatRecord(cls, tg_id, type_, name, username=username, is_bot=is_bot), exclude=exclude)
+    if history is None:
+        history = cls == "user"
+    if history and not excluded:
+        await add_message(conn, chat_id, SEEDED, "Здравствуйте!", sender=OWNER, sender_name="Я",
+                          outgoing=True, age=30 * 86400)
     return chat_id
 
 
@@ -112,6 +125,16 @@ async def take(conn, kind, *, complete=None) -> list[dict]:
 async def owner_messages(conn) -> list[dict]:
     """Сообщения владельцу, вставшие в очередь (и закрывает их как доставленные)."""
     return await take(conn, bridge.NOTIFY_OWNER, complete=lambda i, job: {"message_id": 7000 + job["id"]})
+
+
+async def edits(conn) -> list[dict]:
+    """Замены текста карточек у владельца, вставшие в очередь: [{message_id, text, remove_buttons}]."""
+    return [job["payload"] for job in await take(conn, bridge.NOTIFY_EDIT, complete={})]
+
+
+def switch(env, **changes) -> None:
+    """Меняет настройки окружения сервиса «на лету» (в жизни для этого нужен перезапуск)."""
+    env.state.config = dataclasses.replace(env.state.config, **changes)
 
 
 def texts(notes: list[dict]) -> str:

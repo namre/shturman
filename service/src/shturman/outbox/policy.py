@@ -49,12 +49,20 @@ NUMBERS: dict[str, tuple[float, float, float]] = {
     "approval_max_age_seconds": (120, 10, 900),
     # запас до конца суточного окна бизнес-бота
     "business_window_margin_seconds": (300, 0, 3600),
+    # через сколько дней у завершённого черновика стирается текст (остаются состояние и отпечаток)
+    "text_retention_days": (30, 1, 365),
 }
 INTEGER_KEYS = frozenset(NUMBERS) - {"min_pause_seconds", "part_pause_seconds"}
 CHOICES = {"drafting_default": ("allow", "deny")}
 DEFAULT_CHOICES = {"drafting_default": "allow"}
 
 REASONS = {
+    "sending_disabled": "Отправка сообщений выключена в настройках сервера. Включить её можно только на "
+                        "самом сервере (SHTURMAN_SENDING в файле .env), через ассистента — нельзя.",
+    "first_contact": "Ассистент не пишет первым: в этом чате ещё нет ни одного вашего сообщения. "
+                     "Напишите человеку сами — после этого можно будет готовить черновики.",
+    "card_not_delivered": "Карточка с черновиком не дошла до владельца: согласовать его было некому.",
+    "chat_excluded_cleanup": "Чат исключён владельцем: черновик и его текст удалены.",
     "chat_not_found": "Такого чата нет в архиве.",
     "chat_excluded": "Этот чат исключён владельцем: писать в него нельзя.",
     "chat_blocked": "Это служебный чат Telegram: писать в него нельзя никогда.",
@@ -185,9 +193,25 @@ def normalize(raw: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def load(conn: asyncpg.Connection) -> dict[str, Any]:
-    """Действующие правила: сохранённое поверх значений по умолчанию, всё в допустимых границах."""
+async def stored(conn: asyncpg.Connection) -> dict[str, Any]:
+    """Сохранённые правила поверх значений по умолчанию, всё в допустимых границах."""
     return normalize(_loads(await conn.fetchval("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)))
+
+
+async def load(conn: asyncpg.Connection, config: Any = None) -> dict[str, Any]:
+    """Действующие правила: сохранённые настройки плюс то, что задаётся ТОЛЬКО окружением сервиса.
+
+    `sending` — главный выключатель отправки, `hard_daily_cap` — потолок отправок на аккаунт в
+    сутки. Оба берутся из `config`, в базе не хранятся и через API не меняются: тот, кто завладел
+    токеном API, не может ни включить отправку, ни поднять потолок. Без `config` отправка
+    считается выключенной.
+    """
+    rules = await stored(conn)
+    rules["sending"] = getattr(config, "sending", False) is True
+    rules["hard_daily_cap"] = max(0, int(getattr(config, "send_daily_hard_cap", 0) or 0))
+    rules["daily_cap_stored"] = rules["daily_cap"]
+    rules["daily_cap"] = min(rules["daily_cap"], rules["hard_daily_cap"])
+    return rules
 
 
 def validate_update(data: dict[str, Any]) -> dict[str, Any]:
@@ -216,13 +240,42 @@ async def save_setting(conn: asyncpg.Connection, key: str, value: dict[str, Any]
 
 
 async def update(conn: asyncpg.Connection, changes: dict[str, Any]) -> dict[str, Any]:
-    current = await load(conn)
+    current = await stored(conn)
     current.update(changes)
     await save_setting(conn, SETTINGS_KEY, current)
     return current
 
 
 # --- проверки ---
+
+def check_switch(rules: dict[str, Any]) -> Decision:
+    """Главный выключатель. Пока он выключен, сервис не отправляет ничего, никому и ни одним каналом."""
+    return ALLOW if rules.get("sending") is True else deny("sending_disabled")
+
+
+async def has_fresh_incoming(conn: asyncpg.Connection, rules: dict[str, Any], chat_id: int) -> bool:
+    """Есть ли входящее сообщение собеседника в пределах суточного окна бизнес-бота.
+    Сообщение с неизвестным направлением входящим не считается."""
+    return await conn.fetchval(
+        """SELECT EXISTS (
+               SELECT 1 FROM messages
+               WHERE chat_id = $1 AND kind = 'message' AND is_outgoing IS FALSE
+                 AND sent_at > now() - make_interval(secs => $2) AND sent_at <= now() + interval '5 minutes')""",
+        chat_id, float(BUSINESS_WINDOW_SECONDS - rules["business_window_margin_seconds"]),
+    )
+
+
+async def check_first_contact(conn: asyncpg.Connection, rules: dict[str, Any], tgt: Target, channel: str) -> Decision:
+    """Агент не пишет первым. Черновик возможен, если в чате уже есть исходящее сообщение владельца
+    или помощника, либо это ответ через бизнес-бота человеку, который только что написал сам.
+    Через API это правило не выключается."""
+    if await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE chat_id = $1 AND kind = 'message' AND is_outgoing IS TRUE)",
+            tgt.chat_id):
+        return ALLOW
+    if channel == "business" and await has_fresh_incoming(conn, rules, tgt.chat_id):
+        return ALLOW
+    return deny("first_contact")
 
 async def drafting_allowed(conn: asyncpg.Connection, rules: dict[str, Any], tgt: Target) -> bool:
     own = await conn.fetchval("SELECT drafting FROM outbox_chats WHERE chat_id = $1", tgt.chat_id)
@@ -282,15 +335,7 @@ async def check_channel(
     if await business_connection(conn, tgt.account_id) is None:
         return deny("business_unavailable", temporary=True)
     # Суточное окно считается по архиву: последнее входящее сообщение собеседника.
-    # Сообщение с неизвестным направлением входящим не считается.
-    fresh = await conn.fetchval(
-        """SELECT EXISTS (
-               SELECT 1 FROM messages
-               WHERE chat_id = $1 AND kind = 'message' AND is_outgoing IS FALSE
-                 AND sent_at > now() - make_interval(secs => $2) AND sent_at <= now() + interval '5 minutes')""",
-        tgt.chat_id, float(BUSINESS_WINDOW_SECONDS - rules["business_window_margin_seconds"]),
-    )
-    return ALLOW if fresh else deny("business_window_closed")
+    return ALLOW if await has_fresh_incoming(conn, rules, tgt.chat_id) else deny("business_window_closed")
 
 
 def parts_of(channel: str, text: str) -> list[str]:
@@ -356,10 +401,14 @@ async def check_limits(
            WHERE account_id = $1 AND id <> $2 AND claimed_at > now() - interval '24 hours'""",
         tgt.account_id, me,
     )
-    if row["total"] >= rules["daily_cap"]:
-        return deny("limit_daily", temporary=True, cap=rules["daily_cap"])
-    if origin == "autoreply" and autoreply_daily_cap is not None and row["auto"] >= autoreply_daily_cap:
-        return deny("limit_autoreply_daily", temporary=True, cap=autoreply_daily_cap)
+    # Потолок из окружения сервиса сильнее любых сохранённых настроек.
+    cap = min(rules["daily_cap"], rules.get("hard_daily_cap", 0))
+    if row["total"] >= cap:
+        return deny("limit_daily", temporary=True, cap=cap)
+    if origin == "autoreply" and autoreply_daily_cap is not None:
+        auto_cap = min(autoreply_daily_cap, cap)
+        if row["auto"] >= auto_cap:
+            return deny("limit_autoreply_daily", temporary=True, cap=auto_cap)
     return ALLOW
 
 
@@ -368,12 +417,20 @@ async def check_send(
     channel: str, text: str, text_hash: str, origin: str = "agent",
     autoreply_daily_cap: int | None = None, draft_id: int | None = None,
 ) -> Decision:
-    """Полная проверка перед отправкой: чат, канал, текст, частота. Первая причина отказа — ответ."""
+    """Полная проверка перед отправкой: выключатель, чат, канал, текст, частота. Первая причина
+    отказа — ответ."""
+    decision = check_switch(rules)
+    if not decision.ok:
+        return decision
     for decision in (
         await check_target(conn, rules, tgt),
         await check_channel(conn, tg, rules, tgt, channel),
         check_text(rules, channel, text),
     ):
+        if not decision.ok:
+            return decision
+    if origin == "agent":
+        decision = await check_first_contact(conn, rules, tgt, channel)
         if not decision.ok:
             return decision
     return await check_limits(conn, rules, tgt, text_hash, origin=origin,

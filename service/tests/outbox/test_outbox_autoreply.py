@@ -96,12 +96,10 @@ async def test_prompt_marks_foreign_text_and_takes_context_from_this_chat_only(e
     assert "собеседник: Смета по фасадам была на прошлой неделе" in user["content"]
     assert "помощник: Хорошо, жду" in user["content"]
     assert "сейф" not in user["content"]                      # чужой чат в справку не попал
-    # владелец может расширить поиск на весь аккаунт — явным действием
-    await env.client.put("/api/outbox/autoreply", json={"search_scope": "account", "intro": "Я Штурман."})
-    assert "search_scope" in texts(await owner_messages(env.conn))
+    await env.client.put("/api/outbox/autoreply", json={"intro": "Я Штурман."})
     await incoming(env, chat, 11, "А где сейчас смета по фасадам?")
     job = (await take(env.conn, bridge.LLM_TEXT))[0]["payload"]
-    assert "сейф" in job["messages"][1]["content"] and "Я Штурман." in job["messages"][0]["content"]
+    assert "Я Штурман." in job["messages"][0]["content"]
 
 
 async def test_business_reply_is_in_owner_voice_through_plugin(env):
