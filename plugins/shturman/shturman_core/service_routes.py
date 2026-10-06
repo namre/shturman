@@ -39,6 +39,7 @@ def allowed(routes: Routes, method: str, path: str) -> bool:
 BRIDGE: Routes = _compile([
     ("GET", r"/api/status"),
     ("PUT", r"/api/owner"),
+    ("DELETE", r"/api/owner"),
     ("POST", r"/api/jobs/claim"),
     ("POST", rf"/api/jobs/{_INT}/(complete|fail)"),
     ("POST", r"/api/callbacks/telegram"),
@@ -107,4 +108,11 @@ UI: Routes = _compile([
     ("GET", rf"/api/people/{_INT}"),
     ("POST", rf"/api/people/{_INT}/(aliases|split)"),
     ("DELETE", rf"/api/people/{_INT}/aliases"),
+    # страницы памяти
+    ("GET", r"/api/pages"),
+    ("GET", r"/api/pages/(lint|search|proposals)"),
+    ("POST", r"/api/pages/build"),
+    ("POST", rf"/api/pages/proposals/{_INT}"),
+    ("GET", rf"/api/pages/{_INT}"),
+    ("PUT", rf"/api/pages/{_INT}/owner-block"),
 ])

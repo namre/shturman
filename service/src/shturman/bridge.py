@@ -97,7 +97,44 @@ def button(text: str, module: str, rest: str) -> dict[str, str]:
 
 # --- владелец ---
 
+OwnerChangeHandler = Callable[[asyncpg.Connection, int], Awaitable[None]]
+_owner_change_handlers: list[OwnerChangeHandler] = []
+
+
+def on_owner_change(fn: OwnerChangeHandler) -> OwnerChangeHandler:
+    """Регистрирует реакцию на смену или сброс владельца: fn(conn, новый user_id или 0)."""
+    _owner_change_handlers.append(fn)
+    return fn
+
+
+async def _owner_changed(conn: asyncpg.Connection, new_user_id: int) -> None:
+    # Бизнес-подключения прежнего владельца перестают принимать сообщения и отправлять.
+    await conn.execute(
+        """UPDATE business_connections SET enabled = false, updated_at = now()
+           WHERE account_id IN (SELECT id FROM accounts WHERE tg_user_id <> $1)""",
+        new_user_id,
+    )
+    for fn in _owner_change_handlers:
+        await fn(conn, new_user_id)
+
+
+async def clear_owner(conn: asyncpg.Connection) -> None:
+    """Владелец отвязан (ссылка восстановления): кнопки никто не нажмёт, отправки останавливаются."""
+    async with conn.transaction():
+        removed = await conn.fetchval("DELETE FROM settings WHERE key = 'owner' RETURNING key")
+        if removed:
+            await _owner_changed(conn, 0)
+
+
 async def set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
+    async with conn.transaction():
+        previous = await get_owner(conn)
+        await _set_owner(conn, user_id, chat_id)
+        if previous is not None and int(previous["user_id"]) != int(user_id):
+            await _owner_changed(conn, int(user_id))
+
+
+async def _set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
     await conn.execute(
         """INSERT INTO settings (key, value) VALUES ('owner', $1::jsonb)
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",

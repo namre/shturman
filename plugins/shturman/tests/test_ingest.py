@@ -32,7 +32,7 @@ class FakeService:
         if self.down:
             raise ServiceUnavailable("нет связи")
         if path == "/api/owner":
-            self.owner = json_body
+            self.owner = json_body if method == "PUT" else None
             return {"ok": True}
         if path == CONNECTION:
             if self.owner is None:
@@ -105,7 +105,8 @@ def test_without_owner_nothing_is_pushed_and_connection_is_rejected():
     ingest, service, stats, _, _ = make(owner={})
     ingest.put_connection(CONN)
     drain(ingest)
-    assert "/api/owner" not in service.paths()
+    # владельца нет: сервису сообщается сброс (DELETE), сам владелец не передаётся
+    assert {(m, p) for m, p, _ in service.calls if p == "/api/owner"} == {("DELETE", "/api/owner")}
     assert stats.counters["rejected"] == 1 and len(ingest) == 0
 
 

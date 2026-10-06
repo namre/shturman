@@ -21,7 +21,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -37,6 +37,19 @@ HANDLER_RESOLVE = "commitments.resolve"
 HANDLER_DIGEST = "commitments.digest"
 STATE_KEY = "processing.state"       # {"watermark": messages.id, "floor": ISO-время}
 NIGHTLY_KEY = "processing.nightly"   # {"night": "ГГГГ-ММ-ДД"} — за какую ночь прогон уже запущен
+
+# Кому сообщить, что прогон закончен (сборка страниц памяти). Обработчик вызывается внутри
+# транзакции завершения прогона, поэтому должен быть коротким: поставить отметку, разбудить
+# свою фоновую работу.
+RunHook = Callable[[asyncpg.Connection, int], Awaitable[None]]
+_after_run: list[RunHook] = []
+
+
+def after_run(fn: RunHook) -> RunHook:
+    """Регистрирует обработчик «прогон закончен»: fn(conn, run_id)."""
+    _after_run.append(fn)
+    return fn
+
 
 # Типы чатов, которые не разбираются: каналы (вещание), боты, «Избранное».
 SKIP_CHAT_TYPES = frozenset({"private_channel", "public_channel", "bot_chat", "saved_messages"})
@@ -337,6 +350,8 @@ async def finish_run(conn: asyncpg.Connection, run_id: int) -> int:
         """UPDATE processing_runs SET status = 'done', finished_at = now(), stats = stats || $2::jsonb
            WHERE id = $1""",
         run_id, json.dumps({"digest_messages": len(digests), "merge_proposals_pending": merges}))
+    for fn in _after_run:
+        await fn(conn, run_id)
     return len(digests)
 
 

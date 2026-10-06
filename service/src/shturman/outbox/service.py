@@ -409,6 +409,17 @@ async def list_hits(request: Request) -> JSONResponse:
     return JSONResponse({"hits": hits})
 
 
+@bridge.on_owner_change
+async def _owner_changed(conn, new_user_id: int) -> None:
+    """Новый владелец не должен унаследовать чужие решения: черновики, ждавшие прежнего владельца,
+    отклоняются, автоответ выключается, список доверенных очищается."""
+    await conn.execute(
+        """UPDATE outbox_drafts SET status = 'rejected', error_code = 'owner_changed', finished_at = now()
+           WHERE status = 'pending'""")
+    await conn.execute("UPDATE outbox_accounts SET autoreply_enabled = false WHERE autoreply_enabled")
+    await conn.execute("DELETE FROM outbox_trusted")
+
+
 def routes() -> list[BaseRoute]:
     return [
         Route("/api/outbox/drafts", create_draft, methods=["POST"]),

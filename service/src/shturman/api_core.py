@@ -110,6 +110,13 @@ async def put_owner(request: Request) -> JSONResponse:
 
 
 @handler
+async def delete_owner(request: Request) -> JSONResponse:
+    async with state_of(request).pool.acquire() as conn:
+        await bridge.clear_owner(conn)
+    return JSONResponse({"ok": True})
+
+
+@handler
 async def status(request: Request) -> JSONResponse:
     """Сводное состояние без содержимого переписки: только счётчики."""
     async with state_of(request).ro_pool.acquire() as conn:
@@ -133,6 +140,7 @@ def routes() -> list[BaseRoute]:
     return [
         Route("/api/status", status, methods=["GET"]),
         Route("/api/owner", put_owner, methods=["PUT"]),
+        Route("/api/owner", delete_owner, methods=["DELETE"]),
         Route("/api/jobs/claim", claim_jobs, methods=["POST"]),
         Route("/api/jobs/{job_id:int}/complete", complete_job, methods=["POST"]),
         Route("/api/jobs/{job_id:int}/fail", fail_job, methods=["POST"]),

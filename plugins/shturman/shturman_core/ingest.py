@@ -164,8 +164,16 @@ class Ingest:
         owner = self.owner() or {}
         user_id, chat_id = owner.get("user_id"), owner.get("chat_id")
         if not _is_id(user_id) or not _is_id(chat_id):
-            # Владельца нет (ещё не привязан или привязка сброшена): сервис хранит прежнего,
-            # пока не получит нового. Запоминаем версию, чтобы не проверять файл на каждом шаге.
+            # Владельца нет (ещё не привязан или привязка сброшена ссылкой восстановления).
+            # Сервис должен об этом узнать: он останавливает бизнес-подключения, отклоняет
+            # ждущие черновики и выключает автоответ, пока не привяжется новый владелец.
+            try:
+                await self.call("DELETE", "/api/owner", None)
+            except ServiceUnavailable:
+                self.stats.seen(False)
+                raise _Later() from None
+            except ServiceError:
+                pass
             self._pushed_version = version
             return False
         try:

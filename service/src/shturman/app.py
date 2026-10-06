@@ -42,6 +42,8 @@ MODULES = (
     "shturman.embeddings",
     "shturman.tg.service",
     "shturman.processing.service",
+    "shturman.processing.pages_service",
+    "shturman.processing.mcp_tools",
     "shturman.outbox.service",
 )
 
