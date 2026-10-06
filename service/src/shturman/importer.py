@@ -88,6 +88,7 @@ async def import_export(
     owner_label: str | None = None,
     exclude: Iterable[tuple[str, int]] = (),
     source_name: str = "result.json",
+    stats: ImportStats | None = None,
 ) -> ImportStats:
     """Импортирует экспорт в архив.
 
@@ -96,7 +97,8 @@ async def import_export(
     запоминается и действует на все будущие источники.
     """
     excluded = set(exclude)
-    stats = ImportStats()
+    # Счётчики можно передать снаружи, чтобы показывать ход импорта, пока он идёт.
+    stats = stats if stats is not None else ImportStats()
     account_id: int | None = None
     owner_id = owner_tg_user_id
     import_id: int | None = None

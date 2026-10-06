@@ -114,6 +114,46 @@ async def test_delete_without_chat_needs_unique_match_outside_channels(conn):
     assert [(r["chat_id"], r["tg_message_id"]) for r in rows] == [(ivan, 10)]
 
 
+async def test_null_byte_in_text_and_names_is_dropped_not_fatal(conn):
+    account_id = await store.ensure_account(conn, 1000, "Владелец")
+    chat_id, _ = await store.ensure_chat(conn, account_id, ChatRecord("user", 2001, "personal_chat", "Ив\x00ан"))
+    record = rec(1, "до\x00говор")
+    record.sender_name = "Ив\x00ан"
+    record.entities = [{"type": "bold", "text": "до\x00говор"}]
+    await store.upsert_messages(conn, [(chat_id, record)], source="session", owner_tg_id=1000)
+    row = await conn.fetchrow("SELECT text, sender_name, entities FROM messages")
+    assert (row["text"], row["sender_name"]) == ("договор", "Иван") and "договор" in row["entities"]
+
+
+async def test_verification_codes_dialog_is_excluded_by_type(conn):
+    account_id = await store.ensure_account(conn, 1000, "Владелец")
+    _, excluded = await store.ensure_chat(
+        conn, account_id, ChatRecord("user", 424242, "verification_codes", "Verification Codes"))
+    assert excluded is True
+
+
+async def test_lost_job_is_reported_to_its_module(conn):
+    seen = []
+
+    @bridge.on_failure("t.lost")
+    async def lost(c, job, error):
+        seen.append(job["id"])
+
+    job_id = await jobs.enqueue(conn, bridge.LLM_TEXT, {}, handler="t.lost", max_attempts=1)
+    await jobs.claim(conn, [bridge.LLM_TEXT], worker="w")
+    await conn.execute("UPDATE jobs SET locked_until = now() - interval '1 second' WHERE id = $1", job_id)
+    assert await bridge.reap_lost(conn) == 1 and seen == [job_id]
+
+
+async def test_only_unclaimed_job_can_be_cancelled(conn):
+    job_id = await jobs.enqueue(conn, bridge.BUSINESS_SEND, {})
+    other = await jobs.enqueue(conn, bridge.BUSINESS_SEND, {})
+    await conn.execute("UPDATE jobs SET run_after = now() + interval '1 hour' WHERE id = $1", other)
+    await jobs.claim(conn, [bridge.BUSINESS_SEND], worker="w")
+    assert await jobs.cancel(conn, job_id, "поздно") is False
+    assert await jobs.cancel(conn, other, "снято") is True
+
+
 # --- очередь заданий ---
 
 async def test_job_is_claimed_once_and_dedup_key_prevents_repeat(conn):
@@ -131,7 +171,7 @@ async def test_lost_job_returns_to_queue_until_attempts_run_out(conn):
         assert len(await jobs.claim(conn, [bridge.LLM_TEXT], worker="w")) == 1
         await conn.execute("UPDATE jobs SET locked_until = now() - interval '1 second' WHERE id = $1", job_id)
     assert await jobs.claim(conn, [bridge.LLM_TEXT], worker="w") == []
-    assert await jobs.reap(conn) == 1
+    assert [j["id"] for j in await jobs.reap(conn)] == [job_id]
     assert (await jobs.get(conn, job_id))["status"] == "failed"
 
 

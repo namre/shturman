@@ -54,6 +54,19 @@ async def find(
         vector, model = semantic
         return await fts.hybrid(conn, query, vector, model, **filters)
     rows = await fts.search(conn, query, **filters)
-    for row in rows:
-        row["score"] = float(row.pop("rank"))
+    if len(rows) < limit and _plain_phrase(query):
+        # Без смысловой ветки строгий поиск «все слова сразу» на обычный вопрос чаще всего пуст.
+        # Добираем сообщениями, где совпала часть слов; строгие совпадения остаются первыми.
+        seen = {row["id"] for row in rows}
+        relaxed = await fts.search(conn, query, **filters, any_word=True)
+        rows += [row for row in relaxed if row["id"] not in seen][: limit - len(rows)]
+    for place, row in enumerate(rows):
+        row.pop("rank")
+        row["score"] = 1.0 / (1 + place)
     return rows
+
+
+def _plain_phrase(query: str) -> bool:
+    """Обычная фраза из нескольких слов, без операторов поиска: её можно ослабить до «любое слово»."""
+    words = query.split()
+    return len(words) > 1 and '"' not in query and not any(w == "OR" or w.startswith("-") for w in words)

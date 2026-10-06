@@ -1,6 +1,6 @@
 """Мост к Hermes: что сервис просит сделать плагин и как разбирает ответы.
 
-Плагин умеет ровно четыре вещи (виды заданий) и ничего не знает о том, зачем они нужны:
+Плагин умеет ровно пять вещей (виды заданий) и ничего не знает о том, зачем они нужны:
 
   llm.structured  {instructions, input, json_schema, schema_name, task, max_tokens}
                   -> {parsed: {...} | null, text, model}
@@ -8,8 +8,14 @@
                   -> {text, model}
   notify.owner    {text, buttons: [[{text, data}]] | null, silent: bool}
                   -> {message_id}
+  notify.edit     {message_id, text, remove_buttons: bool}
+                  -> {}
   business.send   {business_connection_id, chat_id, text, reply_to_message_id | null}
                   -> {message_id}
+
+Про business.send: если Telegram точно отказал (сообщение не ушло), исполнитель сообщает
+неудачу с текстом, начинающимся на «not_sent:». Любая другая неудача значит «исход неизвестен»:
+сообщение могло уйти, и повторять отправку без владельца нельзя.
 
 И одно умение в обратную сторону: нажатие кнопки под сообщением владельцу плагин пересылает
 в сервис как есть (`data` кнопки и идентификатор нажавшего), сервис решает, что это значит.
@@ -29,8 +35,10 @@ from . import jobs
 LLM_STRUCTURED = "llm.structured"
 LLM_TEXT = "llm.text"
 NOTIFY_OWNER = "notify.owner"
+NOTIFY_EDIT = "notify.edit"
 BUSINESS_SEND = "business.send"
-EXECUTOR_KINDS = (LLM_STRUCTURED, LLM_TEXT, NOTIFY_OWNER, BUSINESS_SEND)
+EXECUTOR_KINDS = (LLM_STRUCTURED, LLM_TEXT, NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND)
+NOT_SENT_PREFIX = "not_sent:"
 
 # Все кнопки сервиса начинаются с этого префикса: он не пересекается с префиксами ядра Hermes
 # (ea: sc: cl: cp: mp: mm: mc: gt: update_prompt:) и плагина бизнес-режима (bd:).
@@ -118,6 +126,17 @@ async def notify_owner(
     )
 
 
+async def edit_owner_message(
+    conn: asyncpg.Connection, message_id: int, text: str, *, remove_buttons: bool = True,
+) -> int | None:
+    """Меняет текст ранее отправленного владельцу сообщения (например, карточку устаревшего черновика)."""
+    return await jobs.enqueue(
+        conn, NOTIFY_EDIT,
+        {"message_id": int(message_id), "text": text[:4096], "remove_buttons": remove_buttons},
+        max_attempts=2,
+    )
+
+
 async def request_structured(
     conn: asyncpg.Connection, *, handler: str, instructions: str, input: str,
     json_schema: dict[str, Any], schema_name: str, task: str = "shturman_extract",
@@ -180,6 +199,17 @@ async def deliver_failure(conn: asyncpg.Connection, job_id: int, error: str, *, 
             if fn is not None and job is not None:
                 await fn(conn, job, error)
     return status
+
+
+async def reap_lost(conn: asyncpg.Connection) -> int:
+    """Закрывает задания, на которые исполнитель так и не ответил, и сообщает модулям-владельцам."""
+    async with conn.transaction():
+        lost = await jobs.reap(conn)
+        for job in lost:
+            fn = _failure_handlers.get(job.get("handler") or "")
+            if fn is not None:
+                await fn(conn, job, job.get("error") or "исполнитель не ответил")
+    return len(lost)
 
 
 async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: int) -> dict[str, Any]:

@@ -23,6 +23,23 @@ from .records import ChatRecord, MessageRecord
 # 93372553 — @BotFather, 178220800 — @SpamBot. В архив не принимаются и агенту не отдаются.
 BLOCKED_USER_IDS = frozenset({777000, 93372553, 178220800})
 BLOCKED_USERNAMES = frozenset({"botfather", "spambot", "telegram"})
+# Диалог «Коды подтверждения» (коды входа в сторонние сервисы) исключается по типу чата.
+BLOCKED_CHAT_TYPES = frozenset({"verification_codes"})
+
+
+def _clean_deep(value):
+    if isinstance(value, str):
+        return _clean(value)
+    if isinstance(value, list):
+        return [_clean_deep(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _clean_deep(v) for k, v in value.items()}
+    return value
+
+
+def _clean(value: str | None) -> str | None:
+    """Postgres не хранит нулевой байт в тексте; в сообщениях он изредка встречается."""
+    return value.replace("\x00", "") if value and "\x00" in value else value
 
 _STAGE = """
 CREATE TEMP TABLE IF NOT EXISTS import_stage (
@@ -137,7 +154,7 @@ async def ensure_peer(
             SET name = {keep.format('name')}, username = {keep.format('username')},
                 is_bot = COALESCE(peers.is_bot, EXCLUDED.is_bot), updated_at = now()
             RETURNING id""",
-        peer_class, tg_id, name, (username or None) and username.lstrip("@"), is_bot,
+        peer_class, tg_id, _clean(name), (_clean(username) or None) and _clean(username).lstrip("@"), is_bot,
     )
 
 
@@ -154,7 +171,8 @@ async def ensure_chat(
         conn, chat.peer_class, chat.tg_id, name=chat.name, username=chat.username,
         is_bot=is_bot, refresh=refresh,
     )
-    exclude = exclude or is_blocked_peer(chat.peer_class, chat.tg_id, chat.username)
+    exclude = (exclude or chat.type in BLOCKED_CHAT_TYPES
+               or is_blocked_peer(chat.peer_class, chat.tg_id, chat.username))
     title = "COALESCE(EXCLUDED.title, chats.title)" if refresh else "COALESCE(chats.title, EXCLUDED.title)"
     row = await conn.fetchrow(
         f"""INSERT INTO chats (account_id, peer_id, type, title, excluded)
@@ -162,7 +180,7 @@ async def ensure_chat(
             ON CONFLICT (account_id, peer_id) DO UPDATE
             SET title = {title}, excluded = chats.excluded OR EXCLUDED.excluded
             RETURNING id, excluded""",
-        account_id, peer_id, chat.type, chat.name, exclude,
+        account_id, peer_id, chat.type, _clean(chat.name), exclude,
     )
     return row["id"], row["excluded"]
 
@@ -172,9 +190,10 @@ def _row(chat_id: int, m: MessageRecord, owner_tg_id: int, outgoing: bool | None
         outgoing = m.sender_class == "user" and m.sender_tg_id == owner_tg_id
     return (
         chat_id, m.tg_message_id, m.sent_at, m.kind,
-        m.sender_class, m.sender_tg_id, m.sender_name, outgoing,
-        m.text, json.dumps(m.entities, ensure_ascii=False) if m.entities else None,
-        m.reply_to_tg_id, m.forwarded_from, m.edited_at,
+        m.sender_class, m.sender_tg_id, _clean(m.sender_name), outgoing,
+        _clean(m.text) or "",
+        json.dumps(_clean_deep(m.entities), ensure_ascii=False) if m.entities else None,
+        m.reply_to_tg_id, _clean(m.forwarded_from), m.edited_at,
         m.media_type, m.media_path, m.service_action,
     )
 
@@ -200,9 +219,11 @@ async def upsert_messages(
     async with conn.transaction():
         banned = {
             r["id"] for r in await conn.fetch(
-                "SELECT id FROM chats WHERE id = ANY($1::bigint[]) AND excluded",
-                list({k[0] for k in staged}),
-            )
+                # Строки чатов блокируются до конца транзакции: исключение чата с очисткой
+                # (оно берёт строку FOR UPDATE) не может вклиниться между проверкой и записью.
+                "SELECT id, excluded FROM chats WHERE id = ANY($1::bigint[]) ORDER BY id FOR KEY SHARE",
+                sorted({k[0] for k in staged}),
+            ) if r["excluded"]
         }
         records = [v for k, v in staged.items() if k[0] not in banned]
         if not records:

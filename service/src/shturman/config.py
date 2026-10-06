@@ -45,6 +45,8 @@ class Config:
     embeddings_model: str = "intfloat/multilingual-e5-small"
     embeddings_dim: int = 384
     timezone: str = "Europe/Moscow"
+    # Время ночной обработки по часам владельца, «ЧЧ:ММ».
+    nightly_at: str = "03:30"
 
     @property
     def sessions_dir(self) -> Path:
@@ -85,4 +87,5 @@ class Config:
             embeddings_model=_env("SHTURMAN_EMBEDDINGS_MODEL", "intfloat/multilingual-e5-small"),
             embeddings_dim=_int("SHTURMAN_EMBEDDINGS_DIM", 384),
             timezone=_env("SHTURMAN_TIMEZONE", "Europe/Moscow"),
+            nightly_at=_env("SHTURMAN_NIGHTLY_AT", "03:30"),
         )

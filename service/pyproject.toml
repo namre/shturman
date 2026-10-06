@@ -17,6 +17,8 @@ dependencies = [
   "pytrovich>=0.2",       # MIT
   "rapidfuzz>=3.9",       # MIT
   "dateparser>=1.2",      # BSD-3-Clause
+  "regex>=2024.4",        # Apache-2.0 — выражения наблюдателя с пределом времени
+  "python-socks[asyncio]>=2.4",  # Apache-2.0 — исходящий прокси для Telegram
 ]
 
 [project.optional-dependencies]
@@ -37,4 +39,5 @@ shturman = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]

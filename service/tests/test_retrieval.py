@@ -186,7 +186,8 @@ async def test_embedder_failure_degrades_to_fulltext_without_logging_query(conn,
     tei.down = True
     with caplog.at_level(logging.DEBUG, logger="shturman"):
         rows = await retrieval.find(state, conn, "смета фасадов")
-    assert mids(rows) == [1] and "«смету»" in rows[0]["snippet"] and set(rows[0]) == ROW_KEYS
+    # строгое совпадение первым; следом — добор по части слов
+    assert mids(rows)[0] == 1 and "«смету»" in rows[0]["snippet"] and set(rows[0]) == ROW_KEYS
     assert "поиск только по словам" in caplog.text
     assert "смета" not in caplog.text and "фасад" not in caplog.text   # запрос в журнал не попал
 

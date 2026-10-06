@@ -37,7 +37,7 @@ from typing import Any, Mapping
 
 import asyncpg
 
-from .. import bridge
+from .. import bridge, jobs
 from ..tg.gateway import AccountUnavailable, FloodWait, SendForbidden
 from . import policy, runtime
 from . import text as textlib
@@ -662,11 +662,7 @@ async def sweep(mod: runtime.Outbox) -> dict[str, int]:
                         continue
                     if job_status == "queued":
                         # Задание ещё не взято: снимаем его, чтобы оно не ушло с опозданием.
-                        cancelled = await conn.fetchval(
-                            """UPDATE jobs SET status = 'failed', error = 'снято: исполнитель не забрал вовремя',
-                                      finished_at = now() WHERE id = $1 AND status = 'queued' RETURNING id""",
-                            item["job_id"])
-                        if cancelled is None:
+                        if not await jobs.cancel(conn, item["job_id"], "снято: исполнитель не забрал вовремя"):
                             continue
                         await finish(conn, row, tgt, "failed", code="executor_absent",
                                      message=policy.REASONS["executor_absent"])

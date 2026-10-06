@@ -148,7 +148,7 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
         while True:
             await asyncio.sleep(REAP_EVERY)
             async with state.pool.acquire() as conn:
-                await jobs.reap(conn)
+                await bridge.reap_lost(conn)
 
     state.spawn(reaper(), name="jobs-reaper")
     yield

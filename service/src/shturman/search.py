@@ -36,6 +36,16 @@ ORDER BY rank DESC, m.sent_at DESC
 LIMIT $7
 """
 
+# Запрос «любое из слов»: слова фразы приводятся к основам и соединяются через «или».
+# Нужен, когда строгий поиск (все слова сразу) ничего не дал: вопрос обычной фразой почти
+# никогда не совпадает с сообщением всеми словами. Чем больше слов совпало, тем выше ранг.
+_ANY_WORD_QUERY = """
+WITH q AS (
+    SELECT to_tsquery('russian', string_agg(quote_literal(lexeme), ' | ')) AS query
+    FROM unnest(tsvector_to_array(to_tsvector('russian', $1))) AS lexeme
+)"""
+_SEARCH_ANY_WORD = _ANY_WORD_QUERY + "\n" + _SEARCH.split("\n", 2)[2]
+
 _THREAD = """
 WITH anchor AS (SELECT chat_id, sent_at, id FROM messages WHERE id = $1),
 before AS (
@@ -64,10 +74,16 @@ async def search(
     since: datetime | None = None,
     until: datetime | None = None,
     limit: int = 20,
+    any_word: bool = False,
 ) -> list[dict[str, Any]]:
-    """Ищет сообщения по словам с учётом русских словоформ. Исключённые чаты не участвуют."""
+    """Ищет сообщения по словам с учётом русских словоформ. Исключённые чаты не участвуют.
+
+    По умолчанию нужны все слова запроса (с поддержкой "фразы в кавычках", OR и -слово).
+    any_word=True — достаточно любого слова; операторы запроса при этом не действуют.
+    """
     rows = await conn.fetch(
-        _SEARCH, query, account_id, chat_id, sender_peer_id, since, until, max(1, min(limit, 200))
+        _SEARCH_ANY_WORD if any_word else _SEARCH,
+        query, account_id, chat_id, sender_peer_id, since, until, max(1, min(limit, 200)),
     )
     return [dict(r) for r in rows]
 

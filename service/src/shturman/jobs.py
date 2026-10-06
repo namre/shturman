@@ -113,11 +113,28 @@ async def fail(
     return "queued"
 
 
-async def reap(conn: asyncpg.Connection) -> int:
-    """Закрывает как неудачные задания, у которых вышли и аренда, и попытки."""
-    done = await conn.execute(
+async def reap(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """Закрывает как неудачные задания, у которых вышли и аренда, и попытки. Возвращает их строки."""
+    rows = await conn.fetch(
         """UPDATE jobs SET status = 'failed', error = COALESCE(error, 'исполнитель не ответил'),
                   finished_at = now(), locked_until = NULL
-           WHERE status = 'running' AND locked_until < now() AND attempts >= max_attempts"""
+           WHERE status = 'running' AND locked_until < now() AND attempts >= max_attempts
+           RETURNING *"""
     )
-    return int(done.split()[-1])
+    out = []
+    for row in rows:
+        job = dict(row)
+        for key in ("payload", "context", "result"):
+            job[key] = _loads(job[key])
+        out.append(job)
+    return out
+
+
+async def cancel(conn: asyncpg.Connection, job_id: int, reason: str) -> bool:
+    """Снимает задание, которое ещё никто не забрал. Забранное снять нельзя: оно уже выполняется."""
+    done = await conn.execute(
+        """UPDATE jobs SET status = 'failed', error = $2, finished_at = now()
+           WHERE id = $1 AND status = 'queued'""",
+        job_id, reason[:2000],
+    )
+    return done.endswith(" 1")

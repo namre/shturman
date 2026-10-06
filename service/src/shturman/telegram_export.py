@@ -23,6 +23,9 @@ _CHAT_CLASS = {
     "saved_messages": "user",
     "personal_chat": "user",
     "bot_chat": "user",
+    # Служебные диалоги Telegram Desktop: «Ответы» и «Коды подтверждения».
+    "replies": "user",
+    "verification_codes": "user",
     "private_group": "chat",
     "private_supergroup": "channel",
     "public_supergroup": "channel",

@@ -487,7 +487,8 @@ async def test_third_party_text_is_cleaned_and_framed(service, conn):
 async def test_agent_supplied_text_is_cleaned_before_the_database(service):
     client, s, _ = service
     found = await call(client, "search_messages", query="сме\x00та​ фаса‮дам")
-    assert [h["message_id"] for h in found["hits"]] == [s.ids[(s.ivan, 1)]]
+    # первым идёт сообщение со всеми словами запроса; дальше — частичные совпадения
+    assert found["hits"][0]["message_id"] == s.ids[(s.ivan, 1)]
     named = await call(client, "get_chat_history", chat="Се\x00мья​", limit=1)
     assert named["chat"]["id"] == s.family
     assert (await call(client, "find_person", name="Пет\x00ров"))["status"] == "ok"
