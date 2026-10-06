@@ -129,7 +129,8 @@ def main():
                SHTURMAN_DSN=DSN,
                SHTURMAN_API_TOKEN=api_token, SHTURMAN_MCP_TOKEN=mcp_token,
                SHTURMAN_DATA_DIR=str(work / "data"), SHTURMAN_PORT=str(port),
-               SHTURMAN_ALLOWED_HOSTS=f"127.0.0.1:{port}", SHTURMAN_TIMEZONE="Europe/Moscow")
+               SHTURMAN_ALLOWED_HOSTS=f"127.0.0.1:{port}", SHTURMAN_TIMEZONE="Europe/Moscow",
+               SHTURMAN_SENDING="on")       # в сервисе отправка по умолчанию выключена; проверке она нужна
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
         env.pop(name, None)
     # Начинаем с пустой схемы — так же, как тесты самого сервиса.

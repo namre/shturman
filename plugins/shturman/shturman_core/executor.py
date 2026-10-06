@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .bridge_stats import Stats
 from .service_client import ServiceError, ServiceUnavailable
+from .textlimits import TELEGRAM_TEXT_LIMIT, cut_utf16, matches_schema, utf16_len
 
 logger = logging.getLogger("shturman.executor")
 
@@ -48,7 +50,7 @@ BOT_KINDS = (NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND)
 NOT_SENT_PREFIX = "not_sent:"
 CALLBACK_PREFIX = "sh:"           # чужие префиксы кнопок (ядра Hermes, плагина бизнес-режима) не пропускаются
 CALLBACK_DATA_LIMIT = 64          # байт — предел Telegram
-TEXT_LIMIT = 4096                 # знаков в одном сообщении Telegram
+TEXT_LIMIT = TELEGRAM_TEXT_LIMIT  # единиц UTF-16 в одном сообщении Telegram
 MAX_BUTTON_ROWS = 20
 MAX_BUTTONS_IN_ROW = 8
 KEYBOARDS_REMEMBERED = 500
@@ -63,6 +65,11 @@ AUX_TASKS: dict[str, tuple[str, str]] = {
     "shturman_reply": (
         "Штурман: текст ответа",
         "Черновики ответов и автоответ доверенным собеседникам.",
+    ),
+    "shturman_watch": (
+        "Штурман: наблюдатель групп",
+        "Проверка сообщений из групп и каналов по правилам наблюдателя: относится ли сообщение "
+        "к тому, за чем владелец просил следить. Короткие частые запросы: подойдёт недорогая модель.",
     ),
 }
 DEFAULT_TASK = {LLM_STRUCTURED: "shturman_extract", LLM_TEXT: "shturman_reply"}
@@ -142,8 +149,10 @@ def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _brief(exc: BaseException, limit: int = 300) -> str:
-    return f"{type(exc).__name__}: {str(exc)[:limit]}".rstrip(": ")
+def _brief(exc: BaseException) -> str:
+    """Только вид ошибки. Её текст сюда не попадает: в нём бывают куски ответа модели и переписки,
+    а строка уходит в сервис и хранится в очереди заданий (`jobs.error`)."""
+    return type(exc).__name__
 
 
 class Executor:
@@ -328,15 +337,28 @@ class Executor:
         schema = payload.get("json_schema") if isinstance(payload.get("json_schema"), dict) else None
         name = payload.get("schema_name") if isinstance(payload.get("schema_name"), str) else None
         args = self._llm_args(LLM_STRUCTURED, payload)
+        # Схема уходит модели текстом в указаниях, а не параметром `json_schema`. С параметром Hermes
+        # сам сверяет ответ со схемой и при расхождении бросает ValueError, не отдавая ни текста,
+        # ни разобранного JSON (agent/plugin_llm.py:316-334, 536): ответ, который сервис принял бы
+        # своей более терпимой проверкой, пропадал бы после трёх попыток. В режиме `json_mode`
+        # Hermes ничего не бросает: разобралось — отдаёт `parsed`, нет — `parsed=None` и текст.
+        # Один вызов модели в любом случае; запись схемы та же, какой её вставляет сам Hermes
+        # (agent/plugin_llm.py:293-298). Плата — провайдеру уходит подсказка «JSON-объект»
+        # вместо нестрогой схемы.
+        if schema is not None:
+            instructions = (f"{instructions.rstrip()}\n\nJSON schema:\n"
+                            f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}")
         # Hermes ждёт входные данные списком блоков, а не строкой (agent/plugin_llm.py:239-262).
         result = await asyncio.wait_for(
             self.llm.acomplete_structured(
                 instructions=instructions, input=[{"type": "text", "text": text}],
-                json_schema=schema, json_mode=schema is None, schema_name=name, **args),
+                json_mode=True, schema_name=name, **args),
             timeout=self.llm_timeout + 15)
         parsed = getattr(result, "parsed", None)
-        return {"parsed": parsed if isinstance(parsed, (dict, list)) else None,
-                "text": str(getattr(result, "text", "") or ""), "model": str(getattr(result, "model", "") or "")}
+        # Расхождение со схемой и неразборчивый JSON — не сбой задания: сервис проверяет ответ сам.
+        valid = parsed is not None and (schema is None or matches_schema(parsed, schema))
+        return {"parsed": parsed, "text": str(getattr(result, "text", "") or ""),
+                "model": str(getattr(result, "model", "") or ""), "schema_valid": valid}
 
     async def _llm_text(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
         raw = payload.get("messages")
@@ -364,6 +386,14 @@ class Executor:
             raise _Fail("владелец не привязан к боту", 300)     # может привязаться позже
         return chat_id
 
+    def _notify_retry(self, exc: NotSent, attempt: int) -> int | None:
+        """Когда повторить сообщение владельцу после отказа. Ответ Telegram с кодом 4xx («текст
+        слишком длинный», «бот заблокирован») окончателен: повтор дал бы тот же отказ. Повторяем,
+        только если Telegram просит подождать либо запрос до него не дошёл."""
+        if exc.retry_after:
+            return int(exc.retry_after) + 1
+        return None if exc.replied else self._backoff(attempt)
+
     def _remember(self, message_id: int, buttons: Buttons) -> None:
         self._keyboards[message_id] = buttons
         self._keyboards.move_to_end(message_id)
@@ -371,7 +401,7 @@ class Executor:
             self._keyboards.popitem(last=False)
 
     async def _notify_owner(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
-        text = _text(payload)[:TEXT_LIMIT]
+        text = cut_utf16(_text(payload), TEXT_LIMIT)
         try:
             buttons = parse_buttons(payload.get("buttons"))
         except ValueError as exc:
@@ -384,7 +414,7 @@ class Executor:
                 self.bot.send_owner(chat_id, text, buttons, bool(payload.get("silent"))),
                 timeout=self.bot_timeout)
         except NotSent as exc:
-            raise _Fail(f"Telegram отказал: {exc.reason}", (exc.retry_after or 299) + 1) from None
+            raise _Fail(f"Telegram отказал: {exc.reason}", self._notify_retry(exc, attempt)) from None
         if buttons and _int(message_id) is not None:
             self._remember(message_id, buttons)
         return {"message_id": message_id}
@@ -393,7 +423,7 @@ class Executor:
         message_id = _int(payload.get("message_id"))
         if message_id is None:
             raise _Fail("в задании нет поля message_id", None)
-        text = _text(payload)[:TEXT_LIMIT]
+        text = cut_utf16(_text(payload), TEXT_LIMIT)
         buttons = None
         if payload.get("remove_buttons") is False:
             buttons = self._keyboards.get(message_id)
@@ -407,8 +437,7 @@ class Executor:
             await asyncio.wait_for(self.bot.edit_owner(chat_id, message_id, text, buttons),
                                    timeout=self.bot_timeout)
         except NotSent as exc:
-            raise _Fail(f"Telegram отказал: {exc.reason}",
-                        exc.retry_after + 1 if exc.retry_after else None) from None
+            raise _Fail(f"Telegram отказал: {exc.reason}", self._notify_retry(exc, attempt)) from None
         if buttons is None:
             self._keyboards.pop(message_id, None)
         return {}
@@ -424,7 +453,8 @@ class Executor:
         reply_to = payload.get("reply_to_message_id")
         if not isinstance(connection_id, str) or not connection_id or chat_id is None:
             return not_sent("в задании нет подключения или чата")
-        if not isinstance(text, str) or not text.strip() or len(text) > TEXT_LIMIT:
+        # Текст, согласованный владельцем, не обрезается: не помещается — не отправляется.
+        if not isinstance(text, str) or not text.strip() or utf16_len(text) > TEXT_LIMIT:
             return not_sent("текст пуст или длиннее одного сообщения Telegram")
         if reply_to is not None and (_int(reply_to) is None or reply_to <= 0):
             return not_sent("неверный номер сообщения, на которое нужно ответить")

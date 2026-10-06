@@ -51,7 +51,8 @@ def test_stale_heartbeat_means_executor_is_not_running(store, clock):
 def test_not_configured_or_never_started(store, clock):
     assert bridge_stats.status(store, configured=False, now=clock) == {
         "configured": False, "executor_running": False, "reachable": None, "checked_at": None,
-        "started_at": None, "last_job_at": None, "queue": 0, "counters": {name: 0 for name in COUNTERS}}
+        "started_at": None, "last_job_at": None, "queue": 0, "business_disabled": None, "sending": None,
+        "counters": {name: 0 for name in COUNTERS}}
     Heartbeat(store, Stats(now=clock), now=clock).tick()
     assert bridge_stats.status(store, configured=False, now=clock)["executor_running"] is False
 
@@ -131,3 +132,101 @@ def test_skill_file_is_well_formed(name):
         assert tools.TOOLSETS.get(tool) == tools.TOOLSET_READ      # сводка пользуется только чтением
     for job in cron_jobs.JOBS:
         assert (PLUGIN / "skills" / job["key"] / "SKILL.md").is_file()
+
+
+def test_status_shows_sending_switch_and_disabled_business_connection(store, clock):
+    stats = Stats(now=clock)
+    heartbeat = Heartbeat(store, stats, now=clock)
+    heartbeat.tick()
+    status = bridge_stats.status(store, configured=True, now=clock)
+    assert status["sending"] is None and status["business_disabled"] is None      # ещё неизвестно
+    stats.set_flag("sending", False)
+    stats.set_flag("business_disabled", True)
+    stats.bump("not_stored_disabled", 2)
+    assert heartbeat.tick() is True                                                # изменение признака — повод записать
+    status = bridge_stats.status(store, configured=True, now=clock)
+    assert status["sending"] is False and status["business_disabled"] is True
+    assert status["counters"]["not_stored_disabled"] == 2
+    stats.set_flag("sending", False)
+    assert heartbeat.tick() is False                                               # то же значение — не изменение
+    clock.tick(bridge_stats.STALE_AFTER + 1)
+    stale = bridge_stats.status(store, configured=True, now=clock)
+    assert stale["sending"] is None and stale["business_disabled"] is None         # исполнитель стоит — не знаем
+
+
+# --- чтение состояния: «файла нет» и «не удалось прочитать» — разные ответы ---
+
+def test_strict_read_tells_absent_from_unreadable(store):
+    from shturman_core.state import StoreReadError
+
+    with pytest.raises(StoreReadError):
+        store.read_strict("owner")                       # каталога состояния ещё нет: судить не о чем
+    store.write("wizard", {})
+    assert store.read_strict("owner") is None            # каталог есть, файла нет — владельца точно нет
+    store.write("owner", {"user_id": 42, "chat_id": 42})
+    assert store.read_strict("owner") == {"user_id": 42, "chat_id": 42}
+    (store.root / "owner.json").write_text("{ оборванная запись", encoding="utf-8")
+    with pytest.raises(StoreReadError):
+        store.read_strict("owner")
+    assert store.read("owner") == {}                     # прежнее чтение по-прежнему молчит
+    (store.root / "owner.json").write_text("[1, 2]", encoding="utf-8")
+    with pytest.raises(StoreReadError):
+        store.read_strict("owner")
+    (store.root / "owner.json").unlink()
+    (store.root / "owner.json").mkdir()                  # ошибка чтения, не «файла нет»
+    with pytest.raises(StoreReadError):
+        store.read_strict("owner")
+
+
+def test_recovery_link_leaves_a_mark_for_the_gateway(store, clock):
+    from shturman_core.auth import Auth
+    from shturman_core.state import OWNER_UNBOUND
+
+    store.write("owner", {"user_id": 42, "chat_id": 42, "name": "Иван"})
+    auth = Auth(store, now=clock)
+    assert store.read_strict(OWNER_UNBOUND) is None
+    assert auth.redeem_activation(auth.issue_activation()) is True
+    assert auth.owner() is None
+    assert store.read_strict(OWNER_UNBOUND) == {"at": int(clock())}
+
+
+def test_first_activation_leaves_no_mark(store, clock):
+    from shturman_core.auth import Auth
+    from shturman_core.state import OWNER_UNBOUND
+
+    auth = Auth(store, now=clock)
+    assert auth.redeem_activation(auth.issue_activation()) is True
+    assert store.read_strict(OWNER_UNBOUND) is None
+
+
+# --- длина по счёту Telegram и сверка со схемой ---
+
+def test_utf16_length_and_cut():
+    from shturman_core.textlimits import cut_utf16, utf16_len
+
+    assert utf16_len("привет") == 6 and utf16_len("😀") == 2 and utf16_len("a😀б") == 4
+    assert cut_utf16("x" * 4096) == "x" * 4096
+    long = cut_utf16("x" * 5000)
+    assert utf16_len(long) == 4096 and long.endswith("…")
+    emoji = cut_utf16("😀" * 3000)                        # 3000 знаков Python, но 6000 единиц Telegram
+    assert utf16_len(emoji) <= 4096 and emoji.endswith("…")
+    assert emoji[:-1] == "😀" * (len(emoji) - 1)           # знак не разорван пополам
+    assert cut_utf16("😀" * 2048) == "😀" * 2048           # ровно 4096 единиц — помещается
+    assert utf16_len(cut_utf16("a" + "😀" * 2048)) <= 4096
+
+
+def test_schema_check_covers_what_service_schemas_use():
+    from shturman_core.textlimits import matches_schema
+
+    schema = {"type": "object", "additionalProperties": False, "required": ["commitments"], "properties": {
+        "commitments": {"type": "array", "items": {"type": "object", "required": ["message", "what"], "properties": {
+            "message": {"type": "integer"}, "what": {"type": "string"}, "due": {"type": ["string", "null"]},
+            "status": {"type": "string", "enum": ["a", "b"]}}}}}}
+    ok = {"commitments": [{"message": 1, "what": "смета", "due": None, "status": "a"}]}
+    assert matches_schema(ok, schema) and matches_schema({"commitments": []}, schema)
+    for bad in ({}, [], {"commitments": {}}, {"commitments": [{"what": "x"}]}, {"commitments": [], "extra": 1},
+                {"commitments": [{"message": "1", "what": "x"}]}, {"commitments": [{"message": True, "what": "x"}]},
+                {"commitments": [{"message": 1, "what": "x", "due": 5}]},
+                {"commitments": [{"message": 1, "what": "x", "status": "c"}]}):
+        assert not matches_schema(bad, schema), bad
+    assert matches_schema({"что угодно": 1}, None) and matches_schema(1.5, {"type": "number"})
