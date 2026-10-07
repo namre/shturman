@@ -8,7 +8,14 @@
   UI     — страницы владельца в дашборде (проходят через plugin_api, уже за входом).
 
 Агенту недоступно всё, что меняет правила отправки, список доверенных, автоответ, правила
-наблюдателя, исключения чатов, аккаунты Telegram и импорт: это действия владельца в интерфейсе.
+наблюдателя и исключения чатов: это действия владельца в интерфейсе.
+
+Вход в аккаунт Telegram, управление аккаунтами, выбор их чатов и импорт выгрузки не разрешены
+НИ ОДНОЙ роли (перечень `SETUP_PAGE_ONLY` ниже). С версии 0.0.6 это делается только на странице
+настройки переписки, которую сервис отдаёт сам, мимо Hermes: дашборд стоит на адресе, где
+ассистент может исполнять свой код, и через его проход не должны идти ни ссылка для QR-кода
+входа, ни облачный пароль Telegram, ни список всех диалогов владельца. У внутреннего API сервиса
+эти маршруты остаются (ими пользуется оператор командой `shturman call`); плагин к ним не ходит.
 Маршруты сверены с кодом сервиса (`service/src/shturman/**`) на коммите fb46275; маршруты
 подтверждений и состояния своего исполнителя добавлены по коммиту 0d4a600.
 
@@ -79,21 +86,9 @@ UI: Routes = _compile([
     # чаты и исключения
     ("GET", r"/api/chats"),
     ("PUT", rf"/api/chats/{_INT}/excluded"),
-    # импорт экспорта Telegram Desktop
-    ("POST", r"/api/imports"),
-    ("GET", r"/api/imports"),
-    ("GET", rf"/api/imports/{_HEX32}"),
-    ("DELETE", rf"/api/imports/{_HEX32}"),
-    ("GET", rf"/api/imports/{_HEX32}/scan"),
-    ("POST", rf"/api/imports/{_HEX32}/run"),
-    # аккаунты Telegram
+    # аккаунты Telegram: только перечень и состояние. Вход, пауза, выход, выбор чатов и импорт
+    # выгрузки — на странице настройки переписки, не здесь (SETUP_PAGE_ONLY).
     ("GET", r"/api/tg/accounts"),
-    ("POST", r"/api/tg/login"),
-    ("GET", rf"/api/tg/login/{_TOKEN}"),
-    ("POST", rf"/api/tg/login/{_TOKEN}/(password|cancel)"),
-    ("POST", rf"/api/tg/accounts/{_INT}/(logout|pause|resume|sync)"),
-    ("PUT", rf"/api/tg/accounts/{_INT}/options"),
-    ("GET", rf"/api/tg/accounts/{_INT}/(dialogs|sync)"),
     # шлюз отправки
     ("GET", r"/api/outbox/drafts"),
     ("POST", rf"/api/outbox/drafts/{_INT}/cancel"),
@@ -130,4 +125,25 @@ UI: Routes = _compile([
     ("POST", rf"/api/pages/proposals/{_INT}"),
     ("GET", rf"/api/pages/{_INT}"),
     ("PUT", rf"/api/pages/{_INT}/owner-block"),
+])
+
+# Маршруты внутреннего API, которые плагин не вызывает ни одной ролью: то же самое владелец делает
+# на странице настройки переписки (`/shturman-setup/`), мимо Hermes. Перечень нужен тестам — чтобы
+# эти маршруты не вернулись в проход дашборда незаметно — и сверке с кодом сервиса.
+SETUP_PAGE_ONLY: Routes = _compile([
+    # вход в аккаунт Telegram: в ответах — ссылка для QR-кода, в запросе — облачный пароль
+    ("POST", r"/api/tg/login"),
+    ("GET", rf"/api/tg/login/{_TOKEN}"),
+    ("POST", rf"/api/tg/login/{_TOKEN}/(password|cancel)"),
+    # управление аккаунтом и выбор его чатов
+    ("POST", rf"/api/tg/accounts/{_INT}/(logout|pause|resume|sync)"),
+    ("PUT", rf"/api/tg/accounts/{_INT}/options"),
+    ("GET", rf"/api/tg/accounts/{_INT}/(dialogs|sync)"),
+    # импорт выгрузки Telegram Desktop
+    ("POST", r"/api/imports"),
+    ("GET", r"/api/imports"),
+    ("GET", rf"/api/imports/{_HEX32}"),
+    ("DELETE", rf"/api/imports/{_HEX32}"),
+    ("GET", rf"/api/imports/{_HEX32}/scan"),
+    ("POST", rf"/api/imports/{_HEX32}/run"),
 ])

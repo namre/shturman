@@ -467,6 +467,17 @@ async def proxy_checks(work, base, api_token):
         conn.close()
         return resp.status, data
 
+    def direct(method, path):
+        """Тот же запрос прямо во внутренний API сервиса, с его токеном: чтобы отличить «маршрута нет
+        в проходе» от «маршрута нет у сервиса»."""
+        target = urllib.parse.urlsplit(base)
+        conn = http.client.HTTPConnection(target.hostname, target.port, timeout=30)
+        conn.request(method, path, headers={"Authorization": f"Bearer {api_token}"})
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, data
+
     try:
         status, data = await asyncio.to_thread(call, "GET", "/status")
         check("GET /service/status отдаёт состояние сервиса", status == 200 and "messages" in json.loads(data))
@@ -482,51 +493,29 @@ async def proxy_checks(work, base, api_token):
                                           {"Content-Type": "application/json"})
         check("правила отправки владелец меняет через проход", s == 200 and json.loads(data)["policy"]["drafts_per_hour"] == 7, str(s))
 
-        size_mb = 300
-        chunk = b"x" * (1024 * 1024)
-
-        def body():
-            for _ in range(size_mb):
-                yield chunk
-
-        page = os.sysconf("SC_PAGE_SIZE")
-
-        def rss():
-            with open("/proc/self/statm") as fh:
-                return int(fh.read().split()[1]) * page
-
-        before = rss()
-        peak = [before]
-        sampling = True
-
-        def sampler():
-            while sampling:
-                peak[0] = max(peak[0], rss())
-                time.sleep(0.01)
-
-        watcher = threading.Thread(target=sampler, daemon=True)
-        watcher.start()
-        started = time.monotonic()
-        s, data = await asyncio.to_thread(call, "POST", "/imports", body(),
-                                          {"Content-Type": "application/json", "Content-Length": str(size_mb * 1024 * 1024)})
-        sampling = False
-        watcher.join()
-        info = json.loads(data) if s == 201 else {}
-        grew = (peak[0] - before) / 1024 / 1024
-        check(f"загрузка {size_mb} МБ прошла потоком: сервис принял файл целиком",
-              s == 201 and info.get("size_bytes") == size_mb * 1024 * 1024, f"код {s}, {time.monotonic() - started:.1f} с")
-        check("память процесса с проходом почти не выросла (тело не копится в памяти)", grew < 60, f"наибольший прирост RSS за время загрузки {grew:.1f} МБ")
-        if info.get("import_id"):
-            s, data = await asyncio.to_thread(call, "GET", f"/imports/{info['import_id']}")
-            s2, _ = await asyncio.to_thread(call, "DELETE", f"/imports/{info['import_id']}")
-            check("состояние загрузки и её удаление через проход", s == 200 and s2 == 200, f"{s} {s2}")
-        small = json.dumps({"about": "x"}).encode()
-        s, data = await asyncio.to_thread(call, "POST", "/imports", small, {"Content-Type": "application/json"})
-        info = json.loads(data) if s == 201 else {}
-        if info.get("import_id"):
-            s, data = await asyncio.to_thread(call, "GET", f"/imports/{info['import_id']}/scan?wait=5")
-            print("     просмотр не-экспорта ->", s, data[:140].decode(errors="replace"))
-            await asyncio.to_thread(call, "DELETE", f"/imports/{info['import_id']}")
+        # Вход в аккаунт Telegram, управление аккаунтами, выбор чатов и импорт выгрузки с версии 0.0.6
+        # делаются только на странице настройки переписки (её отдаёт сам сервис, мимо Hermes).
+        # Проход дашборда отклоняет такие запросы сам, до сервиса. Раньше здесь же проверялась
+        # загрузка выгрузки в 300 МБ потоком: через дашборд выгрузка больше не идёт, и эту проверку
+        # заменила браузерная проверка страницы сервиса (service/tests/e2e/README.md). Что проход
+        # по-прежнему передаёт тело без изменений, проверяет tests/test_dashboard_service.py.
+        closed = []
+        body = json.dumps({"password": "ne-parol"}).encode()
+        for method, path in (("POST", "/tg/login"), ("GET", "/tg/login/abc"), ("POST", "/tg/login/abc/password"),
+                             ("POST", "/tg/accounts/1/sync"), ("POST", "/tg/accounts/1/logout"),
+                             ("PUT", "/tg/accounts/1/options"), ("GET", "/tg/accounts/1/dialogs"),
+                             ("POST", "/imports"), ("GET", "/imports"), ("GET", "/imports/" + "a" * 32 + "/scan"),
+                             ("POST", "/imports/" + "a" * 32 + "/run"), ("DELETE", "/imports/" + "a" * 32)):
+            has_body = method in ("POST", "PUT")
+            s, _ = await asyncio.to_thread(call, method, path, body if has_body else None,
+                                           {"Content-Type": "application/json"} if has_body else None)
+            closed.append(s)
+        check("вход в Telegram, аккаунты и импорт выгрузки через проход дашборда недоступны",
+              all(s == 404 for s in closed), str(closed))
+        s, data = await asyncio.to_thread(call, "GET", "/imports")
+        s_api, _ = await asyncio.to_thread(direct, "GET", "/api/imports")
+        check("у самого сервиса эти маршруты есть (оператору — через shturman call), а в проходе их нет",
+              s == 404 and s_api == 200, f"проход {s}, сервис {s_api}")
     finally:
         server.should_exit = True
         await task

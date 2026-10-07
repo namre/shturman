@@ -198,14 +198,12 @@
 }
 .shturman-list { margin: 0; padding-left: 22px; list-style: decimal outside; display: flex; flex-direction: column; gap: 10px; }
 .shturman-list li { display: list-item; }
-.shturman-bots { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
-.shturman-bot {
-  display: flex; flex-direction: column; gap: 8px; padding: 16px; font-size: 14px;
-  border: 1px solid var(--color-border); border-radius: var(--radius-sm, 6px);
-}
-.shturman-bot .shturman-muted { border-top: 1px dashed var(--color-border); padding-top: 8px; }
-/* Признаки настройки: подпись слева, значение справа — и в узкой колонке тоже. */
-.shturman-facts .shturman-sumrow { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; }
+/* Мелкая строка под шагом: то, что понадобится позже. */
+.shturman-fine { font-size: 13px; border-top: 1px dashed var(--color-border); padding-top: 12px; }
+/* Признаки настройки: подпись слева, значение справа — и в узкой колонке тоже. Подпись не сжимается,
+   переносится значение. */
+.shturman-facts .shturman-sumrow { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; }
+.shturman-facts .shturman-sumlabel { white-space: nowrap; }
 .shturman-facts .shturman-sumrow > span:last-child { text-align: right; }
 
 .shturman-summary { border: 1px solid var(--color-border); border-radius: var(--radius, 10px); background: var(--color-card); }
