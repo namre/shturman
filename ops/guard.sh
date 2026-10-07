@@ -74,6 +74,13 @@ case "$mode" in
     profile_set off guard
     env_set SHTURMAN_GUARD ""
     env_set SHTURMAN_GUARD_URL ""
+    # Контейнер выключенного профиля Compose сам не останавливает — убираем явно, иначе модель
+    # продолжала бы занимать память. Файлы модели остаются.
+    if docker inspect shturman-guard >/dev/null 2>&1; then
+      echo "Останавливаю и убираю контейнер shturman-guard (файлы модели остаются в data/guard)…"
+      docker compose --profile guard rm --stop --force guard >/dev/null 2>&1 || true
+      if docker inspect shturman-guard >/dev/null 2>&1; then docker rm --force shturman-guard >/dev/null; fi
+    fi
     echo "Защита от внедрённых инструкций выключена в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   status)
