@@ -175,6 +175,19 @@ def _tg_login(role: str) -> None:
         sys.exit("\nотменено")
 
 
+def _bot_bind() -> None:
+    """Одноразовая ссылка привязки владельца к боту согласований (см. executor/commands.py)."""
+    from .executor import commands
+
+    asyncio.run(commands.bot_bind(_dsn()))
+
+
+def _bot_status() -> None:
+    from .executor import commands
+
+    commands.bot_status(_local_api)
+
+
 def _serve() -> None:
     import logging
 
@@ -213,6 +226,8 @@ def main() -> None:
     c.add_argument("json", nargs="?")
     t = sub.add_parser("tg-login", help="вход в аккаунт Telegram по QR в терминале (выполняет человек)")
     t.add_argument("role", choices=["assistant", "owner"])
+    sub.add_parser("bot-bind", help="одноразовая ссылка привязки владельца к боту согласований")
+    sub.add_parser("bot-status", help="состояние бота согласований и своей модели сервиса")
     a = p.parse_args()
 
     if a.cmd == "migrate":
@@ -229,6 +244,10 @@ def main() -> None:
         _call(a.method, a.path, a.json)
     elif a.cmd == "tg-login":
         _tg_login(a.role)
+    elif a.cmd == "bot-bind":
+        _bot_bind()
+    elif a.cmd == "bot-status":
+        _bot_status()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,11 @@
 перезапуска сервиса он удаляется (в нём вся переписка открытым текстом), а значит и помнить
 о нём нечего; повторная загрузка и повторный импорт безопасны.
 
+Обновления бизнес-режима приходят двумя путями: от плагина по HTTP (`via="plugin"`) и от своего
+бота сервиса прямо в процессе (`via="service"`, см. `executor/bot.py`). Оба пути зовут одни и те же
+функции `accept_business_*`. Подключение принадлежит тому пути, которым пришло первым: другой
+путь по нему ничего записать не может (код `foreign_connection`).
+
 Текст сообщений и имена собеседников в журнал не пишутся.
 """
 
@@ -32,7 +37,7 @@ import secrets
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import asyncpg
 import ijson
@@ -147,13 +152,19 @@ async def _owner_ids(conn: asyncpg.Connection) -> set[int]:
     return {r["tg_user_id"] for r in rows}
 
 
-async def _connection(conn: asyncpg.Connection, connection_id: str) -> asyncpg.Record | None:
-    return await conn.fetchrow(
-        """SELECT b.account_id, b.enabled, a.tg_user_id
+async def _connection(conn: asyncpg.Connection, connection_id: str, via: str) -> asyncpg.Record:
+    """Подключение, по которому пришло обновление. Чужой путь доставки отклоняется."""
+    link = await conn.fetchrow(
+        """SELECT b.account_id, b.enabled, b.via, a.tg_user_id
            FROM business_connections b JOIN accounts a ON a.id = b.account_id
            WHERE b.id = $1""",
         connection_id,
     )
+    if link is None:
+        raise _unknown_connection()
+    if link["via"] != via:
+        raise _foreign_connection()
+    return link
 
 
 def _unknown_connection() -> ApiError:
@@ -163,16 +174,30 @@ def _unknown_connection() -> ApiError:
     )
 
 
-@_handler
-async def business_connection(request: Request) -> JSONResponse:
+def _foreign_connection() -> ApiError:
+    return ApiError(
+        "это бизнес-подключение принадлежит другому боту — обновления по нему принимаются только от него",
+        409, "foreign_connection",
+    )
+
+
+OwnerIds = Callable[[asyncpg.Connection], Awaitable[set[int]]]
+
+
+async def accept_business_connection(
+    pool: asyncpg.Pool, link: Any, *, via: str = "plugin", owner_ids: OwnerIds = _owner_ids,
+) -> dict[str, Any]:
     """Подключение бота к аккаунту в бизнес-режиме: создано, изменено или отключено.
 
     Подключить бота к себе может любой пользователь Telegram, поэтому принимается только
     подключение от аккаунта владельца. Пока владелец сервису не известен, подключение
     не принимается вовсе.
+
+    via — каким путём пришло обновление: "plugin" (бот в Hermes) или "service" (свой бот сервиса).
+    Через того же бота потом идёт отправка, поэтому путь у подключения один и не меняется.
     """
-    data = await _json(request)
-    link = _need_dict(data, "connection")
+    if not isinstance(link, dict):
+        raise BadRequest("поле connection: нужен объект")
     connection_id = need_str(link, "id", limit=256)
     user = _need_dict(link, "user")
     user_id = user.get("id")
@@ -185,9 +210,9 @@ async def business_connection(request: Request) -> JSONResponse:
     rights = link.get("rights")
     can_reply = rights.get("can_reply") is True if isinstance(rights, dict) else link.get("can_reply") is True
 
-    async with state_of(request).pool.acquire() as conn:
+    async with pool.acquire() as conn:
         async with conn.transaction():
-            owners = await _owner_ids(conn)
+            owners = await owner_ids(conn)
             if not owners:
                 raise ApiError(
                     "владелец ещё не привязан — подключение бизнес-режима принимается только после привязки",
@@ -200,15 +225,27 @@ async def business_connection(request: Request) -> JSONResponse:
             role = await conn.fetchval("SELECT role FROM accounts WHERE id = $1", account_id)
             if role != "owner":
                 raise ApiError("этот аккаунт записан как помощник, а не как владелец", 409, "not_owner_account")
-            await conn.execute(
-                """INSERT INTO business_connections (id, account_id, can_reply, enabled)
-                   VALUES ($1, $2, $3, $4)
+            saved = await conn.fetchval(
+                """INSERT INTO business_connections (id, account_id, can_reply, enabled, via)
+                   VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (id) DO UPDATE
                    SET account_id = EXCLUDED.account_id, can_reply = EXCLUDED.can_reply,
-                       enabled = EXCLUDED.enabled, updated_at = now()""",
-                connection_id, account_id, can_reply, enabled,
+                       enabled = EXCLUDED.enabled, updated_at = now()
+                   WHERE business_connections.via = EXCLUDED.via
+                   RETURNING id""",
+                connection_id, account_id, can_reply, enabled, via,
             )
-    return JSONResponse({"ok": True, "account_id": account_id, "enabled": enabled, "can_reply": can_reply})
+            if saved is None:
+                # Подключение уже записано другим путём: первый записавший остаётся хозяином.
+                raise _foreign_connection()
+    return {"ok": True, "account_id": account_id, "enabled": enabled, "can_reply": can_reply}
+
+
+@_handler
+async def business_connection(request: Request) -> JSONResponse:
+    data = await _json(request)
+    return JSONResponse(await accept_business_connection(
+        state_of(request).pool, _need_dict(data, "connection")))
 
 
 def _as_newer_edit(record: MessageRecord, stored_edit: datetime | None) -> MessageRecord:
@@ -269,27 +306,24 @@ async def _store_business_message(
     }
 
 
-@_handler
-async def business_message(request: Request) -> JSONResponse:
+async def accept_business_message(
+    state: AppState, message: Any, *, edited: bool = False, via: str = "plugin",
+) -> dict[str, Any]:
     """Новое или изменённое сообщение из личного чата владельца."""
-    data = await _json(request)
-    message = _need_dict(data, "message")
-    edited = _flag(data, "edited", default=False)
+    if not isinstance(message, dict):
+        raise BadRequest("поле message: нужен объект")
     connection_id = need_str(message, "business_connection_id", limit=256)
     try:
         norm = normalize_message(message)
     except SkipMessage:
-        return JSONResponse({"stored": False, "message_id": None, "reason": "no_message_id"})
+        return {"stored": False, "message_id": None, "reason": "no_message_id"}
     except NormalizeError as exc:
         raise BadRequest(str(exc)) from None
 
-    state = state_of(request)
     async with state.pool.acquire() as conn:
-        link = await _connection(conn, connection_id)
-        if link is None:
-            raise _unknown_connection()
+        link = await _connection(conn, connection_id, via)
         if not link["enabled"]:
-            return JSONResponse({"stored": False, "message_id": None, "reason": "connection_disabled"})
+            return {"stored": False, "message_id": None, "reason": "connection_disabled"}
         for attempt in range(DEADLOCK_RETRIES):
             try:
                 saved = await _store_business_message(conn, link, norm, edited=edited)
@@ -299,22 +333,28 @@ async def business_message(request: Request) -> JSONResponse:
                 if attempt == DEADLOCK_RETRIES - 1:
                     raise BadRequest("архив занят, повторите запрос", 503) from None
     if saved is None:
-        return JSONResponse({"stored": False, "message_id": None, "reason": "excluded"})
+        return {"stored": False, "message_id": None, "reason": "excluded"}
     if saved["changed"]:
         state.events.publish(events.MESSAGE_LIVE, {
             "account_id": link["account_id"], "chat_id": saved["chat_id"],
             "message_id": saved["message_id"], "source": "business",
             "outgoing": saved["outgoing"], "edited": edited, "via_bot": norm.via_bot,
         })
-    return JSONResponse({
-        "stored": True, "message_id": saved["message_id"], "new": saved["new"], "changed": saved["changed"],
-    })
+    return {"stored": True, "message_id": saved["message_id"], "new": saved["new"], "changed": saved["changed"]}
 
 
 @_handler
-async def business_deleted(request: Request) -> JSONResponse:
-    """Сообщения удалены в личном чате владельца: в архиве они помечаются, а не стираются."""
+async def business_message(request: Request) -> JSONResponse:
     data = await _json(request)
+    message = _need_dict(data, "message")
+    edited = _flag(data, "edited", default=False)
+    return JSONResponse(await accept_business_message(state_of(request), message, edited=edited))
+
+
+async def accept_business_deleted(state: AppState, data: Any, *, via: str = "plugin") -> dict[str, Any]:
+    """Сообщения удалены в личном чате владельца: в архиве они помечаются, а не стираются."""
+    if not isinstance(data, dict):
+        raise BadRequest("тело запроса должно быть JSON-объектом")
     connection_id = need_str(data, "business_connection_id", limit=256)
     try:
         chat = chat_record(data.get("chat"))
@@ -325,13 +365,10 @@ async def business_deleted(request: Request) -> JSONResponse:
             isinstance(i, bool) or not isinstance(i, int) or not 0 < i <= MAX_ID for i in ids):
         raise BadRequest("поле message_ids: нужен список идентификаторов сообщений (не больше 1000)")
 
-    state = state_of(request)
     async with state.pool.acquire() as conn:
-        link = await _connection(conn, connection_id)
-        if link is None:
-            raise _unknown_connection()
+        link = await _connection(conn, connection_id, via)
         if not link["enabled"]:
-            return JSONResponse({"deleted": 0, "reason": "connection_disabled"})
+            return {"deleted": 0, "reason": "connection_disabled"}
         # Чат ищется, а не создаётся: удалять в незнакомом чате нечего.
         chat_id = await conn.fetchval(
             """SELECT c.id FROM chats c JOIN peers p ON p.id = c.peer_id
@@ -341,7 +378,12 @@ async def business_deleted(request: Request) -> JSONResponse:
         deleted = await store.mark_deleted(conn, chat_id, ids) if chat_id is not None else []
     if deleted:
         state.events.publish(events.MESSAGES_DELETED, {"message_ids": deleted})
-    return JSONResponse({"deleted": len(deleted)})
+    return {"deleted": len(deleted)}
+
+
+@_handler
+async def business_deleted(request: Request) -> JSONResponse:
+    return JSONResponse(await accept_business_deleted(state_of(request), await _json(request)))
 
 
 # ---------------------------------------------------------------------------
