@@ -91,7 +91,8 @@ services:
       SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
       SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
       SHTURMAN_NIGHTLY_AT: ${SHTURMAN_NIGHTLY_AT:-03:30}
-      # Отправка сообщений выключена, пока владелец не включит её сам в .env (docs/service.md).
+      # Отправка сообщений выключена, пока владелец не включит её сам в .env (docs/service.md);
+      # без своего бота согласований (SHTURMAN_BOT_TOKEN) значение on не действует.
       # Через API это значение не меняется.
       SHTURMAN_SENDING: ${SHTURMAN_SENDING:-off}
       SHTURMAN_SEND_DAILY_CAP: ${SHTURMAN_SEND_DAILY_CAP:-50}

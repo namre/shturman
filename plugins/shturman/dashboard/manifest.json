@@ -3,7 +3,7 @@
   "label": "Штурман",
   "description": "Мастер первой настройки: помощник, модель, бот в Telegram, бизнес-режим.",
   "icon": "Sparkles",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "tab": { "path": "/shturman", "position": "before:sessions" },
   "slots": ["header-banner"],
   "entry": "dist/index.js",
