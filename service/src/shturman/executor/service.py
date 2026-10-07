@@ -123,6 +123,8 @@ class Control:
         self._tasks: list[asyncio.Task] = []
         self._clients: list[Any] = []
         self._announced = False      # объявлял ли этот модуль свои виды заданий
+        self._token = ""             # токен работающего бота — чтобы узнать «тот же бот» при перезапуске
+        self._known: Any = None      # (токен, кто бот, место опроса, бизнес-режим) остановленного бота
 
     async def start(self) -> None:
         """Собирает исполнителя по нынешним настройкам (`state.config`) и запускает его."""
@@ -145,6 +147,7 @@ class Control:
             if llm.broken:
                 logger.error("свой доступ к модели не может работать (%s)", llm.broken)
         self._clients = [client for client in (api, llm) if client is not None]
+        self._token = config.bot_token if api is not None else ""
         # При перезапуске прежний перечень заранее не снимается, а заменяется здесь: так плагину
         # ни на миг не открываются привязка владельца и нажатия. Модуль, который ничего своего
         # не объявлял, чужого перечня не трогает.
@@ -160,6 +163,10 @@ class Control:
         if api is not None:
             bot = Bot(state, api, wake=worker.wake, poll=TEST_OVERRIDES.get("poll"))
             worker.bot = bot
+            if self._known is not None and self._known[0] == config.bot_token:
+                # Перезапуск с тем же ботом (сменили только модель): кто он и с какого обновления
+                # продолжать, уже известно — владелец не «отвязывается» на время первого запроса.
+                _, bot.identity, bot.offset, bot.business_capable = self._known
         state.extras["executor"] = Executor(api=api, bot=bot, llm=llm, worker=worker, kinds=frozenset(kinds))
         # Задания этих видов, поставленные до включения своего исполнителя, плагину больше не
         # отдаются: в карточках — метки кнопок, которые должны дойти только до бота согласований.
@@ -179,6 +186,11 @@ class Control:
     async def _halt(self) -> None:
         """Останавливает опрос и дорожки заданий и закрывает клиентов. Перечень своих видов
         заданий не трогает: его выставляет `start` или окончательный `stop`."""
+        old = getattr(self.state.extras.get("executor"), "bot", None)
+        self._known = None
+        if old is not None and old.identity is not None:
+            self._known = (self.state.config.bot_token if not self._token else self._token,
+                           old.identity, old.offset, old.business_capable)
         tasks, self._tasks = self._tasks, []
         for task in tasks:
             task.cancel()

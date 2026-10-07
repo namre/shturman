@@ -45,7 +45,7 @@ class Config:
     # Имена, под которыми к сервису обращаются (защита от подмены адреса в MCP).
     allowed_hosts: tuple[str, ...] = ("127.0.0.1:8765", "localhost:8765")
     tg_api_id: int = 0
-    tg_api_hash: str = ""
+    tg_api_hash: str = field(default="", repr=False)
     proxy_url: str = ""
     embeddings_url: str = ""
     embeddings_model: str = "intfloat/multilingual-e5-small"

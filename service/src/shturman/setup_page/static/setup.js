@@ -1037,7 +1037,7 @@
         var bad = row.outcome !== "ok";
         return el("li", {}, [
           el("time", { datetime: row.at, text: when(row.at) }),
-          el("span", { class: "what" + (bad ? " bad" : ""), text: row.title + (row.outcome === "refused" ? " — отказано" : row.outcome === "failed" ? " — не удалось" : "") }),
+          el("span", { class: "what" + (bad ? " bad" : ""), text: row.title }),
           row.detail ? el("span", { class: "detail", text: row.detail }) : null
         ]);
       });

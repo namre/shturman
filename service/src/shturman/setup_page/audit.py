@@ -56,6 +56,13 @@ ACTIONS = {
 }
 
 
+# Как называется действие, если оно не состоялось (итог не «ok»).
+NOT_DONE = {
+    "bot.token": "Токен бота согласований не сохранён",
+    "llm.save": "Своя модель сервиса не сохранена",
+}
+
+
 async def write(pool: asyncpg.Pool, action: str, outcome: str = OK, detail: str = "") -> None:
     """Пишет запись. Сбой журнала не отменяет уже сделанного действия, но виден в журнале сервиса."""
     if action not in ACTIONS:
@@ -71,7 +78,7 @@ async def write(pool: asyncpg.Pool, action: str, outcome: str = OK, detail: str 
 async def recent(conn: asyncpg.Connection, limit: int = 30) -> list[dict[str, Any]]:
     rows = await conn.fetch(
         "SELECT at, action, outcome, detail FROM setup_audit ORDER BY id DESC LIMIT $1", limit)
-    return [{"at": r["at"].isoformat(), "action": r["action"], "title": ACTIONS.get(r["action"], r["action"]),
+    return [{"at": r["at"].isoformat(), "action": r["action"], "title": (NOT_DONE.get(r["action"]) if r["outcome"] != OK else None) or ACTIONS.get(r["action"], r["action"]),
              "outcome": r["outcome"], "detail": r["detail"]} for r in rows]
 
 

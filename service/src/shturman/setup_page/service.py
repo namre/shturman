@@ -580,7 +580,8 @@ async def bot_token_save(request: Request) -> JSONResponse:
         try:
             await apply.probe_other_poller(state.config, token)
         except apply.Invalid as exc:
-            await _log(request, "bot.token", audit.REFUSED, f"причина: {exc.code}")
+            why = "у бота включён webhook" if exc.code == "webhook" else "ботом уже пользуется другая программа"
+            await _log(request, "bot.token", audit.REFUSED, why)
             raise
     await page.settings.save({ss.BOT_TOKEN: token})
     await _log(request, "bot.token", detail="бот проверен запросом к Telegram")
