@@ -224,7 +224,10 @@
       call("POST", "login/link", { token: token }, true).then(function (r) {
         busy(button, false);
         if (r.ok && r.data.key) { saveKey(r.data.key); startApp(); return; }
-        loginMessage(r.error || GENERIC[500], false);
+        // Ссылка одноразовая. Если владелец открыл её впервые, а она уже израсходована, по ней мог войти
+        // кто-то другой (docs/architecture.md, «Что осталось») — говорим, что делать.
+        loginMessage((r.error || GENERIC[500]) + " Если вы открываете эту ссылку впервые, попросите того, кто ставил ассистента, " +
+          "завершить все входы (./ops/logout-all.sh) и выдать новую ссылку.", false);
       });
     });
 
