@@ -4,9 +4,14 @@
 #   ./ops/set-public-url.sh https://assistant.example.com
 # После изменения — ./ops/up.sh, чтобы Hermes подхватил адрес.
 # Только для режима с Hermes: без него у экземпляра нет ни дашборда, ни внешнего адреса.
+# Тот же адрес получает сервис переписки — для страницы настройки переписки (/shturman-setup/).
+#   -h, --help — эта справка; .env не меняется.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
+case "${1:-}" in -*) ops_unknown "$1" ;; esac
+[ $# -le 1 ] || ops_unknown "$2"
 if [ -f .env ]; then require_hermes "дашборда и внешнего адреса"; fi
 
 url="${1:-}"
@@ -24,8 +29,5 @@ esac
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 umask 077
-tmp="$(mktemp .env.XXXXXX)"
-grep -Ev '^SHTURMAN_PUBLIC_URL=' .env > "$tmp" || true
-printf 'SHTURMAN_PUBLIC_URL=%s\n' "$url" >> "$tmp"
-chmod 600 "$tmp"; mv "$tmp" .env
+env_put SHTURMAN_PUBLIC_URL "$url"
 echo "SHTURMAN_PUBLIC_URL записан: $url"

@@ -22,9 +22,12 @@
 # без --auto — запасной путь. В режиме без Hermes веб-интерфейса нет: токен бота согласований
 # и ключ модели владелец вводит здесь (docs/standalone.md).
 # Читать .env агенту запрещено в любом режиме.
+#
+#   -h, --help — эта справка; .env при этом не создаётся и не меняется.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
 
 auto=0; want=""
 while [ $# -gt 0 ]; do
@@ -34,8 +37,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "после --mode нужен режим: hermes или standalone" >&2; exit 2; }
       want="$2"; shift ;;
     --mode=*) want="${1#--mode=}" ;;
-    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "неизвестный параметр: $1 (см. $0 --help)" >&2; exit 2 ;;
+    *) ops_unknown "$1" ;;
   esac
   shift
 done

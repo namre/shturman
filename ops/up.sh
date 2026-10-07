@@ -2,6 +2,7 @@
 # Поднимает стек (или применяет изменения). Повторный запуск безопасен.
 #   ./ops/up.sh          — скачать образы при необходимости и запустить
 #   ./ops/up.sh --pull   — сначала обновить образы указанных версий
+#   ./ops/up.sh --help   — эта справка; ничего не запускается
 # Что запускается, зависит от режима установки (SHTURMAN_MODE в .env, ./ops/mode.sh):
 #   hermes      — Hermes, сервис переписки, база; плагин и архив подключаются к Hermes;
 #   standalone  — только сервис переписки и база. Шаги Hermes пропускаются, его образ
@@ -9,6 +10,14 @@
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
+pull=no
+for arg in "$@"; do
+  case "$arg" in
+    --pull) pull=yes ;;
+    *) ops_unknown "$arg" ;;
+  esac
+done
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 
@@ -87,6 +96,15 @@ wait_service() {
   done
   return 1
 }
+# Проверка здоровья и, если она прошла, одна строка о том, что дальше. Код возврата — её.
+finish() {
+  local rc=0
+  ./ops/doctor.sh || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "Настройка переписки: ./ops/setup-link.sh — по просьбе владельца."
+  fi
+  exit "$rc"
+}
 wait_dashboard() {
   for _ in $(seq 1 45); do
     if curl -fsS -o /dev/null -m 3 http://127.0.0.1:9119/api/status 2>/dev/null; then return 0; fi
@@ -95,7 +113,7 @@ wait_dashboard() {
   return 1
 }
 
-[ "${1:-}" = "--pull" ] && docker compose pull --quiet --ignore-buildable
+[ "$pull" = yes ] && docker compose pull --quiet --ignore-buildable
 
 docker compose config --quiet
 # Образ сервиса переписки собирается здесь же, из каталога service/.
@@ -120,7 +138,7 @@ if [ "$MODE" != hermes ]; then
   echo "пропущено: режим без Hermes — запись архива (MCP-сервер shturman) в настройки Hermes"
   echo "пропущено: режим без Hermes — ожидание дашборда Hermes"
   echo "Архив к своему Codex CLI или Claude Code владелец подключает по ./ops/connect.sh."
-  exec ./ops/doctor.sh
+  finish
 fi
 
 echo "Жду запуска контейнера…"
@@ -148,7 +166,7 @@ esac
 echo "Жду запуска Hermes…"
 if wait_dashboard; then
   echo "Дашборд Hermes отвечает на локальном адресе."
-  exec ./ops/doctor.sh
+  finish
 fi
 echo "Дашборд не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-hermes" >&2
 exit 1

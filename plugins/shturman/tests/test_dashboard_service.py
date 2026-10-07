@@ -68,6 +68,10 @@ def test_allowed_request_passes_with_the_service_token_and_nothing_from_the_brow
     ("POST", "ingest/business/deleted"), ("POST", "outbox/drafts"), ("POST", "processing/run"),
     ("GET", "status/%2e%2e/owner"), ("PUT", "status/%2e%2e/owner"), ("GET", "status/"), ("GET", ""),
     ("GET", "unknown"), ("POST", "status"), ("GET", "%2e%2e/mcp"), ("GET", "tg/login/a%2fb"),
+    # страница настройки переписки: проход дашборда к ней не ведёт никаким написанием пути
+    ("GET", "%2e%2e/shturman-setup/"), ("GET", "../shturman-setup/"), ("POST", "%2e%2e/shturman-setup/api/login"),
+    ("GET", "status/%2e%2e/%2e%2e/shturman-setup/"), ("GET", "shturman-setup/"), ("GET", "%2fshturman-setup/"),
+    ("GET", "setup"), ("POST", "setup/link"), ("POST", "setup-link"), ("POST", "setup/logout-all"),
 ])
 def test_everything_outside_the_allowlist_is_refused_before_the_service(web, service_env, method, path):
     response = web.request(method, f"{PREFIX}/service/{path}", json={"user_id": 1, "chat_id": 1})
@@ -195,3 +199,94 @@ def test_confirming_the_owner_works_without_the_service(web, monkeypatch):
     started = Pairing(store).start()
     Pairing(store).try_bind(started["code"], user_id=42, chat_id=42, name="Иван")
     assert web.post(f"{PREFIX}/pairing/confirm").json()["owner"]["user_id"] == 42
+
+
+# --- шаг мастера «Переписка»: состояние страницы настройки переписки ---------------------------
+
+PUBLIC = "https://assistant.example.com"
+SETUP_NOTHING = {"enabled": True, "origin_set": True, "tg_keys": False, "accounts": 0, "own_bot": False,
+                 "owner_bound": False, "business_connected": False, "own_model": False}
+SETUP_EVERYTHING = {"enabled": True, "origin_set": True, "tg_keys": True, "accounts": 2, "own_bot": True,
+                    "owner_bound": True, "business_connected": True, "own_model": True}
+
+
+@pytest.fixture
+def public(monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", PUBLIC)
+
+
+def test_correspondence_with_a_service_of_the_previous_version(web, service_env, public):
+    """Сервис 0.0.5 объекта setup не отдаёт: мастер открывается и говорит «обновите экземпляр»."""
+    service_env.replies[("GET", "/api/status")] = (200, {"messages": 1200, "chats": 14, "own_bot": False})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out == {"state": "outdated", "url": PUBLIC + "/shturman-setup/", "setup": None,
+                   "archive": {"messages": 1200, "chats": 14}}
+
+
+def test_correspondence_when_nothing_is_configured(web, service_env, public):
+    service_env.replies[("GET", "/api/status")] = (200, {"messages": 0, "chats": 0, "setup": SETUP_NOTHING})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "ok" and out["url"] == PUBLIC + "/shturman-setup/"
+    assert out["setup"] == {"origin_set": True, "tg_keys": False, "own_bot": False, "owner_bound": False,
+                            "business_connected": False, "own_model": False, "accounts": 0}
+    assert out["archive"] == {"messages": 0, "chats": 0}
+
+
+def test_correspondence_when_everything_is_configured(web, service_env, public):
+    service_env.replies[("GET", "/api/status")] = (
+        200, {"messages": 300000, "chats": 87, "setup": SETUP_EVERYTHING})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "ok"
+    assert out["setup"] == {"origin_set": True, "tg_keys": True, "own_bot": True, "owner_bound": True,
+                            "business_connected": True, "own_model": True, "accounts": 2}
+    assert out["archive"] == {"messages": 300000, "chats": 87}
+
+
+def test_correspondence_asks_the_service_one_read_only_question_and_leaks_nothing(web, service_env, public):
+    link = "/shturman-setup/#" + "k" * 43
+    service_env.replies[("GET", "/api/status")] = (
+        200, {"messages": 5, "chats": 1, "setup": dict(SETUP_NOTHING, login_link=link, own_bot="да")})
+    response = web.get(f"{PREFIX}/correspondence", headers={"Cookie": "hermes_session=abc"})
+    assert response.status_code == 200
+    assert [(r["method"], r["path"]) for r in service_env.requests] == [("GET", "/api/status")]
+    assert "cookie" not in service_env.requests[0]["headers"]
+    assert service_env.token not in response.text and "k" * 43 not in response.text
+    assert response.json()["setup"]["own_bot"] is None           # строка вместо признака — не признак
+    # Мастер только спрашивает: записать что-либо этим адресом нельзя.
+    for method in ("POST", "PUT", "DELETE"):
+        assert web.request(method, f"{PREFIX}/correspondence").status_code == 405
+
+
+def test_correspondence_without_the_service(web, public):
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "no_service" and out["setup"] is None
+
+
+def test_correspondence_when_the_service_does_not_answer(web, monkeypatch, public, caplog):
+    monkeypatch.setenv("SHTURMAN_SERVICE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("SHTURMAN_API_TOKEN", "t" * 40)
+    with caplog.at_level(logging.DEBUG):
+        out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "unreachable" and out["setup"] is None and out["url"] == PUBLIC + "/shturman-setup/"
+    assert "t" * 40 not in caplog.text
+
+
+def test_correspondence_when_the_service_rejects_the_plugin_token(web, service_env, public):
+    service_env.token = "другой" * 8
+    assert web.get(f"{PREFIX}/correspondence").json()["state"] == "unreachable"
+
+
+def test_correspondence_without_a_public_address_gives_no_link(web, service_env, monkeypatch):
+    """Аварийный режим или адрес не задан: кнопки нет, страница открывается через туннель."""
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    service_env.replies[("GET", "/api/status")] = (200, {"setup": dict(SETUP_NOTHING, origin_set=False)})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["url"] is None and out["state"] == "ok" and out["setup"]["origin_set"] is False
+
+
+def test_state_still_does_not_call_the_service_and_knows_nothing_of_the_plugin_to_install(web, service_env):
+    state = web.get(f"{PREFIX}/state").json()
+    assert state["business"] == {"connected": False, "can_reply": False, "updated_at": None}
+    assert service_env.requests == []
+    assert web.post(f"{PREFIX}/mark", json={"key": "correspondence_seen"}).status_code == 200
+    assert web.post(f"{PREFIX}/mark", json={"key": "business_skipped"}).status_code == 200      # прежняя отметка

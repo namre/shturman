@@ -8,7 +8,16 @@ const BASE = process.env.E2E_BASE || 'http://shturman.test:8080';
 const cli = (args) => execSync(`${PYTHON} ${PLUGIN}cli.py ${args}`, {encoding:'utf8', stdio:['ignore','pipe','ignore']}).trim();
 const py = (code) => execSync(`${PYTHON} -c "import sys; sys.path.insert(0,'${PLUGIN}'); ${code}"`, {encoding:'utf8'}).trim();
 const out = []; const check = (n, ok, extra='') => out.push(`${ok?'PASS':'FAIL'}  ${n}${extra?' — '+extra:''}`);
-const shot = (page, name) => page.screenshot({ path: `${OUT}/w-${name}.png`, fullPage: true });
+// Дашборд прокручивает содержимое внутри себя, и снимок «всей страницы» захватывает только видимую
+// часть. Поэтому на время снимка окно растягивается по высоте содержимого мастера.
+const shot = async (page, name) => {
+  const view = page.viewportSize();
+  const need = await page.evaluate(() => { const el = document.querySelector('.shturman'); return el ? Math.ceil(el.scrollHeight) + 260 : 0; });
+  if (need > view.height) await page.setViewportSize({ width: view.width, height: Math.min(need, 6000) });
+  await page.evaluate(() => { const el = document.querySelector('.shturman'); if (el) el.scrollIntoView({ block: 'start' }); });
+  await page.screenshot({ path: `${OUT}/w-${name}.png`, fullPage: true });
+  if (need > view.height) await page.setViewportSize(view);
+};
 
 // чистое состояние мастера (ключ подписи оставляем)
 execSync(`rm -f ${HOME}/plugin-data/shturman/{wizard,owner,pairing,business,login,activation}.json`, {shell:'/bin/bash'});
@@ -19,6 +28,8 @@ const ctx = await browser.newContext({ viewport: { width: 1360, height: 900 } })
 const page = await ctx.newPage();
 const errors = []; page.on('console', m => { if (m.type()==='error') errors.push(m.text()); });
 page.on('pageerror', e => errors.push('pageerror: ' + e.message));
+// Все запросы страницы: мастер не должен ходить ни на страницу настройки переписки, ни в проход к сервису.
+const requested = []; page.on('request', r => requested.push(r.url()));
 
 process.on('uncaughtException', async (e) => { try { await shot(page, 'debug'); } catch (_) {} console.log(out.join('\n')); console.log('ERRORS', errors.join(' || ')); console.log(String(e).split('\n').slice(0,4).join('\n')); process.exit(2); });
 // вход по ссылке активации → сразу мастер
@@ -110,37 +121,91 @@ check('домашний чат записан', envText === '0' /* PUT /api/env 
 await shot(page, '3-bot-done');
 await page.click('.shturman-actions button:has-text("Далее")');
 
-// --- шаг 4: бизнес-режим ---
-let pluginOn = false; const installs = [];
-await page.route('**/api/dashboard/plugins/hub*', r => r.fulfill({ json: { plugins: pluginOn ? [{ name: 'telegram-business', runtime_status: 'enabled' }] : [] } }));
-await page.route('**/api/dashboard/agent-plugins/install*', r => { installs.push(r.request().postDataJSON()); pluginOn = true; r.fulfill({ json: { ok: true, plugin_name: 'telegram-business', enabled: true } }); });
-await page.reload(); await page.waitForSelector('.shturman-stepper');
-await page.click('.shturman-stepbtn:has-text("Бизнес-режим")');
-await page.waitForSelector('button:has-text("Установить защиту")');
-check('инструкции закрыты до установки защиты', (await page.locator('text=Откроется после установки защиты.').count()) === 2);
-await shot(page, '4-business-locked');
-await page.click('button:has-text("Установить защиту")');
-await page.waitForSelector('text=Плагин установлен и включён.', { timeout: 30000 });
-check('плагин ставится по полному SHA', installs[0]?.ref?.length === 40 && installs[0]?.identifier === 'NousResearch/hermes-telegram-business', installs[0]?.ref);
-await shot(page, '4-business-open');
-await page.click('button:has-text("Проверить подключение")');
-await page.waitForSelector('text=Подключения пока не вижу');
+// --- шаг 4: переписка ---
+// Настройка идёт на отдельной странице сервиса переписки; мастер показывает состояние и ссылку.
+const steps = (await page.locator('.shturman-stepbtn').allTextContents()).map(t => t.replace(/^\d+/, '').trim());
+check('шагов пять, шага «Бизнес-режим» нет', steps.join(' | ') === 'Помощник | Модель | Бот в Telegram | Переписка | Готово', steps.join(' | '));
+await page.waitForSelector('h2:has-text("Переписка")');
+const SETUP_URL = BASE + '/shturman-setup/';
+const openLink = page.locator('a:has-text("Открыть настройку переписки")');
+// На стенде сервиса переписки нет — это настоящий ответ плагина, без подмены.
+await page.waitForSelector('text=Сервис переписки не подключён к ассистенту');
+check('без сервиса мастер говорит об этом и ссылку не показывает', (await openLink.count()) === 0);
+check('два бота объяснены', await page.isVisible('text=В бизнес-режиме Telegram его не подключают.') && await page.isVisible('text=К нему подключается бизнес-режим Telegram.'));
+check('бот-ассистент назван по имени', await page.isVisible('text=С ним вы разговариваете: @ivan_shturman_bot'));
+check('сказано, как войти, а ссылки входа нет', await page.isVisible('text=Первый раз — по одноразовой ссылке.') && await page.isVisible('text=Потом — по коду от бота согласований.') && !(await page.content()).includes('shturman-setup/#'));
+await shot(page, '4-correspondence-noservice');
+
+// Дальше ответ о состоянии подменяется: сервис прежней версии, пустой, настроенный.
+let corr = { state: 'outdated', url: SETUP_URL, setup: null, archive: { messages: 1200, chats: 14 } };
+await page.route('**/api/plugins/shturman/correspondence', r => r.fulfill({ json: corr }));
+const refresh = async (text) => { await page.click('button:has-text("Обновить")'); await page.waitForSelector(text); };
+await refresh('text=Страница настройки переписки недоступна — обновите экземпляр');
+check('сервис прежней версии: «обновите экземпляр», ссылки нет', (await openLink.count()) === 0);
+await shot(page, '4-correspondence-outdated');
+
+const nothing = { origin_set: true, tg_keys: false, own_bot: false, owner_bound: false, business_connected: false, own_model: false, accounts: 0 };
+corr = { state: 'ok', url: SETUP_URL, setup: nothing, archive: { messages: 0, chats: 0 } };
+await refresh('text=Ещё не создан');
+check('ссылка на страницу настройки — обычная, в новой вкладке', (await openLink.getAttribute('href')) === SETUP_URL && (await openLink.getAttribute('target')) === '_blank' && (await openLink.getAttribute('rel')) === 'noopener noreferrer');
+check('ничего не настроено: шаг можно отложить', await page.isVisible('.shturman-actions button:has-text("Настрою позже")') && await page.isVisible('text=Не подключены'));
+await shot(page, '4-correspondence-empty');
+
+corr = { state: 'ok', url: SETUP_URL, setup: { ...nothing, tg_keys: true, own_bot: true, owner_bound: true, business_connected: true, own_model: true, accounts: 2 }, archive: { messages: 300000, chats: 87 } };
+await refresh('.shturman-facts .shturman-sumrow:has-text("Бизнес-режим") >> text=Подключён');
+const facts = (await page.locator('.shturman-col-aside .shturman-sumrow').allTextContents()).join(' | ');
+check('всё настроено: состояние показано числами и признаками', /Бот согласованийЕсть/.test(facts) && /Аккаунты Telegram2/.test(facts) && /Сообщений в архиве300\s000/.test(facts), facts);
+await shot(page, '4-correspondence-ready');
+
+// Бот-ассистент подключён в бизнес-режиме (схема до 0.0.6): мастер говорит об этом, но ничего не ломает.
 py(`from shturman_core.state import Store; Store().write('business', {'connected': True, 'can_reply': False, 'updated_at': 1})`);
-await page.click('button:has-text("Проверить подключение")');
-await page.waitForSelector('text=Бизнес-режим подключён.');
-check('подключение видно после события от Telegram', true);
-await page.click('.shturman-actions button:has-text("Далее")');
-await page.waitForSelector('h2:has-text("Переписка и память")');
-await shot(page, '5-later');
+await page.reload(); await page.waitForSelector('.shturman-stepper');
+await page.click('.shturman-stepbtn:has-text("Переписка")');
+await page.waitForSelector('text=Сейчас в бизнес-режиме Telegram подключён бот-ассистент');
+await shot(page, '4-correspondence-legacy');
+py(`from shturman_core.state import Store; Store().delete('business')`);
+await page.reload(); await page.waitForSelector('.shturman-stepper');
+await page.click('.shturman-stepbtn:has-text("Переписка")');
+await page.waitForSelector('.shturman-sumrow:has-text("Аккаунты Telegram")');
+check('без прежнего подключения предупреждения нет', !(await page.isVisible('text=Сейчас в бизнес-режиме Telegram подключён бот-ассистент')));
+
 await page.click('.shturman-actions button:has-text("Далее")');
 await page.waitForSelector('h2:has-text("Курс проложен")');
-await shot(page, '6-done');
+const sumRow = await page.textContent('.shturman-sumrow:has-text("Переписка")');
+check('в итоге одна строка «Переписка» с состоянием', /Бот согласований привязан, аккаунтов Telegram: 2, бизнес-режим подключён, сообщений в архиве: 300\s000/.test(sumRow) && !(await page.isVisible('.shturman-sumlabel:has-text("Бизнес-режим")')), sumRow);
+await shot(page, '5-done');
 await page.click('button:has-text("Завершить настройку")');
 await page.waitForSelector('text=Настройка завершена');
 check('настройка отмечена завершённой', true);
+const marks = py(`import json; from shturman_core.state import Store; print(json.dumps(sorted(Store().read('wizard').get('marks', {}))))`);
+check('шаг «Переписка» отмечен пройденным', JSON.parse(marks).includes('correspondence_seen'), marks);
+
+// узкий экран: шаг «Переписка»
+await page.setViewportSize({ width: 390, height: 800 });
+await page.click('.shturman-stepbtn:has-text("Переписка")');
+await page.waitForSelector('h2:has-text("Переписка")');
+const overflowCorr = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+check('шаг «Переписка» на телефоне без горизонтальной прокрутки', overflowCorr <= 1, 'лишних px: ' + overflowCorr);
+await shot(page, '4-correspondence-phone');
+corr = { state: 'ok', url: SETUP_URL, setup: nothing, archive: { messages: 0, chats: 0 } };
+await refresh('text=Ещё не создан');
+await shot(page, '4-correspondence-empty-phone');
+await page.setViewportSize({ width: 1360, height: 900 });
+
+// Экземпляр, прошедший прежний мастер, но не завершивший его: отметка business_skipped, шаг «later».
+// После обновления мастер открывается на итоге, шаг «Переписка» уже пройден.
+py(`from shturman_core.state import Store; s = Store(); d = s.read('wizard'); d['marks'] = {'persona_saved': 1, 'model_ok': 2, 'bot_applied': 3, 'business_skipped': 4}; d.pop('completed_at', None); d['step'] = 'later'; s.write('wizard', d)`);
+await page.goto(BASE + '/shturman'); await page.waitForSelector('.shturman-stepper');
+check('прежнее состояние мастера: открыт итог', (await page.textContent('.shturman-stepbtn.is-active')).includes('Готово'));
+check('прежнее состояние мастера: «Переписка» пройдена', (await page.locator('.shturman-stepbtn.is-done:has-text("Переписка")').count()) === 1);
+await page.click('button:has-text("Завершить настройку")');
+await page.waitForSelector('text=Настройка завершена');
+
+const stray = requested.filter(u => u.includes('/shturman-setup') || u.includes('/api/plugins/shturman/service/') || u.includes('agent-plugins/install'));
+check('мастер не обращался к странице настройки, проходу к сервису и установке плагинов', stray.length === 0, stray.slice(0, 3).join(' | '));
 check('страница без ошибок в консоли', errors.length === 0, errors.slice(0,3).join(' | '));
 
-// узкий экран
+// узкий экран: шаг «Бот в Telegram»
 await page.setViewportSize({ width: 390, height: 800 });
 await page.click('.shturman-stepbtn:has-text("Бот в Telegram")');
 await page.waitForSelector('h2:has-text("Бот в Telegram")');
