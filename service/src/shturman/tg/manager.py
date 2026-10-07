@@ -176,8 +176,9 @@ class TgManager:
     def require_configured(self) -> None:
         if not self.configured:
             raise TgError(
-                "Работа с аккаунтами Telegram не настроена: не заданы ключи приложения "
-                "(TELEGRAM_API_ID и TELEGRAM_API_HASH).", 503)
+                "Работа с аккаунтами Telegram не настроена: не заданы ключи приложения. Владелец вводит их "
+                "на странице настройки переписки, шаг 1; запасной путь — TELEGRAM_API_ID и "
+                "TELEGRAM_API_HASH в настройках сервера.", 503)
 
     def _default_factory(self, role: str, path: Any, policy: RequestPolicy, on_reconnect: Any) -> Any:
         return make_client_factory(self.config)(role, path, policy, on_reconnect)
@@ -521,10 +522,12 @@ class TgManager:
                     "SELECT EXISTS (SELECT 1 FROM accounts WHERE role = 'owner')")
             if not owner_known:
                 raise TgError(
-                    "Сначала привяжите себя к боту как владельца: в мастере настройки, а если у сервиса "
-                    "свой бот согласований — ссылкой из `./ops/bot-bind.sh`. Пока сервис не знает, "
-                    "какой аккаунт — ваш основной, он не сможет отличить его от помощника, а помощнику "
-                    "разрешена отправка сообщений. После привязки подключите помощника снова.", 409)
+                    "Сервис ещё не знает, какой аккаунт ваш основной. Сначала подключите основной аккаунт: "
+                    "на странице настройки переписки это шаг 2, в терминале — `./ops/tg-login.sh owner`. "
+                    "Другой способ — привяжите себя как владельца к боту: бота согласований привязывают "
+                    "на той же странице, в разделе «Дополнительно», или ссылкой из `./ops/bot-bind.sh`. "
+                    "Иначе сервис не сможет отличить основной аккаунт от помощника, а помощнику "
+                    "разрешена отправка сообщений. После этого подключите помощника снова.", 409)
         current = self.runtimes.get(role)
         if current is not None and current.status in ACTIVE:
             raise TgError(f"{ROLE_NAMES[role].capitalize()} уже подключён. Чтобы сменить его, сначала выйдите.", 409)

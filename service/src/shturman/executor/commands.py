@@ -118,7 +118,8 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
         if bot.get("bind_paused"):
             print("  приём кодов привязки приостановлен: было много неверных кодов. Подождите 10 минут.")
         if bot.get("business_capable") is False:
-            print("  бизнес-режим: у бота он выключен (в @BotFather: Bot Settings → Business Mode)")
+            print("  бизнес-режим: у бота он выключен (в @BotFather: Bot Settings → Secretary Mode; "
+                  "раньше пункт назывался Business Mode)")
         counters = bot.get("counters") or {}
         if counters:
             print("  счётчики: " + ", ".join(f"{k}={v}" for k, v in sorted(counters.items())))
