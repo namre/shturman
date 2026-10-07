@@ -5,17 +5,23 @@
 #
 # ВАЖНО для агента: то, что печатает скрипт, — одноразовый пропуск в дашборд. Передай ссылку
 # владельцу как есть и больше нигде её не сохраняй: ни в состоянии, ни в журнале, ни в отчёте.
+# Запускай только по просьбе владельца в текущей сессии: это стоп-точка (AGENTS.md).
+#
+# Параметров нет. -h, --help — эта справка; ссылка при этом не выпускается.
+# Только для режима с Hermes. Вход на страницу настройки переписки — ./ops/setup-link.sh.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
+ops_no_args "$@"
 # Без Hermes дашборда нет, а владелец привязывается к боту согласований: ./ops/bot-bind.sh.
 require_hermes "дашборда и входа в него"
 
 c=shturman-hermes
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
-url="$(grep -E '^SHTURMAN_PUBLIC_URL=' .env | tail -n 1 | cut -d= -f2- || true)"
+url="$(env_get SHTURMAN_PUBLIC_URL)"
 [ -n "$url" ] || { echo "не задан адрес — сначала ./ops/set-public-url.sh https://ваш-адрес" >&2; exit 1; }
-[ "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)" = "running" ] \
+[ "$(container_state "$c")" = "running" ] \
   || { echo "контейнер $c не запущен — сначала ./ops/up.sh" >&2; exit 1; }
 
 # Под тем же пользователем, под которым работает Hermes: иначе он не прочитает созданный файл.

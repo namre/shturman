@@ -2,9 +2,12 @@
 # Проверка здоровья экземпляра. Ничего не меняет и не читает секретов.
 # Вывод: строки "PASS|WARN|FAIL|SKIP  имя: подробности". Код возврата 1, если есть FAIL.
 # SKIP — проверка к режиму установки не относится (режим без Hermes, docs/standalone.md).
+# Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
+ops_no_args "$@"
 
 fails=0
 pass() { printf 'PASS  %s: %s\n' "$1" "$2"; }
@@ -82,11 +85,11 @@ else
   warn public-url "внешний адрес не задан — дашборд доступен только с самого сервера (./ops/set-public-url.sh)"
 fi
 
-owner_bound=no; wizard_done=no; plugin_own_bot=unknown
+owner_bound=no; wizard_done=no; plugin_own_bot=unknown; hermes_business=no
 while IFS='=' read -r k v; do
   case "$k" in
     owner_bound) owner_bound="$v" ;; wizard_completed) wizard_done="$v" ;;
-    bridge_own_bot) plugin_own_bot="$v" ;;
+    bridge_own_bot) plugin_own_bot="$v" ;; hermes_business) hermes_business="$v" ;;
   esac
 done <<EOF2
 $(hpy /opt/data/plugins/shturman/cli.py status)
@@ -103,7 +106,11 @@ else warn bot-owner "владелец не привязан — бот нико�
 if [ "$wizard_done" = "yes" ]; then pass wizard "мастер настройки пройден"
 else warn wizard "мастер настройки не завершён"; fi
 
-# --- плагин бизнес-режима ---
+# --- бизнес-режим Telegram ---
+# С версии 0.0.6 бизнес-режим подключается к боту согласований сервиса (страница настройки
+# переписки), а бота-ассистента в бизнес-режиме не подключают. Официальный плагин бизнес-режима
+# мастер больше не ставит. На экземпляре, где он уже установлен, проверка его не трогает и только
+# сообщает об этом: от сообщений собеседников ядро Hermes в любом случае закрывает плагин shturman.
 # Состояние берём из настроек и каталога плагинов, а не из таблицы `hermes plugins list`:
 # в ней статус «not enabled» содержит слово «enabled».
 biz="$(hpy -c '
@@ -114,11 +121,15 @@ name = "telegram-business"
 installed = os.path.isdir(os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "plugins", name))
 enabled = name in (p.get("enabled") or []) and name not in (p.get("disabled") or [])
 print("enabled" if installed and enabled else "installed" if installed else "absent")' | tail -n 1)"
+biz_rule="бота-ассистента в бизнес-режиме не подключают; бизнес-режим — у бота согласований (страница настройки переписки)"
 case "$biz" in
-  enabled)   pass business-plugin "установлен и включён" ;;
-  installed) fail business-plugin "установлен, но не включён — бизнес-режим в Telegram подключать нельзя" ;;
-  *)         warn business-plugin "не установлен — бота в бизнес-режиме в Telegram НЕ подключать (issue #127430)" ;;
+  enabled)   pass business-plugin "$biz_rule. Официальный плагин бизнес-режима на этом экземпляре установлен и включён (так делали до 0.0.6) — проверка его не трогает" ;;
+  installed) pass business-plugin "$biz_rule. Официальный плагин бизнес-режима на этом экземпляре установлен, но не включён — проверка его не трогает" ;;
+  *)         pass business-plugin "$biz_rule" ;;
 esac
+if [ "$hermes_business" = "yes" ]; then
+  warn business-hermes "бот-ассистент сейчас подключён в бизнес-режиме Telegram (схема до 0.0.6). Решает владелец: оставить как есть или отключить его в настройках Telegram и подключить бота согласований — UPGRADING.md, «0.0.5 → 0.0.6»"
+fi
 
 else
   skip hermes "пропущено: режим без Hermes — контейнер, дашборд, вход, мастер, плагины Hermes не проверяются"
@@ -202,6 +213,93 @@ print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n
     fail archive "сервис не отдал состояние"
   fi
 
+  # --- страница настройки переписки ---
+  # Её отдаёт сам сервис по пути /shturman-setup/, за собственным входом. Из объекта setup
+  # в состоянии сервиса берутся только признаки и числа: ни токенов, ни имён, ни ссылок входа.
+  setup_known=no; setup_enabled=unknown; setup_origin=unknown; setup_keys=unknown; setup_accounts=0
+  setup_bot=unknown; setup_owner=unknown; setup_business=unknown; setup_model=unknown
+  while IFS='=' read -r k v; do
+    case "$k" in
+      setup_known) setup_known="$v" ;; setup_enabled) setup_enabled="$v" ;; setup_origin) setup_origin="$v" ;;
+      setup_keys) setup_keys="$v" ;; setup_accounts) setup_accounts="$v" ;; setup_bot) setup_bot="$v" ;;
+      setup_owner) setup_owner="$v" ;; setup_business) setup_business="$v" ;; setup_model) setup_model="$v" ;;
+    esac
+  done <<EOF4
+$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+s = d.get("setup") if isinstance(d, dict) else None
+if not isinstance(s, dict):
+    print("setup_known=no")
+    sys.exit(0)
+yn = lambda v: "yes" if v is True else "no" if v is False else "unknown"
+num = lambda v: str(v) if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 10**6 else "0"
+print("setup_known=yes")
+print("setup_enabled=" + yn(s.get("enabled")))
+print("setup_origin=" + yn(s.get("origin_set")))
+print("setup_keys=" + yn(s.get("tg_keys")))
+print("setup_accounts=" + num(s.get("accounts")))
+print("setup_bot=" + yn(s.get("own_bot")))
+print("setup_owner=" + yn(s.get("owner_bound")))
+print("setup_business=" + yn(s.get("business_connected")))
+print("setup_model=" + yn(s.get("own_model")))' 2>/dev/null)
+EOF4
+  word() { case "$1" in yes) printf '%s' "$2" ;; no) printf '%s' "$3" ;; *) printf 'неизвестно' ;; esac; }
+  if [ -z "$st" ]; then
+    :   # сервис не отдал состояние — об этом уже сказано строкой archive
+  elif [ "$setup_known" != "yes" ]; then
+    warn setup-page "страница настройки переписки недоступна: сервис её состояние не отдаёт — это сервис прежней версии, обновите экземпляр (UPGRADING.md)"
+  elif [ "$setup_enabled" != "yes" ]; then
+    warn setup-page "страница настройки переписки в сервисе выключена"
+  else
+    # Тело ответа сохраняется на время проверки: с ним сверяется ответ по внешнему адресу.
+    setup_tmp="$(mktemp -d)"
+    code="$(curl -s -o "$setup_tmp/local" -m 5 -w '%{http_code}' http://127.0.0.1:8765/shturman-setup/ 2>/dev/null)"
+    if [ "${code:-000}" = "200" ]; then
+      pass setup-page "страница настройки переписки отвечает на локальном адресе (вход — ./ops/setup-link.sh, по просьбе владельца)"
+    else
+      fail setup-page "страница настройки переписки не отвечает на 127.0.0.1:8765/shturman-setup/ (HTTP ${code:-000}) — docker logs --tail 50 $svc"
+    fi
+    if [ "$MODE" = hermes ] && [ -n "${public_url:-}" ]; then
+      if [ "$setup_origin" != "yes" ]; then
+        warn setup-origin "сервис переписки запущен без внешнего адреса — по внешнему адресу страница настройки вход не примет: запустите ./ops/up.sh"
+      fi
+      ext="$(curl -s -o "$setup_tmp/public" -m 8 -w '%{http_code} %{redirect_url}' "$public_url/shturman-setup/" 2>/dev/null)"
+      ext_code="${ext%% *}"; ext_to="${ext#* }"
+      proxy_hint="прокси не отдаёт путь /shturman-setup/ сервису переписки — добавьте блок из config/Caddyfile.example (правка прокси — стоп-точка); до тех пор страница открывается через туннель SSH: ./ops/setup-link.sh --local"
+      case "${ext_code:-000}" in
+        200)
+          if [ "${code:-000}" = "200" ] && cmp -s "$setup_tmp/local" "$setup_tmp/public"; then
+            pass setup-page-public "страница настройки переписки открывается по внешнему адресу"
+          else
+            warn setup-page-public "по внешнему адресу /shturman-setup/ отвечает не то же, что сервис переписки на локальном: проверьте из браузера, что открывается страница настройки, и блок /shturman-setup/* в прокси (config/Caddyfile.example)"
+          fi ;;
+        30[1-8]|401|403)
+          case "$ext_to" in
+            # Так отвечает сам дашборд Hermes на незнакомый путь без сессии (проверено на 0.21.5).
+            *"/auth/login?provider="*|*"/shturman-auth/"*)
+              warn setup-page-public "по внешнему адресу /shturman-setup/ отвечает дашборд Hermes (отправляет на свой вход): $proxy_hint" ;;
+            *)
+              warn setup-page-public "перед адресом стоит внешняя защита (HTTP $ext_code) — проверьте страницу настройки переписки из браузера" ;;
+          esac ;;
+        *) warn setup-page-public "страница настройки переписки по внешнему адресу не открывается (HTTP ${ext_code:-000}): $proxy_hint" ;;
+      esac
+    elif [ "$MODE" = hermes ]; then
+      warn setup-page-public "внешний адрес не задан — страница настройки переписки открывается только с сервера или через туннель SSH (./ops/setup-link.sh)"
+    fi
+    rm -rf "$setup_tmp"
+
+    setup_line="бот согласований: $(word "$setup_bot" "задан" "не задан"), владелец: $(word "$setup_owner" "привязан" "не привязан"), ключи приложения Telegram: $(word "$setup_keys" "заданы" "не заданы"), аккаунтов Telegram: ${setup_accounts:-0}, бизнес-режим: $(word "$setup_business" "подключён" "не подключён"), своя модель сервиса: $(word "$setup_model" "задана" "не задана")"
+    if [ "${setup_accounts:-0}" -gt 0 ] || [ "$setup_business" = "yes" ]; then
+      pass setup-state "$setup_line"
+    else
+      warn setup-state "$setup_line. Сбор переписки не настроен: нет ни аккаунта, ни бизнес-режима — владелец настраивает его на странице настройки переписки"
+    fi
+  fi
+
   # Защита от внедрённых инструкций: включена ли, отвечает ли модель и сколько входящих сообщений
   # ассистент видит непроверенными. Только числа и состояния.
   grd="$(container_state shturman-guard off)"
@@ -273,7 +371,7 @@ EOF3
     if [ "$MODE" = standalone ]; then fail approvals-bot "сервис не отдал состояние бота согласований — docker logs --tail 50 $svc"; fi
   elif [ "$bot_configured" = no ]; then
     if [ "$MODE" = standalone ]; then
-      warn approvals-bot "бот согласований не настроен — карточки и кнопки владельцу доставить некому; токен вводит владелец: ./ops/init-env.sh, затем ./ops/up.sh"
+      warn approvals-bot "бот согласований не настроен — карточки и кнопки владельцу доставить некому; токен вводит владелец — на странице настройки переписки (./ops/setup-link.sh) либо в терминале: ./ops/init-env.sh, затем ./ops/up.sh"
     fi
   else
     if [ -n "$bot_problem" ]; then
@@ -281,7 +379,7 @@ EOF3
     elif [ "$bot_polling" = yes ]; then pass approvals-bot "бот согласований на связи с Telegram"
     else warn approvals-bot "бот согласований ещё не начал опрос Telegram — повторите проверку через минуту"; fi
     if [ "$bot_owner" = yes ]; then pass approvals-owner "владелец привязан к боту согласований"
-    else warn approvals-owner "владелец не привязан — карточки не отправляются, кнопки не действуют: ./ops/bot-bind.sh"; fi
+    else warn approvals-owner "владелец не привязан — карточки не отправляются, кнопки не действуют: привязка — на странице настройки переписки либо ./ops/bot-bind.sh"; fi
     if [ "$bot_business" = no ]; then
       warn approvals-business "у бота выключен бизнес-режим — он нужен, только если подключать личные чаты (у @BotFather: Bot Settings → Business Mode)"
     fi

@@ -9,14 +9,23 @@
 # модель скачивается заново.
 #   ./ops/backup.sh            — сделать копию и проверить, что она читается
 #   ./ops/backup.sh --list     — показать имеющиеся копии
+#   ./ops/backup.sh --help     — эта справка; ничего не создаётся
 # Восстановление поверх данных — стоп-точка, отдельной процедурой.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
+ops_help "$@"
+case "${1:-}" in
+  ""|--list) ;;
+  *) ops_unknown "$1" ;;
+esac
+[ $# -le 1 ] || ops_unknown "$2"
 
 dir="local/backups"
 mkdir -p "$dir"; chmod 700 local "$dir"
 
 if [ "${1:-}" = "--list" ]; then
+  # shellcheck disable=SC2012
   ls -lh "$dir" 2>/dev/null | awk 'NR>1 {print $5, $6, $7, $8, $9}'
   exit 0
 fi

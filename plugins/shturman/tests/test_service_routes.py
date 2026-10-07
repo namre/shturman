@@ -140,6 +140,29 @@ def test_path_tricks_do_not_pass(path):
             assert not allowed(routes, method, path)
 
 
+SETUP_PAGE = [
+    "/shturman-setup/", "/shturman-setup", "/shturman-setup/index.html", "/shturman-setup/api/login",
+    "/shturman-setup/api/tg/login", "/api/../shturman-setup/", "/api/status/../../shturman-setup/",
+    "/api/%2e%2e/shturman-setup/", "//shturman-setup/", "/api/shturman-setup/", "/api/setup",
+    "/api/setup/link", "/api/setup-link", "/api/setup/logout-all", "/mcp", "/health",
+]
+
+
+@pytest.mark.parametrize("path", SETUP_PAGE)
+def test_nobody_reaches_the_setup_page_through_the_plugin(path):
+    """Страница настройки переписки живёт мимо Hermes: ни проход дашборда, ни мост, ни инструменты
+    агента не могут ни открыть её, ни выпустить ссылку входа, ни завершить её сессии."""
+    for routes in (BRIDGE, TOOLS, UI):
+        for method in ("GET", "POST", "PUT", "DELETE"):
+            assert not allowed(routes, method, path)
+
+
+def test_every_allowed_pattern_stays_inside_the_internal_api():
+    for routes in (BRIDGE, TOOLS, UI):
+        for _method, pattern in routes:
+            assert pattern.pattern.startswith("/api/") and "setup" not in pattern.pattern
+
+
 def test_method_must_match_and_types_are_checked():
     assert allowed(UI, "get", "/api/status")
     assert not allowed(UI, "POST", "/api/status")
@@ -155,6 +178,8 @@ _SAMPLES = {"{import_id}": "a" * 32, "{login_id}": "abc", "{action}": "close", "
 # Маршруты сервиса, которые из плагина не вызывает никто: создание черновика доступно только
 # агенту, запуск обработки и MCP — не через плагин.
 _NOBODY = {("POST", "/api/processing/run"), ("POST", "/mcp")}
+# Страница настройки переписки и всё под её префиксом — тоже никому: у неё свой вход, мимо Hermes.
+_NOBODY_PREFIX = "/shturman-setup"
 
 
 def _service_routes() -> list[tuple[str, str]]:
@@ -173,8 +198,11 @@ def _service_routes() -> list[tuple[str, str]]:
 def test_every_service_route_is_assigned_and_every_pattern_is_real():
     real = _service_routes()
     assert len(real) > 50                                   # разбор действительно что-то нашёл
+    setup_page = [(m, p) for m, p in real if p.startswith(_NOBODY_PREFIX)]
+    assert not any(allowed(r, m, p) for m, p in setup_page for r in (BRIDGE, TOOLS, UI))
     unassigned = [(m, p) for m, p in real
-                  if (m, p) not in _NOBODY and not any(allowed(r, m, p) for r in (BRIDGE, TOOLS, UI))]
+                  if (m, p) not in _NOBODY and (m, p) not in setup_page
+                  and not any(allowed(r, m, p) for r in (BRIDGE, TOOLS, UI))]
     assert unassigned == []                                 # новый маршрут сервиса нужно явно отнести к роли
     for routes in (BRIDGE, TOOLS, UI):
         for method, pattern in routes:

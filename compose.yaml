@@ -91,6 +91,10 @@ services:
       SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
       SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
       SHTURMAN_NIGHTLY_AT: ${SHTURMAN_NIGHTLY_AT:-03:30}
+      # Внешний адрес экземпляра — для страницы настройки переписки (/shturman-setup/), которую
+      # сервис отдаёт сам, за собственным входом. Пусто (режим без Hermes, адрес не задан) —
+      # страница открывается только с самого сервера или через туннель SSH: ./ops/setup-link.sh.
+      SHTURMAN_SETUP_ORIGIN: ${SHTURMAN_PUBLIC_URL:-}
       # Отправка сообщений выключена, пока владелец не включит её сам в .env (docs/service.md);
       # без своего бота согласований (SHTURMAN_BOT_TOKEN) значение on не действует.
       # Через API это значение не меняется.
@@ -124,6 +128,8 @@ services:
     # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста,
     # а в режиме standalone — клиент владельца (Codex CLI, Claude Code) с этого же сервера
     # или через SSH-туннель (./ops/connect.sh). Наружу порт не публикуется ни в одном режиме.
+    # В режиме с Hermes обратный прокси на хосте отдаёт наружу один префикс этого порта —
+    # /shturman-setup/ (config/Caddyfile.example); /api/* и /mcp наружу не выходят.
     ports:
       - "127.0.0.1:8765:8765"
     # backend — к базе, эмбеддингам и классификатору защиты; egress — выход к Telegram

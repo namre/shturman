@@ -1,7 +1,7 @@
 {
   "name": "shturman",
   "label": "Штурман",
-  "description": "Мастер первой настройки: помощник, модель, бот в Telegram, бизнес-режим.",
+  "description": "Мастер первой настройки: помощник, модель, бот в Telegram, переписка.",
   "icon": "Sparkles",
   "version": "0.0.5",
   "tab": { "path": "/shturman", "position": "before:sessions" },

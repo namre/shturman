@@ -273,3 +273,21 @@ def test_cli_status_tells_doctor_whether_the_bridge_is_in_own_bot_mode(store):
     stats.set_flag("own_bot", False)
     heartbeat.tick()
     assert own_bot_line() == "bridge_own_bot=no"
+
+
+def test_cli_status_tells_doctor_when_the_assistant_bot_is_connected_in_business_mode(store):
+    """Схема до 0.0.6: бот-ассистент подключён в бизнес-режиме. ops/doctor.sh сообщает об этом
+    владельцу и ничего не трогает; по умолчанию признак — «нет»."""
+    import cli
+    from shturman_core.auth import Auth
+
+    def line() -> str:
+        return [x for x in cli.status_lines(store, Auth(store)) if x.startswith("hermes_business=")][0]
+
+    assert line() == "hermes_business=no"
+    store.write("business", {"connected": True, "can_reply": False, "updated_at": 1})
+    assert line() == "hermes_business=yes"
+    store.write("business", {"connected": False, "updated_at": 2})
+    assert line() == "hermes_business=no"
+    store.write("business", {"connected": "yes"})            # не признак — не «да»
+    assert line() == "hermes_business=no"

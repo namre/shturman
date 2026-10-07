@@ -11,8 +11,11 @@
 #   Claude Code 2.1.292 — https://code.claude.com/docs/en/mcp
 #   Codex CLI 0.160.1   — https://developers.openai.com/codex/mcp
 # Подробности и ограничения — docs/standalone.md, раздел «Подключить Codex CLI или Claude Code».
+#   -h, --help — эта справка.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
+ops_help "$@"
 
 ssh_to="<сервер>"
 while [ $# -gt 0 ]; do
@@ -20,8 +23,7 @@ while [ $# -gt 0 ]; do
     --ssh)
       [ $# -ge 2 ] || { echo "после --ssh нужен адрес вида пользователь@сервер" >&2; exit 2; }
       ssh_to="$2"; shift ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "неизвестный параметр: $1 (см. $0 --help)" >&2; exit 2 ;;
+    *) ops_unknown "$1" ;;
   esac
   shift
 done

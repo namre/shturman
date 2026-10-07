@@ -1,8 +1,13 @@
 """Серверная часть мастера настройки. Hermes монтирует её в /api/plugins/shturman/.
 
 Здесь только то, чего нет в самом дашборде Hermes. Ключи модели, токен бота, список разрешённых
-пользователей, перезапуск шлюза и установку плагинов страница мастера отправляет в штатные
-вызовы Hermes напрямую — этот файл их не видит и не хранит.
+пользователей и перезапуск шлюза страница мастера отправляет в штатные вызовы Hermes напрямую —
+этот файл их не видит и не хранит.
+
+Сбор переписки и бот согласований настраиваются не здесь, а на отдельной странице сервиса
+переписки (`/shturman-setup/`), мимо Hermes. Мастер показывает только её состояние (`/correspondence`:
+признаки и числа) и обычную ссылку на неё; ссылку входа он не запрашивает и не показывает,
+запросы на эту страницу не передаёт.
 
 Все маршруты закрыты общим входом дашборда: без сессии Hermes до них не допускает.
 
@@ -16,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -30,7 +36,7 @@ if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
 from shturman_core import (  # noqa: E402
-    botapi, bridge_stats, cron_jobs, personas, service_client, service_routes, wizard,
+    botapi, bridge_stats, correspondence, cron_jobs, personas, service_client, service_routes, wizard,
 )
 from shturman_core.pairing import Pairing  # noqa: E402
 from shturman_core.state import Store  # noqa: E402
@@ -40,6 +46,7 @@ logger = logging.getLogger("shturman.dashboard")
 
 PROBE_TIMEOUT = 90
 OWNER_PUSH_TIMEOUT = 3
+SETUP_STATUS_TIMEOUT = 3
 PROXY_CONNECT_TIMEOUT = 3
 PROXY_IO_TIMEOUT = 130          # просмотр большого экспорта сервис держит до минуты; загрузка идёт долго
 MAX_QUERY = 2000
@@ -222,13 +229,43 @@ async def post_model_probe() -> dict[str, Any]:
     return result
 
 
+# ------------------------------------------------- шаг мастера «Переписка»
+
+def _correspondence_sync() -> dict[str, Any]:
+    # Адрес, по которому владелец открывает дашборд: его Hermes получает из SHTURMAN_PUBLIC_URL.
+    public_url = os.environ.get("HERMES_DASHBOARD_PUBLIC_URL", "")
+    try:
+        client = service_client.ServiceClient.from_env(service_routes.UI, timeout=SETUP_STATUS_TIMEOUT)
+    except ValueError:
+        client = None
+    if client is None:
+        return correspondence.summary(None, public_url=public_url, state=correspondence.NO_SERVICE)
+    try:
+        status = client.request("GET", correspondence.STATUS_PATH)
+    except service_client.ServiceError as exc:
+        logger.warning("shturman: состояние настройки переписки не получено (%s)", exc.code or type(exc).__name__)
+        return correspondence.summary(None, public_url=public_url, state=correspondence.UNREACHABLE)
+    return correspondence.summary(status, public_url=public_url)
+
+
+@router.get("/correspondence")
+async def get_correspondence() -> dict[str, Any]:
+    """Что известно о странице настройки переписки: состояние, адрес, признаки и числа.
+
+    Один запрос `GET /api/status` к сервису переписки. Ссылки входа на страницу здесь нет
+    и запросить её отсюда нельзя: её выдаёт `./ops/setup-link.sh` на сервере.
+    """
+    return await asyncio.to_thread(_correspondence_sync)
+
+
 # ------------------------------------------------------- сервис переписки
 
 @router.api_route("/service/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def service_proxy(path: str, request: Request) -> StreamingResponse:
     """Проход к сервису переписки для страниц владельца. Разрешено только перечисленное
     в `service_routes.UI`; владелец сервиса, очередь заданий, нажатия кнопок и приём
-    сообщений отсюда недоступны.
+    сообщений отсюда недоступны. Путь всегда начинается с `/api/`: страница настройки переписки
+    (`/shturman-setup/`) и архив (`/mcp`) через этот проход не открываются.
 
     Тело запроса и тело ответа идут потоком и в память целиком не читаются: так передаётся
     и многогигабайтный экспорт, и пароль — без следа в журнале.

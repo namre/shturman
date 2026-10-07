@@ -2,9 +2,14 @@
  * Штурман — мастер первой настройки. Вкладка дашборда Hermes.
  *
  * Обычный скрипт без сборки: React и клиент API берутся из SDK дашборда.
- * Ключи, токен бота, список разрешённых пользователей, перезапуск шлюза и установка плагинов
- * уходят в штатные вызовы Hermes (SDK.api). В /api/plugins/shturman идёт только то, чего в
- * дашборде нет: выбор помощника, привязка владельца, проверка модели, отметки шагов.
+ * Ключи, токен бота, список разрешённых пользователей и перезапуск шлюза уходят в штатные
+ * вызовы Hermes (SDK.api). В /api/plugins/shturman идёт только то, чего в дашборде нет: выбор
+ * помощника, привязка владельца, проверка модели, отметки шагов, состояние настройки переписки.
+ *
+ * Сбор переписки и бот согласований настраиваются не здесь, а на отдельной странице, которую
+ * отдаёт сервис переписки (/shturman-setup/), мимо Hermes. Мастер показывает её состояние
+ * и обычную ссылку на неё. Ссылку входа он не запрашивает и не показывает и ничего на эту
+ * страницу не передаёт. Бота-ассистента в бизнес-режиме Telegram мастер не подключает.
  */
 (function () {
   "use strict";
@@ -90,9 +95,6 @@
     h("span", { className: "shturman-hl" }, n ? h(Mark, { n }) : null, children);
   const Key = ({ n, children }) =>
     h("div", { className: "shturman-key" + (n ? " is-marked" : "") }, n ? h(Mark, { n }) : null, children);
-  const Row = ({ n, children }) =>
-    h("div", { className: "shturman-row" + (n ? " is-marked" : "") }, n ? h(Mark, { n }) : null,
-      h("span", null, children), h("span", { className: "shturman-row-arrow", "aria-hidden": true }, "›"));
   const Addr = ({ children }) => h("div", { className: "shturman-addr" }, children);
 
   const ShotKey = ({ site, button }) =>
@@ -139,31 +141,6 @@
       h(In, null, "Здесь будет ваш разговор с ассистентом."),
       h("div", { className: "shturman-startbar" }, h(Key, { n: 2 }, "ЗАПУСТИТЬ")));
 
-  const ShotBotFatherBusiness = ({ bot }) =>
-    h(Shot, { title: "Telegram · @BotFather", legend: [
-      "Отправьте @BotFather команду /mybots и выберите своего бота.",
-      "Нажмите Bot Settings.",
-      "Нажмите Business Mode (в новых версиях может называться Secretary Mode).",
-      "Нажмите Turn on.",
-    ] },
-      h(Out, null, "/mybots"),
-      h(Key, { n: 1 }, "@" + (bot || "ваш_бот")),
-      h(Key, { n: 2 }, "Bot Settings"),
-      h(Key, { n: 3 }, "Business Mode"),
-      h(Key, { n: 4 }, "Turn on"));
-
-  const ShotTelegramBusiness = ({ bot }) =>
-    h(Shot, { title: "Telegram · Настройки", legend: [
-      "В Telegram откройте Настройки → «Telegram для бизнеса».",
-      "Выберите «Чат-боты» (может называться Chat Automation).",
-      "Впишите адрес своего бота и нажмите «Добавить».",
-      "Выберите, в каких чатах бот может работать.",
-    ] },
-      h(Row, { n: 1 }, "Telegram для бизнеса"),
-      h(Row, { n: 2 }, "Чат-боты"),
-      h("div", { className: "shturman-input-fake" }, h(Hl, { n: 3 }, "@" + (bot || "ваш_бот"))),
-      h(Row, { n: 4 }, "Доступные чаты"));
-
   /* ----------------------------------------------- память страницы и операции
    *
    * Дашборд может заново смонтировать вкладку в любой момент (например, когда уточнил
@@ -172,7 +149,7 @@
    * ссылка привязки и ход длинных операций. Операции не зависят от того, смонтирован ли
    * компонент, который их запустил: начатая настройка всегда доводится до конца. */
 
-  const mem = { st: null, index: null, draft: null, model: {}, bot: {}, biz: {} };
+  const mem = { st: null, index: null, draft: null, model: {}, bot: {}, corr: null };
   const jobs = {};
   const listeners = new Set();
   const emit = () => listeners.forEach((fn) => fn());
@@ -633,7 +610,9 @@
     return h("div", { className: "shturman-step" },
       h("h2", null, "Бот в Telegram"),
       h("p", { className: "shturman-lead" },
-        "Через бота вы разговариваете с ассистентом. Он же присылает код для входа на эту страницу."),
+        "Это бот-ассистент: через него вы разговариваете с ассистентом. Он же присылает код для входа на эту страницу."),
+      h("p", { className: "shturman-muted" },
+        "Второй бот — бот согласований — настраивается позже, на шаге «Переписка»."),
 
       h("div", { className: "shturman-split" },
         h("div", { className: "shturman-col" },
@@ -708,117 +687,168 @@
         h(Btn, { kind: applied ? "primary" : "ghost", onClick: next }, applied ? "Далее" : "Пропустить пока")));
   }
 
-  /* ======================================================= шаг 4: бизнес-режим */
+  /* ============================================================ шаг 4: переписка
+   *
+   * Сама настройка идёт на отдельной странице сервиса переписки. Здесь — объяснение, состояние
+   * (признаки и числа из /correspondence) и обычная ссылка. Ссылки входа здесь нет. */
 
-  async function loadBusinessPlugin(name) {
-    const hub = await api.getPluginsHub();
-    const found = (hub.plugins || []).filter((p) => p.name === name)[0];
-    patch("biz", { installed: !!(found && found.runtime_status === "enabled") });
+  const SETUP_LINK_CMD = "./ops/setup-link.sh";
+  const count = (n) => Number(n || 0).toLocaleString("ru-RU");
+
+  async function loadCorrespondence() {
+    try { mem.corr = await get("/correspondence"); }
+    catch (e) { mem.corr = { state: "unreachable", url: null, setup: null, archive: {} }; }
+    emit();
+    return mem.corr;
   }
 
-  function installBusinessPlugin(plugin) {
-    return run("biz.install", async () => {
-      await api.installAgentPlugin({ identifier: plugin.identifier, ref: plugin.ref, enable: true });
-      const failure = await restartGatewayAndWait();
-      await loadBusinessPlugin(plugin.name);
-      return failure;
-    });
+  const refreshCorrespondence = () => run("corr.load", async () => { await loadCorrespondence(); return ""; });
+
+  /* Настроен ли сбор переписки: есть аккаунт Telegram или подключён бизнес-режим. */
+  const collecting = (c) => !!(c && c.state === "ok" && c.setup && (c.setup.accounts > 0 || c.setup.business_connected));
+
+  const CORR_PROBLEMS = {
+    outdated: "Страница настройки переписки недоступна — обновите экземпляр. У сервиса переписки на вашем сервере " +
+      "прежняя версия, в которой этой страницы ещё нет. Попросите того, кто ставил ассистента, обновить его.",
+    disabled: "Страница настройки переписки выключена в сервисе переписки. Попросите того, кто ставил ассистента, разобраться.",
+    unreachable: "Сервис переписки сейчас не отвечает, поэтому состояние показать не могу. Попросите того, " +
+      "кто ставил ассистента, запустить проверку.",
+    no_service: "Сервис переписки не подключён к ассистенту. Попросите того, кто ставил ассистента, запустить проверку.",
+  };
+
+  function CorrFacts({ c }) {
+    const s = c.setup;
+    const fact = (label, ok, text) => h("div", { className: "shturman-sumrow" },
+      h("span", { className: "shturman-sumlabel" }, label),
+      h("span", { className: ok ? "is-ok" : "shturman-muted" }, text));
+    const yes = (v, on, off) => (v === true ? on : v === false ? off : "Неизвестно");
+    const messages = c.archive && c.archive.messages;
+    return h("div", { className: "shturman-summary shturman-facts" },
+      fact("Бот согласований", s.own_bot === true, yes(s.own_bot, "Есть", "Ещё не создан")),
+      fact("Владелец привязан", s.owner_bound === true, yes(s.owner_bound, "Да", "Нет")),
+      fact("Ключи Telegram", s.tg_keys === true, yes(s.tg_keys, "Заданы", "Не заданы")),
+      fact("Аккаунты Telegram", s.accounts > 0, s.accounts > 0 ? count(s.accounts) : "Не подключены"),
+      fact("Бизнес-режим", s.business_connected === true, yes(s.business_connected, "Подключён", "Не подключён")),
+      fact("Сообщений в архиве", messages > 0, messages === null || messages === undefined ? "Неизвестно" : count(messages)));
   }
 
-  function checkBusiness() {
-    return run("biz.check", async () => {
-      patch("biz", { checked: false });
-      await loadState();
-      patch("biz", { checked: true });
-      return "";
-    });
-  }
-
-  function BusinessStep({ st, next }) {
-    const z = mem.biz;
-    const plugin = st.business.plugin;
-    const botReady = !!(st.pairing.owner && st.marks.bot_applied);
+  function CorrespondenceStep({ st, next }) {
+    const c = mem.corr;
     const botName = (st.bot && st.bot.username) || "";
-    const installed = z.installed === true;
-    const installing = running("biz.install");
-    const connectedNow = st.business.connected;
 
-    useEffect(() => { loadBusinessPlugin(plugin.name).catch(() => patch("biz", { installed: false })); }, []);
+    // Владелец уходит на страницу настройки в другую вкладку; когда возвращается — состояние свежее.
+    useEffect(() => {
+      loadCorrespondence();
+      const onFocus = () => { loadCorrespondence(); };
+      window.addEventListener("focus", onFocus);
+      return () => window.removeEventListener("focus", onFocus);
+    }, []);
 
-    async function skip() {
-      try { await post("/mark", { key: "business_skipped" }); await loadState(); } catch (e) { /* отметка не критична */ }
+    async function proceed() {
+      try { await post("/mark", { key: "correspondence_seen" }); await loadState(); } catch (e) { /* отметка не критична */ }
       next();
     }
 
+    const ok = !!(c && c.state === "ok");
+    const ready = collecting(c);
+
     return h("div", { className: "shturman-step" },
-      h("h2", null, "Личные чаты: бизнес-режим"),
+      h("h2", null, "Переписка"),
       h("p", { className: "shturman-lead" },
-        "Необязательный шаг. В бизнес-режиме ассистент видит ваши личные чаты в Telegram и готовит черновики ответов. Без вашего подтверждения он ничего не отправляет от вашего имени."),
-      h("p", { className: "shturman-muted" }, "Нужна подписка Telegram Premium. Шаг можно пропустить и вернуться к нему позже."),
+        "Чтобы ассистент помнил, о чём вы договаривались, ему нужен архив вашей переписки в Telegram. " +
+        "Сбор переписки и согласования настраиваются на отдельной защищённой странице."),
 
-      !botReady ? h(Note, { kind: "warn" }, "Сначала привяжите бота на предыдущем шаге.") : null,
-
-      h(Section, { n: 1, title: "Защита", locked: !botReady, lockedText: "Откроется после привязки бота." },
-        h("div", { className: "shturman-stack" },
-          h("p", null, "Сначала ставится защитный плагин. Без него ассистент принял бы сообщения ваших собеседников за ваши команды и начал бы им отвечать."),
-          installed
-            ? h(Note, { kind: "ok" }, "Плагин установлен и включён.")
-            : h("div", null, h(Btn, { busy: installing, disabled: z.installed === undefined,
-                                      onClick: () => installBusinessPlugin(plugin) }, "Установить защиту")),
-          installing ? h("p", { className: "shturman-muted" }, "Ставлю плагин и перезапускаю бота. Это занимает до двух минут.") : null)),
+      st.business.connected ? h(Note, { kind: "warn" },
+        "Сейчас в бизнес-режиме Telegram подключён бот-ассистент — так делали в прежних версиях. Теперь схема другая: " +
+        "бизнес-режим подключается к боту согласований. Когда будете готовы, отключите бота-ассистента в Telegram " +
+        "(Настройки → «Telegram для бизнеса» → «Чат-боты») и подключите бота согласований на странице настройки переписки.") : null,
 
       h("div", { className: "shturman-split" },
         h("div", { className: "shturman-col" },
-          h(Section, { n: 2, title: "Включите режим у @BotFather", locked: !installed,
-                       lockedText: "Откроется после установки защиты." },
-            h("p", null, "Telegram не даст подключить бота к личным чатам, пока у бота не включён бизнес-режим. ",
-              h("a", { href: "https://t.me/BotFather", target: "_blank", rel: "noopener noreferrer" }, "Открыть @BotFather"), "."))),
-        h("div", { className: "shturman-col shturman-col-aside" },
-          installed ? h(ShotBotFatherBusiness, { bot: botName }) : null)),
 
-      h("div", { className: "shturman-split" },
-        h("div", { className: "shturman-col" },
-          h(Section, { n: 3, title: "Подключите бота к своему аккаунту", locked: !installed,
-                       lockedText: "Откроется после установки защиты." },
+          h(Section, { title: "Почему отдельная страница" },
             h("div", { className: "shturman-stack" },
-              h("p", null, "В настройках Telegram укажите своего бота" + (botName ? " (@" + botName + ")" : "") +
-                " и выберите чаты, к которым у него будет доступ."),
-              connectedNow
-                ? h(Note, { kind: "ok" }, "Бизнес-режим подключён.")
-                : h("div", null, h(Btn, { busy: running("biz.check"), onClick: checkBusiness }, "Проверить подключение")),
-              z.checked && !connectedNow
-                ? h(Note, { kind: "warn" }, "Подключения пока не вижу. Проверьте действия 2 и 3 и нажмите «Проверить подключение» ещё раз.")
-                : null))),
+              h("p", null, "Там вы входите в свой аккаунт Telegram, вводите токен второго бота, выбираете чаты и загружаете " +
+                "историю. Ассистент не должен видеть ваш вход в Telegram, поэтому эту страницу показывает не он, а отдельный " +
+                "сервис на вашем сервере — со своим входом."),
+              !c ? h("p", { className: "shturman-muted" }, "Узнаю состояние…") : null,
+              c && !ok ? h(Note, { kind: "warn" }, CORR_PROBLEMS[c.state] || CORR_PROBLEMS.unreachable) : null,
+              ok && c.url && c.setup.origin_set === false ? h(Note, { kind: "warn" },
+                "Сервис переписки ещё не знает внешний адрес ассистента, и вход на странице не сработает. " +
+                "Попросите того, кто ставил ассистента, перезапустить его (", h("code", null, "./ops/up.sh"), ").") : null,
+              ok && c.url ? h("div", null,
+                h("a", { className: "shturman-btn shturman-btn-primary", href: c.url,
+                         target: "_blank", rel: "noopener noreferrer" }, "Открыть настройку переписки")) : null,
+              ok && c.url ? h("p", { className: "shturman-muted" },
+                "Страница откроется в новой вкладке. Эта вкладка останется открытой — вернитесь сюда, когда закончите.") : null,
+              ok && !c.url ? h(Note, { kind: "info" },
+                "У ассистента не задан внешний адрес, поэтому страница открывается только с самого сервера. " +
+                "Попросите того, кто ставил ассистента, выполнить ", h("code", null, SETUP_LINK_CMD + " --local"),
+                ": команда даст ссылку и подскажет, как открыть её со своего компьютера.") : null)),
+
+          h(Section, { title: "Как туда войти" },
+            h("ol", { className: "shturman-list" },
+              h("li", null, h("strong", null, "Первый раз — по одноразовой ссылке. "),
+                "Её выдаёт тот, кто ставил ассистента: ИИ-агент по вашей просьбе или вы сами командой ",
+                h("code", null, SETUP_LINK_CMD), " на сервере. Ссылка действует 30 минут и срабатывает один раз."),
+              h("li", null, h("strong", null, "Потом — по коду от бота согласований. "),
+                "Когда бот согласований создан и привязан к вам, страница входа присылает код в Telegram.")),
+            h("p", { className: "shturman-muted" },
+              "Мастер ссылку входа не выдаёт и не показывает: так она не проходит через ассистента."))),
+
         h("div", { className: "shturman-col shturman-col-aside" },
-          installed ? h(ShotTelegramBusiness, { bot: botName }) : null)),
+          h("section", { className: "shturman-section" },
+            h("h3", null, "Что уже настроено"),
+            ok ? h(CorrFacts, { c })
+               : h("p", { className: "shturman-muted" }, c ? "Состояние недоступно." : "Узнаю состояние…"),
+            h("div", null, h(Btn, { kind: "ghost", busy: running("corr.load"), onClick: refreshCorrespondence }, "Обновить"))))),
 
-      h(JobError, { names: ["biz.install", "biz.check"] }),
+      h("section", { className: "shturman-section" },
+        h("h3", null, "Два бота — не перепутайте"),
+        h("div", { className: "shturman-bots" },
+          h("div", { className: "shturman-bot" },
+            h("span", { className: "shturman-card-name" }, "Бот-ассистент"),
+            h("span", null, "С ним вы разговариваете" + (botName ? ": @" + botName : "") + ". Его вы подключили на шаге «Бот в Telegram»."),
+            h("span", { className: "shturman-muted" }, "В бизнес-режиме Telegram его не подключают.")),
+          h("div", { className: "shturman-bot" },
+            h("span", { className: "shturman-card-name" }, "Бот согласований"),
+            h("span", null, "Присылает карточки с кнопками: показать черновик, подтвердить действие. На сообщения не отвечает. " +
+              "Это отдельный бот — его вы создаёте на странице настройки переписки."),
+            h("span", { className: "shturman-muted" }, "К нему подключается бизнес-режим Telegram.")))),
+
+      h(JobError, { names: ["corr.load"] }),
       h("div", { className: "shturman-actions" },
-        connectedNow ? h(Btn, { onClick: next }, "Далее") : h(Btn, { kind: "ghost", onClick: skip }, "Пропустить")));
+        h(Btn, { kind: ready ? "primary" : "ghost", onClick: proceed }, ready ? "Далее" : "Настрою позже")));
   }
 
-  /* ========================================================= шаг 5: что дальше */
-
-  function LaterStep({ next }) {
-    const card = (title, text) => h("div", { className: "shturman-soon" },
-      h("span", { className: "shturman-tag" }, "Скоро"), h("h3", null, title), h("p", null, text));
-    return h("div", { className: "shturman-step" },
-      h("h2", null, "Переписка и память"),
-      h("p", { className: "shturman-lead" },
-        "Эти возможности появятся в следующих версиях. Когда они будут готовы, мастер предложит включить их здесь."),
-      h("div", { className: "shturman-cards shturman-cards-2" },
-        card("Аккаунт-помощник", "Отдельный аккаунт Telegram, с которого ассистент сам пишет и напоминает. Вход по QR-коду, как в Telegram на компьютере."),
-        card("История чатов", "Загрузка выгрузки из Telegram Desktop, чтобы ассистент помнил, о чём вы договаривались раньше.")),
-      h("div", { className: "shturman-actions" }, h(Btn, { onClick: next }, "Далее")));
+  /* Одна строка для итога: что с перепиской. Возвращает [признак, текст]. */
+  function correspondenceSummary(c) {
+    if (!c) return [null, "Узнаю состояние…"];
+    if (c.state === "outdated") return [false, "Страница настройки недоступна — обновите экземпляр"];
+    if (c.state !== "ok") return [null, "Состояние недоступно: сервис переписки не отвечает"];
+    const s = c.setup;
+    const messages = c.archive && c.archive.messages;
+    const parts = [];
+    if (s.own_bot) parts.push(s.owner_bound ? "бот согласований привязан" : "бот согласований не привязан");
+    if (s.accounts > 0) parts.push("аккаунтов Telegram: " + count(s.accounts));
+    if (s.business_connected) parts.push("бизнес-режим подключён");
+    if (messages > 0) parts.push("сообщений в архиве: " + count(messages));
+    if (!collecting(c)) {
+      return [false, "Сбор не настроен — шаг «Переписка»" + (parts.length ? " (" + parts.join(", ") + ")" : "")];
+    }
+    const text = parts.join(", ");
+    return [true, text.charAt(0).toUpperCase() + text.slice(1)];
   }
 
-  /* ================================================================ шаг 6: итог */
+  /* ================================================================ шаг 5: итог */
 
   function DoneStep({ st }) {
     const row = (label, ok, text) => h("div", { className: "shturman-sumrow" },
       h("span", { className: "shturman-sumlabel" }, label),
       h("span", { className: ok === true ? "is-ok" : ok === false ? "is-warn" : "shturman-muted" }, text));
     const botOk = !!(st.pairing.owner && st.marks.bot_applied);
+    const corr = correspondenceSummary(mem.corr);
+    useEffect(() => { loadCorrespondence(); }, []);
     const finish = () => run("finish", async () => { await post("/mark", { key: "completed" }); await loadState(); return ""; });
 
     return h("div", { className: "shturman-step" },
@@ -830,9 +860,7 @@
         row("Представляется", null, st.resolved.signature),
         row("Модель", !!st.marks.model_ok, st.marks.model_ok ? "Проверена" : "Не проверена: ассистент не сможет отвечать"),
         row("Бот и вход", botOk, botOk ? "Владелец привязан" : "Не привязан: войти можно только по ссылке активации"),
-        row("Бизнес-режим", st.business.connected ? true : null,
-          st.business.connected ? "Подключён" : "Не подключён, можно включить позже"),
-        row("Переписка и память", null, "В следующих версиях")),
+        row("Переписка", corr[0], corr[1])),
       botOk ? h("p", null, "Напишите боту «привет». Если он ответил, всё работает.") : null,
       h(JobError, { names: ["finish"] }),
       st.completed
@@ -848,8 +876,7 @@
     { id: "persona", title: "Помощник", view: PersonaStep },
     { id: "model", title: "Модель", view: ModelStep },
     { id: "bot", title: "Бот в Telegram", view: BotStep },
-    { id: "business", title: "Бизнес-режим", view: BusinessStep },
-    { id: "later", title: "Переписка и память", view: LaterStep },
+    { id: "correspondence", title: "Переписка", view: CorrespondenceStep },
     { id: "done", title: "Готово", view: DoneStep },
   ];
 
@@ -858,8 +885,12 @@
     if (id === "persona") return !!m.persona_saved;
     if (id === "model") return !!m.model_ok;
     if (id === "bot") return !!(st.pairing.owner && m.bot_applied);
-    if (id === "business") return !!(st.business.connected || m.business_skipped);
-    if (id === "later") return !!(st.business.connected || m.business_skipped || st.completed);
+    // Прежние шаги «Бизнес-режим» и «Переписка и память» слиты в один. Кто прошёл их до
+    // обновления (отметка business_skipped, подключённый бизнес-режим, завершённый мастер),
+    // для того шаг остаётся пройденным.
+    if (id === "correspondence") {
+      return !!(m.correspondence_seen || m.business_skipped || st.business.connected || st.completed);
+    }
     return !!st.completed;
   }
 

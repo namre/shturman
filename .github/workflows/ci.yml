@@ -63,6 +63,12 @@ jobs:
           test "$(emb)" = "--model-id /data/model --served-model-name intfloat/multilingual-e5-small --max-batch-tokens 2048 intfloat/multilingual-e5-small"
           export SHTURMAN_EMBEDDINGS_MODEL=deepvk/USER2-small SHTURMAN_EMBEDDINGS_MODEL_DIR=user2-small
           test "$(emb)" = "--model-id /data/user2-small --served-model-name deepvk/USER2-small --max-batch-tokens 2048 deepvk/USER2-small"
+          # Страница настройки переписки: сервис получает внешний адрес экземпляра, а его порт по-прежнему
+          # опубликован только на локальном адресе сервера. Без адреса (режим без Hermes) значение пустое.
+          svc() { docker compose config --format json | python3 -c 'import json, sys; s = json.load(sys.stdin)["services"]["shturman"]; print(s["environment"]["SHTURMAN_SETUP_ORIGIN"] or "-", " ".join(p["host_ip"] + ":" + str(p["published"]) + ":" + str(p["target"]) for p in s["ports"]))'; }
+          test "$(svc)" = "- 127.0.0.1:8765:8765"
+          export SHTURMAN_PUBLIC_URL=https://assistant.example.com
+          test "$(svc)" = "https://assistant.example.com 127.0.0.1:8765:8765"
         env:
           HERMES_UID: "1000"
           HERMES_GID: "1000"
@@ -115,6 +121,53 @@ jobs:
           ./ops/init-env.sh --auto > /dev/null
           grep -qx 'COMPOSE_PROFILES=hermes' .env
           test "$(stat -c '%a' .env)" = "600"
+      # Справка и неизвестные ключи. На -h и --help каждый скрипт печатает своё назначение и выходит
+      # с кодом 0 до любых действий: в каталоге без .env и данных он ничего не создаёт и не зовёт
+      # ни Docker, ни curl (вместо них подставлены заглушки, которые записывают вызов). На
+      # неизвестный ключ — сообщение и код 2, тоже без действий. Так ./ops/activation-link.sh --help
+      # не выпустит настоящую ссылку входа.
+      - name: ops — справка и неизвестные ключи
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops "$tmp"/; mkdir "$tmp/stub" "$tmp/empty"
+          for tool in docker curl ssh; do
+            printf '#!/bin/sh\necho "%s $*" >> "%s/called"\nexit 1\n' "$tool" "$tmp" > "$tmp/stub/$tool"
+          done
+          chmod +x "$tmp"/stub/*
+          export PATH="$tmp/stub:$PATH"
+          cd "$tmp/empty"
+          listing() { find "$tmp" | sort; }
+          before="$(listing)"
+          run() { code=0; out="$(bash "$@" < /dev/null 2>&1)" || code=$?; }
+          for f in ../ops/*.sh; do
+            for key in --help -h; do
+              run "$f" "$key"
+              [ "$code" -eq 0 ] || { echo "$f $key: код $code вместо 0"; exit 1; }
+              [ -n "$out" ] || { echo "$f $key: справка пустая"; exit 1; }
+            done
+            run "$f" --no-such-key
+            [ "$code" -eq 2 ] || { echo "$f --no-such-key: код $code вместо 2"; exit 1; }
+            grep -q 'no-such-key' <<< "$out" || { echo "$f --no-such-key: в сообщении нет имени ключа"; exit 1; }
+          done
+          # Справка побеждает и после других параметров; лишний параметр — тоже ошибка, а не действие.
+          for args in "up.sh --pull --help" "guard.sh on --help" "embeddings.sh on --model e5-small --help" \
+                      "mode.sh set standalone --help" "setup-link.sh --local --help" "backup.sh --list --help"; do
+            # shellcheck disable=SC2086
+            run ../ops/$args
+            [ "$code" -eq 0 ] || { echo "$args: код $code вместо 0"; exit 1; }
+          done
+          for args in "activation-link.sh сейчас" "bot-bind.sh x" "setup-link.sh x" "guard.sh on x" \
+                      "backup.sh x" "doctor.sh x" "preflight.sh x" "logout-all.sh x" "up.sh x"; do
+            # shellcheck disable=SC2086
+            run ../ops/$args
+            [ "$code" -eq 2 ] || { echo "$args: код $code вместо 2"; exit 1; }
+          done
+          test "$(listing)" = "$before"
+          if [ -e "$tmp/called" ]; then echo "справка обратилась к внешней программе:"; cat "$tmp/called"; exit 1; fi
+          # Без Hermes и без запущенного сервиса ссылка настройки переписки не выдаётся; из .env
+          # читаются только режим и внешний адрес.
+          cd "$tmp"; printf 'SHTURMAN_MODE=standalone\n' > .env
+          if ./ops/setup-link.sh > link.out 2>&1; then echo "без сервиса ссылки быть не должно"; exit 1; fi
+          grep -q 'не запущен' link.out
       # Образ сервиса должен собираться и запускаться: без базы он обязан выйти с понятной ошибкой.
       - run: docker build -t shturman-service:ci service
       - run: docker run --rm shturman-service:ci --help

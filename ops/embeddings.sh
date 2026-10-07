@@ -25,14 +25,21 @@
 # Из .env он читает только строки SHTURMAN_MODE, COMPOSE_PROFILES и SHTURMAN_EMBEDDINGS_MODEL: свой
 # профиль добавляется и убирается, а защита от внедрённых инструкций (./ops/guard.sh) и профиль
 # Hermes не трогаются.
+#   -h, --help — эта справка; ничего не скачивается и не меняется.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 
 . ops/lib.sh
+ops_help "$@"
 
 usage() { echo "использование: $0 on [--model e5-small|user2-small] | off | status" >&2; exit 2; }
 
 action="${1:-status}"
+case "$action" in
+  on|off|status) ;;
+  -*) ops_unknown "$action" ;;
+  *) usage ;;
+esac
 [ $# -gt 0 ] && shift
 want=""
 while [ $# -gt 0 ]; do
@@ -41,7 +48,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "после --model нужно имя: e5-small или user2-small" >&2; exit 2; }
       want="$2"; shift ;;
     --model=*) want="${1#--model=}" ;;
-    *) usage ;;
+    *) ops_unknown "$1" ;;
   esac
   shift
 done

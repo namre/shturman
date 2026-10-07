@@ -12,11 +12,19 @@
 #
 # Защита снижает риск, а не устраняет его: классификатор пропускает часть атак и иногда прячет
 # обычные сообщения. Измеренные числа — docs/guard.md.
+#   -h, --help — эта справка; ничего не скачивается и не меняется.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 
 . ops/lib.sh
+ops_help "$@"
 mode="${1:-status}"
+case "$mode" in
+  on|off|status) ;;
+  -*) ops_unknown "$mode" ;;
+  *) echo "использование: $0 on|off|status" >&2; exit 2 ;;
+esac
+[ $# -le 1 ] || ops_unknown "$2"
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 # Неизвестный режим установки — остановиться до скачивания модели, а не после.
 shturman_mode > /dev/null || exit 2
