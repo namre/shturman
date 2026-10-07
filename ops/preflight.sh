@@ -2,6 +2,7 @@
 # Проверка сервера перед развёртыванием. Ничего не меняет.
 # Вывод: строки "PASS|WARN|FAIL  имя: подробности". Код возврата 1, если есть FAIL.
 # Запускается из корня репозитория: место на диске и файл .env проверяются в текущем каталоге.
+# Из .env читаются только несекретные строки SHTURMAN_MODE и SHTURMAN_SETUP_URL.
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 . "$(dirname "$0")/lib.sh"
@@ -46,6 +47,25 @@ fi
 for tool in git curl; do
   if command -v "$tool" >/dev/null 2>&1; then pass "$tool" "есть"; else fail "$tool" "не установлен"; fi
 done
+
+# --- порт страницы настройки переписки ---
+# Только режим с Hermes: страницу настройки переписки обратный прокси отдаёт на отдельном порту
+# (по умолчанию 8443, иначе — порт из SHTURMAN_SETUP_URL). Без Hermes наружу не отдаётся ничего.
+# Из .env читаются две несекретные строки.
+pf_mode="$(env_get SHTURMAN_MODE)"
+if [ "${pf_mode:-hermes}" = hermes ]; then
+  pf_port="$(url_port "$(env_get SHTURMAN_SETUP_URL)")"
+  pf_port="${pf_port:-$SETUP_PORT_DEFAULT}"
+  if [ "$pf_port" = 443 ]; then
+    : # отдельное имя на обычном порту: его занимает тот же обратный прокси, проверять нечего
+  elif ! command -v ss >/dev/null 2>&1; then
+    warn setup-port "нет программы ss (пакет iproute2) — не проверено, свободен ли порт $pf_port для страницы настройки переписки"
+  elif ss -tlnH 2>/dev/null | awk '{print $4}' | grep -Eq ":${pf_port}\$"; then
+    warn setup-port "порт $pf_port уже кто-то слушает. Если это ваш обратный прокси со страницей настройки переписки — так и должно быть; если другая программа — выберите другой порт: ./ops/set-setup-url.sh https://имя:порт"
+  else
+    pass setup-port "порт $pf_port свободен — на нём обратный прокси будет отдавать страницу настройки переписки (открыть его в firewall — стоп-точка)"
+  fi
+fi
 
 # --- время ---
 if command -v timedatectl >/dev/null 2>&1; then

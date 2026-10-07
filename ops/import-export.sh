@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Импорт выгрузки Telegram Desktop (result.json) в архив — запасной путь без веб-интерфейса.
+# Импорт выгрузки Telegram Desktop (result.json) в архив — запасной путь, в терминале. Основной
+# путь — страница настройки переписки (./ops/setup-link.sh): выгрузка загружается там, в браузере.
 #   ./ops/import-export.sh scan  /путь/к/result.json            — показать чаты, ничего не записывая
 #   ./ops/import-export.sh import /путь/к/result.json [--exclude user:123 ...] [--owner-id N]
 # Файл подключается контейнеру только для чтения и никуда не копируется.
