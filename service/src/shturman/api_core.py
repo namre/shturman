@@ -9,7 +9,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from . import bridge, confirm, jobs
+from . import bridge, confirm, embeddings, jobs
 from .guard import service as guard_service
 from .app import AppState, state_of
 
@@ -214,10 +214,14 @@ async def status(request: Request) -> JSONResponse:
                       (SELECT value IS NOT NULL FROM settings WHERE key = 'owner') AS owner_known"""
         )
         guard = await guard_service.overview(conn, state_of(request).config)
+        search = await embeddings.overview(conn, state_of(request))
     out = dict(row)
     # Защита от внедрённых инструкций: включена ли, чем проверяет, и счётчики (проверено, скрыто,
     # показано владельцем, не проверено). Только числа и состояние.
     out.update(guard)
+    # Поиск по смыслу: включён ли, какой моделью, сколько сообщений с вектором этой модели
+    # и сколько ещё осталось посчитать (после смены модели — пересчитать).
+    out.update(search)
     config = state_of(request).config
     out.update(sending=config.sending, own_bot=bridge.owns_bot(),
                own_llm=bridge.LLM_TEXT in bridge.builtin_kinds())

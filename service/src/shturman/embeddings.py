@@ -14,12 +14,20 @@
 с содержательным текстом — не меньше `min_words` слов (по умолчанию 3). Реплики вроде «ок» или
 «спасибо большое» смысла для поиска не несут, зато оказываются «ближайшими» к любому короткому
 запросу; по словам их и так находит полнотекстовая ветка. Длинный текст обрезает сам сервер
-(`truncate: true`): модель видит первые 512 токенов.
+(`truncate: true`): `multilingual-e5-small` видит первые 512 токенов, `USER2-small` — первые 2048
+(столько разрешает параметр `--max-batch-tokens` контейнера в `compose.yaml`).
+
+Поддерживаемых моделей две, обе на 384 измерения: `intfloat/multilingual-e5-small` (по умолчанию)
+и `deepvk/USER2-small`. Выбирает владелец: `./ops/embeddings.sh on --model …`. Смена модели —
+это пересчёт всех векторов; что при этом происходит с поиском, сказано у `reset_stale`.
 
 Текст сообщений и запросов в журнал не пишется: только счётчики, идентификаторы и вид ошибки.
 
 Переменные окружения модуля (кроме общих `SHTURMAN_EMBEDDINGS_URL`, `_MODEL`, `_DIM`):
   SHTURMAN_EMBEDDINGS_BATCH           размер пачки, по умолчанию 32 (предел TEI по умолчанию);
+  SHTURMAN_EMBEDDINGS_BATCH_CHARS     сколько знаков текста уходит серверу за один запрос, по
+                                      умолчанию 8000: пачка из длинных сообщений режется, иначе
+                                      модель с длинным окном считала бы её дольше срока ожидания;
   SHTURMAN_EMBEDDINGS_PAUSE_MS        пауза между пачками, по умолчанию 500 — чтобы не занимать
                                       процессор сервера целиком;
   SHTURMAN_EMBEDDINGS_MIN_WORDS       минимум слов в сообщении, по умолчанию 3;
@@ -74,11 +82,21 @@ class ModelProfile:
 # "passage: ", even for non-English texts».
 _E5 = ModelProfile(query_prefix="query: ", passage_prefix="passage: ")
 
+# Семейство USER2 обучено с приставками задачи, как Nomic Embed. Карточка и файл
+# `config_sentence_transformers.json` модели deepvk/USER2-small, ревизия 23f65b3 (сверено
+# 2026-10-07): для поиска — "search_query: " и "search_document: ".
+_USER2 = ModelProfile(query_prefix="search_query: ", passage_prefix="search_document: ")
+
 MODEL_PROFILES: dict[str, ModelProfile] = {
-    "intfloat/multilingual-e5-small": _E5,   # 384
+    "intfloat/multilingual-e5-small": _E5,   # 384 — модель по умолчанию
     "intfloat/multilingual-e5-base": _E5,    # 768 — нужна миграция размерности
     "intfloat/multilingual-e5-large": _E5,   # 1024 — нужна миграция размерности
+    "deepvk/USER2-small": _USER2,            # 384 — вторая поддерживаемая модель
 }
+
+# Модели, которые ставит ./ops/embeddings.sh: для них скачивание, суммы и запуск проверены.
+# Остальное из MODEL_PROFILES — только приставки на случай ручной настройки.
+SUPPORTED_MODELS = ("intfloat/multilingual-e5-small", "deepvk/USER2-small")
 
 
 def profile_for(model: str, env: Mapping[str, str] | None = None) -> ModelProfile:
@@ -295,6 +313,7 @@ def passage_text(text: str, *, sender_name: str | None = None) -> str:
 @dataclass(frozen=True)
 class WorkerSettings:
     batch: int = 32
+    batch_chars: int = 8000     # знаков текста на один запрос к серверу; одно сообщение идёт всегда
     pause: float = 0.5          # между пачками, секунд
     idle: float = 5.0           # между проверками пустой очереди
     min_words: int = 3
@@ -319,6 +338,7 @@ class WorkerSettings:
 
         return cls(
             batch=number("SHTURMAN_EMBEDDINGS_BATCH", 32, 1, 256),
+            batch_chars=number("SHTURMAN_EMBEDDINGS_BATCH_CHARS", 8000, 500, 1_000_000),
             pause=number("SHTURMAN_EMBEDDINGS_PAUSE_MS", 500, 0, 60_000) / 1000,
             min_words=number("SHTURMAN_EMBEDDINGS_MIN_WORDS", 3, 1, 50),
         )
@@ -390,6 +410,13 @@ async def reset_stale(
     Вызывается один раз при запуске: модель меняется только настройкой и перезапуском. Идёт по
     первичному ключу небольшими шагами, чтобы не держать долгих блокировок и не читать таблицу
     целиком одним запросом.
+
+    Что видит поиск, пока идёт пересчёт. Векторы двух моделей в одной выдаче не смешиваются
+    никогда: смысловая ветка берёт только строки с именем текущей модели (`search._HYBRID`),
+    а вектор запроса считает та же модель. Поэтому с первой секунды после смены модели поиск
+    по смыслу видит только уже пересчитанные сообщения — сначала свежие, счётчик идёт от новых
+    к старым, — а ветка слов по-прежнему видит весь архив. Старые векторы не хранятся рядом
+    с новыми: столбец один, возврат к прежней модели — такой же полный пересчёт.
     """
     async with pool.acquire() as conn:
         top = await conn.fetchval("SELECT max(id) FROM messages") or 0
@@ -409,6 +436,26 @@ async def reset_stale(
     return total
 
 
+def _within_budget(rows: Sequence[Any], settings: WorkerSettings) -> list[Any]:
+    """Отрезает хвост пачки, если текста в ней больше `batch_chars`; первая строка идёт всегда.
+
+    Зачем: модель с длинным окном (USER2 — 2048 токенов) считает пачку из 32 сообщений предельной
+    длины дольше срока ожидания ответа, и такая пачка возвращалась бы в очередь бесконечно.
+    Отрезанные строки остаются в очереди и уйдут следующим запросом. В счёт идут только тексты,
+    которые действительно уйдут серверу.
+    """
+    taken: list[Any] = []
+    spent = 0
+    for row in rows:
+        counts = not row["excluded"] and is_embeddable(row["text"], settings.min_words)
+        cost = len(row["text"]) if counts else 0
+        if taken and spent + cost > settings.batch_chars:
+            break
+        taken.append(row)
+        spent += cost
+    return taken
+
+
 async def embed_batch(pool: asyncpg.Pool, embedder: Embedder, settings: WorkerSettings) -> BatchResult:
     """Один шаг счётчика: взять пачку из очереди, посчитать, записать.
 
@@ -419,6 +466,7 @@ async def embed_batch(pool: asyncpg.Pool, embedder: Embedder, settings: WorkerSe
     await embedder.ensure_verified()
     async with pool.acquire() as conn:
         rows = await conn.fetch(_TAKE, max(1, min(settings.batch, embedder.max_batch)))
+    rows = _within_budget(rows, settings)
     result = BatchResult(taken=len(rows))
     if not rows:
         return result
@@ -467,6 +515,10 @@ async def run_worker(
     while True:
         try:
             if not stale_done:
+                # Сначала сервер: пока он не подтвердил, что отдаёт настроенную модель, прежние
+                # векторы не трогаем. Опечатка в настройке или не перезапущенный контейнер иначе
+                # стоили бы владельцу нескольких часов пересчёта.
+                await embedder.ensure_verified()
                 returned = await reset_stale(pool, embedder.model, sleep=sleep)
                 stale_done = True
                 if returned:
@@ -495,12 +547,54 @@ async def run_worker(
 
 # --- состояние для владельца ---
 
+# embedded — вектор текущей модели есть; pending — в очереди; skipped — рассмотрено, вектора не
+# будет; stale — посчитано или пропущено другой моделью и ещё не возвращено в очередь (бывает
+# сразу после смены модели и пока сервер не подтвердил новую). Осталось пересчитать —
+# pending + stale; смысловая ветка поиска видит только embedded.
 _COUNTS = """
 SELECT count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model = $1) AS embedded,
        count(*) FILTER (WHERE embedding_model IS NULL AND kind = 'message' AND deleted_at IS NULL) AS pending,
-       count(*) FILTER (WHERE embedding IS NULL AND embedding_model = $1) AS skipped
+       count(*) FILTER (WHERE embedding IS NULL AND embedding_model = $1) AS skipped,
+       count(*) FILTER (WHERE embedding_model IS NOT NULL AND embedding_model <> $1) AS stale
 FROM messages
 """
+
+
+async def counters(conn: asyncpg.Connection, model: str) -> dict[str, int]:
+    row = await conn.fetchrow(_COUNTS, model)
+    return {key: int(row[key]) for key in ("embedded", "pending", "skipped", "stale")}
+
+
+async def _health(embedder: Embedder | None) -> tuple[bool | None, str | None]:
+    """Отвечает ли сервер сейчас и что с ним не так.
+
+    Неполадка: None — всё в порядке или модуль выключен; "unreachable" — сервер не отвечает;
+    "model_mismatch" — отвечает, но отдаёт не ту модель, поэтому векторы не считаются.
+    Доступность проверяется обращением к серверу, а не по последней попытке счётчика: после сбоя
+    он ждёт до пяти минут, и его сведения успевают устареть.
+    """
+    if embedder is None:
+        return None, None
+    if not await embedder.healthy():
+        return False, "unreachable"
+    return True, "model_mismatch" if embedder.problem == "model_mismatch" else None
+
+
+async def overview(conn: asyncpg.Connection, state: Any) -> dict[str, Any]:
+    """Состояние поиска по смыслу для `/api/status` и `ops/doctor.sh`: модель и счётчики.
+
+    Содержимого переписки в ответе нет.
+    """
+    embedder: Embedder | None = (getattr(state, "extras", None) or {}).get("embedder")
+    count = await counters(conn, state.config.embeddings_model)
+    _, problem = await _health(embedder)
+    return {
+        "embeddings_enabled": embedder is not None,
+        "embeddings_model": state.config.embeddings_model if embedder is not None else None,
+        "embeddings_embedded": count["embedded"],
+        "embeddings_left": count["pending"] + count["stale"],
+        "embeddings_problem": problem,
+    }
 
 
 async def status(request: Request) -> JSONResponse:
@@ -508,22 +602,12 @@ async def status(request: Request) -> JSONResponse:
     state = request.app.state.shturman
     embedder: Embedder | None = state.extras.get("embedder")
     async with state.ro_pool.acquire() as conn:
-        row = await conn.fetchrow(_COUNTS, state.config.embeddings_model)
-    reachable = await embedder.healthy() if embedder else None
-    # None — всё в порядке или модуль выключен; "unreachable" — сервер не отвечает;
-    # "model_mismatch" — отвечает, но отдаёт не ту модель, поэтому векторы не считаются.
-    problem = None
-    if embedder is not None:
-        if not reachable:
-            problem = "unreachable"
-        elif embedder.problem == "model_mismatch":
-            problem = "model_mismatch"
+        count = await counters(conn, state.config.embeddings_model)
+    reachable, problem = await _health(embedder)
     return JSONResponse({
         "enabled": embedder is not None,
         "model": state.config.embeddings_model,
-        "embedded": row["embedded"],
-        "pending": row["pending"],
-        "skipped": row["skipped"],
+        **count,
         "reachable": reachable,
         "problem": problem,
     })
