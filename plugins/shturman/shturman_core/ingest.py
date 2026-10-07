@@ -19,6 +19,12 @@ Hermes не ждёт сервис и не страдает от его отка�
     на странице состояния поднимается признак `business_disabled`;
   * excluded — чат исключён владельцем; прочее (например, у сообщения нет номера) — отдельно.
 
+У сервиса может быть свой бот согласований (`own_bot.py`). Пока он включён, сервис отвечает
+на всё перечисленное отказом `own_bot`, и пересылка стоит: владелец не передаётся, очередь
+пуста, новые обновления в неё не кладутся (сервис получает их через своего бота). Повторов
+нет; раз в несколько минут у сервиса спрашивается, включён ли бот. Когда он выключен,
+владелец передаётся заново (и отложенное «владелец отвязан» — тоже), пересылка возобновляется.
+
 Здесь же сервису сообщается владелец: при запуске шлюза и при каждой смене привязки.
 Сообщение «владелец отвязан» (DELETE /api/owner) необратимо для сервиса — он отклоняет ждущие
 черновики и очищает список доверенных, — поэтому уходит только в двух случаях:
@@ -38,6 +44,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 from .bridge_stats import Stats
+from .own_bot import OwnBot
 from .service_client import ServiceError, ServiceUnavailable
 
 logger = logging.getLogger("shturman.ingest")
@@ -74,7 +81,8 @@ class Ingest:
                        исключение — прочитать не удалось (тогда ничего не решается);
     owner_version    — значение, меняющееся при смене привязки (время изменения файла);
     unbound_marker   — есть ли отметка «привязку сбросил сам плагин»; clear_marker её снимает;
-    fetch_connection — запрос подключения у Telegram: словарь, None (такого нет) либо исключение.
+    fetch_connection — запрос подключения у Telegram: словарь, None (такого нет) либо исключение;
+    own_bot          — режим «бизнес-поток ведёт бот сервиса»; общий с обработчиком кнопок.
     """
 
     def __init__(
@@ -83,7 +91,7 @@ class Ingest:
         fetch_connection: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
         unbound_marker: Callable[[], bool] = lambda: False, clear_marker: Callable[[], None] = lambda: None,
         stats: Stats | None = None, capacity: int = CAPACITY, idle: float = IDLE_SECONDS,
-        now: Callable[[], float] = time.monotonic,
+        now: Callable[[], float] = time.monotonic, own_bot: OwnBot | None = None,
     ) -> None:
         self.call = call
         self.owner = owner
@@ -102,10 +110,14 @@ class Ingest:
         self._read_failed = False
         self._refused: dict[str, float] = {}
         self._disabled: dict[str, float] = {}       # подключения, которые сервис держит выключенными
+        self.own_bot = own_bot or OwnBot(call, stats=self.stats, now=now)
+        self._standing_down = False                 # пересылка остановлена режимом own_bot
 
     # --- приём от обработчиков Telegram: мгновенно и без исключений ---
 
     def put(self, path: str, body: dict[str, Any], connection_id: str | None = None) -> bool:
+        if self.own_bot.active:
+            return False                # бизнес-поток ведёт бот сервиса: это не потеря
         if len(self._queue) >= self.capacity:
             self.stats.bump("dropped")
             return False
@@ -159,8 +171,11 @@ class Ingest:
 
     async def step(self) -> bool:
         """Передаёт владельца, если он сменился, и одно обновление из очереди. True — была работа."""
+        await self.own_bot.refresh()
+        if self._stand_down():
+            return False
         await self.sync_owner()
-        if not self._queue:
+        if self._stand_down() or not self._queue:
             return False
         item = self._queue[0]
         done = False
@@ -175,8 +190,26 @@ class Ingest:
                 self.stats.set_queue(len(self._queue))
         return True
 
+    def _stand_down(self) -> bool:
+        """Останавливает пересылку на время режима own_bot и возобновляет её после. True — стоим."""
+        if self.own_bot.active:
+            if not self._standing_down or self._queue:
+                self._standing_down = True
+                self._queue.clear()     # сервис их не примет: он получает бизнес-поток через своего бота
+                self.stats.set_queue(0)
+                self._refused.clear()
+                self._disabled.clear()
+                self.stats.set_flag("business_disabled", None)
+            return True
+        if self._standing_down:
+            self._standing_down = False
+            self._pushed_version = object()     # сервис снова принимает владельца — передать заново
+        return False
+
     async def sync_owner(self, *, force: bool = False) -> bool:
         """Сообщает сервису владельца, если привязка изменилась. True — сервис знает владельца."""
+        if self.own_bot.active:
+            return False                # владельца привязывает бот сервиса; повторов нет
         version = self.owner_version()
         if not force and version == self._pushed_version:
             return self._owner_known
@@ -204,8 +237,10 @@ class Ingest:
             except ServiceUnavailable:
                 self.stats.seen(False)
                 raise _Later() from None
-            except ServiceError:
-                pass
+            except ServiceError as exc:
+                if self.own_bot.refused(exc):
+                    # Отметка сброса остаётся: «владелец отвязан» уйдёт, когда сервис снова примет.
+                    return False
             self._owner_known = False
             try:
                 self.clear_marker()
@@ -219,7 +254,8 @@ class Ingest:
         except ServiceUnavailable:
             self.stats.seen(False)
             raise _Later() from None
-        except ServiceError:
+        except ServiceError as exc:
+            self.own_bot.refused(exc)
             return False
         self.stats.seen(True)
         self._pushed_version = version
@@ -245,6 +281,8 @@ class Ingest:
             try:
                 out = await self._post(item.path, item.body)
             except ServiceError as exc:
+                if self.own_bot.refused(exc):
+                    return              # не отказ этому обновлению: пересылка останавливается целиком
                 if attempt == 1 and exc.code == "unknown_connection" and cid and await self._resend_connection(cid):
                     continue
                 if attempt == 1 and exc.code == "owner_unknown" and await self.sync_owner(force=True):
@@ -270,7 +308,8 @@ class Ingest:
             else:
                 self.stats.bump("not_stored_excluded" if reason == "excluded" else "not_stored_other")
             return
-        self.stats.bump("rejected")
+        if not self.own_bot.active:     # отказ own_bot — не отказ этому обновлению
+            self.stats.bump("rejected")
 
     @staticmethod
     def _not_stored(item: Item, out: Mapping[str, Any]) -> str | None:
@@ -329,6 +368,8 @@ class Ingest:
                 self.stats.bump("forwarded_connections")
                 return True
             except ServiceError as exc:
+                if self.own_bot.refused(exc):
+                    return False
                 if attempt == 1 and exc.code == "owner_unknown" and await self.sync_owner(force=True):
                     continue
                 break
