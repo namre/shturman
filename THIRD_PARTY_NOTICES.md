@@ -9,7 +9,7 @@
 | Компонент | Роль | Лицензия | Источник |
 |---|---|---|---|
 | Hermes Agent | Агент и шлюз сообщений | MIT | https://github.com/NousResearch/hermes-agent |
-| hermes-telegram-business | Плагин бизнес-режима; ставится из мастера по SHA | MIT | https://github.com/NousResearch/hermes-telegram-business |
+| hermes-telegram-business | Плагин бизнес-режима. С версии 0.0.6 мастер его не ставит (решение Р-59); на экземплярах прежней схемы он установлен по SHA | MIT | https://github.com/NousResearch/hermes-telegram-business |
 | PostgreSQL 16 | Хранилище архива | PostgreSQL License | https://www.postgresql.org |
 | pgvector 0.8.7 | Векторный поиск в Postgres | PostgreSQL License | https://github.com/pgvector/pgvector |
 | text-embeddings-inference 1.9.4 | Сервер эмбеддингов и сервер классификатора защиты (оба по желанию) | Apache-2.0 | https://github.com/huggingface/text-embeddings-inference |

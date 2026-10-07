@@ -296,55 +296,68 @@ async def scenario(raw, base, api_token, work):
         print("\n5. Черновик через инструмент агента")
         draft_tool = shturman_tools._handler("shturman_draft_message")
         out = json.loads(await asyncio.to_thread(draft_tool, {"chat_id": chat_id, "text": "Спасибо, жду в пятницу"}))
-        check("инструмент создал черновик и сказал, что ничего не отправлено",
-              out.get("ok") and out.get("sent") is False and out.get("status") == "pending", json.dumps(out, ensure_ascii=False)[:160])
-        draft_id = out.get("draft_id")
-        card = await wait(lambda: [p for p in tg.of("sendMessage") if "reply_markup" in p and p["chat_id"] == "42"])
-        check("notify.owner выполнен: карточка пришла владельцу с кнопками", bool(card))
-        buttons = json.loads(card[-1]["reply_markup"])["inline_keyboard"] if card else []
-        flat = [b for row in buttons for b in row]
-        print("     кнопки:", [(b["text"], b["callback_data"][:6] + "…") for b in flat])
-        check("карточка — обычный текст, данные кнопок начинаются с sh:",
-              card and "parse_mode" not in card[-1] and all(b["callback_data"].startswith("sh:") for b in flat))
-        check("от имени владельца пока ничего не ушло", not [p for p in tg.of("sendMessage") if p.get("business_connection_id")])
-        drafts = (await ui_get("/api/outbox/drafts"))["drafts"]
-        check("черновик ждёт решения", drafts and drafts[0]["status"] == "pending", drafts[0]["status"] if drafts else "нет")
+        card = []
+        if out.get("reason") == "sending_disabled":
+            # С версии 0.0.4 отправка работает только со своим ботом согласований сервиса: без него
+            # нажатие «Отправить» шло бы через Hermes, где его может подделать ассистент. В этом
+            # сценарии бота согласований нет, поэтому черновик не создаётся при любом значении
+            # SHTURMAN_SENDING. Путь «черновик → карточка → нажатие → отправка» проверяют тесты
+            # сервиса (service/tests/outbox, service/tests/executor), здесь он пропускается.
+            check("без бота согласований черновик не создаётся: отправка выключена",
+                  out.get("ok") is False and out.get("sent") is False, json.dumps(out, ensure_ascii=False)[:120])
+            check("от имени владельца ничего не ушло", not [p for p in tg.of("sendMessage") if p.get("business_connection_id")])
+            check("черновиков в сервисе нет", not (await ui_get("/api/outbox/drafts"))["drafts"])
+            print("     шаги 6 и 7 (нажатие и отправка) пропущены: отправка без бота согласований выключена")
+        else:
+            check("инструмент создал черновик и сказал, что ничего не отправлено",
+                  out.get("ok") and out.get("sent") is False and out.get("status") == "pending", json.dumps(out, ensure_ascii=False)[:160])
+            draft_id = out.get("draft_id")
+            card = await wait(lambda: [p for p in tg.of("sendMessage") if "reply_markup" in p and p["chat_id"] == "42"])
+            check("notify.owner выполнен: карточка пришла владельцу с кнопками", bool(card))
+            buttons = json.loads(card[-1]["reply_markup"])["inline_keyboard"] if card else []
+            flat = [b for row in buttons for b in row]
+            print("     кнопки:", [(b["text"], b["callback_data"][:6] + "…") for b in flat])
+            check("карточка — обычный текст, данные кнопок начинаются с sh:",
+                  card and "parse_mode" not in card[-1] and all(b["callback_data"].startswith("sh:") for b in flat))
+            check("от имени владельца пока ничего не ушло", not [p for p in tg.of("sendMessage") if p.get("business_connection_id")])
+            drafts = (await ui_get("/api/outbox/drafts"))["drafts"]
+            check("черновик ждёт решения", drafts and drafts[0]["status"] == "pending", drafts[0]["status"] if drafts else "нет")
 
-        send_button = next((b for b in flat if "тправ" in b["text"]), flat[0] if flat else None)
-        card_message_id = tg.next_id
+            send_button = next((b for b in flat if "тправ" in b["text"]), flat[0] if flat else None)
+            card_message_id = tg.next_id
 
-        def press(user, update_id):
-            return {"update_id": update_id, "callback_query": {
-                "id": f"q{update_id}", "from": user, "chat_instance": "ci", "data": send_button["callback_data"],
-                "message": {"message_id": card_message_id, "date": now(), "chat": {"id": user["id"] if user is PETR else 42, "type": "private"},
-                            "text": card[-1]["text"], "from": BOT_USER, "reply_markup": {"inline_keyboard": buttons}}}}
+            def press(user, update_id):
+                return {"update_id": update_id, "callback_query": {
+                    "id": f"q{update_id}", "from": user, "chat_instance": "ci", "data": send_button["callback_data"],
+                    "message": {"message_id": card_message_id, "date": now(), "chat": {"id": user["id"] if user is PETR else 42, "type": "private"},
+                                "text": card[-1]["text"], "from": BOT_USER, "reply_markup": {"inline_keyboard": buttons}}}}
 
-        print("\n6. Нажатие постороннего")
-        await feed(press(PETR, 20))
-        await wait(lambda: tg.of("answerCallbackQuery"), 5)
-        drafts = (await ui_get("/api/outbox/drafts"))["drafts"]
-        check("нажатие не владельца не передано сервису, черновик не тронут",
-              runtime.stats.counters["callbacks"] == 0 and runtime.stats.counters["callbacks_refused"] == 1
-              and drafts[0]["status"] == "pending")
+            print("\n6. Нажатие постороннего")
+            await feed(press(PETR, 20))
+            await wait(lambda: tg.of("answerCallbackQuery"), 5)
+            drafts = (await ui_get("/api/outbox/drafts"))["drafts"]
+            check("нажатие не владельца не передано сервису, черновик не тронут",
+                  runtime.stats.counters["callbacks"] == 0 and runtime.stats.counters["callbacks_refused"] == 1
+                  and drafts[0]["status"] == "pending")
 
-        print("\n7. Нажатие владельца «Отправить»")
-        await feed(press(OWNER, 21))
-        sent = await wait(lambda: [p for p in tg.of("sendMessage") if p.get("business_connection_id")])
-        check("business.send выполнен через бизнес-подключение владельца",
-              len(sent) == 1 and sent[0]["business_connection_id"] == "bc1" and sent[0]["chat_id"] == str(PETR["id"])
-              and sent[0]["text"] == "Спасибо, жду в пятницу" and "parse_mode" not in sent[0],
-              f"отправок: {len(sent)}")
-        done = await wait(lambda: raw("GET", "/api/outbox/drafts")[1]["drafts"][0]["status"] == "sent")
-        drafts = (await ui_get("/api/outbox/drafts"))["drafts"]
-        check("черновик в сервисе — sent, номер сообщения записан",
-              done and drafts[0]["sent_tg_message_ids"], f"status={drafts[0]['status']} ids={drafts[0]['sent_tg_message_ids']}")
-        check("владельцу ответили на нажатие и обновили карточку",
-              len(tg.of("answerCallbackQuery")) >= 2 and (tg.of("editMessageText") or tg.of("editMessageReplyMarkup")),
-              f"answers={[p.get('text') for p in tg.of('answerCallbackQuery')]}")
-        await feed(press(OWNER, 22))        # повторное нажатие
-        await asyncio.sleep(1.5)
-        check("повторное нажатие не даёт второй отправки",
-              len([p for p in tg.of("sendMessage") if p.get("business_connection_id")]) == 1)
+            print("\n7. Нажатие владельца «Отправить»")
+            await feed(press(OWNER, 21))
+            sent = await wait(lambda: [p for p in tg.of("sendMessage") if p.get("business_connection_id")])
+            check("business.send выполнен через бизнес-подключение владельца",
+                  len(sent) == 1 and sent[0]["business_connection_id"] == "bc1" and sent[0]["chat_id"] == str(PETR["id"])
+                  and sent[0]["text"] == "Спасибо, жду в пятницу" and "parse_mode" not in sent[0],
+                  f"отправок: {len(sent)}")
+            done = await wait(lambda: raw("GET", "/api/outbox/drafts")[1]["drafts"][0]["status"] == "sent")
+            drafts = (await ui_get("/api/outbox/drafts"))["drafts"]
+            check("черновик в сервисе — sent, номер сообщения записан",
+                  done and drafts[0]["sent_tg_message_ids"], f"status={drafts[0]['status']} ids={drafts[0]['sent_tg_message_ids']}")
+            check("владельцу ответили на нажатие и обновили карточку",
+                  len(tg.of("answerCallbackQuery")) >= 2 and (tg.of("editMessageText") or tg.of("editMessageReplyMarkup")),
+                  f"answers={[p.get('text') for p in tg.of('answerCallbackQuery')]}")
+            await feed(press(OWNER, 22))        # повторное нажатие
+            await asyncio.sleep(1.5)
+            check("повторное нажатие не даёт второй отправки",
+                  len([p for p in tg.of("sendMessage") if p.get("business_connection_id")]) == 1)
 
         print("\n8. Обязательства: разбор переписки моделью (llm.structured) и инструменты")
         code, plan = raw("POST", "/api/processing/run", {})
@@ -367,7 +380,7 @@ async def scenario(raw, base, api_token, work):
                 refused = json.loads(update_tool({"commitment_id": cid, "action": "accept"}))
                 check("принять предложение инструментом нельзя (действие владельца)", refused.get("reason") == "bad_args")
                 digest = await wait(lambda: [p for p in tg.of("sendMessage") if "reply_markup" in p and "sh:" in p["reply_markup"]
-                                             and p is not card[-1]], 15)
+                                             and (not card or p is not card[-1])], 15)
                 accept = None
                 for p in digest or []:
                     for row in json.loads(p["reply_markup"])["inline_keyboard"]:
@@ -423,7 +436,8 @@ async def scenario(raw, base, api_token, work):
         state = bridge_stats.status(store, configured=sc.configured())
         check("страница состояния: исполнитель работает, сервис доступен, счётчики — числа",
               state["executor_running"] and state["reachable"] is True and state["counters"]["forwarded_messages"] >= 5
-              and state["counters"]["jobs_done"] >= 3 and state["last_job_at"], json.dumps({k: state[k] for k in ("executor_running", "reachable", "queue")}))
+              and state["counters"]["jobs_done"] >= (3 if card else 2) and state["last_job_at"],   # без черновика заданий меньше
+              json.dumps({k: state[k] for k in ("executor_running", "reachable", "queue")}))
         final = await ui_get("/api/status")
         print("     сервис:", json.dumps(final, ensure_ascii=False))
         check("в очереди сервиса нет зависших и неудачных заданий", final["jobs_failed"] == 0, f"failed={final['jobs_failed']} waiting={final['jobs_waiting']}")
