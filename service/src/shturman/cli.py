@@ -241,17 +241,21 @@ def _bot_status() -> None:
     commands.bot_status(_local_api)
 
 
-def _setup_base() -> tuple[str, bool]:
-    """Адрес, под которым открывается страница настройки, и внешний ли он."""
-    from .config import ConfigError, _setup_origin
+def _setup_base() -> tuple[str, str | None]:
+    """Адрес, под которым открывается страница настройки, и причина, по которой он не внешний
+    (None — внешний; no_origin — не задан; same_origin — совпал с адресом дашборда Hermes)."""
+    from .config import ConfigError, _setup_origin, normalize_origin
 
     try:
         origin = _setup_origin(os.environ.get("SHTURMAN_SETUP_ORIGIN", "").strip())
+        dashboard = normalize_origin(os.environ.get("SHTURMAN_DASHBOARD_ORIGIN", "").strip(),
+                                     "SHTURMAN_DASHBOARD_ORIGIN", strict=False)
     except ConfigError as exc:
         sys.exit(str(exc))
-    if origin:
-        return origin, True
-    return f"http://127.0.0.1:{os.environ.get('SHTURMAN_PORT', '').strip() or '8765'}", False
+    if origin and origin != dashboard:
+        return origin, None
+    local = f"http://127.0.0.1:{os.environ.get('SHTURMAN_PORT', '').strip() or '8765'}"
+    return local, "same_origin" if origin else "no_origin"
 
 
 async def _setup_link(full_url: bool) -> None:
@@ -271,7 +275,7 @@ async def _setup_link(full_url: bool) -> None:
         token, expires_at = await auth.create_link(conn)
     finally:
         await conn.close()
-    base, external = _setup_base()
+    base, local_reason = _setup_base()
     path = f"{setup_page.PREFIX}/#{token}"
     print(base + path if full_url else path)
     note = sys.stderr
@@ -279,7 +283,12 @@ async def _setup_link(full_url: bool) -> None:
           f"(до {expires_at:%H:%M} UTC) и срабатывает один раз.", file=note)
     if not full_url:
         print(f"Это путь: допишите его к адресу страницы — {base}", file=note)
-    if not external:
+    if local_reason == "same_origin":
+        print("ВНИМАНИЕ: адрес страницы (SHTURMAN_SETUP_ORIGIN) совпадает с адресом дашборда Hermes "
+              "(SHTURMAN_DASHBOARD_ORIGIN). По такому адресу страница не отдаётся: дайте ей другой порт "
+              "(например :8443) или другое имя. Пока она открывается только с самого сервера либо через "
+              "туннель SSH на порт сервиса.", file=note)
+    elif local_reason:
         print("Внешний адрес страницы не задан (SHTURMAN_SETUP_ORIGIN пуст): она открывается только "
               "с самого сервера либо через туннель SSH на порт сервиса.", file=note)
     print("Кто откроет ссылку, тот войдёт на страницу настройки: её передают владельцу как есть "

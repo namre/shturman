@@ -6,7 +6,7 @@
 Ссылка входа
   * случайная, 256 бит; в базе — только её SHA-256;
   * живёт 30 минут и срабатывает один раз; новая отменяет прежнюю;
-  * создаётся командой `shturman setup-link` прямой записью в базу. Маршрута для неё нет и быть
+  * создаётся командой `shturman setup-link` (на сервере — `./ops/setup-link.sh`) прямой записью в базу. Маршрута для неё нет и быть
     не должно: токен внутреннего API есть у ассистента в Hermes, строка подключения к базе —
     только в контейнере сервиса;
   * вход по ссылке завершает все прежние сессии и снимает блокировку входа по коду: владелец
@@ -22,13 +22,27 @@
   * после неудачной отправки — новая попытка не раньше чем через минуту;
   * 5 неверных кодов подряд — вход по коду закрывается на 1, 5, 15, 60 минут; счётчик новым
     кодом не обнуляется. Счётчик один на всех, а не «на адрес»: адресу клиента за прокси
-    верить нельзя. Цена — посторонний может на время закрыть вход по коду; выход — новая ссылка.
+    верить нельзя. Цена — посторонний может на время закрыть вход по коду; выход — новая ссылка;
+  * о закрытии входа владельцу уходит одно сообщение за период блокировки (`verify_code`
+    возвращает `locked_now` не чаще).
   Правила те же, что у входа в дашборд по коду от бота Hermes (plugins/shturman, auth.py).
 
-Сессия
-  * случайный идентификатор, 256 бит; в базе — его SHA-256, сам он — только в cookie;
-  * 12 часов без обращений — и вход заново; не дольше 7 дней от входа в любом случае;
-  * «выйти» завершает эту сессию, «выйти везде» и команда `shturman setup-logout-all` — все.
+Сессия — без cookie
+  * ключ сессии: случайный, 256 бит; в базе — его SHA-256. Сервер отдаёт ключ один раз, в ответе
+    на вход; страница хранит его в `localStorage` своего origin и присылает в заголовке
+    `X-Shturman-Session` с каждым запросом, в том числе с загрузкой выгрузки;
+  * почему не cookie. Страница стоит на том же имени узла, что и дашборд Hermes, но на другом
+    порту. Cookie по портам не разделяются: поставленная страницей cookie уходила бы и на порт
+    дашборда — в Hermes, которым может управлять противник, — а скрипт дашборда мог бы подложить
+    свою cookie на то же имя. `localStorage` разделяется по origin вместе с портом: дашборд его
+    не видит. Заголовок браузер сам не приставляет ни к какому запросу — его ставит только
+    скрипт страницы, поэтому подделка запроса с чужого сайта (CSRF) невозможна по построению, и
+    отдельного значения против неё больше нет;
+  * cookie страница не ставит и не читает: с любыми cookie, но без заголовка запрос — гость;
+  * ключ не попадает ни в адрес, ни в журналы, ни в ответы (кроме единственного ответа на вход);
+  * сессия живёт 7 дней от входа; «выйти» завершает её, «выйти везде» и команда
+    `shturman setup-logout-all` (на сервере — `./ops/logout-all.sh`) — все;
+  * вход по новой ссылке завершает все прежние сессии.
 """
 
 from __future__ import annotations
@@ -46,14 +60,14 @@ from typing import Any, Awaitable, Callable
 import asyncpg
 
 LINK_TTL = 30 * 60
-SESSION_IDLE = 12 * 3600
 SESSION_MAX = 7 * 24 * 3600
+SESSION_HEADER = "x-shturman-session"
 CODE_TTL = 5 * 60
 CODE_DIGITS = 8
 CODE_RETRY = 60
 CODE_MAX_ATTEMPTS = 5
 LOCK_STEPS = (60, 5 * 60, 15 * 60, 60 * 60)
-COOKIE = "shturman_setup"
+LOCK_NOTICE_EVERY = 15 * 60     # и не чаще раза в 15 минут, пока блокировки ещё короткие
 CODE_STATE = "login_code"
 
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
@@ -72,12 +86,6 @@ def well_formed(value: Any) -> bool:
 
 def token_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def csrf_token(session_token: str) -> str:
-    """Значение для заголовка X-Shturman-Csrf. Выводится из идентификатора сессии, поэтому
-    отдельно не хранится; сам идентификатор по нему не восстановить."""
-    return hashlib.sha256(b"shturman-setup-csrf:" + session_token.encode("utf-8")).hexdigest()
 
 
 # --- ссылка входа ---
@@ -117,33 +125,32 @@ async def redeem_link(conn: asyncpg.Connection, token: Any) -> bool:
 class Session:
     id: int
     via: str
-    csrf: str
     created_at: datetime
     expires_at: datetime
 
 
 async def create_session(conn: asyncpg.Connection, via: str) -> tuple[str, Session]:
+    """Новая сессия: (ключ сессии, запись). Ключ существует только здесь и у страницы."""
     token = new_token()
     row = await conn.fetchrow(
         """INSERT INTO setup_sessions (token_hash, via, expires_at)
            VALUES ($1, $2, now() + make_interval(secs => $3)) RETURNING id, via, created_at, expires_at""",
         token_hash(token), via, float(SESSION_MAX))
-    return token, Session(row["id"], row["via"], csrf_token(token), row["created_at"], row["expires_at"])
+    return token, Session(row["id"], row["via"], row["created_at"], row["expires_at"])
 
 
 async def find_session(conn: asyncpg.Connection, token: Any) -> Session | None:
-    """Действующая сессия по значению из cookie; заодно отмечает обращение."""
+    """Действующая сессия по ключу из заголовка запроса; заодно отмечает обращение."""
     if not well_formed(token):
         return None
     row = await conn.fetchrow(
         """UPDATE setup_sessions SET last_seen_at = now()
            WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
-             AND last_seen_at > now() - make_interval(secs => $2)
            RETURNING id, via, created_at, expires_at""",
-        token_hash(token), float(SESSION_IDLE))
+        token_hash(token))
     if row is None:
         return None
-    return Session(row["id"], row["via"], csrf_token(token), row["created_at"], row["expires_at"])
+    return Session(row["id"], row["via"], row["created_at"], row["expires_at"])
 
 
 async def revoke_session(conn: asyncpg.Connection, session_id: int) -> None:
@@ -164,8 +171,7 @@ async def cleanup(conn: asyncpg.Connection) -> None:
     await conn.execute("DELETE FROM setup_links WHERE expires_at < now() - interval '1 day'")
     await conn.execute(
         """DELETE FROM setup_sessions
-           WHERE expires_at < now() - interval '1 day' OR revoked_at < now() - interval '1 day'
-              OR last_seen_at < now() - make_interval(secs => $1) - interval '1 day'""", float(SESSION_IDLE))
+           WHERE expires_at < now() - interval '1 day' OR revoked_at < now() - interval '1 day'""")
 
 
 # --- код от бота согласований ---
@@ -227,9 +233,11 @@ async def request_code(conn: asyncpg.Connection, key: bytes, send: Send | None) 
 
 
 async def verify_code(conn: asyncpg.Connection, key: bytes, code: Any) -> str:
-    """ok | wrong | expired | locked | locked_now | none (код не запрашивали).
+    """ok | wrong | expired | locked | locked_now | locked_again | none (код не запрашивали).
 
-    locked_now — эта попытка стала пятой неверной: вход закрыт, владельцу стоит сообщить."""
+    locked_now — эта попытка стала пятой неверной: вход закрыт, владельцу стоит сообщить.
+    locked_again — вход закрыт этой попыткой, но о блокировке владельцу сообщали только что:
+    второе сообщение не нужно. Сообщение уходит не чаще раза за период блокировки."""
     digits = "".join(ch for ch in str(code) if ch in "0123456789")[:CODE_DIGITS * 2]
     moment = int(now())
     async with conn.transaction():
@@ -251,9 +259,16 @@ async def verify_code(conn: asyncpg.Connection, key: bytes, code: Any) -> str:
             await _save_state(conn, data)
             return "wrong"
         level = int(data.get("lock_level", 0))
-        data["lock_until"] = moment + LOCK_STEPS[min(level, len(LOCK_STEPS) - 1)]
+        period = LOCK_STEPS[min(level, len(LOCK_STEPS) - 1)]
+        data["lock_until"] = moment + period
         data["lock_level"] = level + 1
         data["attempts"] = 0
         data.pop("digest", None)
+        # Сообщение владельцу — одно на период: следующее не раньше, чем через длину этой
+        # блокировки после предыдущего. Иначе тот, кто раз за разом запрашивает код и вводит
+        # пять неверных, слал бы владельцу сообщение на каждый круг.
+        notify = moment >= int(data.get("lock_notice_until", 0))
+        if notify:
+            data["lock_notice_until"] = moment + max(period, LOCK_NOTICE_EVERY)
         await _save_state(conn, data)
-    return "locked_now"
+    return "locked_now" if notify else "locked_again"

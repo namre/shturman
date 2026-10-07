@@ -142,6 +142,8 @@ class Control:
                 models=task_models(os.environ), proxy_url=config.proxy_url,
                 transport=TEST_OVERRIDES.get("llm_transport"),
                 tokens_param=os.environ.get("SHTURMAN_LLM_TOKENS_PARAM", "").strip(),
+                # Адрес, введённый на странице настройки, — только https и только наружу.
+                restricted=config.llm_url_from_page,
             )
             kinds.update(LLM_OWNED)
             if llm.broken:

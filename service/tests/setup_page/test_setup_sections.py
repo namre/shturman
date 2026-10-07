@@ -274,7 +274,7 @@ async def test_roles_are_guarded_the_same_way_as_in_the_terminal(stand, conn):
     await s.page.put("/tg/keys", KEYS)
     # помощник — только когда сервис знает владельца
     early = await s.page.post("/tg/login", {"role": "assistant"})
-    assert early.status_code == 409 and early.json()["code"] == "owner_unknown" and "раздел 1" in early.json()["error"]
+    assert early.status_code == 409 and early.json()["code"] == "owner_unknown" and "шаг 2" in early.json()["error"]
     assert (await s.page.post("/tg/login", {"role": "admin"})).status_code == 400
     # основной аккаунт — только с явным согласием
     assert (await s.page.post("/tg/login", {"role": "owner"})).status_code == 400
@@ -495,7 +495,8 @@ async def test_upload_keeps_the_size_limit_and_refuses_what_is_not_an_export(sta
     assert bad.status_code == 201
     scan = await s.page.get(f"/imports/{bad.json()['import_id']}/scan")
     assert scan.status_code == 422 and scan.json()["code"] == "scan_failed"
-    assert (await s.browser().http.post(API + "/imports", content=export_bytes(), headers=s.page.headers())).status_code in (401, 403)
+    guest = s.browser()
+    assert (await guest.http.post(API + "/imports", content=export_bytes(), headers=guest.headers())).status_code == 401
 
 
 # --- 6. бизнес-режим ---
@@ -534,6 +535,8 @@ async def test_model_key_is_checked_by_a_live_request_and_applied(stand, conn):
     assert (await s.page.put("/llm", {"model": "gpt-test"})).json()["code"] == "empty"
     for body, code in (({"api_key": LLM_KEY, "model": "две части"}, "bad_model"), ({"api_key": LLM_KEY, "model": ""}, "bad_model"),
                        ({"api_key": LLM_KEY, "model": "m", "base_url": "ftp://llm.example"}, "bad_base_url"),
+                       ({"api_key": LLM_KEY, "model": "m", "base_url": "http://llm.example/v1"}, "bad_base_url"),
+                       ({"api_key": LLM_KEY, "model": "m", "base_url": "https://127.0.0.1:9119/v1"}, "blocked_base_url"),
                        ({"api_key": LLM_KEY, "model": "m", "base_url": "https://u:p@llm.example/v1"}, "bad_base_url")):
         got = await s.page.put("/llm", body)
         assert got.status_code == 422 and got.json()["code"] == code
@@ -556,10 +559,14 @@ async def test_model_key_is_checked_by_a_live_request_and_applied(stand, conn):
     # сервис сам выполняет задания модели — без перезапуска
     job = await bridge.request_text(conn, handler="x", messages=[{"role": "user", "content": "привет"}])
     await until(lambda: conn.fetchval("SELECT status = 'done' FROM jobs WHERE id = $1", job))
-    # сменить только модель можно без повторного ввода ключа
-    again = await s.page.put("/llm", {"model": "gpt-other"})
+    # сменить только модель можно без повторного ввода ключа — пока адрес прежний
+    again = await s.page.put("/llm", {"model": "gpt-other", "base_url": "https://llm.example/v1"})
     assert again.status_code == 200 and s.state.config.llm_model == "gpt-other" and s.state.config.llm_api_key == LLM_KEY
-    assert s.state.config.llm_base_url == "https://api.openai.com/v1"          # адрес не назван — обычный
+    assert s.state.config.llm_base_url == "https://llm.example/v1"
+    # а смена адреса (в том числе «не назван» — значит обычный) без ключа не проходит
+    moved = await s.page.put("/llm", {"model": "gpt-other"})
+    assert moved.status_code == 422 and moved.json()["code"] == "key_required"
+    assert s.state.config.llm_base_url == "https://llm.example/v1"
     assert (await s.page.delete("/llm")).status_code == 200
     assert s.state.config.own_llm is False and bridge.LLM_TEXT not in bridge.builtin_kinds()
     assert ss.SecretStore(s.config.data_dir).load() == {}
@@ -585,6 +592,10 @@ async def test_overview_shows_counts_and_recent_actions(stand, conn):
     await audit.write(s.state.pool, "bot.token", audit.REFUSED, "ботом уже пользуется другая программа")
     assert (await s.page.get("/overview")).json()["audit"][0]["title"] == "Токен бота согласований не сохранён"
     assert set(out["audit"][0]) == {"at", "action", "title", "outcome", "detail"}
+    # входы, ключи и аккаунты — отдельным списком
+    key_titles = [row["title"] for row in out["audit_key"]]
+    assert "Вход по ссылке" in key_titles and "Ключи приложения Telegram сохранены" in key_titles
+    assert "Запущен импорт выгрузки" not in key_titles
     assert (await s.browser().get("/overview")).status_code == 401
 
 
@@ -609,6 +620,41 @@ async def test_every_audit_action_has_a_title_and_unknown_actions_are_refused(st
         await audit.write(s.state.pool, "logout", detail=str(i))
     await conn.execute("DELETE FROM setup_audit WHERE id <= (SELECT max(id) FROM setup_audit) - 3")
     assert [r["detail"] for r in await audit.recent(conn)] == ["4", "3", "2"]
+
+
+async def test_flood_of_small_actions_cannot_push_out_logins_keys_and_accounts(stand, conn, monkeypatch):
+    """Журнал обрезается, но записи о входах, смене ключей и входе в аккаунты Telegram хранятся
+    отдельно от обычных: потоком мелких действий их не вытеснить ни из базы, ни из вида."""
+    s = await ready(stand, conn)
+    account_id = await connect(s, "owner", ME, confirm_owner=True)
+    monkeypatch.setattr(audit, "KEEP", 50)
+    monkeypatch.setattr(audit, "KEEP_IMPORTANT", 40)
+    important = {r["action"] for r in await conn.fetch("SELECT DISTINCT action FROM setup_audit")} & audit.IMPORTANT
+    assert {"login.link", "bot.token", "bot.bind_link", "tg.keys", "tg.login", "tg.login_done"} <= important
+    # тот, кто получил доступ, заметает следы: сотни действий, каждое из которых оставляет обычную запись
+    for i in range(4):
+        await s.page.put(f"/tg/accounts/{account_id}/options", {"backfill_months": i + 1})
+    await conn.execute(
+        """INSERT INTO setup_audit (action, outcome, detail)
+           SELECT (ARRAY['tg.options', 'tg.sync_on', 'tg.sync_off', 'login.failed', 'login.code_sent', 'logout'])[1 + i % 6],
+                  'ok', '' FROM generate_series(1, 3000) i""")
+    await audit.trim(conn)
+    left = {r["action"]: r["n"] for r in await conn.fetch("SELECT action, count(*) AS n FROM setup_audit GROUP BY action")}
+    assert sum(n for action, n in left.items() if action not in audit.IMPORTANT) == 50
+    assert important <= set(left)                                   # все важные записи на месте
+    out = (await s.page.get("/overview")).json()
+    assert {row["action"] for row in out["audit"]} <= {"tg.options", "tg.sync_on", "tg.sync_off", "login.failed",
+                                                       "login.code_sent", "logout"}       # общий список залит
+    assert {"login.link", "tg.keys", "tg.login_done"} <= {row["action"] for row in out["audit_key"]}
+    # у важных свой предел: поток важных записей обычные не трогает и сам обрезается
+    await conn.execute(
+        "INSERT INTO setup_audit (action, outcome, detail) SELECT 'tg.keys', 'ok', '' FROM generate_series(1, 500)")
+    await audit.trim(conn)
+    counts = await conn.fetchrow(
+        "SELECT count(*) FILTER (WHERE action = ANY($1::text[])) AS important, count(*) AS total FROM setup_audit",
+        sorted(audit.IMPORTANT))
+    assert (counts["important"], counts["total"]) == (40, 90)
+    assert audit.IMPORTANT <= set(audit.ACTIONS)
 
 
 async def test_changing_actions_need_a_session(stand, conn):

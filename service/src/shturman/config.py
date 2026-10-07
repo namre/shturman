@@ -74,9 +74,16 @@ class Config:
     # одни правила: это заметно слабее модели.
     guard_url: str = ""
     guard_model: str = "Horizon-Labs/prompt-injection-guard-small"
-    # Внешний адрес страницы настройки (схема и имя, без пути), например https://assistant.example.com.
-    # Пусто — страница отвечает только под локальными именами из allowed_hosts (туннель SSH).
+    # Внешний адрес страницы настройки (схема, имя и порт, без пути), например
+    # https://assistant.example.com:8443. Пусто — страница отвечает только под локальными именами
+    # из allowed_hosts (туннель SSH). Адрес обязан отличаться от адреса дашборда Hermes хотя бы
+    # портом: см. `setup_reason`.
     setup_origin: str = ""
+    # Адрес дашборда Hermes (схема, имя, порт). Нужен только для сравнения с адресом страницы.
+    dashboard_origin: str = ""
+    # Адрес API своей модели введён на странице настройки (а не задан окружением и не взят по
+    # умолчанию): запросы по нему идут только наружу и только по https (netguard.py).
+    llm_url_from_page: bool = False
     # Какие из значений страницы настройки заданы окружением сервиса: страница их не меняет
     # (имена — как в setup_page/secrets_store.py).
     locked: frozenset[str] = frozenset()
@@ -89,6 +96,25 @@ class Config:
     @property
     def own_llm(self) -> bool:
         return bool(self.llm_api_key and self.llm_model)
+
+    @property
+    def setup_reason(self) -> str | None:
+        """Почему страница настройки не отдаётся по внешнему адресу; None — отдаётся.
+
+        same_origin — адрес страницы совпал с адресом дашборда Hermes. Ассистент в Hermes может
+        исполнять свой JavaScript на адресе дашборда; на том же адресе этот скрипт читал бы
+        хранилище страницы и слал бы запросы от её имени. Поэтому страница по такому адресу не
+        обслуживается вовсе — только под локальными именами."""
+        if not self.setup_origin:
+            return "no_origin"
+        if self.dashboard_origin and self.setup_origin == self.dashboard_origin:
+            return "same_origin"
+        return None
+
+    @property
+    def setup_external(self) -> str:
+        """Внешний адрес, под которым страница настройки действительно отдаётся, либо пусто."""
+        return self.setup_origin if self.setup_reason is None else ""
 
     @property
     def sessions_dir(self) -> Path:
@@ -125,6 +151,8 @@ class Config:
             data_dir=data_dir,
             allowed_hosts=hosts or (f"127.0.0.1:{port}", f"localhost:{port}"),
             setup_origin=_setup_origin(_env("SHTURMAN_SETUP_ORIGIN")),
+            dashboard_origin=normalize_origin(_env("SHTURMAN_DASHBOARD_ORIGIN"), "SHTURMAN_DASHBOARD_ORIGIN",
+                                              strict=False),
             tg_api_id=_int("TELEGRAM_API_ID", 0), tg_api_hash=_env("TELEGRAM_API_HASH"),
             proxy_url=_env("EGRESS_PROXY_URL"),
             embeddings_url=_env("SHTURMAN_EMBEDDINGS_URL"),
@@ -162,23 +190,44 @@ def with_page_values(config: Config, env) -> Config:
     return dataclasses.replace(secrets_store.overlay(config, stored, managed), locked=locked)
 
 
-def _setup_origin(raw: str) -> str:
-    """Внешний адрес страницы настройки: только схема и имя узла (с портом, если он не обычный)."""
+def normalize_origin(raw: str, name: str, *, strict: bool = True) -> str:
+    """Адрес как его сравнивает браузер (origin): схема, имя узла и порт — и ничего больше.
+
+    Приводится к одному виду: регистр, порт по умолчанию (80 для http, 443 для https) не
+    пишется, точка в конце имени убирается, имя не латиницей записывается в punycode. Два
+    адреса, которые после этого совпали, для браузера — один origin.
+
+    strict — путь, запрос и фрагмент запрещены (так задаётся адрес страницы настройки). Без
+    него они отбрасываются: адрес дашборда нужен только для сравнения."""
     if not raw:
         return ""
     from urllib.parse import urlsplit
 
-    parts = urlsplit(raw)
-    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
-        raise ConfigError("SHTURMAN_SETUP_ORIGIN: нужен адрес вида https://assistant.example.com")
-    if parts.path not in ("", "/") or parts.query or parts.fragment:
-        raise ConfigError("SHTURMAN_SETUP_ORIGIN: только схема и имя, без пути — например https://assistant.example.com")
+    example = "https://assistant.example.com:8443"
     try:
+        parts = urlsplit(raw)
         port = parts.port
     except ValueError:
-        raise ConfigError("SHTURMAN_SETUP_ORIGIN: неверный порт") from None
-    default = {"http": 80, "https": 443}[parts.scheme]
-    host = parts.hostname.lower()
+        raise ConfigError(f"{name}: неверный адрес или порт; нужен адрес вида {example}") from None
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username is not None \
+            or parts.password is not None or "@" in parts.netloc:
+        raise ConfigError(f"{name}: нужен адрес вида {example}")
+    if strict and (parts.path not in ("", "/") or parts.query or parts.fragment):
+        raise ConfigError(f"{name}: только схема, имя и порт, без пути — например {example}")
+    host = parts.hostname.lower().rstrip(".")
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ConfigError(f"{name}: имя узла записано неверно") from None
+    if not host or port == 0:
+        raise ConfigError(f"{name}: нужен адрес вида {example}")
     if ":" in host:
         host = f"[{host}]"
+    default = {"http": 80, "https": 443}[parts.scheme]
     return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
+def _setup_origin(raw: str) -> str:
+    """Внешний адрес страницы настройки: схема, имя узла и порт (если он не обычный)."""
+    return normalize_origin(raw, "SHTURMAN_SETUP_ORIGIN")

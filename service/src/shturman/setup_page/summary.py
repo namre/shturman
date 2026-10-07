@@ -25,11 +25,18 @@ async def overview(conn: asyncpg.Connection, state: Any) -> dict[str, Any]:
         """SELECT (SELECT count(*) FROM tg_sessions) AS accounts,
                   (SELECT EXISTS (SELECT 1 FROM business_connections
                                   WHERE via = 'service' AND enabled)) AS business""")
+    running = EXTRAS_KEY in state.extras
+    reason = config.setup_reason
     return {
-        # страница включена в этот сервис (модуль запущен)
-        "enabled": EXTRAS_KEY in state.extras,
-        # задан внешний адрес: страницу можно открыть не только с сервера и через туннель
-        "origin_set": bool(config.setup_origin),
+        # Страницей можно пользоваться. false — модуль не запущен либо её внешний адрес совпал
+        # с адресом дашборда Hermes (reason = same_origin): тогда снаружи она не отдаётся вовсе.
+        "enabled": running and reason != "same_origin",
+        # Страницу можно открыть по внешнему адресу, а не только с сервера и через туннель.
+        "origin_set": bool(config.setup_external),
+        # Внешний адрес страницы (схема, имя, порт) — не секрет; null, если снаружи её нет.
+        "origin": config.setup_external or None,
+        # Почему внешнего адреса нет: null | "no_origin" (не задан) | "same_origin" (совпал с дашбордом).
+        "reason": reason,
         "tg_keys": bool(config.tg_api_id and config.tg_api_hash),
         "accounts": int(row["accounts"]),
         "own_bot": bool(config.own_bot),

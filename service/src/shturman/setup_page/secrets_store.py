@@ -209,6 +209,11 @@ def overlay(config: Any, values: Mapping[str, str], managed: Iterable[str]) -> A
     """
     import dataclasses
 
+    managed = list(managed)
     changes = {FIELD[name]: _typed(name, values[name]) if values.get(name) else _empty(name)
                for name in managed}
+    if LLM_BASE_URL in managed:
+        # Адрес модели пришёл со страницы: запросы по нему ограничены (netguard.py). Адрес из
+        # окружения сюда не попадает (он не в managed), адрес по умолчанию — тоже.
+        changes["llm_url_from_page"] = bool(values.get(LLM_BASE_URL))
     return dataclasses.replace(config, **changes) if changes else config

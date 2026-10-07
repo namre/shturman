@@ -12,8 +12,8 @@
   После входа:
   POST   /shturman-setup/api/logout                     завершить эту сессию
   POST   /shturman-setup/api/logout-all                 завершить все сессии
-  GET    /shturman-setup/api/state                      состояние разделов 1–7
-  GET    /shturman-setup/api/overview                   раздел «Что собрано» и журнал действий
+  GET    /shturman-setup/api/state                      состояние шагов и блока «Дополнительно»
+  GET    /shturman-setup/api/overview                   счётчики архива и журнал действий
   POST   /shturman-setup/api/bot/token                  проверить и сохранить токен бота: {token, separate?}
   DELETE /shturman-setup/api/bot/token                  убрать токен, введённый на странице
   POST   /shturman-setup/api/bot/bind                   ссылка привязки владельца к боту
@@ -37,6 +37,9 @@
   DELETE /shturman-setup/api/imports/{import_id}
   PUT    /shturman-setup/api/llm                        {api_key?, base_url?, model}
   DELETE /shturman-setup/api/llm
+
+Вход — по одноразовой ссылке; ответ на вход один раз отдаёт ключ сессии. Дальше страница
+присылает его в заголовке `X-Shturman-Session`; cookie нет вовсе (почему — `auth.py`).
 
 Три правила.
 
@@ -84,8 +87,8 @@ MAX_BODY = 64 * 1024          # байт: JSON-запросы страницы �
 FAIL_DELAY = 0.4              # секунд «думает» отказ во входе по ссылке
 FAIL_SLOTS = 8                # столько отказов «думают» одновременно; остальные отвечают сразу
 FAIL_AUDIT_EVERY = 60.0       # не чаще раза в минуту в журнал действий пишется неудачный вход
-CSRF_HEADER = "x-shturman-csrf"
 PAGE_HEADER = "x-shturman-setup"
+PAGE_MARK = "x-shturman-setup-page"       # метка на ответе с самой страницей: по ней её узнаёт проверка
 
 STATIC_TYPES = {
     "setup.css": "text/css; charset=utf-8",
@@ -138,15 +141,23 @@ def _context(request: Request) -> dict[str, Any]:
 
 
 def _check_fetch(request: Request, ctx: dict[str, Any]) -> None:
-    """Запрос сделала сама страница, а не чужой сайт. Заголовки `Origin` и `Sec-Fetch-Site`
-    ставит браузер; скрипт на странице подделать их не может."""
+    """Запрос сделала сама страница, а не другой сайт и не соседний порт того же имени.
+
+    Это вторая линия: первая — ключ сессии в заголовке, которого у чужого скрипта нет. Заголовки
+    `Origin` и `Sec-Fetch-Site` ставит браузер; скрипт подделать их не может. Отвергается всё,
+    что не `same-origin`, для любого метода, включая GET: `same-site` — это дашборд Hermes на
+    соседнем порту, `cross-site` — чужой сайт, `none` — адрес API, набранный в адресной строке
+    (странице он не нужен). Запрос без этих заголовков (не из браузера) решает ключ сессии."""
     site = request.headers.get("sec-fetch-site")
+    origin = request.headers.get("origin")
     refused = BadRequest("Запрос пришёл не со страницы настройки.", 403, "bad_origin")
+    if site is not None and site != "same-origin":
+        raise refused
     if request.method == "GET":
-        if site is not None and site not in ("same-origin", "none"):
+        if origin is not None and origin != ctx["origin"]:
             raise refused
         return
-    if request.headers.get("origin") != ctx["origin"] or (site is not None and site != "same-origin"):
+    if origin != ctx["origin"]:
         raise refused
     if request.headers.get(PAGE_HEADER) != "1":
         # Свой заголовок простая форма на чужом сайте выставить не может.
@@ -154,7 +165,8 @@ def _check_fetch(request: Request, ctx: dict[str, Any]) -> None:
 
 
 async def _session(request: Request) -> auth.Session | None:
-    token = request.cookies.get(auth.COOKIE)
+    """Сессия по ключу из заголовка. Cookie не читаются вовсе."""
+    token = request.headers.get(auth.SESSION_HEADER)
     if not token:
         return None
     async with state_of(request).pool.acquire() as conn:
@@ -165,8 +177,8 @@ Handler = Callable[[Request], Awaitable[Response]]
 
 
 def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
-    """Обёртка маршрута: проверка источника запроса, сессии и защиты от подделки запроса;
-    отказы превращаются в ответ с текстом для владельца. public — маршрут входа: сессии ещё нет."""
+    """Обёртка маршрута: проверка источника запроса и сессии; отказы превращаются в ответ
+    с текстом для владельца. public — маршрут входа: сессии ещё нет."""
     def deco(fn: Handler) -> Handler:
         async def wrapped(request: Request) -> Response:
             try:
@@ -175,10 +187,6 @@ def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
                     session = await _session(request)
                     if session is None:
                         raise BadRequest("Вход устарел. Войдите заново.", 401, "unauthenticated")
-                    if request.method != "GET":
-                        sent = request.headers.get(CSRF_HEADER, "")
-                        if not _same(sent, session.csrf):
-                            raise BadRequest("Страница устарела. Обновите её и повторите.", 403, "bad_csrf")
                     request.state.setup_session = session
                 return await fn(request)
             except BadRequest as exc:
@@ -197,12 +205,6 @@ def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
         wrapped.__name__ = fn.__name__
         return wrapped
     return deco(fn) if fn is not None else deco
-
-
-def _same(a: str, b: str) -> bool:
-    import hmac
-
-    return hmac.compare_digest(a.encode("utf-8", "replace"), b.encode("utf-8"))
 
 
 async def _body(request: Request) -> dict[str, Any]:
@@ -289,7 +291,9 @@ def _static(name: str) -> bytes:
 
 
 async def index(request: Request) -> Response:
-    return Response(_static("index.html"), media_type="text/html; charset=utf-8")
+    """Сама страница. Тело одно и то же для любого запроса: данных в нём нет, а вошёл ли
+    браузер, страница узнаёт уже своим запросом с ключом сессии."""
+    return Response(_static("index.html"), media_type="text/html; charset=utf-8", headers={PAGE_MARK: "1"})
 
 
 async def static_file(request: Request) -> Response:
@@ -297,24 +301,17 @@ async def static_file(request: Request) -> Response:
     media = STATIC_TYPES.get(name)
     if media is None:
         return JSONResponse({"error": "not_found"}, status_code=404)
+    if request.headers.get("sec-fetch-site") not in (None, "same-origin"):
+        # Скрипты и стили страницы нужны только ей самой: соседнему порту и чужому сайту — отказ.
+        return JSONResponse({"error": "forbidden"}, status_code=403)
     return Response(_static(name), media_type=media)
 
 
 # --- вход ---------------------------------------------------------------------------------------
 
-def _signed_in(request: Request, token: str, session: auth.Session) -> JSONResponse:
-    response = JSONResponse({"ok": True, "csrf": session.csrf})
-    response.set_cookie(
-        auth.COOKIE, token, max_age=auth.SESSION_MAX, path=PREFIX + "/", httponly=True,
-        samesite="strict", secure=bool(_context(request)["secure"]))
-    return response
-
-
-def _signed_out(request: Request, body: dict[str, Any]) -> JSONResponse:
-    response = JSONResponse(body)
-    response.delete_cookie(auth.COOKIE, path=PREFIX + "/", httponly=True, samesite="strict",
-                           secure=bool(_context(request)["secure"]))
-    return response
+def _signed_in(token: str, session: auth.Session) -> JSONResponse:
+    """Единственный ответ, в котором есть ключ сессии. Cookie не ставится."""
+    return JSONResponse({"ok": True, "key": token, "expires_at": session.expires_at.isoformat()})
 
 
 async def _failed_login(request: Request, how: str) -> None:
@@ -333,8 +330,7 @@ async def session_info(request: Request) -> JSONResponse:
     # Без входа — только то, без чего не войти: есть ли кому прислать код. Версию не сообщаем.
     out: dict[str, Any] = {"authenticated": session is not None, "code_login": owner is not None}
     if session is not None:
-        out.update(csrf=session.csrf, via=session.via, expires_at=session.expires_at.isoformat(),
-                   idle_hours=auth.SESSION_IDLE // 3600)
+        out.update(via=session.via, expires_at=session.expires_at.isoformat())
     return JSONResponse(out)
 
 
@@ -349,12 +345,12 @@ async def login_link(request: Request) -> JSONResponse:
     if created is None:
         await _page(request).slow_refusal()
         await _failed_login(request, "ссылка не подошла")
-        raise BadRequest("Эта ссылка уже использована или устарела. Попросите выдать новую: "
-                         "на сервере — команда `shturman setup-link`.", 401, "link_invalid")
+        raise BadRequest("Эта ссылка уже использована или устарела. Попросите того, кто ставил ассистента, "
+                         "выдать новую — или выполните на сервере ./ops/setup-link.sh", 401, "link_invalid")
     await _log(request, "login.link", detail="прежние сессии завершены")
     _tell_owner(state, "Выполнен вход на страницу настройки Штурмана по одноразовой ссылке. "
-                       "Если это были не вы — на сервере выполните команду `shturman setup-logout-all`.")
-    return _signed_in(request, *created)
+                       "Если это были не вы — выполните на сервере ./ops/logout-all.sh")
+    return _signed_in(*created)
 
 
 CODE_TEXT = ("Код входа на страницу настройки Штурмана: {code}\n"
@@ -393,10 +389,11 @@ async def login_code(request: Request) -> JSONResponse:
     if created is not None:
         await _log(request, "login.code")
         _tell_owner(state, "Выполнен вход на страницу настройки Штурмана по коду из этого чата.")
-        return _signed_in(request, *created)
-    if result == "locked_now":
+        return _signed_in(*created)
+    if result in ("locked_now", "locked_again"):
         await _log(request, "login.code_locked", audit.REFUSED)
-        _tell_owner(state, LOCK_TEXT)
+        if result == "locked_now":          # одно сообщение владельцу на период блокировки
+            _tell_owner(state, LOCK_TEXT)
         result = "locked"
     elif result == "wrong":
         await _failed_login(request, "код не подошёл")
@@ -408,7 +405,7 @@ async def logout(request: Request) -> JSONResponse:
     async with state_of(request).pool.acquire() as conn:
         await auth.revoke_session(conn, request.state.setup_session.id)
     await _log(request, "logout")
-    return _signed_out(request, {"ok": True})
+    return JSONResponse({"ok": True})
 
 
 @endpoint
@@ -416,7 +413,7 @@ async def logout_all(request: Request) -> JSONResponse:
     async with state_of(request).pool.acquire() as conn:
         count = await auth.revoke_all(conn)
     await _log(request, "logout.all", detail=f"сессий завершено: {count}")
-    return _signed_out(request, {"ok": True, "sessions": count})
+    return JSONResponse({"ok": True, "sessions": count})
 
 
 # --- состояние разделов ------------------------------------------------------------------------
@@ -534,7 +531,7 @@ async def page_state(request: Request) -> JSONResponse:
     state, page = state_of(request), _page(request)
     return JSONResponse({
         "version": __version__,
-        "origin_set": bool(state.config.setup_origin),
+        "origin_set": bool(state.config.setup_external),
         "sending": bool(state.config.sending),
         "bot": await _bot_state(state, page),
         "tg": await _tg_state(state, page),
@@ -549,11 +546,14 @@ async def page_overview(request: Request) -> JSONResponse:
     counts = await api_core.overview(state)
     async with state.ro_pool.acquire() as conn:
         log = await audit.recent(conn, 30)
+        key_log = await audit.recent_important(conn, 10)
     keep = ("messages", "chats", "chats_excluded", "accounts", "last_message_seen_at", "jobs_waiting",
             "jobs_failed", "guard_enabled", "guard_model_used", "guard_problem", "guard_checked",
             "guard_hidden", "guard_released", "guard_unchecked", "embeddings_enabled", "embeddings_model",
             "embeddings_embedded", "embeddings_left", "embeddings_problem", "sending")
-    return JSONResponse({"archive": {k: counts[k] for k in keep if k in counts}, "audit": log})
+    # audit_key — входы, смена ключей и аккаунтов: их не вытеснить из вида потоком мелких действий.
+    return JSONResponse({"archive": {k: counts[k] for k in keep if k in counts}, "audit": log,
+                         "audit_key": key_log})
 
 
 # --- 1. бот согласований -----------------------------------------------------------------------
@@ -657,7 +657,7 @@ def _tg(request: Request) -> TgManager:
     if not isinstance(manager, TgManager):
         raise BadRequest("Модуль аккаунтов Telegram не запущен.", 503)
     if not manager.configured:
-        raise BadRequest("Сначала введите ключи приложения Telegram (раздел 2).", 409, "no_keys")
+        raise BadRequest("Сначала введите ключи приложения Telegram — шаг 1.", 409, "no_keys")
     return manager
 
 
@@ -688,8 +688,8 @@ async def tg_login_start(request: Request) -> JSONResponse:
         raise BadRequest("Выберите, какой аккаунт подключаете.")
     if role == "assistant" and not await _owner_known(state_of(request)):
         raise BadRequest(
-            "Сначала привяжите себя к боту согласований (раздел 1). Пока сервис не знает, какой аккаунт — "
-            "ваш основной, он не сможет отличить его от помощника, а помощнику разрешена отправка сообщений.",
+            "Сначала подключите свой основной аккаунт — шаг 2. Пока сервис не знает, какой аккаунт ваш, "
+            "он не сможет отличить его от помощника, а помощнику разрешена отправка сообщений.",
             409, "owner_unknown")
     flow = await manager.start_login(role, confirm_owner=_flag(data, "confirm_owner") is True)
     await _log(request, "tg.login", detail=f"роль: {ROLE_NAMES[role]}")
@@ -932,17 +932,26 @@ async def llm_save(request: Request) -> JSONResponse:
     settings = page.settings
     if not settings.editable(ss.LLM_API_KEY):
         raise apply.Invalid("Ключ модели задан в настройках сервера. Изменить его можно только там.", "locked")
+    config = state.config
+    # Адрес из окружения задаёт оператор (там может быть локальная модель): он не проверяется
+    # и со страницы не меняется. Адрес со страницы — только https и только наружу.
+    from_page = settings.editable(ss.LLM_BASE_URL)
+    base_url = apply.check_llm_url(data.get("base_url")) if from_page else config.llm_base_url
+    model = apply.check_llm_model(data.get("model")) if settings.editable(ss.LLM_MODEL) else config.llm_model
     key = apply.clean(data.get("api_key"), limit=500)
     if not key:
-        key = settings.store.get(ss.LLM_API_KEY)      # ключ уже введён раньше: меняют адрес или модель
+        key = settings.store.get(ss.LLM_API_KEY)      # ключ уже введён раньше: меняют только модель
         if not key:
             raise apply.Invalid("Вставьте ключ API провайдера модели.", "empty")
-    config = state.config
-    base_url, model = apply.check_llm_fields(
-        data.get("base_url") if settings.editable(ss.LLM_BASE_URL) else config.llm_base_url,
-        data.get("model") if settings.editable(ss.LLM_MODEL) else config.llm_model)
+        if base_url != config.llm_base_url:
+            # Сохранённый ключ на новый адрес не уходит никогда: иначе тот, кто получил доступ
+            # к странице, одной сменой адреса увёл бы ключ на свой сервер.
+            await _log(request, "llm.save", audit.REFUSED, "смена адреса без ввода ключа")
+            raise apply.Invalid("Вы меняете адрес API. Вставьте ключ заново: сохранённый ключ на новый адрес "
+                                "не отправляется.", "key_required")
+    restricted = from_page and base_url != ss.DEFAULT_LLM_BASE_URL
     try:
-        used = await apply.check_llm(config, api_key=key, base_url=base_url, model=model)
+        used = await apply.check_llm(config, api_key=key, base_url=base_url, model=model, restricted=restricted)
     except apply.Invalid as exc:
         await _log(request, "llm.save", audit.REFUSED, f"проверка не прошла: {exc.code}")
         raise
@@ -1038,10 +1047,17 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
             await asyncio.sleep(JANITOR_EVERY)
 
     state.spawn(janitor(), name="setup-janitor")
-    if state.config.setup_origin:
-        logger.info("страница настройки: внешний адрес задан, вход — по ссылке из `shturman setup-link`")
-    else:
+    reason = state.config.setup_reason
+    if reason == "same_origin":
+        logger.error(
+            "страница настройки: её адрес (SHTURMAN_SETUP_ORIGIN) совпадает с адресом дашборда Hermes "
+            "(SHTURMAN_DASHBOARD_ORIGIN) — по внешнему адресу страница НЕ отдаётся; дайте ей другой порт "
+            "или другое имя. Под локальными именами страница работает")
+    elif reason == "no_origin":
         logger.info("страница настройки: внешний адрес не задан, страница отвечает только под локальными именами")
+    else:
+        logger.info("страница настройки: внешний адрес %s, вход — по ссылке из ./ops/setup-link.sh",
+                    state.config.setup_external)
     try:
         yield
     finally:

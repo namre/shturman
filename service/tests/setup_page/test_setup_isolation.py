@@ -69,7 +69,7 @@ async def test_api_and_mcp_tokens_are_not_a_way_in(stand):
     s = await stand()
     for token in (API_TOKEN, MCP_TOKEN):
         for headers in ({"Authorization": f"Bearer {token}"}, {"Cookie": f"shturman_setup={token}"},
-                        {"X-Shturman-Csrf": token, "Authorization": f"Bearer {token}"}):
+                        {"X-Shturman-Session": token, "Authorization": f"Bearer {token}"}):
             got = await s.page.http.get(API + "/state", headers=headers)
             assert got.status_code == 401 and got.json()["code"] == "unauthenticated"
             changed = await s.page.http.post(API + "/bot/bind", json={}, headers={**s.page.headers(), **headers})
@@ -83,11 +83,11 @@ async def test_api_and_mcp_tokens_are_not_a_way_in(stand):
 async def test_page_session_does_not_open_the_internal_api(stand, conn):
     s = await stand()
     await s.page.login(conn)
-    cookie = s.page.http.cookies.get("shturman_setup")
-    assert cookie
+    key = s.page.key
+    assert key
     for path in ("/api/status", "/mcp"):
-        got = await s.page.http.get(path, headers={"Cookie": f"shturman_setup={cookie}",
-                                                   "Authorization": f"Bearer {cookie}"})
+        got = await s.page.http.get(path, headers={"X-Shturman-Session": key, "Cookie": f"shturman_setup={key}",
+                                                   "Authorization": f"Bearer {key}"})
         assert got.status_code == 401
 
 
@@ -107,7 +107,7 @@ async def test_only_known_host_names_are_served(stand):
 def test_origin_table_is_built_from_settings_only():
     from types import SimpleNamespace
 
-    cfg = SimpleNamespace(allowed_hosts=("127.0.0.1:8765", "LocalHost:8765"), setup_origin="https://assistant.example.com")
+    cfg = SimpleNamespace(allowed_hosts=("127.0.0.1:8765", "LocalHost:8765"), setup_external="https://assistant.example.com")
     assert shield.origins(cfg) == {"127.0.0.1:8765": "http://127.0.0.1:8765", "localhost:8765": "http://localhost:8765",
                                    "assistant.example.com": "https://assistant.example.com"}
 
@@ -120,10 +120,8 @@ def test_origin_table_is_built_from_settings_only():
     ({"Sec-Fetch-Site": "cross-site"}, "bad_origin"),
     ({"Sec-Fetch-Site": "same-site"}, "bad_origin"),                                 # соседний поддомен — тоже чужой
     ({"X-Shturman-Setup": None}, "bad_origin"),                                      # простая форма с чужого сайта
-    ({"X-Shturman-Csrf": None}, "bad_csrf"),
-    ({"X-Shturman-Csrf": "0" * 64}, "bad_csrf"),
 ])
-async def test_forged_requests_change_nothing_even_with_the_cookie(stand, conn, headers, code):
+async def test_forged_requests_change_nothing_even_with_the_session_key(stand, conn, headers, code):
     s = await stand()
     await s.page.login(conn)
     sent = {k: v for k, v in {**s.page.headers(), **headers}.items() if v is not None}
@@ -131,11 +129,10 @@ async def test_forged_requests_change_nothing_even_with_the_cookie(stand, conn, 
         got = await s.page.http.request(method, API + path, json={}, headers=sent)
         assert got.status_code == 403 and got.json()["code"] == code, (method, path, got.text)
     assert (await s.page.get("/state")).status_code == 200                 # сессия цела: ничего не выполнилось
-    if code == "bad_origin":
-        token, _ = await auth.create_link(conn)
-        login = await s.browser().http.post(API + "/login/link", json={"token": token}, headers=sent)
-        assert login.status_code == 403
-        assert await conn.fetchval("SELECT used_at IS NULL FROM setup_links")   # ссылка не израсходована
+    token, _ = await auth.create_link(conn)
+    login = await s.browser().http.post(API + "/login/link", json={"token": token}, headers=sent)
+    assert login.status_code == 403
+    assert await conn.fetchval("SELECT used_at IS NULL FROM setup_links")   # ссылка не израсходована
 
 
 async def test_cross_site_reads_are_refused_too(stand, conn):
@@ -172,7 +169,8 @@ async def test_status_reports_only_flags_about_the_setup_page(stand, conn):
 
     s = await stand(setup_origin="https://assistant.example.com")
     empty = (await s.api.get("/api/status")).json()["setup"]
-    assert empty == {"enabled": True, "origin_set": True, "tg_keys": False, "accounts": 0, "own_bot": False,
+    assert empty == {"enabled": True, "origin_set": True, "origin": "https://assistant.example.com", "reason": None,
+                     "tg_keys": False, "accounts": 0, "own_bot": False,
                      "owner_bound": False, "business_connected": False, "own_model": False}
     await s.page.login(conn)
     await save_bot(s)
@@ -180,10 +178,13 @@ async def test_status_reports_only_flags_about_the_setup_page(stand, conn):
     await s.page.put("/tg/keys", {"api_id": "1234567", "api_hash": "0123456789abcdef0123456789abcdef"})
     await s.page.put("/llm", {"api_key": LLM_KEY, "model": "gpt-test"})
     raw = await s.api.get("/api/status")
-    assert raw.json()["setup"] == {"enabled": True, "origin_set": True, "tg_keys": True, "accounts": 0, "own_bot": True,
+    assert raw.json()["setup"] == {"enabled": True, "origin_set": True, "origin": "https://assistant.example.com",
+                                   "reason": None, "tg_keys": True, "accounts": 0, "own_bot": True,
                                    "owner_bound": True, "business_connected": False, "own_model": True}
     # ни значений, ни имён через внутренний API не видно
     for secret in (TOKEN, LLM_KEY, "0123456789abcdef0123456789abcdef", "Евгений", "shturman_soglasovaniya_bot"):
         assert secret not in raw.text
-    assert all(isinstance(v, (bool, int)) for v in raw.json()["setup"].values())
+    # только признаки и числа; адрес страницы — не секрет; ключа сессии страницы здесь нет
+    assert all(isinstance(v, (bool, int)) for k, v in raw.json()["setup"].items() if k not in ("origin", "reason"))
+    assert s.page.key not in raw.text
     assert ORIGIN
