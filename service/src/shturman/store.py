@@ -6,7 +6,10 @@
   * более свежая правка заменяет текст, прежний уходит в историю версий; более старая версия,
     пришедшая позже, текст не перезаписывает;
   * исключённый чат не принимает сообщения ни из одного источника;
-  * служебные собеседники Telegram (коды входа, токены ботов) исключены всегда.
+  * служебные собеседники Telegram (коды входа, токены ботов) исключены всегда;
+  * новый текст (новое сообщение или правка) — это непроверенный текст: итог проверки на
+    внедрённые инструкции сбрасывается, а при `hold` входящее сообщение ещё и скрыто от
+    ассистента, пока его не проверят (см. guard/).
 """
 
 from __future__ import annotations
@@ -82,20 +85,39 @@ WHERE m.text IS DISTINCT FROM s.text AND NOT ({_NEWER})
   )
 """
 
+# «Пришёл другой текст, и он новее» — то же условие, по которому ниже заменяется текст.
+_NEW_TEXT = """(COALESCE(EXCLUDED.edited_at, '-infinity') > COALESCE(m.edited_at, '-infinity')
+               AND EXCLUDED.text IS DISTINCT FROM m.text)"""
+
 # Сообщение, помеченное удалённым, остаётся удалённым: повторный приход из старого экспорта
 # его не «воскрешает» — отметку снимает только явное восстановление.
-_UPSERT_MESSAGES = """
+#
+# Защита от внедрённых инструкций ($2 — «придержать»: живой источник при включённой защите):
+#   * новое входящее текстовое сообщение при $2 записывается скрытым от ассистента — видимым его
+#     сделает проверка (guard.screen) сразу после записи;
+#   * правка с новым текстом сбрасывает итог прежней проверки; уже скрытое остаётся скрытым,
+#     видимое входящее при $2 скрывается до новой проверки. Столбцы guard_* упомянуты раньше text:
+#     в SET все выражения считаются от прежней строки, порядок здесь только для читателя.
+_UPSERT_MESSAGES = f"""
 INSERT INTO messages AS m (
     chat_id, tg_message_id, sent_at, kind, sender_peer_id, sender_name, is_outgoing,
     text, entities, reply_to_tg_id, forwarded_from, edited_at,
-    media_type, media_path, service_action, sources
+    media_type, media_path, service_action, sources, agent_visible
 )
 SELECT s.chat_id, s.tg_message_id, s.sent_at, s.kind, p.id, s.sender_name, s.is_outgoing,
        s.text, s.entities, s.reply_to_tg_id, s.forwarded_from, s.edited_at,
-       s.media_type, s.media_path, s.service_action, ARRAY[$1::text]
+       s.media_type, s.media_path, s.service_action, ARRAY[$1::text],
+       NOT ($2::boolean AND s.is_outgoing IS NOT TRUE AND s.kind = 'message' AND s.text <> '')
 FROM import_stage s
 LEFT JOIN peers p ON p.class = s.sender_class AND p.tg_id = s.sender_tg_id
 ON CONFLICT (chat_id, tg_message_id) DO UPDATE SET
+    agent_visible    = CASE WHEN {_NEW_TEXT} AND $2::boolean AND COALESCE(m.is_outgoing, EXCLUDED.is_outgoing)
+                                 IS NOT TRUE AND m.kind = 'message' AND EXCLUDED.text <> ''
+                            THEN false ELSE m.agent_visible END,
+    guard_label      = CASE WHEN {_NEW_TEXT} THEN NULL ELSE m.guard_label END,
+    guard_score      = CASE WHEN {_NEW_TEXT} THEN NULL ELSE m.guard_score END,
+    guard_model      = CASE WHEN {_NEW_TEXT} THEN NULL ELSE m.guard_model END,
+    guard_checked_at = CASE WHEN {_NEW_TEXT} THEN NULL ELSE m.guard_checked_at END,
     text      = CASE WHEN COALESCE(EXCLUDED.edited_at, '-infinity') > COALESCE(m.edited_at, '-infinity')
                      THEN EXCLUDED.text ELSE m.text END,
     entities  = CASE WHEN COALESCE(EXCLUDED.edited_at, '-infinity') > COALESCE(m.edited_at, '-infinity')
@@ -201,13 +223,18 @@ def _row(chat_id: int, m: MessageRecord, owner_tg_id: int, outgoing: bool | None
 async def upsert_messages(
     conn: asyncpg.Connection,
     rows: Iterable[tuple[int, MessageRecord] | tuple[int, MessageRecord, bool | None]],
-    *, source: str, owner_tg_id: int,
+    *, source: str, owner_tg_id: int, hold: bool = False,
 ) -> UpsertResult:
     """Записывает пачку сообщений. Элемент — (чат, запись) или (чат, запись, исходящее ли).
 
     Третий элемент нужен источникам, которые знают направление точнее, чем сравнение
     отправителя с владельцем (флаг `out` у сессии). Сообщения исключённых чатов отбрасываются.
     Повтор внутри пачки: остаётся последний.
+
+    hold — придержать новые входящие тексты: записать скрытыми от ассистента до проверки на
+    внедрённые инструкции. Так пишут живые источники при включённой защите; вызывающий обязан
+    сразу после записи отдать сообщения на проверку (`guard.screen`). Импорт и догрузка истории
+    пишут без hold: их сообщения видны сразу и проверяются фоном.
     """
     staged: dict[tuple[int, int], tuple] = {}
     for item in rows:
@@ -233,7 +260,7 @@ async def upsert_messages(
         await conn.execute(_UPSERT_SENDERS)
         v1 = await conn.execute(_KEEP_OLD_VERSION)
         v2 = await conn.execute(_KEEP_INCOMING_AS_VERSION)
-        result = await conn.fetch(_UPSERT_MESSAGES, source)
+        result = await conn.fetch(_UPSERT_MESSAGES, source, bool(hold))
     new_ids = tuple(r["id"] for r in result if r["inserted"])
     known_ids = tuple(r["id"] for r in result if not r["inserted"])
     return UpsertResult(

@@ -2,18 +2,25 @@
 # Поднимает стек (или применяет изменения). Повторный запуск безопасен.
 #   ./ops/up.sh          — скачать образы при необходимости и запустить
 #   ./ops/up.sh --pull   — сначала обновить образы указанных версий
+# Что запускается, зависит от режима установки (SHTURMAN_MODE в .env, ./ops/mode.sh):
+#   hermes      — Hermes, сервис переписки, база; плагин и архив подключаются к Hermes;
+#   standalone  — только сервис переписки и база. Шаги Hermes пропускаются, его образ
+#                 не скачивается, а оставшийся от прежнего режима контейнер убирается.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 
-# Служебные значения, появившиеся в новой версии (токены сервиса переписки), дописываются сами.
-# Уже заданные значения скрипт не трогает и не печатает.
+# Служебные значения, появившиеся в новой версии (токены сервиса переписки, режим установки),
+# дописываются сами. Уже заданные значения скрипт не трогает и не печатает.
 ./ops/init-env.sh --auto > /dev/null
+load_mode
 
 # Каталог данных принадлежит тому, кто запускает стек; Hermes и сервис переписки в контейнерах
 # работают под ним же. Точки подключения создаём сами: иначе Docker создаст их от имени root.
-mkdir -p data/hermes/plugins/shturman data/shturman data/embeddings/model
+mkdir -p data/shturman data/embeddings/model
+if [ "$MODE" = hermes ]; then mkdir -p data/hermes/plugins/shturman; fi
 chmod 700 data data/shturman
 HERMES_UID="$(id -u)"
 HERMES_GID="$(id -g)"
@@ -50,7 +57,22 @@ cfg = load_config() or {}
 servers = cfg.get("mcp_servers")
 if not isinstance(servers, dict):
     servers = {}
-if servers.get("shturman") == want:
+# load_config отдаёт настройки с уже подставленными переменными окружения: на месте имени
+# переменной в заголовке стоит её значение, и сравнение с образцом никогда бы не сошлось —
+# запись переписывалась бы, а Hermes перезапускался бы при каждом запуске скрипта. Поэтому
+# сравниваем запись как она лежит в файле, а если такой функции в этой версии Hermes нет —
+# с образцом, в который переменная подставлена так же. Значение переменной не печатается.
+try:
+    from hermes_cli.config import read_raw_config
+    current = ((read_raw_config() or {}).get("mcp_servers") or {}).get("shturman")
+except Exception:
+    current = None
+import copy, os
+filled = copy.deepcopy(want)
+token = os.environ.get("MCP_SHTURMAN_API_KEY")
+if token is not None:
+    filled["headers"]["Authorization"] = "Bearer " + token
+if current == want or (current is None and servers.get("shturman") in (want, filled)):
     print("same")
 else:
     servers["shturman"] = want
@@ -78,12 +100,27 @@ wait_dashboard() {
 docker compose config --quiet
 # Образ сервиса переписки собирается здесь же, из каталога service/.
 docker compose build --quiet shturman
+if [ "$MODE" != hermes ] && docker inspect "$c" >/dev/null 2>&1; then
+  # Остался от режима с Hermes. Убирается только контейнер: данные Hermes (data/hermes) не трогаем.
+  echo "Режим без Hermes: останавливаю и убираю контейнер $c (его данные остаются в data/hermes)…"
+  docker compose --profile hermes rm --stop --force hermes || true
+  # Если контейнер создавали не этим файлом Compose, первая команда его не увидит.
+  if docker inspect "$c" >/dev/null 2>&1; then docker rm --force "$c" >/dev/null; fi
+fi
 docker compose up -d --remove-orphans
 
 echo "Жду запуска сервиса переписки…"
 if ! wait_service; then
   echo "Сервис переписки не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-service" >&2
   exit 1
+fi
+
+if [ "$MODE" != hermes ]; then
+  echo "пропущено: режим без Hermes — включение плагина shturman в Hermes"
+  echo "пропущено: режим без Hermes — запись архива (MCP-сервер shturman) в настройки Hermes"
+  echo "пропущено: режим без Hermes — ожидание дашборда Hermes"
+  echo "Архив к своему Codex CLI или Claude Code владелец подключает по ./ops/connect.sh."
+  exec ./ops/doctor.sh
 fi
 
 echo "Жду запуска контейнера…"

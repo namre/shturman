@@ -59,6 +59,31 @@ NUMBERS: dict[str, tuple[float, float, float]] = {
     "max_reply_chars": (3000, 200, 7000),
 }
 INTEGER_KEYS = frozenset(NUMBERS) - {"pause_seconds", "debounce_seconds"}
+# В какую сторону настройка ослабляет ограничение (см. policy.LOOSER). Текст представления
+# (`intro`) в перечне нет намеренно: он целиком попадает в указания модели, поэтому любая его
+# правка ждёт владельца. Область поиска справки (`search_scope`) разбирает policy.loosens.
+LOOSER: dict[str, int] = {
+    "pause_seconds": -1,
+    "daily_cap": +1,
+    "debounce_seconds": 0,       # только сколько ждать, не допишет ли собеседник
+    "max_age_seconds": +1,       # отвечать и на более старые сообщения
+    "typing_seconds": 0,         # только индикатор «печатает…»
+    "context_messages": +1,      # больше переписки уходит модели
+    "search_hits": +1,           # больше найденного в архиве уходит модели
+    "max_reply_chars": +1,
+}
+LABELS: dict[str, str] = {
+    "pause_seconds": "пауза между автоответами (секунд)",
+    "daily_cap": "автоответов с одного аккаунта в сутки",
+    "debounce_seconds": "сколько секунд ждать, не допишет ли собеседник",
+    "max_age_seconds": "на сообщения старше скольких секунд не отвечать",
+    "typing_seconds": "сколько секунд показывать «печатает…»",
+    "context_messages": "сколько последних сообщений чата давать модели",
+    "search_hits": "сколько найденных в архиве сообщений давать модели",
+    "max_reply_chars": "наибольшая длина ответа (знаков)",
+    "intro": "как ассистент представляется собеседнику",
+    "search_scope": "где искать справку для ответа",
+}
 # Где искать справку для ответа: chat — только в этом же чате; account — ещё и собственные
 # (исходящие) сообщения владельца или помощника в других чатах аккаунта. Чужие сообщения из
 # других чатов в запрос не попадают никогда: это и чужая тайна, и путь для внедрённых указаний.
@@ -150,7 +175,8 @@ async def eligible(conn: asyncpg.Connection, tgt: Target) -> Decision:
 async def _trigger_state(conn: asyncpg.Connection, settings: dict[str, Any], tgt: Target, message_id: int) -> Decision:
     """Входящее ещё на месте, не изменено, не устарело и после него в чате ничего нет."""
     row = await conn.fetchrow(
-        """SELECT m.deleted_at IS NOT NULL AS gone, m.edited_at IS NOT NULL AS edited,
+        # Скрытое защитой от внедрённых инструкций — как исчезнувшее: на него не отвечают.
+        """SELECT (m.deleted_at IS NOT NULL OR NOT m.agent_visible) AS gone, m.edited_at IS NOT NULL AS edited,
                   m.sent_at < now() - make_interval(secs => $3) AS stale,
                   EXISTS (SELECT 1 FROM messages n
                           WHERE n.chat_id = m.chat_id AND n.kind = 'message' AND n.deleted_at IS NULL
@@ -262,7 +288,7 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
             return
         msg = await conn.fetchrow(
             """SELECT id, text, is_outgoing, sender_peer_id FROM messages
-               WHERE id = $1 AND chat_id = $2 AND kind = 'message' AND deleted_at IS NULL""",
+               WHERE id = $1 AND chat_id = $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible""",
             message_id, chat_id)
         if msg is None or not msg["text"].strip() or msg["is_outgoing"] is True:
             return
@@ -288,7 +314,7 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
         recent = await conn.fetch(
             """SELECT sent_at, is_outgoing, text FROM (
                    SELECT id, sent_at, is_outgoing, text FROM messages
-                   WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL
+                   WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible
                    ORDER BY sent_at DESC, id DESC LIMIT $3) t
                ORDER BY sent_at, id""",
             chat_id, message_id, settings["context_messages"])
@@ -388,7 +414,7 @@ async def _warn_if_model_is_silent(conn: asyncpg.Connection) -> None:
                WHERE outcome IN ('replied', 'declined')""")
         await bridge.notify_owner(
             conn, "Автоответ доверенным не получает ответ модели: несколько раз подряд пришла пустота. "
-                  "Собеседники остаются без ответа. Проверьте модель в настройках Hermes.",
+                  "Собеседники остаются без ответа. " + bridge.model_hint(),
             dedup_key=f"autoreply:silent:{streak_start}")
 
 

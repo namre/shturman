@@ -7,6 +7,9 @@
 # владельцу как есть и больше нигде её не сохраняй: ни в состоянии, ни в журнале, ни в отчёте.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
+# Без Hermes дашборда нет, а владелец привязывается к боту согласований: ./ops/bot-bind.sh.
+require_hermes "дашборда и входа в него"
 
 c=shturman-hermes
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }

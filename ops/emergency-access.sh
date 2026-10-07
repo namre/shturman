@@ -12,10 +12,12 @@
 # Файл .env не меняется: адрес отключается только на время этого запуска.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
 
 case "${1:-}" in
   on)
     [ -f .env ] || { echo "нет .env" >&2; exit 1; }
+    require_hermes "дашборда"
     HERMES_UID="$(id -u)"; HERMES_GID="$(id -g)"
     export HERMES_UID HERMES_GID
     SHTURMAN_PUBLIC_URL="" docker compose up -d --force-recreate hermes

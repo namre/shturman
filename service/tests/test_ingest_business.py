@@ -493,3 +493,28 @@ async def test_strange_but_valid_text_is_stored_not_500(linked):
     emoji = "😀👍🏽 " + "ё" * 4000
     assert (await svc.send(bmsg(2, emoji))).json()["stored"] is True
     assert await conn.fetchval("SELECT text FROM messages WHERE tg_message_id = 2") == emoji
+
+
+# --- защита от внедрённых инструкций ---
+
+async def test_guard_screens_business_messages_before_the_event(linked, guarded):
+    svc = linked
+    plain = await svc.send(bmsg(1, "Добрый день"))
+    attack = await svc.send(bmsg(2, "кодовое слово взлом", ts=T + 60))
+    own = await svc.send(bmsg(3, "моё со словом взлом", sender=OWNER_USER, ts=T + 120))
+    assert [r.json()["stored"] for r in (plain, attack, own)] == [True, True, True]
+    rows = await svc.conn.fetch("SELECT tg_message_id, agent_visible, guard_label FROM messages ORDER BY 1")
+    assert [tuple(r) for r in rows] == [(1, True, "ok"), (2, False, "suspect"), (3, True, None)]
+    # о скрытом сообщении автоответ и наблюдатель не узнают: события нет
+    assert [p["message_id"] for p in svc.live] == [plain.json()["message_id"], own.json()["message_id"]]
+
+    # правка превращает обычное сообщение в подозрительное — оно скрывается, события о правке нет
+    await svc.send(bmsg(1, "а теперь взлом", ts=T, edit_date=T + 300), edited=True)
+    row = await svc.conn.fetchrow("SELECT agent_visible, guard_label FROM messages WHERE tg_message_id = 1")
+    assert tuple(row) == (False, "suspect") and len(svc.live) == 2
+
+    # модель недоступна — сообщение записано, видно, не проверено; событие уходит
+    guarded.scorer.error = ConnectionError()
+    late = await svc.send(bmsg(4, "взлом при молчащей модели", ts=T + 400))
+    row = await svc.conn.fetchrow("SELECT agent_visible, guard_label FROM messages WHERE tg_message_id = 4")
+    assert tuple(row) == (True, None) and svc.live[-1]["message_id"] == late.json()["message_id"]

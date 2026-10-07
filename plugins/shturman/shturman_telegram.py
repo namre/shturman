@@ -18,6 +18,11 @@ Hermes подключает их раньше собственных, а Telegra
 
 Пункты 5 и 6 работают, только когда сервис переписки подключён; без него они ничего не делают.
 
+Если у сервиса включён свой бот согласований (`shturman_core/own_bot.py`), пункты 5 и 6 сервису
+ничего не передают: бизнес-поток и нажатия он получает через своего бота. На нажатие старой
+карточки владелец получает короткое пояснение. Пункты 1–4 от этого не зависят: защита
+бизнес-режима перехватывает сообщения собеседников так же, как без своего бота.
+
 Порядок, от которого зависит запись в архив (python-telegram-bot 22.8, Hermes 0.21.5):
   * группы обработчиков выполняются по возрастанию номера, в каждой срабатывает первый подошедший;
   * защита (п. 2) стоит в группе 0 и ничего не останавливает: она просто занимает место
@@ -57,6 +62,7 @@ REPLIES = {
                "и нажмите там «Открыть бота».",
     "service_down": "Сервис переписки недоступен, попробуйте позже",
     "button_refused": "Кнопка недоступна.",
+    "own_bot": "Теперь согласования приходят в отдельного бота",
 }
 
 UNBOUND_REPLY_INTERVAL = 3600      # одному чату подсказку не чаще раза в час
@@ -228,6 +234,11 @@ def _wire_service(application, store) -> None:
         if not runtime.ensure_started():
             await answer(query, REPLIES["service_down"])
             return
+        if runtime.own_bot.active:
+            # Карточка осталась с тех пор, когда согласования шли через этого бота: сервис нажатие
+            # не примет. Не ошибка — пояснение; в сервис ничего не уходит.
+            await answer(query, REPLIES["own_bot"])
+            return
         try:
             out = await runtime.call("POST", "/api/callbacks/telegram",
                                      {"data": query.data, "from_user_id": presser},
@@ -235,6 +246,9 @@ def _wire_service(application, store) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # сервис недоступен или отказал — кнопки остаются
+            if runtime.own_bot.refused(exc):      # у сервиса включён свой бот: это не сбой
+                await answer(query, REPLIES["own_bot"])
+                return
             logger.warning("shturman: нажатие кнопки не передано сервису (%s)", type(exc).__name__)
             await answer(query, REPLIES["service_down"])
             return

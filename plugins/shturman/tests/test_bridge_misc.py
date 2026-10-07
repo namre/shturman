@@ -52,7 +52,7 @@ def test_not_configured_or_never_started(store, clock):
     assert bridge_stats.status(store, configured=False, now=clock) == {
         "configured": False, "executor_running": False, "reachable": None, "checked_at": None,
         "started_at": None, "last_job_at": None, "queue": 0, "business_disabled": None, "sending": None,
-        "counters": {name: 0 for name in COUNTERS}}
+        "own_bot": None, "counters": {name: 0 for name in COUNTERS}}
     Heartbeat(store, Stats(now=clock), now=clock).tick()
     assert bridge_stats.status(store, configured=False, now=clock)["executor_running"] is False
 
@@ -154,6 +154,28 @@ def test_status_shows_sending_switch_and_disabled_business_connection(store, clo
     assert stale["sending"] is None and stale["business_disabled"] is None         # исполнитель стоит — не знаем
 
 
+def test_status_shows_that_the_service_runs_its_own_bot(store, clock):
+    stats = Stats(now=clock)
+    heartbeat = Heartbeat(store, stats, now=clock)
+    heartbeat.tick()
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is None      # ещё неизвестно
+    stats.set_flag("own_bot", True)
+    assert heartbeat.tick() is True                                                # вход в режим — повод записать
+    status = bridge_stats.status(store, configured=True, now=clock)
+    assert status["own_bot"] is True and store.read("bridge")["own_bot"] is True
+    assert status["counters"] == {name: 0 for name in COUNTERS}                    # прежние поля на месте
+    stats.set_flag("own_bot", False)
+    heartbeat.tick()
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is False
+    clock.tick(bridge_stats.STALE_AFTER + 1)
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is None      # исполнитель стоит
+
+
+def test_state_written_before_the_field_existed_reads_as_unknown(store, clock):
+    store.write("bridge", {"heartbeat_at": int(clock()), "counters": {}})
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is None
+
+
 # --- чтение состояния: «файла нет» и «не удалось прочитать» — разные ответы ---
 
 def test_strict_read_tells_absent_from_unreadable(store):
@@ -230,3 +252,24 @@ def test_schema_check_covers_what_service_schemas_use():
                 {"commitments": [{"message": 1, "what": "x", "status": "c"}]}):
         assert not matches_schema(bad, schema), bad
     assert matches_schema({"что угодно": 1}, None) and matches_schema(1.5, {"type": "number"})
+
+
+def test_cli_status_tells_doctor_whether_the_bridge_is_in_own_bot_mode(store):
+    """`cli.py status` читает ops/doctor.sh: одна строка о том, что мост знает о своём боте сервиса."""
+    import cli
+    from shturman_core.auth import Auth
+
+    def own_bot_line() -> str:
+        lines = cli.status_lines(store, Auth(store))
+        assert all(re.fullmatch(r"[a-z_]+=(yes|no|unknown)", line) for line in lines)     # только признаки
+        return [line for line in lines if line.startswith("bridge_own_bot=")][0]
+
+    assert own_bot_line() == "bridge_own_bot=unknown"              # шлюз ещё ничего не записал
+    stats = Stats()
+    heartbeat = Heartbeat(store, stats)
+    stats.set_flag("own_bot", True)
+    heartbeat.tick()
+    assert own_bot_line() == "bridge_own_bot=yes"
+    stats.set_flag("own_bot", False)
+    heartbeat.tick()
+    assert own_bot_line() == "bridge_own_bot=no"

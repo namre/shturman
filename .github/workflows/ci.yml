@@ -45,13 +45,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck -S warning ops/*.sh
-      - run: docker compose config --quiet
+      # Оба режима установки. Без профилей (режим standalone) в стеке нет Hermes: его контейнер
+      # не создаётся и образ не скачивается; с профилем hermes — прежний состав.
+      - name: compose — режим без Hermes и режим с Hermes
+        run: |
+          docker compose config --quiet
+          test "$(docker compose config --services | sort | tr '\n' ' ')" = "postgres shturman "
+          if docker compose config --images | grep -q hermes-agent; then echo "образ Hermes в режиме без Hermes"; exit 1; fi
+          docker compose --profile hermes config --quiet
+          test "$(docker compose --profile hermes config --services | sort | tr '\n' ' ')" = "hermes postgres shturman "
+          docker compose --profile hermes --profile embeddings --profile guard config --quiet
+          test "$(docker compose --profile guard config --services | sort | tr '\n' ' ')" = "guard postgres shturman "
         env:
           HERMES_UID: "1000"
           HERMES_GID: "1000"
           POSTGRES_PASSWORD: ci-only
           SHTURMAN_API_TOKEN: ci-only-api-token-0123456789abcdef0123
           SHTURMAN_MCP_TOKEN: ci-only-mcp-token-0123456789abcdef0123
+      # Режим записывается в .env и ведёт за собой профили Compose; экземпляр без строки режима
+      # остаётся режимом с Hermes и не теряет включённый поиск по смыслу.
+      - name: ops — режим установки и профили
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops .env.example "$tmp"/; cd "$tmp"
+          ./ops/init-env.sh --auto --mode standalone
+          grep -qx 'SHTURMAN_MODE=standalone' .env
+          grep -qx 'COMPOSE_PROFILES=' .env
+          ./ops/init-env.sh --auto
+          if ./ops/init-env.sh --auto --mode hermes; then echo "режим не должен меняться молча"; exit 1; fi
+          if ./ops/activation-link.sh; then echo "без Hermes ссылки входа нет"; exit 1; fi
+          ./ops/mode.sh set hermes
+          grep -qx 'SHTURMAN_MODE=hermes' .env
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          printf 'POSTGRES_PASSWORD=x\nCOMPOSE_PROFILES=embeddings\n' > .env
+          ./ops/init-env.sh --auto
+          grep -qx 'SHTURMAN_MODE=hermes' .env
+          grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
+          test "$(stat -c '%a' .env)" = "600"
+          # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
+          # профиль и не трогает ни чужой, ни профиль Hermes. Запуск стека здесь подменён.
+          printf '#!/bin/sh\nexit 0\n' > ops/up.sh
+          printf 'SHTURMAN_MODE=hermes\nCOMPOSE_PROFILES=hermes,embeddings,guard\nSHTURMAN_GUARD=on\n' > .env
+          ./ops/guard.sh off
+          grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
+          if grep -q '^SHTURMAN_GUARD=' .env; then echo "выключатель защиты должен исчезнуть"; exit 1; fi
+          ./ops/embeddings.sh off
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          ./ops/init-env.sh --auto > /dev/null
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          test "$(stat -c '%a' .env)" = "600"
       # Образ сервиса должен собираться и запускаться: без базы он обязан выйти с понятной ошибкой.
       - run: docker build -t shturman-service:ci service
       - run: docker run --rm shturman-service:ci --help

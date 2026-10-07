@@ -993,6 +993,10 @@ six==1.17.0 \
     --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \
     --hash=sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81
     # via python-dateutil
+socksio==1.0.0 \
+    --hash=sha256:95dc1f15f9b34e8d7b16f06d74b8ccf48f609af32ab33c608d08761c5dcbb1f3 \
+    --hash=sha256:f88beb3da5b5c38b9890469de67d0cb0f9d494b78b106ca1845f96c10b91c4ac
+    # via httpx
 sse-starlette==3.5.0 \
     --hash=sha256:3e6e1070df3f0f5d9cea81496de92dbb72f6721871d99748ece67441dd8b7997 \
     --hash=sha256:75de713aa8a9441513cc283220826da079d982770965b951e9437720e8bafdb2

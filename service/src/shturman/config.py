@@ -54,6 +54,29 @@ class Config:
     # Жёсткий потолок отправок на аккаунт в сутки. Тоже только из окружения; настройки шлюза
     # отправки могут его уменьшить, но не превысить.
     send_daily_hard_cap: int = 50
+    # Свой бот сервиса («бот согласований»): уведомления владельцу, кнопки, бизнес-режим.
+    # Его токен есть только у сервиса — в Hermes, где у ассистента терминал, он не попадает.
+    bot_token: str = field(default="", repr=False)
+    # Свой доступ сервиса к модели (API, совместимый с OpenAI). Пусто — модель вызывает плагин в Hermes.
+    llm_api_key: str = field(default="", repr=False)
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_model: str = ""
+    # Защита от внедрённых инструкций во входящих сообщениях (guard/, docs/guard.md). По умолчанию
+    # выключена; включает её ./ops/guard.sh on — он же скачивает модель и поднимает контейнер с ней.
+    guard: bool = False
+    # Адрес контейнера с моделью-классификатором (TEI). Пусто при включённой защите — работают
+    # одни правила: это заметно слабее модели.
+    guard_url: str = ""
+    guard_model: str = "Horizon-Labs/prompt-injection-guard-small"
+
+    @property
+    def own_bot(self) -> bool:
+        """Есть ли у сервиса свой бот. Только тогда нажатие владельца нельзя подделать из Hermes."""
+        return bool(self.bot_token)
+
+    @property
+    def own_llm(self) -> bool:
+        return bool(self.llm_api_key and self.llm_model)
 
     @property
     def sessions_dir(self) -> Path:
@@ -95,6 +118,16 @@ class Config:
             embeddings_dim=_int("SHTURMAN_EMBEDDINGS_DIM", 384),
             timezone=_env("SHTURMAN_TIMEZONE", "Europe/Moscow"),
             nightly_at=_env("SHTURMAN_NIGHTLY_AT", "03:30"),
-            sending=_env("SHTURMAN_SENDING", "off").lower() in ("on", "1", "true", "yes"),
+            # Отправка возможна только со своим ботом согласований: без него нажатие «Отправить»
+            # проходит через Hermes и может быть подделано ассистентом.
+            sending=(_env("SHTURMAN_SENDING", "off").lower() in ("on", "1", "true", "yes")
+                     and bool(_env("SHTURMAN_BOT_TOKEN"))),
+            bot_token=_env("SHTURMAN_BOT_TOKEN"),
+            llm_api_key=_env("SHTURMAN_LLM_API_KEY"),
+            llm_base_url=_env("SHTURMAN_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+            llm_model=_env("SHTURMAN_LLM_MODEL"),
+            guard=_env("SHTURMAN_GUARD", "off").lower() in ("on", "1", "true", "yes"),
+            guard_url=_env("SHTURMAN_GUARD_URL").rstrip("/"),
+            guard_model=_env("SHTURMAN_GUARD_MODEL", "Horizon-Labs/prompt-injection-guard-small"),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )

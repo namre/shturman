@@ -22,7 +22,7 @@ UPDATE jobs SET status = 'running', attempts = attempts + 1, worker = $3,
        locked_until = now() + make_interval(secs => $4)
 WHERE id IN (
     SELECT id FROM jobs
-    WHERE kind = ANY($1::text[])
+    WHERE kind = ANY($1::text[]) AND executor = $5
       AND ((status = 'queued' AND run_after <= now())
            OR (status = 'running' AND locked_until < now() AND attempts < max_attempts))
     ORDER BY run_after, id
@@ -41,23 +41,25 @@ async def enqueue(
     conn: asyncpg.Connection, kind: str, payload: dict[str, Any], *,
     handler: str | None = None, context: dict[str, Any] | None = None,
     dedup_key: str | None = None, run_after: datetime | None = None, max_attempts: int = 3,
+    executor: str = "plugin",
 ) -> int | None:
     """Ставит задание. Возвращает его идентификатор или None, если такое уже ставилось."""
     return await conn.fetchval(
-        """INSERT INTO jobs (kind, handler, payload, context, dedup_key, run_after, max_attempts)
-           VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, COALESCE($6, now()), $7)
+        """INSERT INTO jobs (kind, handler, payload, context, dedup_key, run_after, max_attempts, executor)
+           VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, COALESCE($6, now()), $7, $8)
            ON CONFLICT (kind, dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
            RETURNING id""",
         kind, handler, json.dumps(payload, ensure_ascii=False),
-        json.dumps(context or {}, ensure_ascii=False), dedup_key, run_after, max_attempts,
+        json.dumps(context or {}, ensure_ascii=False), dedup_key, run_after, max_attempts, executor,
     )
 
 
 async def claim(
     conn: asyncpg.Connection, kinds: Sequence[str], *, worker: str, limit: int = 1,
-    lease: int = DEFAULT_LEASE,
+    lease: int = DEFAULT_LEASE, executor: str = "plugin",
 ) -> list[dict[str, Any]]:
-    rows = await conn.fetch(_CLAIM, list(kinds), max(1, min(limit, 20)), worker, float(lease))
+    """Берёт задания в работу. Исполнитель получает только свои: плагин — plugin, сервис — builtin."""
+    rows = await conn.fetch(_CLAIM, list(kinds), max(1, min(limit, 20)), worker, float(lease), executor)
     return [
         {"id": r["id"], "kind": r["kind"], "payload": _loads(r["payload"]), "attempt": r["attempts"]}
         for r in rows
@@ -74,13 +76,19 @@ async def get(conn: asyncpg.Connection, job_id: int) -> dict[str, Any] | None:
     return out
 
 
-async def complete(conn: asyncpg.Connection, job_id: int, result: dict[str, Any]) -> dict[str, Any] | None:
-    """Закрывает задание. Возвращает его строку (с контекстом) или None, если оно уже закрыто."""
+async def complete(
+    conn: asyncpg.Connection, job_id: int, result: dict[str, Any], *, executor: str | None = None,
+) -> dict[str, Any] | None:
+    """Закрывает задание. Возвращает его строку (с контекстом) или None, если оно уже закрыто.
+
+    executor — чьё задание разрешено закрыть. Плагин по HTTP закрывает только свои задания:
+    иначе держатель токена API мог бы подложить результат заданию своего исполнителя сервиса.
+    """
     row = await conn.fetchrow(
         """UPDATE jobs SET status = 'done', result = $2::jsonb, finished_at = now(), locked_until = NULL
-           WHERE id = $1 AND status = 'running'
+           WHERE id = $1 AND status = 'running' AND ($3::text IS NULL OR executor = $3)
            RETURNING *""",
-        job_id, json.dumps(result, ensure_ascii=False),
+        job_id, json.dumps(result, ensure_ascii=False), executor,
     )
     if row is None:
         return None
@@ -91,11 +99,16 @@ async def complete(conn: asyncpg.Connection, job_id: int, result: dict[str, Any]
 
 
 async def fail(
-    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None = 60
+    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None = 60,
+    executor: str | None = None,
 ) -> str:
-    """Отмечает неудачу. Пока попытки остались, задание возвращается в очередь. Возвращает новый статус."""
+    """Отмечает неудачу. Пока попытки остались, задание возвращается в очередь. Возвращает новый статус.
+
+    executor — чьё задание разрешено трогать (см. complete)."""
     row = await conn.fetchrow(
-        "SELECT attempts, max_attempts FROM jobs WHERE id = $1 AND status = 'running' FOR UPDATE", job_id
+        """SELECT attempts, max_attempts FROM jobs
+           WHERE id = $1 AND status = 'running' AND ($2::text IS NULL OR executor = $2) FOR UPDATE""",
+        job_id, executor,
     )
     if row is None:
         return "unknown"

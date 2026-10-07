@@ -350,6 +350,122 @@ def test_foreign_buttons_are_left_to_their_owners(app, runtime, service_env, pre
     assert (0, "on_service_button") not in handled and service_env.calls("POST", CALLBACK) == []
 
 
+# --- у сервиса свой бот согласований: плагин не привязывает владельца, не шлёт нажатия и бизнес-поток ---
+
+OWN_BOT_REFUSAL = (403, {"error": "это действие выполняется только через бота согласований", "code": "own_bot"})
+OWN_BOT_ANSWER = "Теперь согласования приходят в отдельного бота"
+REFUSED_ROUTES = (("PUT", "/api/owner"), ("DELETE", "/api/owner"), ("POST", CALLBACK),
+                  ("POST", CONNECTION), ("POST", MESSAGE), ("POST", DELETED))
+
+
+@pytest.fixture
+def own_bot_service(service_env):
+    service_env.replies[("GET", "/api/status")] = (200, {"own_bot": True, "messages": 0})
+    for route in REFUSED_ROUTES:
+        service_env.replies[route] = OWN_BOT_REFUSAL
+    return service_env
+
+
+def refused(service):
+    return [(r["method"], r["path"]) for r in service.requests if (r["method"], r["path"]) in REFUSED_ROUTES]
+
+
+def mode_seen(runtime):
+    """Условие ожидания: мост вошёл в режим. Запоминает это — остановка моста признак сбрасывает."""
+    seen = []
+
+    def check():
+        if runtime.own_bot.active:
+            seen.append(runtime.stats.own_bot)
+        return bool(seen)
+
+    check.seen = seen
+    return check
+
+
+@pytest.mark.parametrize("plugin_active", [False, True])
+def test_with_own_bot_business_updates_are_still_intercepted_but_not_forwarded(
+        app, runtime, own_bot_service, monkeypatch, caplog, plugin_active):
+    """Защита бизнес-режима от режима не зависит: ядро Hermes сообщения собеседников не получает."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(shturman_telegram, "business_plugin_active", lambda: plugin_active)
+    check = mode_seen(runtime)
+    handled = dispatch(app, runtime, {"update_id": 60, "business_message": business_message()}, until=check)
+    assert check.seen and check.seen[0] is True
+    assert handled[0] == (shturman_telegram.ARCHIVE_GROUP, "archive")       # перехват на месте
+    assert ((0, "drop_business_message") in handled) is (not plugin_active)  # как и без своего бота
+    photo = business_message(text=None, photo=[{"file_id": "a", "file_unique_id": "b", "width": 1, "height": 1}])
+    handled = dispatch(app, runtime, {"update_id": 61, "business_message": photo}, until=mode_seen(runtime))
+    assert (0, "drop_business_message") in handled                          # медиа до ядра не доходит никогда
+    dispatch(app, runtime, connection_update(update_id=62), until=mode_seen(runtime))
+    assert refused(own_bot_service) == []                                   # сервису не ушло ничего
+    assert runtime.stats.counters["rejected"] == 0 and runtime.stats.counters["dropped"] == 0
+    assert SECRET not in caplog.text and "WARNING" not in caplog.text
+
+
+def test_with_own_bot_press_on_an_old_card_gets_an_explanation(app, runtime, own_bot_service, presses, caplog):
+    caplog.set_level(logging.INFO)
+    update = telegram.Update.de_json(press(), app.bot)
+    handler = next(h for h in app.handlers[0] if h.callback.__name__ == "on_service_button")
+
+    async def scenario():
+        assert runtime.ensure_started()
+        for _ in range(300):
+            if runtime.own_bot.active:
+                break
+            await asyncio.sleep(0.01)
+        assert runtime.own_bot.active and runtime.stats.own_bot is True
+        for _ in range(3):
+            await handler.callback(update, CallbackContext.from_update(update, app))
+        await runtime.stop()
+
+    asyncio.run(scenario())
+    assert presses["answers"] == [OWN_BOT_ANSWER] * 3                       # пояснение, а не «сервис недоступен»
+    assert presses["texts"] == [] and presses["markups"] == []              # карточка не тронута
+    assert refused(own_bot_service) == []                                   # ни нажатий, ни привязки владельца
+    assert len(own_bot_service.calls("GET", "/api/status")) == 1
+    assert runtime.stats.counters["callbacks"] == 0 and runtime.stats.counters["callbacks_refused"] == 0
+    lines = [r.getMessage() for r in caplog.records if r.name == "shturman.own_bot"]
+    assert len(lines) == 1 and "WARNING" not in caplog.text                 # одна строка о входе в режим
+
+
+def test_press_refused_with_own_bot_code_turns_the_mode_on_quietly(app, runtime, service_env, presses, caplog):
+    """Сервис ещё не сказал о своём боте в состоянии (плагин узнаёт о нём из отказа на нажатие)."""
+    service_env.replies[("POST", CALLBACK)] = OWN_BOT_REFUSAL
+    check = mode_seen(runtime)
+    dispatch(app, runtime, press(), until=lambda: check() and presses["answers"])
+    assert presses["answers"] == [OWN_BOT_ANSWER] and presses["texts"] == []
+    assert len(service_env.calls("POST", CALLBACK)) == 1 and check.seen[0] is True
+    assert "нажатие кнопки не передано" not in caplog.text
+
+
+def test_with_own_bot_stranger_press_is_still_refused(app, runtime, own_bot_service, presses):
+    dispatch(app, runtime, press(user=STRANGER, chat_id=99), until=lambda: presses["answers"])
+    assert presses["answers"] == ["Кнопка недоступна."] and own_bot_service.calls("POST", CALLBACK) == []
+
+
+def test_own_bot_mode_reaches_the_status_block(runtime, own_bot_service):
+    from shturman_core import bridge_stats
+
+    application = Application.builder().token(BOT_TOKEN).updater(None).build()
+    store = Store()
+
+    async def scenario():
+        runtime.attach(application, store)
+        for _ in range(300):
+            if store.read("bridge").get("own_bot") is True:
+                break
+            await asyncio.sleep(0.01)
+        status = bridge_stats.status(store, configured=True)
+        await asyncio.sleep(0.1)
+        await runtime.stop()
+        return status
+
+    status = asyncio.run(scenario())
+    assert status["own_bot"] is True and status["executor_running"] is True
+    assert refused(own_bot_service) == []                                   # владелец сервису не навязывается
+
+
 # --- бот: настоящая библиотека и её разбор ответов «Telegram» ---
 
 class FakeTelegram:

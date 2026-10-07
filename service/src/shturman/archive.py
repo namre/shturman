@@ -4,17 +4,19 @@
 возвращают словари с «сырыми» значениями: чистка текста и перевод времени в пояс владельца —
 дело вызывающего (`mcp_server.py`).
 
-Три правила видимости зашиты в каждый запрос и проверены тестами:
+Четыре правила видимости зашиты в каждый запрос и проверены тестами:
   * чат с признаком `chats.excluded` не виден: ни он сам, ни его сообщения, ни счётчики;
   * сообщение с отметкой `deleted_at` не видно;
+  * сообщение, скрытое защитой от внедрённых инструкций (`agent_visible = false`, см. guard/),
+    не видно: ни его текст, ни оно как сосед или как «ответ на», ни в счётчике сообщений чата;
   * служебные собеседники Telegram (`store.is_blocked_peer`: уведомления 777000, @BotFather,
     @SpamBot) не видны ни как чат, ни как отправитель, ни как найденный человек.
-Третье правило проверяется дважды: условием в SQL (собранным из списков `store.py`) и повторно
+Правило о служебных собеседниках проверяется дважды: условием в SQL (собранным из списков `store.py`) и повторно
 в коде функцией `store.is_blocked_peer` — для каждой возвращаемой строки: чата, сообщения,
 человека. Счётчики и время последнего сообщения считает база, для них проверка одна — в SQL.
 
 Поиск по словам здесь не живёт: он идёт только через `retrieval.find`. Но его результат
-перед выдачей проходит `visible_messages` — те же три правила.
+перед выдачей проходит `visible_messages` — те же правила.
 """
 
 from __future__ import annotations
@@ -78,7 +80,7 @@ WHERE NOT c.excluded AND {_peer_ok('cp')}
 _BLOCKED_PEER_IDS = f"ARRAY(SELECT bp.id FROM peers bp WHERE NOT ({_peer_ok('bp')}))"
 _VISIBLE_MESSAGE_OF_CHAT = f"""
         FROM messages m
-        WHERE m.chat_id = {{chat}} AND m.deleted_at IS NULL
+        WHERE m.chat_id = {{chat}} AND m.deleted_at IS NULL AND m.agent_visible
           AND (m.sender_peer_id IS NULL OR m.sender_peer_id <> ALL ({_BLOCKED_PEER_IDS}))"""
 
 # Сначала выбирается страница чатов по времени последнего сообщения (один шаг по индексу на чат),
@@ -191,9 +193,9 @@ JOIN peers cp ON cp.id = c.peer_id
 JOIN accounts a ON a.id = c.account_id
 LEFT JOIN peers sp ON sp.id = m.sender_peer_id
 LEFT JOIN messages r ON r.chat_id = m.chat_id AND r.tg_message_id = m.reply_to_tg_id
-                    AND r.deleted_at IS NULL
+                    AND r.deleted_at IS NULL AND r.agent_visible
 LEFT JOIN peers rp ON rp.id = r.sender_peer_id
-WHERE m.deleted_at IS NULL AND NOT c.excluded
+WHERE m.deleted_at IS NULL AND m.agent_visible AND NOT c.excluded
   AND {_peer_ok('cp')} AND {_peer_ok('sp', optional=True)}
 """
 

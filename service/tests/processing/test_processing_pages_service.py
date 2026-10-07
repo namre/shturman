@@ -175,6 +175,9 @@ async def test_proposal_routes(make_client, conn, config, monkeypatch):
     yes = await client.post(f"/api/pages/proposals/{w.maria}", json={"accept": True})
     assert yes.json()["status"] == "accepted" and yes.json()["page_id"]
     await until(lambda: conn.fetchval("SELECT count(*) = 2 FROM pages WHERE file_hash IS NOT NULL"))
+    async def committed():     # запись в историю идёт следом за записью файла и отметкой в базе
+        return len(log(config)) >= 2
+    await until(committed)
     assert [subject for _, subject in log(config)] == ["Обновление страниц: создано 1, обновлено 0"] * 2
 
 
@@ -280,7 +283,9 @@ async def test_deletion_event_scrubs_the_page_in_the_background(make_client, con
     text = path.read_text(encoding="utf-8")
     assert "Про монтаж" in text and f"msg:{m1})" not in text and "обязательство (" not in text
     assert blocks_of(text).commitments == pages.NO_COMMITMENTS
-    assert (await client.get("/api/pages/search", params={"query": "смету"})).json()["pages"] == []
+    async def unindexed():     # поисковый индекс страницы обновляется следом за записью файла
+        return (await client.get("/api/pages/search", params={"query": "смету"})).json()["pages"] == []
+    await until(unindexed)
     async def committed():     # запись в историю идёт следом за записью файла
         return log(config)[0][1] == "Обновление страниц: создано 0, обновлено 1"
     await until(committed)

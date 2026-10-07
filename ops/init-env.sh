@@ -1,19 +1,42 @@
 #!/usr/bin/env bash
-# Создаёт .env из .env.example.
+# Создаёт .env из .env.example и запоминает режим установки.
 #
 #   ./ops/init-env.sh --auto   — только служебные значения, которые генерируются сами
 #                                (пароль базы и т.п.). Ничего не спрашивает и не печатает
 #                                значений. Этот режим может запускать агент.
-#   ./ops/init-env.sh          — запасной путь без веб-интерфейса: спрашивает все значения
-#                                у ЧЕЛОВЕКА в его терминале, секреты — скрытым вводом.
+#   ./ops/init-env.sh          — спрашивает значения у ЧЕЛОВЕКА в его терминале, секреты —
+#                                скрытым вводом: набранное не показывается на экране и не попадает
+#                                ни в историю команд, ни в журналы. Агент так скрипт не запускает.
 #
-# Основной путь ввода токенов и ключей — веб-интерфейс (docs/setup.md), а не этот скрипт.
+#   --mode hermes|standalone   — режим установки, записывается при первом запуске:
+#                                  hermes      — с Hermes (по умолчанию, как раньше);
+#                                  standalone  — без Hermes: только архив и согласования.
+#                                Уже записанный режим этот ключ не меняет: смена — ./ops/mode.sh.
+#
+# В режиме с Hermes токены и ключи владелец вводит в веб-интерфейсе (docs/setup.md), а запуск
+# без --auto — запасной путь. В режиме без Hermes веб-интерфейса нет: токен бота согласований
+# и ключ модели владелец вводит здесь (docs/standalone.md).
 # Читать .env агенту запрещено в любом режиме.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
 
-auto=0
-[ "${1:-}" = "--auto" ] && auto=1
+auto=0; want=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --auto) auto=1 ;;
+    --mode)
+      [ $# -ge 2 ] || { echo "после --mode нужен режим: hermes или standalone" >&2; exit 2; }
+      want="$2"; shift ;;
+    --mode=*) want="${1#--mode=}" ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "неизвестный параметр: $1 (см. $0 --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+if [ -n "$want" ] && ! valid_mode "$want"; then
+  echo "неизвестный режим: $want — допустимы hermes и standalone" >&2; exit 2
+fi
 
 if [ "$auto" -eq 0 ] && [ ! -t 0 ]; then
   echo "Без --auto этот скрипт запускает человек в интерактивном терминале." >&2
@@ -26,27 +49,65 @@ src=".env.example"; dst=".env"
 umask 077
 touch "$dst"; chmod 600 "$dst"
 
+# --- режим установки ---
+have_mode="$(env_get SHTURMAN_MODE)"
+if [ -z "$have_mode" ]; then
+  # Экземпляр, развёрнутый до появления режимов, — это режим с Hermes.
+  mode="${want:-hermes}"
+  env_put SHTURMAN_MODE "$mode"
+  echo "[SHTURMAN_MODE] записан режим: $mode"
+else
+  mode="$(shturman_mode)" || exit 2
+  if [ -n "$want" ] && [ "$want" != "$mode" ]; then
+    echo "Режим уже выбран: $mode. Этот скрипт его не меняет: смена режима — ./ops/mode.sh set $want" >&2
+    exit 2
+  fi
+  echo "[SHTURMAN_MODE] режим: $mode"
+fi
+# Профили Compose следуют за режимом; включённый поиск по смыслу сохраняется.
+profiles="$(compose_profiles "$mode" keep)"
+if ! grep -q '^COMPOSE_PROFILES=' "$dst" || [ "$(env_get COMPOSE_PROFILES)" != "$profiles" ]; then
+  env_put COMPOSE_PROFILES "$profiles"
+fi
+
 current() { grep -E "^$1=" "$dst" | tail -n 1 | cut -d= -f2- || true; }
-put() {
-  local tmp; tmp="$(mktemp .env.XXXXXX)"
-  grep -Ev "^$1=" "$dst" > "$tmp" || true
-  printf '%s=%s\n' "$1" "$2" >> "$tmp"
-  chmod 600 "$tmp"; mv "$tmp" "$dst"
+put() { env_put "$1" "$2"; }
+
+# Значение, которое .env не передаст контейнеру как есть. О самом значении ничего не печатаем.
+unsafe() {
+  case "$1" in
+    *[[:space:]]*|*\$*|*\"*|*\'*|*\\*|*\#*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# Очевидная опечатка в секрете известного вида. Проверяется только форма, не само значение.
+malformed() {
+  case "$1" in
+    SHTURMAN_BOT_TOKEN|TELEGRAM_BOT_TOKEN)
+      printf '%s' "$2" | grep -Eq '^[0-9]{3,20}:[A-Za-z0-9_-]{20,128}$' && return 1
+      return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-kind=""; desc=""
+kind=""; desc=""; scope=""
 while IFS= read -r line <&3; do
   case "$line" in
-    "# [secret]"*) kind="secret"; desc="${line#\# \[secret\] }" ;;
-    "# [value]"*)  kind="value";  desc="${line#\# \[value\] }" ;;
-    "# [auto]"*)   kind="auto";   desc="${line#\# \[auto\] }" ;;
+    "# ["*"]"*)
+      tag="${line#\# \[}"; tag="${tag%%\]*}"
+      desc="${line#*\] }"
+      kind="${tag%%:*}"; scope=""
+      case "$tag" in *:*) scope="${tag#*:}" ;; esac
+      case "$kind" in secret|value|auto) ;; *) kind=""; desc=""; scope="" ;; esac ;;
     [A-Z]*=*)
       key="${line%%=*}"; default="${line#*=}"
       have="$(current "$key")"
       if [ -n "$have" ]; then
         echo "[$key] уже задано — пропускаю (чтобы изменить, удалите строку из .env)"
+      elif [ -n "$scope" ] && [ "$scope" != "$mode" ]; then
+        : # значение другого режима: не спрашиваем
       else
-        if [ "$auto" -eq 1 ] && [ "$kind" != "auto" ]; then kind=""; desc=""; continue; fi
+        if [ "$auto" -eq 1 ] && [ "$kind" != "auto" ]; then kind=""; desc=""; scope=""; continue; fi
         case "$kind" in
           auto)
             put "$key" "$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
@@ -54,19 +115,27 @@ while IFS= read -r line <&3; do
           secret)
             printf '%s\n[%s] (ввод скрыт, Enter — пропустить): ' "$desc" "$key"
             IFS= read -rs val; echo
-            if [ -n "$val" ]; then put "$key" "$val"; echo "  записано"; else echo "  пропущено"; fi
+            if [ -z "$val" ]; then echo "  пропущено"
+            elif unsafe "$val"; then echo "  НЕ записано: в значении пробел, кавычка или один из знаков \$ # \\ — проверьте, что скопировали его целиком и без лишнего"
+            elif malformed "$key" "$val"; then echo "  НЕ записано: это не похоже на токен бота (ожидается вид 123456789:буквы-и-цифры) — запустите скрипт ещё раз"
+            else put "$key" "$val"; echo "  записано"; fi
             val="" ;;
           *)
             printf '%s\n[%s]%s: ' "$desc" "$key" "${default:+ (по умолчанию: $default)}"
             IFS= read -r val
             val="${val:-$default}"
-            if [ -n "$val" ]; then put "$key" "$val"; echo "  записано"; else echo "  пропущено"; fi ;;
+            if [ -z "$val" ]; then echo "  пропущено"
+            elif unsafe "$val"; then echo "  НЕ записано: в значении пробел, кавычка или один из знаков \$ # \\"
+            else put "$key" "$val"; echo "  записано"; fi ;;
         esac
       fi
-      kind=""; desc="" ;;
+      kind=""; desc=""; scope="" ;;
   esac
 done 3< "$src"
 
 echo
-echo "Готово: $dst (права $(stat -c '%a' "$dst")). Заполнено переменных: $(grep -Ec '^[A-Z_]+=.+' "$dst")."
-if [ "$auto" -eq 0 ]; then echo "Сообщите агенту слово «готово». Содержимое файла ему не показывайте."; fi
+echo "Готово: $dst (права $(stat -c '%a' "$dst")), режим: $mode. Заполнено переменных: $(grep -Ec '^[A-Z_]+=.+' "$dst")."
+if [ "$auto" -eq 0 ]; then
+  echo "Чтобы сервис подхватил новые значения — ./ops/up.sh."
+  echo "Сообщите агенту слово «готово». Содержимое файла ему не показывайте."
+fi

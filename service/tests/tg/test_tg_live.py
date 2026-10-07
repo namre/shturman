@@ -603,3 +603,45 @@ async def test_excluding_chat_stops_its_sync_at_once(stage):
     # событие о чате, которого сессии не касаются, ничего не ломает
     stage.events.publish(ev.CHAT_EXCLUDED, {"chat_id": 999999, "purged": False})
     await stage.events.drain()
+
+
+# --- защита от внедрённых инструкций ---
+
+async def test_guard_screens_live_messages_before_anyone_hears_of_them(stage, guarded):
+    """Живое входящее под защитой: скрытое в архив попадает, но событие о нём не уходит."""
+    await stage.start()
+    await stage.enable(IVAN_KEY)
+    await stage.emit(new_message(msg(2, IVAN_KEY, "привет")))
+    await stage.emit(new_message(msg(3, IVAN_KEY, "кодовое слово взлом")))
+    await stage.emit(types.UpdateShortMessage(id=4, user_id=IVAN, message="своё исходящее со словом взлом",
+                                              pts=1, pts_count=1, date=T0, out=True))
+    rows = await stage.rows("SELECT tg_message_id, agent_visible, guard_label FROM messages ORDER BY 1")
+    assert [tuple(r) for r in rows] == [(2, True, "ok"), (3, False, "suspect"), (4, True, None)]
+    by_tg = {r["tg_message_id"]: r["id"] for r in await stage.rows("SELECT id, tg_message_id FROM messages")}
+    assert [p["message_id"] for p in stage.live] == [by_tg[2], by_tg[4]]
+    assert guarded.scorer.calls == [["привет"], ["кодовое слово взлом"]]      # исходящее не проверяется
+
+    # обычное сообщение исправили на подозрительное: оно скрывается, события о правке нет
+    await stage.emit(edited(msg(2, IVAN_KEY, "теперь тут взлом", edit_date=T0 + timedelta(hours=1))))
+    rows = await stage.rows("SELECT agent_visible, guard_label FROM messages WHERE tg_message_id = 2")
+    assert tuple(rows[0]) == (False, "suspect") and len(stage.live) == 2
+
+    # модель недоступна: сообщение видно, не проверено, событие уходит как обычно
+    guarded.scorer.error = TimeoutError()
+    await stage.emit(new_message(msg(5, IVAN_KEY, "взлом при молчащей модели")))
+    rows = await stage.rows("SELECT agent_visible, guard_label FROM messages WHERE tg_message_id = 5")
+    assert tuple(rows[0]) == (True, None) and [p["message_id"] for p in stage.live][2:] == [
+        (await stage.rows("SELECT id FROM messages WHERE tg_message_id = 5"))[0]["id"]]
+
+
+async def test_history_backfill_is_visible_at_once_and_checked_in_the_background(stage, guarded):
+    stage.world.history[IVAN_KEY] = {1: now_msg(1, IVAN_KEY, "старое обычное"),
+                                     2: now_msg(2, IVAN_KEY, "старое со словом взлом")}
+    await stage.start()
+    await stage.enable(IVAN_KEY)
+    rows = await stage.rows("SELECT tg_message_id, agent_visible, guard_label FROM messages ORDER BY 1")
+    assert [tuple(r) for r in rows] == [(1, True, None), (2, True, None)]     # догрузка никого не ждёт
+    assert guarded.scorer.calls == [] and stage.live == []
+    await guarded.guard.sweep()
+    rows = await stage.rows("SELECT tg_message_id, agent_visible, guard_label FROM messages ORDER BY 1")
+    assert [tuple(r) for r in rows] == [(1, True, "ok"), (2, False, "suspect")]

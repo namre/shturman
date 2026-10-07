@@ -232,6 +232,13 @@ async def service_proxy(path: str, request: Request) -> StreamingResponse:
 
     Тело запроса и тело ответа идут потоком и в память целиком не читаются: так передаётся
     и многогигабайтный экспорт, и пароль — без следа в журнале.
+
+    Код и тело ответа сервиса передаются как есть. В том числе 202 с телом
+    {"status": "pending_confirmation", "action_id", "summary", ...}: у сервиса свой бот
+    согласований, действие не применено и ждёт нажатия владельца в боте. Страница должна
+    показать это как «ждёт подтверждения», а не как «сохранено»; ждущие действия отдаёт
+    `service/confirmations`, отменить можно через `service/confirmations/{id}/cancel`.
+    Подтвердить действие отсюда нельзя.
     """
     target = "/api/" + path
     if not service_routes.allowed(service_routes.UI, request.method, target):

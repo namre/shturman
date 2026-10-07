@@ -26,11 +26,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Awaitable, Callable
 
 import asyncpg
 
 from . import jobs
+
+logger = logging.getLogger("shturman.bridge")
 
 LLM_STRUCTURED = "llm.structured"
 LLM_TEXT = "llm.text"
@@ -90,8 +93,11 @@ def on_callback(module: str) -> Callable[[CallbackHandler], CallbackHandler]:
 
     fn(conn, остальное, tg_id нажавшего) -> {"answer": "короткий текст-подсказка",
                                               "edit_text": "новый текст сообщения" | None,
-                                              "remove_buttons": bool}
-    Нажатие приходит только от владельца: это проверено до вызова.
+                                              "remove_buttons": bool,
+                                              "after_commit": async-функция без аргументов | None}
+    Нажатие приходит только от владельца: это проверено до вызова. `after_commit` выполняется
+    после фиксации транзакции нажатия — для событий и фоновой работы, которым нужны уже
+    записанные изменения.
     """
     def deco(fn: CallbackHandler) -> CallbackHandler:
         _callback_handlers[module] = fn
@@ -108,6 +114,39 @@ def callback_data(module: str, rest: str) -> str:
 
 def button(text: str, module: str, rest: str) -> dict[str, str]:
     return {"text": text, "data": callback_data(module, rest)}
+
+
+# --- кто выполняет задания ---
+
+# Виды заданий, которые сервис выполняет сам (свой бот, свой ключ модели). Задаёт модуль
+# исполнителя при запуске; остальное забирает плагин в Hermes.
+_builtin_kinds: frozenset[str] = frozenset()
+
+
+def set_builtin(kinds) -> None:
+    global _builtin_kinds
+    _builtin_kinds = frozenset(kinds)
+
+
+def builtin_kinds() -> frozenset[str]:
+    return _builtin_kinds
+
+
+def executor_for(kind: str) -> str:
+    return "builtin" if kind in _builtin_kinds else "plugin"
+
+
+def owns_bot() -> bool:
+    """Свой бот сервиса активен: нажатия и привязка владельца идут только через него."""
+    return NOTIFY_OWNER in _builtin_kinds
+
+
+def model_hint() -> str:
+    """Куда владельцу смотреть, если модель не отвечает. Сервис не знает, установлен ли Hermes,
+    поэтому судит по своему исполнителю: своя модель — её настройки, иначе модель у Hermes."""
+    if LLM_TEXT in _builtin_kinds:
+        return "Проверьте ключ и имя модели сервиса: `shturman bot-status`."
+    return "Проверьте модель в настройках Hermes."
 
 
 # --- владелец ---
@@ -182,7 +221,7 @@ async def notify_owner(
     """Сообщение владельцу в управляющий чат. Текст — без разметки, не длиннее 4096 знаков."""
     return await jobs.enqueue(
         conn, NOTIFY_OWNER, {"text": fit_message(text), "buttons": buttons, "silent": silent},
-        handler=handler, context=context, dedup_key=dedup_key,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(NOTIFY_OWNER),
     )
 
 
@@ -193,7 +232,7 @@ async def edit_owner_message(
     return await jobs.enqueue(
         conn, NOTIFY_EDIT,
         {"message_id": int(message_id), "text": fit_message(text), "remove_buttons": remove_buttons},
-        max_attempts=2,
+        max_attempts=2, executor=executor_for(NOTIFY_EDIT),
     )
 
 
@@ -207,7 +246,7 @@ async def request_structured(
         conn, LLM_STRUCTURED,
         {"instructions": instructions, "input": input, "json_schema": json_schema,
          "schema_name": schema_name, "task": task, "max_tokens": max_tokens},
-        handler=handler, context=context, dedup_key=dedup_key,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_STRUCTURED),
     )
 
 
@@ -218,7 +257,7 @@ async def request_text(
 ) -> int | None:
     return await jobs.enqueue(
         conn, LLM_TEXT, {"messages": messages, "task": task, "max_tokens": max_tokens},
-        handler=handler, context=context, dedup_key=dedup_key,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_TEXT),
     )
 
 
@@ -228,20 +267,27 @@ async def request_business_send(
     context: dict[str, Any] | None = None, dedup_key: str | None = None,
 ) -> int | None:
     """Отправка от имени владельца через бизнес-бота. Ставится только после согласования."""
+    # Отправляет тот бот, через которого пришло подключение: свой бот сервиса или бот в Hermes.
+    via = await conn.fetchval("SELECT via FROM business_connections WHERE id = $1", business_connection_id)
     return await jobs.enqueue(
         conn, BUSINESS_SEND,
         {"business_connection_id": business_connection_id, "chat_id": int(chat_id),
          "text": text, "reply_to_message_id": reply_to_message_id},
         handler=handler, context=context, dedup_key=dedup_key, max_attempts=1,
+        executor="builtin" if via == "service" else "plugin",
     )
 
 
 # --- разбор ответов ---
 
-async def deliver_result(conn: asyncpg.Connection, job_id: int, result: dict[str, Any]) -> bool:
-    """Закрывает задание и передаёт результат модулю-владельцу. Одна транзакция."""
+async def deliver_result(
+    conn: asyncpg.Connection, job_id: int, result: dict[str, Any], *, executor: str | None = None,
+) -> bool:
+    """Закрывает задание и передаёт результат модулю-владельцу. Одна транзакция.
+
+    executor — чьё задание разрешено закрыть; по HTTP от плагина это всегда "plugin"."""
     async with conn.transaction():
-        job = await jobs.complete(conn, job_id, result)
+        job = await jobs.complete(conn, job_id, result, executor=executor)
         if job is None:
             return False
         fn = _result_handlers.get(job["handler"] or "")
@@ -250,9 +296,11 @@ async def deliver_result(conn: asyncpg.Connection, job_id: int, result: dict[str
     return True
 
 
-async def deliver_failure(conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None) -> str:
+async def deliver_failure(
+    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None, executor: str | None = None,
+) -> str:
     async with conn.transaction():
-        status = await jobs.fail(conn, job_id, error, retry_in=retry_in)
+        status = await jobs.fail(conn, job_id, error, retry_in=retry_in, executor=executor)
         if status == "failed":
             job = await jobs.get(conn, job_id)
             fn = _failure_handlers.get((job or {}).get("handler") or "")
@@ -286,5 +334,11 @@ async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: i
         return refused
     async with conn.transaction():
         out = await fn(conn, rest, int(from_user_id))
+    after = out.get("after_commit")
+    if after is not None:
+        try:
+            await after()
+        except Exception as exc:  # нажатие уже разобрано и записано; сбой «после» его не отменяет
+            logger.error("нажатие разобрано, но работа после него не выполнена (%s)", type(exc).__name__)
     return {"answer": str(out.get("answer") or "")[:190], "edit_text": out.get("edit_text"),
             "remove_buttons": bool(out.get("remove_buttons"))}

@@ -3,5 +3,7 @@
 # После этого вход — заново по коду от бота или по ссылке из ./ops/activation-link.sh.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
+require_hermes "дашборда и его сессий"
 docker exec -u "$(id -u):$(id -g)" shturman-hermes /opt/hermes/.venv/bin/python \
   /opt/data/plugins/shturman/cli.py logout-all

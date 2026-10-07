@@ -352,7 +352,7 @@ SELECT m.id, m.chat_id, m.text, m.sender_name, m.tg_message_id, c.title, c.type 
 FROM messages m
 JOIN chats c ON c.id = m.chat_id
 JOIN peers p ON p.id = c.peer_id
-WHERE m.id = $1 AND m.chat_id = $2 AND m.kind = 'message' AND m.deleted_at IS NULL
+WHERE m.id = $1 AND m.chat_id = $2 AND m.kind = 'message' AND m.deleted_at IS NULL AND m.agent_visible
 """
 _COUNTED = "('checking', 'relevant', 'not_relevant', 'failed', 'no_answer')"
 
@@ -487,7 +487,7 @@ async def _warn_if_model_is_silent(conn: asyncpg.Connection) -> None:
         "SELECT COALESCE(max(id), 0) FROM watch_hits WHERE status IN ('relevant', 'not_relevant')")
     await bridge.notify_owner(
         conn, "Наблюдатель групп не получает ответ модели: несколько проверок подряд вернулись пустыми. "
-              "Важные сообщения могут проходить мимо. Проверьте модель в настройках Hermes.",
+              "Важные сообщения могут проходить мимо. " + bridge.model_hint(),
         dedup_key=f"watch:silent:{streak_start}")
 
 

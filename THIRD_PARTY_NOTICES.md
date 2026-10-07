@@ -1,6 +1,6 @@
 # Сторонние компоненты
 
-Три вида стороннего в продукте: компоненты, которые скачиваются при развёртывании; библиотеки, от которых зависит сервис переписки; фрагменты чужого кода, переработанные и включённые в этот репозиторий. Лицензии указаны по состоянию на 2026-10-06 и подлежат сверке при каждом обновлении версии.
+Три вида стороннего в продукте: компоненты, которые скачиваются при развёртывании; библиотеки, от которых зависит сервис переписки; фрагменты чужого кода, переработанные и включённые в этот репозиторий. Лицензии указаны по состоянию на 2026-10-06, для добавленного в версии 0.0.4 (модель защиты, `socksio`) — на 2026-10-07, и подлежат сверке при каждом обновлении версии.
 
 Правило: компоненты под AGPL, LGPL и BSL в поставку не включаются без отдельной записи в `docs/decisions.md`; код под GPL в репозиторий не переносится (решение Р-18).
 
@@ -12,10 +12,13 @@
 | hermes-telegram-business | Плагин бизнес-режима; ставится из мастера по SHA | MIT | https://github.com/NousResearch/hermes-telegram-business |
 | PostgreSQL 16 | Хранилище архива | PostgreSQL License | https://www.postgresql.org |
 | pgvector 0.8.7 | Векторный поиск в Postgres | PostgreSQL License | https://github.com/pgvector/pgvector |
-| text-embeddings-inference 1.9.4 | Сервер эмбеддингов (по желанию) | Apache-2.0 | https://github.com/huggingface/text-embeddings-inference |
+| text-embeddings-inference 1.9.4 | Сервер эмбеддингов и сервер классификатора защиты (оба по желанию) | Apache-2.0 | https://github.com/huggingface/text-embeddings-inference |
 | intfloat/multilingual-e5-small | Модель эмбеддингов (по желанию) | MIT | https://huggingface.co/intfloat/multilingual-e5-small |
+| Horizon-Labs/prompt-injection-guard-small, ревизия `3215a27` | Модель-классификатор защиты от внедрённых инструкций (по желанию); основа — `jhu-clsp/mmBERT-small` (MIT) | Apache-2.0 (по карточке модели; файла лицензии в репозитории модели нет) | https://huggingface.co/Horizon-Labs/prompt-injection-guard-small |
 | Python 3.12, образ `python:3.12.12-slim-bookworm` | Основа образа сервиса переписки | PSF License; пакеты Debian — под своими лицензиями | https://hub.docker.com/_/python |
 | git | История страниц памяти; ставится в образ сервиса как отдельная программа | GPL-2.0 | https://git-scm.com |
+
+Модель защиты скачивает `./ops/guard.sh` по закреплённой ревизии `3215a27edd62c5ba0bd786c57a9d243b2158e70e` с проверкой контрольных сумм; в репозитории и в образе сервиса её нет. Лицензия Apache-2.0 названа только в карточке модели: файла лицензии в её репозитории нет, автор малоизвестен — при обновлении ревизии сверить заново.
 
 git вызывается как отдельная программа и с кодом сервиса не связывается; без него страницы собираются без истории. Python-библиотека python-telegram-bot (LGPL-3.0) приходит вместе с Hermes, в наш образ и в плагин не входит (решение Р-28).
 
@@ -29,7 +32,8 @@ git вызывается как отдельная программа и с ко
 | ijson | Потоковое чтение экспорта | BSD-3-Clause | https://github.com/ICRAR/ijson |
 | starlette | Каркас HTTP | BSD-3-Clause | https://pypi.org/project/starlette/ |
 | uvicorn | Сервер HTTP | BSD-3-Clause | https://pypi.org/project/uvicorn/ |
-| httpx | Клиент сервера эмбеддингов | BSD-3-Clause | https://pypi.org/project/httpx/ |
+| httpx | Клиент сервера эмбеддингов, классификатора защиты, Bot API и модели | BSD-3-Clause | https://pypi.org/project/httpx/ |
+| socksio | Поддержка SOCKS-прокси для httpx | MIT | https://pypi.org/project/socksio/ |
 | mcp | SDK протокола MCP, сервер архива | MIT | https://pypi.org/project/mcp/ |
 | pydantic | Модели ответов инструментов (приходит с `mcp`) | MIT | https://pypi.org/project/pydantic/ |
 | Telethon 1.x | Клиент пользовательского аккаунта Telegram | MIT | https://codeberg.org/Lonami/Telethon |
@@ -55,6 +59,7 @@ git вызывается как отдельная программа и с ко
 |---|---|---|---|
 | VsevaTech/promise-tracker | MIT, © 2026 VsevaTech | Ход разбора сроков; инструкция модели; основы глаголов-обещаний и оговорок; проверка «срок есть в исходном тексте» | `service/src/shturman/processing/dates.py` (полный текст лицензии — в шапке файла), `processing/extract.py` |
 | NousResearch/hermes-telegram-business | MIT | Жизненный цикл черновика, разбор нажатий и клавиатура; сбор «пачки» сообщений | `service/src/shturman/outbox/drafts.py`, `outbox/autoreply.py` |
+| NousResearch/hermes-agent | MIT | Порядок сборки запроса «JSON по схеме» и разбор ответа модели | `service/src/shturman/executor/llm.py` |
 | Luan-X/hermes-telegram-business | MIT | Нормализация текста, отпечаток содержимого, разбор ответа модели | `service/src/shturman/outbox/watcher.py`, `outbox/text.py` |
 | paulpierre/informer, aahnik/tgcf | MIT | Образец цикла «чат из списка → слова → уведомление» | `service/src/shturman/outbox/watcher.py` |
 | j2h4u/mcp-telegram (форк sparfenyuk/mcp-telegram) | MIT | Порядок запросов и курсоры синхронизации; состав обработчиков событий; разбор вложений и пересылок; рамка «чужой текст»; связка «поиск → окно вокруг найденного»; запас времени QR-кода | `service/src/shturman/tg/sync.py`, `tg/live.py`, `tg/normalize.py`, `tg/qr.py`, `sanitize.py`, `mcp_server.py`; через `sanitize.py` — `plugins/shturman/shturman_core/tools.py` |

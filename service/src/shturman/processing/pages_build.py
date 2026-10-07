@@ -168,7 +168,7 @@ SELECT c.id, c.status, c.direction, c.what, c.due_expression, c.due_date, c.due_
        COALESCE(cpe.display_name, cp.name) AS creditor_name
 FROM commitments c
 JOIN chats ch ON ch.id = c.chat_id AND NOT ch.excluded
-JOIN messages m ON m.id = c.source_message_id AND m.deleted_at IS NULL
+JOIN messages m ON m.id = c.source_message_id AND m.deleted_at IS NULL AND m.agent_visible
 LEFT JOIN messages dm ON dm.id = c.due_message_id
 LEFT JOIN peers dp ON dp.id = c.debtor_peer_id
 LEFT JOIN person_peers dpp ON dpp.peer_id = c.debtor_peer_id
@@ -178,7 +178,7 @@ LEFT JOIN person_peers cpp ON cpp.peer_id = c.creditor_peer_id
 LEFT JOIN people cpe ON cpe.id = cpp.person_id
 WHERE c.status IN ('open', 'done', 'cancelled')
   AND (c.debtor_peer_id = ANY($1::bigint[]) OR c.creditor_peer_id = ANY($1::bigint[]))
-  AND (c.due_message_id IS NULL OR dm.deleted_at IS NULL)
+  AND (c.due_message_id IS NULL OR (dm.deleted_at IS NULL AND dm.agent_visible))
 ORDER BY m.sent_at, c.id
 """
 
@@ -190,7 +190,7 @@ LEFT JOIN commitment_changes x
        ON x.status = 'accepted' AND x.commitment_id = e.commitment_id
       AND x.id = CASE WHEN e.details->>'change_id' ~ '^[0-9]{1,18}$'
                       THEN (e.details->>'change_id')::bigint END
-LEFT JOIN messages xm ON xm.id = x.evidence_message_id AND xm.deleted_at IS NULL
+LEFT JOIN messages xm ON xm.id = x.evidence_message_id AND xm.deleted_at IS NULL AND xm.agent_visible
 WHERE e.commitment_id = ANY($1::bigint[]) AND e.actor = 'owner'
   AND e.action IN ('closed', 'cancelled', 'rescheduled', 'reopened')
 ORDER BY e.at, e.id
@@ -282,12 +282,13 @@ async def _from_base(
 
 
 async def _alive(conn: asyncpg.Connection, ids: Sequence[int]) -> dict[int, bool | None]:
-    """Какие сообщения ещё есть в архиве (не удалены, чат не исключён): {id: исходящее ли}."""
+    """Какие сообщения ещё есть в архиве (не удалены, не скрыты защитой от внедрённых инструкций,
+    чат не исключён): {id: исходящее ли}."""
     if not ids:
         return {}
     rows = await conn.fetch(
         """SELECT m.id, m.is_outgoing FROM messages m JOIN chats c ON c.id = m.chat_id
-           WHERE m.id = ANY($1::bigint[]) AND m.deleted_at IS NULL AND NOT c.excluded""",
+           WHERE m.id = ANY($1::bigint[]) AND m.deleted_at IS NULL AND m.agent_visible AND NOT c.excluded""",
         list({int(i) for i in ids}))
     return {r["id"]: r["is_outgoing"] for r in rows}
 
@@ -464,12 +465,13 @@ async def _reindex(conn: asyncpg.Connection, page_id: int, page: pages.Page, nam
             page_id, block, text.replace("\x00", ""))
 
 
-# Записи, у которых источник удалён (в том числе вместе с чатом) или оказался в исключённом чате.
+# Записи, у которых источник удалён (в том числе вместе с чатом), скрыт защитой от внедрённых
+# инструкций или оказался в исключённом чате.
 _DEAD_ENTRIES = """
 SELECT 1 FROM page_entries e
 WHERE e.removed_at IS NULL AND e.n_sources > (
     SELECT count(*) FROM page_entry_sources s
-    JOIN messages m ON m.id = s.message_id AND m.deleted_at IS NULL
+    JOIN messages m ON m.id = s.message_id AND m.deleted_at IS NULL AND m.agent_visible
     JOIN chats c ON c.id = m.chat_id AND NOT c.excluded
     WHERE s.entry_id = e.id)
 """
@@ -679,20 +681,22 @@ async def _sample(
     conn: asyncpg.Connection, peers: Sequence[int], *, since: datetime, options: Options,
 ) -> list[asyncpg.Record]:
     """Последние сообщения с человеком: его личные чаты целиком и его реплики в группах.
-    Только неисключённые чаты и неудалённые сообщения."""
+    Только неисключённые чаты, неудалённые и не скрытые защитой сообщения."""
     if not peers:
         return []
     rows = await conn.fetch(
         """(SELECT m.id, m.sent_at, m.is_outgoing, m.text, m.forwarded_from IS NOT NULL AS forwarded
             FROM messages m JOIN chats c ON c.id = m.chat_id
             WHERE c.type = 'personal_chat' AND c.peer_id = ANY($1::bigint[]) AND NOT c.excluded
-              AND m.deleted_at IS NULL AND m.kind = 'message' AND m.text <> '' AND m.sent_at >= $2
+              AND m.deleted_at IS NULL AND m.agent_visible AND m.kind = 'message' AND m.text <> ''
+              AND m.sent_at >= $2
             ORDER BY m.sent_at DESC, m.id DESC LIMIT $3)
            UNION
            (SELECT m.id, m.sent_at, m.is_outgoing, m.text, m.forwarded_from IS NOT NULL
             FROM messages m JOIN chats c ON c.id = m.chat_id
             WHERE m.sender_peer_id = ANY($1::bigint[]) AND c.type = ANY($4::text[]) AND NOT c.excluded
-              AND m.deleted_at IS NULL AND m.kind = 'message' AND m.text <> '' AND m.sent_at >= $2
+              AND m.deleted_at IS NULL AND m.agent_visible AND m.kind = 'message' AND m.text <> ''
+              AND m.sent_at >= $2
             ORDER BY m.sent_at DESC, m.id DESC LIMIT $3)""",
         list(peers), since, options.sample_messages, list(GROUP_TYPES))
     rows = sorted(rows, key=lambda r: (r["sent_at"], r["id"]))[-options.sample_messages:]
@@ -1220,7 +1224,8 @@ async def finish_build(
 # --- удаление источников ---------------------------------------------------------------------------------
 
 async def mark_deleted(conn: asyncpg.Connection, message_ids: Sequence[int]) -> int:
-    """Сообщения удалены: страницы, на которых есть выведенное из них, ждут перерисовки."""
+    """Сообщения удалены или скрыты защитой от внедрённых инструкций: страницы, на которых
+    есть выведенное из них, ждут перерисовки."""
     if not message_ids:
         return 0
     done = await conn.execute(

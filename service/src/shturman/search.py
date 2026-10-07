@@ -2,6 +2,9 @@
 
 `search` и `thread` — полнотекстовый поиск и контекст вокруг сообщения. `hybrid` добавляет
 смысловую ветку по эмбеддингам и сливает ранги; вызывать его стоит через `retrieval.find`.
+
+Сообщения, скрытые защитой от внедрённых инструкций (`agent_visible = false`), не участвуют ни
+в одной ветке и не занимают мест в выдаче: ни по словам, ни по смыслу, ни как соседи.
 """
 
 # Слияние рангов в `_HYBRID`:
@@ -26,6 +29,7 @@ JOIN chats c ON c.id = m.chat_id
 CROSS JOIN q
 WHERE m.fts @@ q.query
   AND m.deleted_at IS NULL
+  AND m.agent_visible
   AND NOT c.excluded
   AND ($2::bigint IS NULL OR c.account_id = $2)
   AND ($3::bigint IS NULL OR m.chat_id = $3)
@@ -51,11 +55,13 @@ WITH anchor AS (SELECT chat_id, sent_at, id FROM messages WHERE id = $1),
 before AS (
     SELECT m.* FROM messages m, anchor a
     WHERE m.chat_id = a.chat_id AND (m.sent_at, m.id) < (a.sent_at, a.id) AND m.deleted_at IS NULL
+      AND m.agent_visible
     ORDER BY m.sent_at DESC, m.id DESC LIMIT $2
 ),
 after AS (
     SELECT m.* FROM messages m, anchor a
     WHERE m.chat_id = a.chat_id AND (m.sent_at, m.id) >= (a.sent_at, a.id) AND m.deleted_at IS NULL
+      AND m.agent_visible
     ORDER BY m.sent_at, m.id LIMIT $3 + 1
 )
 SELECT id, tg_message_id, sent_at, sender_name, is_outgoing, text, kind
@@ -99,6 +105,7 @@ async def thread(
 # Общие условия обеих веток: удалённое и исключённое не участвует, фильтры вызывающего — тоже.
 # Параметры: $3 аккаунт, $4 чат, $5 отправитель, $6 «не раньше», $7 «раньше».
 _FILTERS = """m.deleted_at IS NULL
+      AND m.agent_visible
       AND NOT c.excluded
       AND ($3::bigint IS NULL OR c.account_id = $3)
       AND ($4::bigint IS NULL OR m.chat_id = $4)

@@ -10,6 +10,10 @@
                    message_id — идентификатор строки архива (messages.id);
                    source — "session" или "business"; via_bot — сообщение отправлено через бота
   messages.deleted {message_ids: [...]}
+  messages.hidden  {message_ids: [...]}
+                   защита от внедрённых инструкций скрыла сообщения от ассистента (guard/). Они
+                   могли быть видны раньше (импорт проверяется фоном): модули перерисовывают то,
+                   что из них вывели. Само сообщение в архиве остаётся.
   chat.excluded    {chat_id, purged}
                    владелец исключил чат из архива (purged — сообщения стёрты). Модули убирают
                    всё, что вывели из этого чата: обязательства, строки страниц, черновики, векторы.
@@ -26,6 +30,7 @@ logger = logging.getLogger("shturman.events")
 
 MESSAGE_LIVE = "message.live"
 MESSAGES_DELETED = "messages.deleted"
+MESSAGES_HIDDEN = "messages.hidden"
 CHAT_EXCLUDED = "chat.excluded"
 
 Subscriber = Callable[[dict[str, Any]], Awaitable[None]]

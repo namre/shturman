@@ -9,16 +9,18 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from . import bridge, jobs
+from . import bridge, confirm, jobs
+from .guard import service as guard_service
 from .app import AppState, state_of
 
 REAP_EVERY = 60  # секунд
 
 
 class BadRequest(Exception):
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(self, message: str, status: int = 400, code: str | None = None,
+                 extra: dict[str, Any] | None = None) -> None:
         super().__init__(message)
-        self.message, self.status = message, status
+        self.message, self.status, self.code, self.extra = message, status, code, extra or {}
 
 
 MAX_BODY = 1024 * 1024  # байт: JSON-запросы внутреннего API заведомо меньше
@@ -65,12 +67,61 @@ def handler(fn):
         try:
             return await fn(request)
         except BadRequest as exc:
-            return JSONResponse({"error": exc.message}, status_code=exc.status)
+            return error_response(exc)
         except (ValueError, TypeError):
             # число не того вида в запросе — это ошибка запроса, а не сервиса
             return JSONResponse({"error": "неверное значение в запросе"}, status_code=400)
     wrapped.__name__ = fn.__name__
     return wrapped
+
+
+def error_response(exc: BadRequest) -> JSONResponse:
+    payload = {**exc.extra, "error": exc.message}
+    if exc.code:
+        payload["code"] = exc.code
+    return JSONResponse(payload, status_code=exc.status)
+
+
+# --- подтверждение владельцем (см. confirm.py) ---
+
+async def settle(
+    conn, kind: str, payload: dict[str, Any], *, summary: str | None,
+    applied_now: dict[str, Any] | None = None,
+) -> tuple[JSONResponse | None, Any]:
+    """Применяет действие или ставит его ждать нажатия владельца в боте согласований.
+
+    summary — что именно изменится, простыми словами: этот текст увидит владелец на карточке.
+    summary=None значит «это ужесточение»: действие применяется сразу в любом режиме.
+
+    Возвращает (ответ, результат). Ответ не None — действие ждёт подтверждения: его и нужно
+    вернуть вызывающему (HTTP 202, тело {"status": "pending_confirmation", "action_id", "summary",
+    "expires_at", "note"}; в applied_now — то, что из запроса применено сразу). Иначе действие
+    применено, и результат — то, что вернула функция применения (`confirm.Done.result`).
+
+    Вызывать вне транзакции (см. `confirm.apply`).
+    """
+    try:
+        if summary is None:
+            out = await confirm.apply(conn, kind, payload)
+        else:
+            out = await confirm.request(conn, kind, summary, payload)
+    except confirm.Refused as exc:
+        raise BadRequest(exc.message, exc.status, exc.code, exc.extra) from None
+    except confirm.TooManyPending:
+        raise BadRequest(
+            "Слишком много действий уже ждут вашего подтверждения в боте согласований. "
+            "Ответьте на карточки в боте или отмените лишние, затем повторите.", 429, "too_many_pending") from None
+    except confirm.NoOwner:
+        raise BadRequest(
+            "Это действие нужно подтвердить в боте согласований, а владелец к боту ещё не привязан: "
+            "подтвердить некому. Сначала привяжите владельца.", 409, "owner_unknown") from None
+    if out["status"] != confirm.PENDING:
+        return None, out.get("result")
+    answer = {"status": confirm.PENDING, "action_id": out["action_id"], "summary": out["summary"],
+              "expires_at": out["expires_at"], "note": out["note"]}
+    if applied_now:
+        answer["applied_now"] = applied_now
+    return JSONResponse(answer, status_code=202), None
 
 
 @handler
@@ -94,7 +145,9 @@ async def complete_job(request: Request) -> JSONResponse:
     if not isinstance(result, dict):
         raise BadRequest("поле result: нужен объект")
     async with state_of(request).pool.acquire() as conn:
-        ok = await bridge.deliver_result(conn, int(request.path_params["job_id"]), result)
+        ok = await bridge.deliver_result(
+            conn, int(request.path_params["job_id"]), result, executor="plugin",
+        )
     return JSONResponse({"ok": ok}, status_code=200 if ok else 409)
 
 
@@ -105,13 +158,24 @@ async def fail_job(request: Request) -> JSONResponse:
     async with state_of(request).pool.acquire() as conn:
         status = await bridge.deliver_failure(
             conn, int(request.path_params["job_id"]), str(data.get("error") or "ошибка без описания"),
-            retry_in=None if retry is None else int(retry),
+            retry_in=None if retry is None else int(retry), executor="plugin",
         )
     return JSONResponse({"status": status})
 
 
+OWN_BOT = "own_bot"  # код отказа: по нему плагин понимает, что повторять запрос бесполезно
+
+
+def only_without_own_bot() -> None:
+    """Со своим ботом сервиса нажатия, привязка владельца и бизнес-поток через плагин
+    не принимаются: иначе их мог бы подделать ассистент, у которого в Hermes есть терминал."""
+    if bridge.owns_bot():
+        raise BadRequest("это действие выполняется только через бота согласований", 403, OWN_BOT)
+
+
 @handler
 async def telegram_callback(request: Request) -> JSONResponse:
+    only_without_own_bot()
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
         out = await bridge.dispatch_callback(conn, need_str(data, "data", limit=64), need_int(data, "from_user_id"))
@@ -120,6 +184,7 @@ async def telegram_callback(request: Request) -> JSONResponse:
 
 @handler
 async def put_owner(request: Request) -> JSONResponse:
+    only_without_own_bot()
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
         await bridge.set_owner(conn, need_int(data, "user_id"), need_int(data, "chat_id"))
@@ -128,6 +193,7 @@ async def put_owner(request: Request) -> JSONResponse:
 
 @handler
 async def delete_owner(request: Request) -> JSONResponse:
+    only_without_own_bot()
     async with state_of(request).pool.acquire() as conn:
         await bridge.clear_owner(conn)
     return JSONResponse({"ok": True})
@@ -147,14 +213,47 @@ async def status(request: Request) -> JSONResponse:
                       (SELECT count(*) FROM jobs WHERE status = 'failed') AS jobs_failed,
                       (SELECT value IS NOT NULL FROM settings WHERE key = 'owner') AS owner_known"""
         )
+        guard = await guard_service.overview(conn, state_of(request).config)
     out = dict(row)
+    # Защита от внедрённых инструкций: включена ли, чем проверяет, и счётчики (проверено, скрыто,
+    # показано владельцем, не проверено). Только числа и состояние.
+    out.update(guard)
+    config = state_of(request).config
+    out.update(sending=config.sending, own_bot=bridge.owns_bot(),
+               own_llm=bridge.LLM_TEXT in bridge.builtin_kinds())
     out["last_message_seen_at"] = out["last_message_seen_at"].isoformat() if out["last_message_seen_at"] else None
     out["owner_known"] = bool(out["owner_known"])
     return JSONResponse(out)
 
 
+@handler
+async def confirmations(request: Request) -> JSONResponse:
+    async with state_of(request).ro_pool.acquire() as conn:
+        return JSONResponse({"required": confirm.required(), "pending": await confirm.list_pending(conn)})
+
+
+@handler
+async def confirmation(request: Request) -> JSONResponse:
+    """Что стало с действием, которое ждало владельца: по номеру из ответа 202."""
+    async with state_of(request).ro_pool.acquire() as conn:
+        out = await confirm.get(conn, int(request.path_params["action_id"]))
+    if out is None:
+        raise BadRequest("такого действия нет", 404)
+    return JSONResponse(out)
+
+
+@handler
+async def cancel_confirmation(request: Request) -> JSONResponse:
+    async with state_of(request).pool.acquire() as conn:
+        ok = await confirm.cancel(conn, int(request.path_params["action_id"]))
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
 def routes() -> list[BaseRoute]:
     return [
+        Route("/api/confirmations", confirmations, methods=["GET"]),
+        Route("/api/confirmations/{action_id:int}", confirmation, methods=["GET"]),
+        Route("/api/confirmations/{action_id:int}/cancel", cancel_confirmation, methods=["POST"]),
         Route("/api/status", status, methods=["GET"]),
         Route("/api/owner", put_owner, methods=["PUT"]),
         Route("/api/owner", delete_owner, methods=["DELETE"]),
@@ -175,6 +274,7 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
             async with state.pool.acquire() as conn:
                 await bridge.reap_lost(conn)
                 await jobs.scrub_finished(conn)
+                await confirm.expire(conn)
 
     state.spawn(reaper(), name="jobs-reaper")
     yield

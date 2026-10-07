@@ -28,6 +28,28 @@ TOKEN_ENV = "SHTURMAN_API_TOKEN"
 DEFAULT_TIMEOUT = 5.0
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
+# Сервис со своим ботом согласований не применяет часть действий сразу: отвечает 202 с этим
+# значением в поле status и ждёт нажатия владельца в боте.
+PENDING_CONFIRMATION = "pending_confirmation"
+PENDING_NOTE = (
+    "Действие НЕ выполнено: сервис ждёт, пока владелец сам подтвердит его кнопкой в боте согласований. "
+    "Не повторяйте запрос и не ищите другой путь. Скажите владельцу, что действие ждёт его решения "
+    "в боте: нужно открыть бота и нажать «Да, сделать» или «Нет»."
+)
+
+
+def is_pending(status: int, payload: Any) -> bool:
+    """Ответ сервиса — «ждёт подтверждения владельца», а не «сделано»."""
+    return status == 202 and isinstance(payload, Mapping) and payload.get("status") == PENDING_CONFIRMATION
+
+
+def pending_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """То же для того, кто читает только тело ответа (инструменты агента): ясно, что действие
+    не выполнено. Текст карточки сюда не идёт — в нём имена из переписки, а читает его владелец."""
+    return {"ok": False, "applied": False, "status": PENDING_CONFIRMATION,
+            "action_id": payload.get("action_id"), "expires_at": payload.get("expires_at"),
+            "note": PENDING_NOTE}
+
 
 class ServiceError(Exception):
     """Сервис ответил отказом. `status` — код HTTP, `code` — машинный код из ответа, если есть."""
@@ -123,14 +145,18 @@ class ServiceClient:
         """Выполняет запрос и возвращает JSON-объект ответа.
 
         Отказ сервиса (4xx) — `ServiceError` с кодом и текстом из ответа; нет связи, истекло
-        время, ответ 5xx или не JSON — `ServiceUnavailable`.
+        время, ответ 5xx или не JSON — `ServiceUnavailable`. Если сервис не применил действие, а
+        ждёт подтверждения владельца в боте, возвращается `pending_result`: по нему видно, что
+        действие не выполнено.
         """
-        return self.call(method, path, json_body=json_body, query=query, timeout=timeout)[1]
+        status, payload = self.call(method, path, json_body=json_body, query=query, timeout=timeout)
+        return pending_result(payload) if is_pending(status, payload) else payload
 
     def call(self, method: str, path: str, *, json_body: Any = None,
              query: Mapping[str, Any] | None = None, timeout: float | None = None,
              ) -> tuple[int, dict[str, Any]]:
-        """То же, что `request`, но вместе с кодом ответа (например, 202 «ещё считается»)."""
+        """То же, что `request`, но вместе с кодом ответа (например, 202 «ещё считается») и с телом
+        как есть. Ответ «ждёт подтверждения владельца» распознаёт `is_pending(status, payload)`."""
         method = method.upper()
         if not allowed(self._allow, method, path):
             raise NotAllowed("этот запрос к сервису переписки не разрешён", code="not_allowed")
