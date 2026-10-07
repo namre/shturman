@@ -33,6 +33,7 @@ import asyncpg
 from .. import bridge, ingest_api
 from ..api_core import BadRequest
 from ..app import AppState
+from ..sanitize import clean_line
 from . import binding
 from .botapi import BotApi, BotApiError, NeverLeft, OutcomeUnknown, Refused
 
@@ -66,6 +67,12 @@ class _Later(Exception):
 
 def _id(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _display_name(user: dict[str, Any]) -> str | None:
+    """Имя отправителя одной строкой, без управляющих знаков — для отметки о привязке владельца."""
+    parts = [user.get(key) for key in ("first_name", "last_name")]
+    return clean_line(" ".join(p for p in parts if isinstance(p, str) and p.strip()), 64) or None
 
 
 class Bot:
@@ -229,7 +236,7 @@ class Bot:
         start = _START.match(text.strip())
         code = start.group(1) if start else None
         if code is not None:
-            await self._bind(code, user_id=user_id, chat_id=chat_id, private=private)
+            await self._bind(code, user_id=user_id, chat_id=chat_id, private=private, name=_display_name(sender))
             return
         if not private:
             return
@@ -242,7 +249,8 @@ class Bot:
         self._hint_at = now
         await self._say(chat_id, TEXT_HINT)
 
-    async def _bind(self, code: str, *, user_id: int, chat_id: int, private: bool) -> None:
+    async def _bind(self, code: str, *, user_id: int, chat_id: int, private: bool,
+                    name: str | None = None) -> None:
         """`/start <код>`. При любом отказе бот молчит: посторонний не узнает даже, что код неверен."""
         if self.bot_id is None:
             return
@@ -259,7 +267,8 @@ class Bot:
         bound = False
         if binding.well_formed(code):
             async with self.state.pool.acquire() as conn:
-                bound = await binding.redeem(conn, code, user_id=user_id, chat_id=chat_id, bot_id=self.bot_id)
+                bound = await binding.redeem(conn, code, user_id=user_id, chat_id=chat_id, bot_id=self.bot_id,
+                                             name=name)
         if not bound:
             self.counters["bind_wrong"] += 1
             self.flood.wrong()

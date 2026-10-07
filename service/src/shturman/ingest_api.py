@@ -962,6 +962,27 @@ def _parse_exclude(value: Any) -> set[tuple[str, int]]:
 @_handler
 async def run_import(request: Request) -> JSONResponse:
     """Запускает импорт загруженного файла в фоне. Одновременно идёт только один импорт."""
+    payload, summary = await _import_request(request)
+    async with state_of(request).pool.acquire() as conn:
+        answer, view = await settle(conn, IMPORT_RUN, payload, summary=summary)
+    return answer or JSONResponse(view, status_code=202)
+
+
+async def run_import_as_owner(request: Request) -> dict[str, Any]:
+    """Тот же запуск импорта для страницы настройки сервиса: запрос пришёл от самого владельца
+    каналом, которого ассистент не видит, поэтому карточка в боте не нужна (`confirm.apply_owner`).
+    Возвращает состояние загрузки. Вызывающий отвечает за проверку сессии страницы."""
+    payload, _ = await _import_request(request)
+    async with state_of(request).pool.acquire() as conn:
+        try:
+            out = await confirm.apply_owner(conn, IMPORT_RUN, payload)
+        except confirm.Refused as exc:
+            raise BadRequest(exc.message, exc.status, exc.code, exc.extra) from None
+    return out["result"]
+
+
+async def _import_request(request: Request) -> tuple[dict[str, Any], str]:
+    """Разбирает запрос на импорт: что именно запустить и как описать это владельцу."""
     upload = _upload(request)
     data = await _json(request, limit=8 * 1024 * 1024, allow_empty=True)
     exclude = _parse_exclude(data.get("exclude"))
@@ -970,7 +991,6 @@ async def run_import(request: Request) -> JSONResponse:
                                  or not 0 < owner_id <= MAX_ID):
         raise BadRequest("поле owner_id: нужен положительный идентификатор")
 
-    state = state_of(request)
     _check_runnable(_registry(request), upload, ApiError)
     # Импорт добавляет в архив сообщения, подлинность которых сервис проверить не может: среди
     # них могут быть и «ваши собственные», после которых ассистенту разрешено готовить черновики
@@ -991,9 +1011,7 @@ async def run_import(request: Request) -> JSONResponse:
                 "выгрузка настоящая, сервис не может: подтверждайте, только если загружали её сами.")
     payload = {"import_id": upload.id, "exclude": sorted(f"{kind}:{tg_id}" for kind, tg_id in exclude),
                "owner_id": owner_id}
-    async with state.pool.acquire() as conn:
-        answer, view = await settle(conn, IMPORT_RUN, payload, summary=summary)
-    return answer or JSONResponse(view, status_code=202)
+    return payload, summary
 
 
 def _check_runnable(registry: Registry, upload: Upload, error: type[Exception]) -> None:

@@ -2,13 +2,18 @@
 
   /health  — без токена, только «жив»;
   /api/*   — внутренний API для плагина «Штурмана» в Hermes (токен SHTURMAN_API_TOKEN);
-  /mcp     — MCP-сервер архива для агента Hermes, только чтение (токен SHTURMAN_MCP_TOKEN).
+  /mcp     — MCP-сервер архива для агента Hermes, только чтение (токен SHTURMAN_MCP_TOKEN);
+  /shturman-setup/* — страница настройки для владельца: свой вход по одноразовой ссылке,
+             своя сессия; токены API и архива здесь входом не служат (setup_page/).
 
-Наружу порт не публикуется: сервис слушает локальный адрес сервера.
+Порт слушает локальный адрес сервера. Обратный прокси может отдать наружу только префикс
+/shturman-setup/; /api/* и /mcp наружу не выводятся.
 
 Модуль подключается именем в MODULES и может определить:
-  routes() -> list[BaseRoute]            — свои маршруты (пути начинаются с /api/ или /mcp);
-  lifespan(state) -> async context manager — запуск и остановка фоновой работы.
+  routes() -> list[BaseRoute]            — свои маршруты (пути начинаются с /api/ или /mcp;
+                                           у страницы настройки — с /shturman-setup/);
+  lifespan(state) -> async context manager — запуск и остановка фоновой работы;
+  make_shield(app, config) -> ASGI       — общая защита своего префикса (только у страницы настройки).
 Обработчик получает состояние как `request.app.state.shturman`.
 """
 
@@ -32,6 +37,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import __version__, db
 from .config import Config
 from .events import Events
+from .setup_page import PREFIX as SETUP_PREFIX
 
 logger = logging.getLogger("shturman")
 
@@ -47,6 +53,7 @@ MODULES = (
     "shturman.processing.pages_service",
     "shturman.processing.mcp_tools",
     "shturman.outbox.service",
+    "shturman.setup_page.service",  # последним: страница настройки пользуется остальными модулями
 )
 
 
@@ -81,10 +88,14 @@ class AppState:
 
 
 class Gate:
-    """Проверка токена по префиксу пути. Сравнение — за постоянное время."""
+    """Проверка токена по префиксу пути. Сравнение — за постоянное время.
 
-    def __init__(self, app: ASGIApp, config: Config) -> None:
+    Префикс страницы настройки (`/shturman-setup`) токеном не открывается вовсе: у него свой
+    вход и своя защита (`setup`), а заголовок `Authorization` там ничего не значит."""
+
+    def __init__(self, app: ASGIApp, config: Config, *, setup: ASGIApp | None = None) -> None:
         self.app = app
+        self.setup = setup
         self._tokens = {
             "/api": f"Bearer {config.api_token}".encode(),
             "/mcp": f"Bearer {config.mcp_token}".encode(),
@@ -102,6 +113,12 @@ class Gate:
         path = scope.get("path", "")
         if path == "/health":
             await self.app(scope, receive, send)
+            return
+        if path == SETUP_PREFIX or path.startswith(SETUP_PREFIX + "/"):
+            if self.setup is None:      # модуль страницы не подключён
+                await JSONResponse({"error": "not_found"}, status_code=404)(scope, receive, send)
+            else:
+                await self.setup(scope, receive, send)
             return
         expected = next((t for p, t in self._tokens.items() if path == p or path.startswith(p + "/")), None)
         if expected is None:
@@ -171,7 +188,8 @@ def build_app(
             await pool.close()
 
     app = Starlette(routes=routes, lifespan=lifespan)
-    gate = Gate(app, config)
+    shield = next((m.make_shield(app, config) for m in modules if hasattr(m, "make_shield")), None)
+    gate = Gate(app, config, setup=shield)
     gate.inner = app  # для тестов: запуск жизненного цикла и доступ к состоянию
     return gate
 

@@ -1,6 +1,7 @@
 """Запуск и остановка своего исполнителя, маршрут его состояния.
 
-Что запускается, решается один раз при старте по настройкам сервиса:
+Что запускается, решается по настройкам сервиса — при старте и заново, когда владелец меняет
+токен бота или ключ модели на странице настройки (`Control.restart`):
   * задан `SHTURMAN_BOT_TOKEN` — опрос бота согласований и дорожка заданий бота; виды
     `notify.owner` и `notify.edit` объявляются своими (`bridge.set_builtin`), а с ними внутренний
     API перестаёт принимать нажатия кнопок и владельца от плагина;
@@ -17,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -107,59 +109,122 @@ def routes() -> list[BaseRoute]:
     return [Route("/api/executor/status", status, methods=["GET"])]
 
 
+class Control:
+    """Запуск, остановка и перезапуск исполнителя внутри работающего сервиса.
+
+    Перезапуск нужен странице настройки (`setup_page/`): владелец ввёл или сменил токен бота
+    либо ключ модели, и они должны начать действовать без перезапуска процесса. Лежит в
+    `state.extras["executor_control"]`.
+    """
+
+    def __init__(self, state: AppState) -> None:
+        self.state = state
+        self.lock = asyncio.Lock()
+        self._tasks: list[asyncio.Task] = []
+        self._clients: list[Any] = []
+        self._announced = False      # объявлял ли этот модуль свои виды заданий
+        self._token = ""             # токен работающего бота — чтобы узнать «тот же бот» при перезапуске
+        self._known: Any = None      # (токен, кто бот, место опроса, бизнес-режим) остановленного бота
+
+    async def start(self) -> None:
+        """Собирает исполнителя по нынешним настройкам (`state.config`) и запускает его."""
+        state, config = self.state, self.state.config
+        api = llm = None
+        kinds: set[str] = set()
+        if config.own_bot:
+            api = BotApi(config.bot_token, proxy_url=config.proxy_url, transport=TEST_OVERRIDES.get("bot_transport"))
+            kinds.update(BOT_OWNED)
+            if api.broken:
+                logger.error("бот согласований не может работать (%s)", api.broken)
+        if config.own_llm:
+            llm = LlmClient(
+                base_url=config.llm_base_url, api_key=config.llm_api_key, model=config.llm_model,
+                models=task_models(os.environ), proxy_url=config.proxy_url,
+                transport=TEST_OVERRIDES.get("llm_transport"),
+                tokens_param=os.environ.get("SHTURMAN_LLM_TOKENS_PARAM", "").strip(),
+            )
+            kinds.update(LLM_OWNED)
+            if llm.broken:
+                logger.error("свой доступ к модели не может работать (%s)", llm.broken)
+        self._clients = [client for client in (api, llm) if client is not None]
+        self._token = config.bot_token if api is not None else ""
+        # При перезапуске прежний перечень заранее не снимается, а заменяется здесь: так плагину
+        # ни на миг не открываются привязка владельца и нажатия. Модуль, который ничего своего
+        # не объявлял, чужого перечня не трогает.
+        if kinds or self._announced:
+            bridge.set_builtin(kinds)
+        self._announced = bool(kinds)
+        if not kinds:
+            state.extras["executor"] = Executor()
+            return
+
+        worker = Worker(state, api=api, llm=llm, idle=TEST_OVERRIDES.get("idle", 1.0))
+        bot = None
+        if api is not None:
+            bot = Bot(state, api, wake=worker.wake, poll=TEST_OVERRIDES.get("poll"))
+            worker.bot = bot
+            if self._known is not None and self._known[0] == config.bot_token:
+                # Перезапуск с тем же ботом (сменили только модель): кто он и с какого обновления
+                # продолжать, уже известно — владелец не «отвязывается» на время первого запроса.
+                _, bot.identity, bot.offset, bot.business_capable = self._known
+        state.extras["executor"] = Executor(api=api, bot=bot, llm=llm, worker=worker, kinds=frozenset(kinds))
+        # Задания этих видов, поставленные до включения своего исполнителя, плагину больше не
+        # отдаются: в карточках — метки кнопок, которые должны дойти только до бота согласований.
+        async with state.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE jobs SET executor = 'builtin'
+                   WHERE status IN ('queued', 'running') AND executor = 'plugin' AND kind = ANY($1::text[])""",
+                sorted(kinds))
+        if bot is not None:
+            self._tasks.append(state.spawn(bot.run(), name="executor-bot-poll"))
+            self._tasks.append(state.spawn(worker.run_lane("bot"), name="executor-jobs-bot"))
+        if llm is not None:
+            self._tasks.append(state.spawn(worker.run_lane("llm"), name="executor-jobs-llm"))
+        logger.info("свой исполнитель запущен: бот — %s, модель — %s",
+                    "да" if bot else "нет", "да" if llm else "нет")
+
+    async def _halt(self) -> None:
+        """Останавливает опрос и дорожки заданий и закрывает клиентов. Перечень своих видов
+        заданий не трогает: его выставляет `start` или окончательный `stop`."""
+        old = getattr(self.state.extras.get("executor"), "bot", None)
+        self._known = None
+        if old is not None and old.identity is not None:
+            self._known = (self.state.config.bot_token if not self._token else self._token,
+                           old.identity, old.offset, old.business_capable)
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        clients, self._clients = self._clients, []
+        for client in clients:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+    async def stop(self) -> None:
+        async with self.lock:
+            await self._halt()
+            if self._announced:
+                bridge.set_builtin(())
+                self._announced = False
+            self.state.extras["executor"] = Executor()
+
+    async def restart(self) -> None:
+        """Пересобирает исполнителя по изменившимся настройкам. Задание, которое выполнялось
+        в этот миг, остаётся в очереди и вернётся по истечении аренды — как при перезапуске
+        сервиса; отправка от имени владельца сама при этом не повторяется (см. worker.py)."""
+        async with self.lock:
+            await self._halt()
+            await self.start()
+
+
 @contextlib.asynccontextmanager
 async def lifespan(state: AppState) -> AsyncIterator[None]:
-    config = state.config
-    api = llm = None
-    kinds: set[str] = set()
-    if config.own_bot:
-        api = BotApi(config.bot_token, proxy_url=config.proxy_url, transport=TEST_OVERRIDES.get("bot_transport"))
-        kinds.update(BOT_OWNED)
-        if api.broken:
-            logger.error("бот согласований не может работать (%s)", api.broken)
-    if config.own_llm:
-        llm = LlmClient(
-            base_url=config.llm_base_url, api_key=config.llm_api_key, model=config.llm_model,
-            models=task_models(os.environ), proxy_url=config.proxy_url,
-            transport=TEST_OVERRIDES.get("llm_transport"),
-            tokens_param=os.environ.get("SHTURMAN_LLM_TOKENS_PARAM", "").strip(),
-        )
-        kinds.update(LLM_OWNED)
-        if llm.broken:
-            logger.error("свой доступ к модели не может работать (%s)", llm.broken)
-    if not kinds:
-        state.extras["executor"] = Executor()
-        yield
-        return
-
-    worker = Worker(state, api=api, llm=llm, idle=TEST_OVERRIDES.get("idle", 1.0))
-    bot = None
-    if api is not None:
-        bot = Bot(state, api, wake=worker.wake, poll=TEST_OVERRIDES.get("poll"))
-        worker.bot = bot
-    runtime = Executor(api=api, bot=bot, llm=llm, worker=worker, kinds=frozenset(kinds))
-    state.extras["executor"] = runtime
-    bridge.set_builtin(kinds)
-    # Задания этих видов, поставленные до включения своего исполнителя, плагину больше не
-    # отдаются: в карточках — метки кнопок, которые должны дойти только до бота согласований.
-    async with state.pool.acquire() as conn:
-        await conn.execute(
-            """UPDATE jobs SET executor = 'builtin'
-               WHERE status IN ('queued', 'running') AND executor = 'plugin' AND kind = ANY($1::text[])""",
-            sorted(kinds))
-    if bot is not None:
-        state.spawn(bot.run(), name="executor-bot-poll")
-        state.spawn(worker.run_lane("bot"), name="executor-jobs-bot")
-    if llm is not None:
-        state.spawn(worker.run_lane("llm"), name="executor-jobs-llm")
-    logger.info("свой исполнитель запущен: бот — %s, модель — %s",
-                "да" if bot else "нет", "да" if llm else "нет")
+    control = Control(state)
+    state.extras["executor_control"] = control
+    await control.start()
     try:
         yield
     finally:
         # Фоновые задачи к этому моменту остановлены (см. app.build_app).
-        bridge.set_builtin(())
-        for client in (api, llm):
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    await client.aclose()
+        await control.stop()
+        state.extras.pop("executor_control", None)

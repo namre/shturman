@@ -241,6 +241,64 @@ def _bot_status() -> None:
     commands.bot_status(_local_api)
 
 
+def _setup_base() -> tuple[str, bool]:
+    """Адрес, под которым открывается страница настройки, и внешний ли он."""
+    from .config import ConfigError, _setup_origin
+
+    try:
+        origin = _setup_origin(os.environ.get("SHTURMAN_SETUP_ORIGIN", "").strip())
+    except ConfigError as exc:
+        sys.exit(str(exc))
+    if origin:
+        return origin, True
+    return f"http://127.0.0.1:{os.environ.get('SHTURMAN_PORT', '').strip() or '8765'}", False
+
+
+async def _setup_link(full_url: bool) -> None:
+    """Одноразовая ссылка входа на страницу настройки (см. setup_page/auth.py).
+
+    Пишет прямо в базу, а не просит работающий сервис: токен внутреннего API есть у ассистента
+    в Hermes, и маршрут «выдать ссылку» позволил бы ему войти на страницу самому.
+
+    В стандартный вывод идёт одна строка — путь со значением ссылки (или полный адрес с ключом
+    --url); пояснения — в поток ошибок, значения ссылки в них нет."""
+    from . import setup_page
+    from .setup_page import auth
+
+    conn = await db.connect(_dsn())
+    try:
+        await db.migrate(conn)
+        token, expires_at = await auth.create_link(conn)
+    finally:
+        await conn.close()
+    base, external = _setup_base()
+    path = f"{setup_page.PREFIX}/#{token}"
+    print(base + path if full_url else path)
+    note = sys.stderr
+    print(f"\nОдноразовая ссылка входа на страницу настройки. Действует {auth.LINK_TTL // 60} минут "
+          f"(до {expires_at:%H:%M} UTC) и срабатывает один раз.", file=note)
+    if not full_url:
+        print(f"Это путь: допишите его к адресу страницы — {base}", file=note)
+    if not external:
+        print("Внешний адрес страницы не задан (SHTURMAN_SETUP_ORIGIN пуст): она открывается только "
+              "с самого сервера либо через туннель SSH на порт сервиса.", file=note)
+    print("Кто откроет ссылку, тот войдёт на страницу настройки: её передают владельцу как есть "
+          "и нигде не сохраняют.", file=note)
+    print("Прежняя ссылка входа больше не действует. Вход по новой ссылке завершит открытые сессии.", file=note)
+
+
+async def _setup_logout_all() -> None:
+    from .setup_page import auth
+
+    conn = await db.connect(_dsn())
+    try:
+        await db.migrate(conn)
+        count = await auth.revoke_all(conn)
+    finally:
+        await conn.close()
+    print(f"Завершено сессий страницы настройки: {count}. Невостребованная ссылка входа отменена.")
+
+
 def _serve() -> None:
     import logging
 
@@ -254,8 +312,13 @@ def _serve() -> None:
         config = Config.from_env()
     except ConfigError as exc:
         sys.exit(str(exc))
-    # access_log выключен: в адресах запросов нет секретов, но журнал не должен расти от опроса очереди
-    uvicorn.run(build_app(config), host=config.host, port=config.port, log_level="warning", access_log=False)
+    # access_log выключен: в адресах запросов нет секретов (на странице настройки они идут только
+    # в теле POST), но журнал не должен расти от опроса очереди. proxy_headers выключен: сервис
+    # стоит за обратным прокси, но заголовкам X-Forwarded-* не верит и ими не пользуется
+    # (setup_page/shield.py) — адрес клиента и схема из них не подставляются. server_header выключен:
+    # страница настройки видна снаружи, и версию сервера ей сообщать незачем.
+    uvicorn.run(build_app(config), host=config.host, port=config.port, log_level="warning", access_log=False,
+                proxy_headers=False, server_header=False)
 
 
 def main() -> None:
@@ -281,6 +344,10 @@ def main() -> None:
     t.add_argument("role", choices=["assistant", "owner"])
     sub.add_parser("bot-bind", help="одноразовая ссылка привязки владельца к боту согласований")
     sub.add_parser("bot-status", help="состояние бота согласований и своей модели сервиса")
+    link = sub.add_parser("setup-link", help="одноразовая ссылка входа на страницу настройки")
+    link.add_argument("--url", action="store_true",
+                      help="напечатать полный адрес, а не только путь /shturman-setup/#…")
+    sub.add_parser("setup-logout-all", help="завершить все сессии страницы настройки")
     a = p.parse_args()
 
     if a.cmd == "migrate":
@@ -301,6 +368,10 @@ def main() -> None:
         _bot_bind()
     elif a.cmd == "bot-status":
         _bot_status()
+    elif a.cmd == "setup-link":
+        asyncio.run(_setup_link(a.url))
+    elif a.cmd == "setup-logout-all":
+        asyncio.run(_setup_logout_all())
 
 
 if __name__ == "__main__":

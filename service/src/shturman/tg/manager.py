@@ -156,7 +156,9 @@ class TgManager:
         client_factory: ClientFactory | None = None, pacing: float = 3.0,
     ) -> None:
         self.config, self.pool, self.events = config, pool, events
-        self.client_factory: ClientFactory = client_factory or make_client_factory(config)
+        # Настоящая фабрика читает ключи приложения из нынешних настроек: их можно ввести на
+        # странице настройки уже после запуска сервиса (см. `reconfigure`).
+        self.client_factory: ClientFactory = client_factory or self._default_factory
         self.pacing = pacing
         self.runtimes: dict[str, AccountRuntime] = {}
         self.flows: dict[str, LoginFlow] = {}
@@ -176,6 +178,30 @@ class TgManager:
             raise TgError(
                 "Работа с аккаунтами Telegram не настроена: не заданы ключи приложения "
                 "(TELEGRAM_API_ID и TELEGRAM_API_HASH).", 503)
+
+    def _default_factory(self, role: str, path: Any, policy: RequestPolicy, on_reconnect: Any) -> Any:
+        return make_client_factory(self.config)(role, path, policy, on_reconnect)
+
+    async def reconfigure(self, config: Config) -> None:
+        """Принимает новые настройки сервиса — владелец ввёл или сменил ключи приложения на
+        странице настройки. Сессия привязана к ключам, с которыми создана, поэтому менять их
+        при подключённых аккаунтах нельзя: сначала выход из аккаунтов."""
+        changed = (config.tg_api_id, config.tg_api_hash) != (self.config.tg_api_id, self.config.tg_api_hash)
+        if changed and await self.has_sessions():
+            raise TgError("Сначала выйдите из подключённых аккаунтов Telegram: их сессии созданы "
+                          "с прежними ключами приложения.", 409)
+        self.config = config
+        if changed:
+            await self.start()
+
+    async def has_sessions(self) -> bool:
+        """Есть ли подключённые аккаунты, идущие входы или файлы сессий на диске."""
+        if self.runtimes or any(not flow.done for flow in self.flows.values()):
+            return True
+        if any(session_path(self.config, slot).exists() for slot in ROLES):
+            return True
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT EXISTS (SELECT 1 FROM tg_sessions)"))
 
     def _by_account(self, account_id: int) -> AccountRuntime | None:
         return next((rt for rt in self.runtimes.values() if rt.account_id == account_id), None)
@@ -552,6 +578,10 @@ class TgManager:
         except errors.FloodWaitError as exc:
             await close()
             raise TgError(f"Telegram просит подождать {int(exc.seconds)} с. Попробуйте позже.", 429) from None
+        except (errors.ApiIdInvalidError, errors.ApiIdPublishedFloodError):
+            await close()
+            raise TgError("Telegram не принял ключи приложения (api_id и api_hash). Проверьте, что они "
+                          "скопированы с my.telegram.org без ошибок, и введите их заново.", 400) from None
         except Exception as exc:
             await close()
             logger.warning("вход (%s): не удалось начать (%s)", role, type(exc).__name__)
@@ -796,10 +826,20 @@ class TgManager:
     async def list_dialogs(
         self, account_id: int, *, offset: int = 0, limit: int = 100,
         chat_type: str | None = None, refresh: bool = False,
+        chat_types: Any = None, query: str | None = None, only_enabled: bool = False,
     ) -> dict[str, Any]:
+        """Страница списка диалогов для экрана выбора. Отбор: один вид чата (`chat_type`),
+        несколько видов (`chat_types`), подстрока названия или адреса (`query`), только уже
+        включённые (`only_enabled`). `total` — сколько диалогов прошло отбор."""
         dialogs = await self.dialogs(account_id, refresh=refresh)
         if chat_type:
             dialogs = [d for d in dialogs if d.chat.type == chat_type]
+        if chat_types:
+            dialogs = [d for d in dialogs if d.chat.type in chat_types]
+        needle = (query or "").strip().lstrip("@").casefold()
+        if needle:
+            dialogs = [d for d in dialogs
+                       if needle in (d.chat.name or "").casefold() or needle in (d.chat.username or "").casefold()]
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT p.class, p.tg_id, c.excluded, COALESCE(s.enabled, false) AS enabled
@@ -807,6 +847,8 @@ class TgManager:
                    LEFT JOIN tg_sync_chats s ON s.chat_id = c.id
                    WHERE c.account_id = $1""", account_id)
         known = {(r["class"], r["tg_id"]): r for r in rows}
+        if only_enabled:
+            dialogs = [d for d in dialogs if d.key in known and known[d.key]["enabled"]]
         items = []
         for d in dialogs[offset:offset + limit]:
             row = known.get(d.key)
