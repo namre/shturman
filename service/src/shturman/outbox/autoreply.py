@@ -414,7 +414,7 @@ async def _warn_if_model_is_silent(conn: asyncpg.Connection) -> None:
                WHERE outcome IN ('replied', 'declined')""")
         await bridge.notify_owner(
             conn, "Автоответ доверенным не получает ответ модели: несколько раз подряд пришла пустота. "
-                  "Собеседники остаются без ответа. Проверьте модель в настройках Hermes.",
+                  "Собеседники остаются без ответа. " + bridge.model_hint(),
             dedup_key=f"autoreply:silent:{streak_start}")
 
 

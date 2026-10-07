@@ -224,7 +224,8 @@ async def test_one_bad_update_does_not_block_the_rest(rig):
 async def test_status_has_flags_and_counters_but_no_ids_or_secrets(live, conn, capsys):
     start, tg, llm = live
     client, state = await start(bot_token=TOKEN, llm_api_key=KEY, llm_model="main-model")
-    await until(lambda: tg.calls("getUpdates"))
+    # признак «опрос работает» выставляется после возврата первого getUpdates, а не при его вызове
+    await until(lambda: state.extras["executor"].bot.polling)
     status = (await client.get("/api/executor/status")).json()
     assert status["bot"]["configured"] is True and status["bot"]["username"] == BOT_NAME
     assert status["bot"]["polling"] is True and status["bot"]["owner_bound"] is False
@@ -255,7 +256,23 @@ def test_bot_status_explains_problems_in_plain_words(capsys):
     assert "опрос Telegram: не работает" in out and "уже опрашивает другая программа" in out
     assert "shturman bot-bind" in out and "приостановлен" in out and "Business Mode" in out
     commands.bot_status(lambda method, path: (200, {"bot": {"configured": False}, "llm": {"configured": False}}))
-    assert "не настроен" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "не настроен" in out
+    # сервис не знает, установлен ли Hermes: текст не утверждает, что задания кто-то выполняет
+    assert "идут через Hermes" not in out and "вызывает плагин в Hermes" not in out
+    assert out.count("без Hermes") == 2
+
+
+def test_model_hint_points_at_whoever_really_asks_the_model():
+    try:
+        bridge.set_builtin(())
+        assert "Hermes" in bridge.model_hint()
+        bridge.set_builtin({bridge.NOTIFY_OWNER, bridge.NOTIFY_EDIT})      # свой бот без своей модели
+        assert "Hermes" in bridge.model_hint()
+        bridge.set_builtin({bridge.LLM_STRUCTURED, bridge.LLM_TEXT})
+        assert "Hermes" not in bridge.model_hint() and "bot-status" in bridge.model_hint()
+    finally:
+        bridge.set_builtin(())
 
 
 async def test_bot_bind_refuses_until_the_service_has_met_telegram(conn, monkeypatch, capsys):

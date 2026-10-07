@@ -7,8 +7,9 @@
 #   standalone  — только сервис переписки и база: архив, свой бот согласований, своя модель
 #                 (docs/standalone.md). Контейнер Hermes не создаётся и не скачивается.
 #
-# Из .env здесь читаются только две несекретные строки: SHTURMAN_MODE и COMPOSE_PROFILES.
-# Значения секретов эти функции не читают и не печатают.
+# Сами функции читают из .env только две несекретные строки: SHTURMAN_MODE и COMPOSE_PROFILES.
+# env_get и env_set работают со строкой, которую назвал вызывающий скрипт; скрипты ops/ называют
+# ими только несекретные строки. Значения секретов эти функции не читают и не печатают.
 
 # Значение несекретной строки .env (пусто, если её нет).
 env_get() {
@@ -23,6 +24,40 @@ env_put() {
   grep -Ev "^$1=" .env > "$tmp" || true
   printf '%s=%s\n' "$1" "$2" >> "$tmp"
   chmod 600 "$tmp"; mv "$tmp" .env
+}
+
+# Убрать строку из .env, не трогая и не печатая остальные.
+env_del() {
+  local tmp
+  tmp="$(mktemp .env.XXXXXX)"
+  grep -Ev "^$1=" .env > "$tmp" || true
+  chmod 600 "$tmp"; mv "$tmp" .env
+}
+
+# Записать строку, а при пустом значении — убрать её.
+env_set() {
+  if [ -n "$2" ]; then env_put "$1" "$2"; else env_del "$1"; fi
+}
+
+# Включён ли профиль Compose в .env.
+profile_on() {
+  case ",$(env_get COMPOSE_PROFILES)," in *,"$1",*) return 0 ;; *) return 1 ;; esac
+}
+
+# Добавить (on) или убрать (off) один профиль Compose в .env.
+#   $1 — on или off; $2 — имя профиля (embeddings, guard).
+# Профили включаются независимо друг от друга, поэтому меняется только названный: остальные,
+# включая hermes, остаются как были.
+profile_set() {
+  local want="$1" name="$2" cur out="" p
+  cur="$(env_get COMPOSE_PROFILES)"
+  local IFS=,
+  # shellcheck disable=SC2086
+  for p in $cur; do
+    if [ -n "$p" ] && [ "$p" != "$name" ]; then out="${out:+$out,}$p"; fi
+  done
+  if [ "$want" = on ]; then out="${out:+$out,}$name"; fi
+  env_set COMPOSE_PROFILES "$out"
 }
 
 # Состояние контейнера (running, exited…); контейнера нет — значение по умолчанию ($2, иначе missing).

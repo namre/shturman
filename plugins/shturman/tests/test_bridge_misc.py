@@ -252,3 +252,24 @@ def test_schema_check_covers_what_service_schemas_use():
                 {"commitments": [{"message": 1, "what": "x", "status": "c"}]}):
         assert not matches_schema(bad, schema), bad
     assert matches_schema({"что угодно": 1}, None) and matches_schema(1.5, {"type": "number"})
+
+
+def test_cli_status_tells_doctor_whether_the_bridge_is_in_own_bot_mode(store):
+    """`cli.py status` читает ops/doctor.sh: одна строка о том, что мост знает о своём боте сервиса."""
+    import cli
+    from shturman_core.auth import Auth
+
+    def own_bot_line() -> str:
+        lines = cli.status_lines(store, Auth(store))
+        assert all(re.fullmatch(r"[a-z_]+=(yes|no|unknown)", line) for line in lines)     # только признаки
+        return [line for line in lines if line.startswith("bridge_own_bot=")][0]
+
+    assert own_bot_line() == "bridge_own_bot=unknown"              # шлюз ещё ничего не записал
+    stats = Stats()
+    heartbeat = Heartbeat(store, stats)
+    stats.set_flag("own_bot", True)
+    heartbeat.tick()
+    assert own_bot_line() == "bridge_own_bot=yes"
+    stats.set_flag("own_bot", False)
+    heartbeat.tick()
+    assert own_bot_line() == "bridge_own_bot=no"

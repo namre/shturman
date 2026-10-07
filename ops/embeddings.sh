@@ -5,37 +5,17 @@
 #                                 Сам контейнер в интернет не ходит.
 #   ./ops/embeddings.sh off     — убрать; поиск остаётся, но только по словам
 #   ./ops/embeddings.sh status  — показать, что включено и сколько сообщений обработано
-# Значения, которые скрипт пишет в .env, не секретные. Из .env он читает только строку
-# COMPOSE_PROFILES.
+# Значения, которые скрипт пишет в .env, не секретные. Из .env он читает только строки
+# SHTURMAN_MODE и COMPOSE_PROFILES: свой профиль добавляется и убирается, а защита от внедрённых
+# инструкций (./ops/guard.sh) и профиль Hermes не трогаются.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 
 . ops/lib.sh
 mode="${1:-status}"
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
-# Профили Compose — режим установки плюс эмбеддинги: профиль Hermes при этом не теряется.
-install_mode="$(shturman_mode)" || exit 2
-
-set_env() {
-  local tmp; tmp="$(mktemp .env.XXXXXX)"
-  grep -Ev "^$1=" .env > "$tmp" || true
-  [ -n "$2" ] && printf '%s=%s\n' "$1" "$2" >> "$tmp"
-  chmod 600 "$tmp"; mv "$tmp" .env
-}
-
-# Профили Compose — общий список через запятую: рядом с поиском по смыслу может быть включена
-# защита от внедрённых инструкций (./ops/guard.sh), поэтому свой профиль добавляется и убирается,
-# а чужой не трогается. Из .env читается только строка COMPOSE_PROFILES.
-set_profile() {
-  local want="$1" name="$2" now out="" p
-  now="$(grep -E '^COMPOSE_PROFILES=' .env | tail -n 1 | cut -d= -f2- || true)"
-  local IFS=','
-  for p in $now; do
-    [ -n "$p" ] && [ "$p" != "$name" ] && out="${out:+$out,}$p"
-  done
-  [ "$want" = "on" ] && out="${out:+$out,}$name"
-  set_env COMPOSE_PROFILES "$out"
-}
+# Неизвестный режим установки — остановиться до скачивания модели, а не после.
+shturman_mode > /dev/null || exit 2
 
 # Модель и её точная версия. Смена модели — отдельным изменением: вместе с суммами ниже
 # и настройкой SHTURMAN_EMBEDDINGS_MODEL сервиса.
@@ -68,18 +48,18 @@ case "$mode" in
       echo "Свободной памяти ${mem_mb} МБ — для модели нужно около 1200 МБ. Включаю, но следите за ./ops/doctor.sh." >&2
     fi
     umask 077
-    set_profile on embeddings
-    set_env SHTURMAN_EMBEDDINGS_URL http://embeddings:80
+    profile_set on embeddings
+    env_set SHTURMAN_EMBEDDINGS_URL http://embeddings:80
     echo "Поиск по смыслу включён в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   off)
     umask 077
-    set_profile off embeddings
-    set_env SHTURMAN_EMBEDDINGS_URL ""
+    profile_set off embeddings
+    env_set SHTURMAN_EMBEDDINGS_URL ""
     echo "Поиск по смыслу выключен в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   status)
-    if grep -Eq '^COMPOSE_PROFILES=(.*,)?embeddings(,|$)' .env; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
+    if profile_on embeddings; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
     docker exec shturman-service shturman call GET /api/embeddings/status 2>/dev/null \
       || echo "сервис переписки не отвечает — ./ops/doctor.sh" ;;
   *) echo "использование: $0 on|off|status" >&2; exit 2 ;;

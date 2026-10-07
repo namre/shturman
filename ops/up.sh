@@ -57,7 +57,22 @@ cfg = load_config() or {}
 servers = cfg.get("mcp_servers")
 if not isinstance(servers, dict):
     servers = {}
-if servers.get("shturman") == want:
+# load_config отдаёт настройки с уже подставленными переменными окружения: на месте имени
+# переменной в заголовке стоит её значение, и сравнение с образцом никогда бы не сошлось —
+# запись переписывалась бы, а Hermes перезапускался бы при каждом запуске скрипта. Поэтому
+# сравниваем запись как она лежит в файле, а если такой функции в этой версии Hermes нет —
+# с образцом, в который переменная подставлена так же. Значение переменной не печатается.
+try:
+    from hermes_cli.config import read_raw_config
+    current = ((read_raw_config() or {}).get("mcp_servers") or {}).get("shturman")
+except Exception:
+    current = None
+import copy, os
+filled = copy.deepcopy(want)
+token = os.environ.get("MCP_SHTURMAN_API_KEY")
+if token is not None:
+    filled["headers"]["Authorization"] = "Bearer " + token
+if current == want or (current is None and servers.get("shturman") in (want, filled)):
     print("same")
 else:
     servers["shturman"] = want

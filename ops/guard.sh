@@ -6,36 +6,20 @@
 #   ./ops/guard.sh off     — выключить проверку и убрать контейнер. Уже скрытые сообщения остаются
 #                            скрытыми, пока владелец не решит по ним в боте.
 #   ./ops/guard.sh status  — что включено и счётчики: проверено, скрыто, показано, не проверено
-# Значения, которые скрипт пишет в .env, не секретные. Из .env он читает только строку
-# COMPOSE_PROFILES — чтобы не выключить поиск по смыслу, включённый ./ops/embeddings.sh.
+# Значения, которые скрипт пишет в .env, не секретные. Из .env он читает только строки
+# SHTURMAN_MODE, SHTURMAN_GUARD и COMPOSE_PROFILES: свой профиль добавляется и убирается,
+# а поиск по смыслу (./ops/embeddings.sh) и профиль Hermes не трогаются.
 #
 # Защита снижает риск, а не устраняет его: классификатор пропускает часть атак и иногда прячет
 # обычные сообщения. Измеренные числа — docs/guard.md.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 
+. ops/lib.sh
 mode="${1:-status}"
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
-
-set_env() {
-  local tmp; tmp="$(mktemp .env.XXXXXX)"
-  grep -Ev "^$1=" .env > "$tmp" || true
-  [ -n "$2" ] && printf '%s=%s\n' "$1" "$2" >> "$tmp"
-  chmod 600 "$tmp"; mv "$tmp" .env
-}
-
-# Профили Compose — общий список через запятую: поиск по смыслу (embeddings) и защита (guard)
-# включаются независимо, поэтому свой профиль добавляется и убирается, а чужой не трогается.
-set_profile() {
-  local want="$1" name="$2" now out="" p
-  now="$(grep -E '^COMPOSE_PROFILES=' .env | tail -n 1 | cut -d= -f2- || true)"
-  local IFS=','
-  for p in $now; do
-    [ -n "$p" ] && [ "$p" != "$name" ] && out="${out:+$out,}$p"
-  done
-  [ "$want" = "on" ] && out="${out:+$out,}$name"
-  set_env COMPOSE_PROFILES "$out"
-}
+# Неизвестный режим установки — остановиться до скачивания модели, а не после.
+shturman_mode > /dev/null || exit 2
 
 # Модель и её точная версия. Смена модели — отдельным изменением: вместе с суммами ниже, именем
 # в compose.yaml (--served-model-name), значением по умолчанию в service/src/shturman/config.py
@@ -80,20 +64,20 @@ case "$mode" in
       echo "Свободной памяти ${mem_mb} МБ — для модели нужно около 600 МБ. Включаю, но следите за ./ops/doctor.sh." >&2
     fi
     umask 077
-    set_profile on guard
-    set_env SHTURMAN_GUARD on
-    set_env SHTURMAN_GUARD_URL http://guard:80
+    profile_set on guard
+    env_set SHTURMAN_GUARD on
+    env_set SHTURMAN_GUARD_URL http://guard:80
     echo "Защита от внедрённых инструкций включена в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   off)
     umask 077
-    set_profile off guard
-    set_env SHTURMAN_GUARD ""
-    set_env SHTURMAN_GUARD_URL ""
+    profile_set off guard
+    env_set SHTURMAN_GUARD ""
+    env_set SHTURMAN_GUARD_URL ""
     echo "Защита от внедрённых инструкций выключена в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   status)
-    if grep -Eq '^SHTURMAN_GUARD=on' .env; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
+    if [ "$(env_get SHTURMAN_GUARD)" = on ]; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
     docker exec shturman-service shturman call GET /api/guard/status 2>/dev/null \
       || echo "сервис переписки не отвечает — ./ops/doctor.sh" ;;
   *) echo "использование: $0 on|off|status" >&2; exit 2 ;;

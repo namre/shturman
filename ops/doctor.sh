@@ -82,9 +82,12 @@ else
   warn public-url "внешний адрес не задан — дашборд доступен только с самого сервера (./ops/set-public-url.sh)"
 fi
 
-owner_bound=no; wizard_done=no
+owner_bound=no; wizard_done=no; plugin_own_bot=unknown
 while IFS='=' read -r k v; do
-  case "$k" in owner_bound) owner_bound="$v" ;; wizard_completed) wizard_done="$v" ;; esac
+  case "$k" in
+    owner_bound) owner_bound="$v" ;; wizard_completed) wizard_done="$v" ;;
+    bridge_own_bot) plugin_own_bot="$v" ;;
+  esac
 done <<EOF2
 $(hpy /opt/data/plugins/shturman/cli.py status)
 EOF2
@@ -175,9 +178,24 @@ print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n
       warn jobs "в очереди $waiting заданий — их некому выполнять: смотрите строки approvals-bot и model"
     else pass jobs "очередь заданий: ${waiting:-0}, неудачных: ${failed:-0}"; fi
     if [ "$MODE" = hermes ]; then
+      # Со своим ботом сервиса владельца привязывает он (строка approvals-owner ниже), а плагин
+      # в Hermes уходит в спокойный режим: не привязывает владельца, не передаёт нажатия и не
+      # пересылает бизнес-сообщения. О своём боте плагин узнаёт не сразу — переспрашивает раз в 5 минут.
       case "$st" in
-        *'"owner_known":true'*) pass service-owner "сервис знает владельца" ;;
-        *) warn service-owner "сервис ещё не знает владельца — кнопки согласования не работают, пока бот не привязан в мастере" ;;
+        *'"own_bot":true'*)
+          if [ "$plugin_own_bot" = yes ]; then
+            pass plugin-own-bot "согласования и бизнес-поток ведёт бот сервиса; плагин в Hermes их не пересылает"
+          else
+            warn plugin-own-bot "у сервиса свой бот согласований, а плагин в Hermes об этом ещё не знает (шлюз не запущен или не успел спросить) — повторите проверку через 5 минут"
+          fi ;;
+        *)
+          if [ "$plugin_own_bot" = yes ]; then
+            warn plugin-own-bot "плагин в Hermes считает, что согласования ведёт бот сервиса, а у сервиса своего бота нет — плагин заметит это в течение 5 минут"
+          fi
+          case "$st" in
+            *'"owner_known":true'*) pass service-owner "сервис знает владельца" ;;
+            *) warn service-owner "сервис ещё не знает владельца — кнопки согласования не работают, пока бот не привязан в мастере" ;;
+          esac ;;
       esac
     fi
   else

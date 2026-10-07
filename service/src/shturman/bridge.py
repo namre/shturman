@@ -141,6 +141,14 @@ def owns_bot() -> bool:
     return NOTIFY_OWNER in _builtin_kinds
 
 
+def model_hint() -> str:
+    """Куда владельцу смотреть, если модель не отвечает. Сервис не знает, установлен ли Hermes,
+    поэтому судит по своему исполнителю: своя модель — её настройки, иначе модель у Hermes."""
+    if LLM_TEXT in _builtin_kinds:
+        return "Проверьте ключ и имя модели сервиса: `shturman bot-status`."
+    return "Проверьте модель в настройках Hermes."
+
+
 # --- владелец ---
 
 OwnerChangeHandler = Callable[[asyncpg.Connection, int], Awaitable[None]]

@@ -130,6 +130,8 @@ async def test_owner_free_text_gets_one_short_hint_per_hour(rig):
     hints = rig.tg.sent()[before:]
     assert len(hints) == 1 and hints[0]["text"].startswith("Это бот согласований Штурмана")
     assert hints[0]["chat_id"] == OWNER
+    # подсказка верна и без Hermes: к «ассистенту в другом чате» она не отсылает
+    assert "ассистент" not in hints[0]["text"] and "Hermes" not in hints[0]["text"]
 
     rig.clock.tick(3601)
     rig.tg.text("ещё вопрос")

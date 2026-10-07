@@ -86,8 +86,10 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
         sys.exit(out.get("error") or f"сервис ответил ошибкой {code}")
     bot, llm, jobs = out.get("bot") or {}, out.get("llm") or {}, out.get("jobs") or {}
     if not bot.get("configured"):
+        # Сервис не знает, установлен ли Hermes: говорим о том, что видно ему самому.
         print("Бот согласований: не настроен (SHTURMAN_BOT_TOKEN не задан). "
-              "Уведомления и кнопки идут через Hermes, отправка выключена.")
+              "Карточки и кнопки сервис сам не ведёт: их задания ждут плагин в Hermes, "
+              "а без Hermes доставлять их некому. Отправка выключена.")
     else:
         print("Бот согласований: настроен")
         print(f"  имя бота: {'@' + bot['username'] if bot.get('username') else 'ещё не получено от Telegram'}")
@@ -107,7 +109,8 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
         if counters:
             print("  счётчики: " + ", ".join(f"{k}={v}" for k, v in sorted(counters.items())))
     if not llm.get("configured"):
-        print("Своя модель: не настроена. Модель вызывает плагин в Hermes.")
+        print("Своя модель: не настроена. Запросы к модели ждут плагин в Hermes; "
+              "без Hermes выполнять их некому.")
     else:
         print(f"Своя модель: {llm.get('model')}")
         for task, model in sorted((llm.get("task_models") or {}).items()):

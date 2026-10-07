@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from shturman_core import bridge_stats  # noqa: E402
 from shturman_core.auth import ACTIVATION_TTL, Auth  # noqa: E402
 from shturman_core.state import Store  # noqa: E402
 
@@ -20,6 +21,19 @@ from shturman_core.state import Store  # noqa: E402
 def _pages_prefix() -> str:
     value = os.environ.get("SHTURMAN_AUTH_PAGES", "/shturman-auth").strip() or "/shturman-auth"
     return "/" + value.strip("/")
+
+
+def status_lines(store: Store, auth: Auth) -> list[str]:
+    """Строки «имя=значение» для ops/doctor.sh: только признаки, без значений и имён."""
+    wizard = store.read("wizard")
+    # Что мост плагина знает о своём боте сервиса; unknown — шлюз не работает или ещё не спрашивал.
+    own_bot = bridge_stats.status(store, configured=True)["own_bot"]
+    return [
+        f"owner_bound={'yes' if auth.owner() else 'no'}",
+        f"wizard_completed={'yes' if wizard.get('completed_at') else 'no'}",
+        f"activation_pending={'yes' if store.read('activation').get('digest') else 'no'}",
+        f"bridge_own_bot={'unknown' if own_bot is None else 'yes' if own_bot else 'no'}",
+    ]
 
 
 def main(argv: list[str]) -> int:
@@ -44,11 +58,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     if command == "status":
-        owner = auth.owner()
-        wizard = store.read("wizard")
-        print(f"owner_bound={'yes' if owner else 'no'}")
-        print(f"wizard_completed={'yes' if wizard.get('completed_at') else 'no'}")
-        print(f"activation_pending={'yes' if store.read('activation').get('digest') else 'no'}")
+        print("\n".join(status_lines(store, auth)))
         return 0
 
     if command == "logout-all":

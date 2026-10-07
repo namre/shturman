@@ -54,7 +54,8 @@ jobs:
           if docker compose config --images | grep -q hermes-agent; then echo "образ Hermes в режиме без Hermes"; exit 1; fi
           docker compose --profile hermes config --quiet
           test "$(docker compose --profile hermes config --services | sort | tr '\n' ' ')" = "hermes postgres shturman "
-          docker compose --profile hermes --profile embeddings config --quiet
+          docker compose --profile hermes --profile embeddings --profile guard config --quiet
+          test "$(docker compose --profile guard config --services | sort | tr '\n' ' ')" = "guard postgres shturman "
         env:
           HERMES_UID: "1000"
           HERMES_GID: "1000"
@@ -79,6 +80,18 @@ jobs:
           ./ops/init-env.sh --auto
           grep -qx 'SHTURMAN_MODE=hermes' .env
           grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
+          test "$(stat -c '%a' .env)" = "600"
+          # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
+          # профиль и не трогает ни чужой, ни профиль Hermes. Запуск стека здесь подменён.
+          printf '#!/bin/sh\nexit 0\n' > ops/up.sh
+          printf 'SHTURMAN_MODE=hermes\nCOMPOSE_PROFILES=hermes,embeddings,guard\nSHTURMAN_GUARD=on\n' > .env
+          ./ops/guard.sh off
+          grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
+          if grep -q '^SHTURMAN_GUARD=' .env; then echo "выключатель защиты должен исчезнуть"; exit 1; fi
+          ./ops/embeddings.sh off
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          ./ops/init-env.sh --auto > /dev/null
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
           test "$(stat -c '%a' .env)" = "600"
       # Образ сервиса должен собираться и запускаться: без базы он обязан выйти с понятной ошибкой.
       - run: docker build -t shturman-service:ci service
