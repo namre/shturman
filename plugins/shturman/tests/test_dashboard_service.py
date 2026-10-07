@@ -105,6 +105,27 @@ def test_service_errors_are_passed_to_the_page_as_they_are(web, service_env):
     assert web.get(f"{PREFIX}/service/imports/{'a' * 32}/scan?wait=1").status_code == 202
 
 
+def test_waiting_for_the_owner_reaches_the_page_as_it_is(web, service_env):
+    """У сервиса свой бот согласований: действие не применено, странице — тот же 202 и то же тело."""
+    waiting = {"status": "pending_confirmation", "action_id": 7, "expires_at": "2026-10-07T12:00:00+00:00",
+               "summary": "Добавить в доверенные: Иван Петров (идентификатор Telegram 2001).",
+               "note": "Ждёт вашего подтверждения в боте согласований."}
+    service_env.replies[("POST", "/api/outbox/trusted")] = (202, waiting)
+    response = web.post(f"{PREFIX}/service/outbox/trusted", json={"tg_user_id": 2001})
+    assert response.status_code == 202 and response.json() == waiting
+    # страница может посмотреть ждущие действия и отменить, но не подтвердить
+    service_env.replies[("GET", "/api/confirmations")] = (200, {"required": True, "pending": [{"id": 7}]})
+    assert web.get(f"{PREFIX}/service/confirmations").json()["pending"] == [{"id": 7}]
+    service_env.replies[("GET", "/api/confirmations/7")] = (200, {"id": 7, "status": "pending"})
+    assert web.get(f"{PREFIX}/service/confirmations/7").json()["status"] == "pending"
+    service_env.replies[("POST", "/api/confirmations/7/cancel")] = (200, {"ok": True})
+    assert web.post(f"{PREFIX}/service/confirmations/7/cancel").json() == {"ok": True}
+    sent = len(service_env.requests)
+    for path in ("confirmations/7/confirm", "confirmations/7/apply", "callbacks/telegram"):
+        assert web.post(f"{PREFIX}/service/{path}", json={}).status_code in (404, 405)
+    assert len(service_env.requests) == sent                    # до сервиса не дошло
+
+
 def test_wrong_service_token_is_not_shown_as_the_owners_session_expiring(web, service_env, monkeypatch):
     monkeypatch.setenv("SHTURMAN_API_TOKEN", "w" * 40)
     response = web.get(f"{PREFIX}/service/status")

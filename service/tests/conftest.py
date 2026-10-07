@@ -131,3 +131,100 @@ async def make_client(conn, config):
         yield factory
     finally:
         await stack.aclose()
+
+
+# --- подтверждение владельцем в своём боте согласований (см. shturman/confirm.py) ---
+
+@pytest.fixture
+def own_bot():
+    """У сервиса свой бот согласований: действия, расширяющие права ассистента, ждут нажатия владельца."""
+    from shturman import bridge
+
+    bridge.set_builtin({bridge.NOTIFY_OWNER, bridge.NOTIFY_EDIT})
+    yield
+    bridge.set_builtin(())
+
+
+@pytest.fixture(params=["свой бот", "без своего бота"])
+def either_mode(request):
+    """Оба режима по очереди. Значение — есть ли у сервиса свой бот."""
+    from shturman import bridge
+
+    with_bot = request.param == "свой бот"
+    bridge.set_builtin({bridge.NOTIFY_OWNER, bridge.NOTIFY_EDIT} if with_bot else ())
+    yield with_bot
+    bridge.set_builtin(())
+
+
+class Approvals:
+    """Владелец в боте согласований: ждущие действия и нажатия под их карточками.
+
+    Нажатие приходит тем же путём, что и от настоящего бота: `bridge.dispatch_callback` с данными
+    кнопки и идентификатором нажавшего."""
+
+    def __init__(self, conn, owner=OWNER):
+        self.conn, self.owner = conn, owner
+
+    def waiting(self, response) -> int:
+        """Ответ маршрута — «ждёт подтверждения»: 202, номер действия и текст карточки простыми словами."""
+        assert response.status_code == 202, response.text
+        body = response.json()
+        assert body["status"] == "pending_confirmation" and isinstance(body["action_id"], int), body
+        summary = body["summary"]
+        assert isinstance(summary, str) and len(summary) > 20
+        assert "{" not in summary and '":' not in summary, summary   # не сырой JSON
+        assert body["expires_at"] and body["note"]
+        return body["action_id"]
+
+    async def press(self, action_id: int, yes: bool = True, user: int | None = None) -> dict:
+        from shturman import bridge
+
+        nonce = await self.conn.fetchval("SELECT nonce FROM pending_actions WHERE id = $1", action_id)
+        data = f"sh:cf:{'y' if yes else 'n'}:{action_id}:{nonce}"
+        return await bridge.dispatch_callback(self.conn, data, self.owner if user is None else user)
+
+    async def lapse(self, action_id: int) -> None:
+        await self.conn.execute(
+            "UPDATE pending_actions SET expires_at = now() - interval '1 minute' WHERE id = $1", action_id)
+
+    async def status(self, action_id: int) -> str:
+        return await self.conn.fetchval("SELECT status FROM pending_actions WHERE id = $1", action_id)
+
+    async def pending(self) -> int:
+        return await self.conn.fetchval("SELECT count(*) FROM pending_actions WHERE status = 'pending'")
+
+    async def card(self, action_id: int) -> str:
+        """Текст карточки, которая ушла владельцу по этому действию."""
+        from shturman import bridge
+
+        return await self.conn.fetchval(
+            """SELECT payload->>'text' FROM jobs
+               WHERE kind = $1 AND executor = 'builtin' AND (context->>'action_id')::bigint = $2""",
+            bridge.NOTIFY_OWNER, action_id)
+
+    async def gate(self, send, read, before, after) -> None:
+        """Со своим ботом действие ничего не меняет до нажатия; «нет» и истёкший срок — тоже ничего;
+        после «да» — применяется. send() -> ответ маршрута, read() -> то, что должно измениться."""
+        action = self.waiting(await send())
+        assert await read() == before
+        assert (await self.press(action, yes=False))["answer"] == "Отклонено."
+        assert await read() == before and await self.status(action) == "rejected"
+
+        action = self.waiting(await send())
+        await self.lapse(action)
+        assert (await self.press(action))["answer"] == "Срок вышел."
+        assert await read() == before and await self.status(action) == "expired"
+
+        action = self.waiting(await send())
+        assert await read() == before
+        assert (await self.press(action, user=self.owner + 1))["answer"] == "Кнопка недоступна."   # не владелец
+        assert await read() == before
+        done = await self.press(action)
+        assert done["answer"] == "Сделано.", done
+        assert await read() == after and await self.status(action) == "applied"
+        assert (await self.press(action))["answer"] == "Действие уже недоступно."   # второй раз не применяется
+
+
+@pytest.fixture
+def approvals(conn):
+    return Approvals(conn)

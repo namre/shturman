@@ -14,6 +14,12 @@
 Инструменты агента (MCP, только чтение): get_person_page, search_pages. Сводка, обязательства
 и хронология отдаются как чужой текст в рамке; блок владельца — как собственные заметки владельца.
 
+Подтверждение владельцем (см. `confirm.py`). Блок владельца ассистент читает как слова самого
+владельца, без рамки «чужой текст», а страница о новом человеке заводится только с его
+одобрения. Поэтому при своём боте согласований запись блока владельца и согласие завести
+страницу ждут нажатия в боте (маршрут отвечает 202); отказ завести страницу, сборка, проверки
+и чтение — нет.
+
 Фоновая работа. Сборка идёт после ночного прогона обработки. Пока в `pipeline.py` нет вызова
 «прогон закончен», модуль сам раз в несколько минут смотрит, не появился ли завершённый прогон
 новее последней сборки. Тем же обходом дописывается сборка, ждавшая ответов модели, и
@@ -34,8 +40,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from .. import events
-from ..api_core import BadRequest, body, handler
+from .. import confirm, events, sanitize
+from ..api_core import BadRequest, body, handler, settle
 from ..app import AppState, state_of
 from ..mcp_server import (
     READ_ONLY,
@@ -94,20 +100,82 @@ async def get_page(request: Request) -> JSONResponse:
     return JSONResponse({**page, "markdown": markdown, "blocks": blocks})
 
 
+OWNER_BLOCK = "pages.owner_block"
+PAGE_ACCEPT = "pages.accept"
+PREVIEW = 1800   # столько знаков нового текста блока владельца показывается на карточке
+
+# Состояние работающего сервиса: функции применения действий его не получают.
+_state: AppState | None = None
+
+
+@confirm.applier(OWNER_BLOCK)
+async def _apply_owner_block(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    state = _state
+    if state is None:
+        raise confirm.Refused("Модуль страниц памяти не запущен.", 503)
+    confirm.must_not_widen(True)      # слова «от владельца» — только с его нажатия
+    # На отдельном соединении и вне транзакции действия: запись страницы меняет и файлы, и базу
+    # своими шагами, и откат «снаружи» разошёл бы их между собой.
+    async with state.pool.acquire() as own:
+        try:
+            result = await pages_build.write_owner_block(
+                own, state.config.pages_dir, int(payload["person_id"]), payload.get("text"),
+                tz=state.config.timezone)
+        except pages_build.PagesError as exc:
+            raise confirm.Refused(str(exc), _status_of(exc)) from None
+    return confirm.Done(result=result)
+
+
+@confirm.applier(PAGE_ACCEPT)
+async def _apply_page_accept(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    # Без нажатия владельца — только повтор уже принятого им решения.
+    confirm.must_not_widen(await conn.fetchval(
+        "SELECT status FROM page_proposals WHERE person_id = $1", int(payload["person_id"])) != "accepted")
+    try:
+        result = await pages_build.decide_proposal(conn, int(payload["person_id"]), True)
+    except pages_build.PagesError as exc:
+        raise confirm.Refused(str(exc), _status_of(exc)) from None
+    except people.PeopleError as exc:
+        raise confirm.Refused(str(exc), 409) from None
+    return confirm.Done(result=result)
+
+
+async def _person_title(conn: asyncpg.Connection, person_id: int) -> str:
+    name = await conn.fetchval("SELECT display_name FROM people WHERE id = $1", person_id)
+    return f"«{sanitize.clean_line(name, 60) or 'без имени'}» (запись № {person_id})"
+
+
 @handler
 async def put_owner_block(request: Request) -> JSONResponse:
     data = await body(request)
     text = data.get("text")
     if not isinstance(text, str):
         raise BadRequest("поле text: нужна строка")
+    person_id = request.path_params["person_id"]
     state = state_of(request)
     async with state.pool.acquire() as conn:
-        try:
-            result = await pages_build.write_owner_block(
-                conn, state.config.pages_dir, request.path_params["person_id"], text, tz=state.config.timezone)
-        except pages_build.PagesError as exc:
-            raise BadRequest(str(exc), status=_status_of(exc)) from None
-    return JSONResponse(result)
+        summary = ""
+        if confirm.required():
+            # Проверки, которые иначе сработали бы только после нажатия владельца.
+            if len(text) > 20_000:
+                raise BadRequest("Текст блока владельца: строка не длиннее 20 000 знаков.")
+            if pages.has_marker(text):
+                raise BadRequest("В тексте не должно быть меток блоков страницы "
+                                 "(<!-- summary …, owner, commitments, timeline).")
+            if await pages_build.get_page(conn, person_id) is None:
+                raise BadRequest("У этого человека нет страницы.", status=404)
+            who = await _person_title(conn, person_id)
+            if text.strip():
+                shown = sanitize.clean_text(text, PREVIEW)
+                summary = (f"Заменить ваши заметки на странице памяти о человеке {who}. Ассистент читает этот "
+                           "блок как ваши собственные слова и доверяет ему больше, чем переписке.\n"
+                           f"Новый текст (знаков: {len(text)}"
+                           + ("; ниже только начало, остальное посмотрите в кабинете" if len(text) > PREVIEW else "")
+                           + f"):\n{shown}")
+            else:
+                summary = f"Очистить ваши заметки на странице памяти о человеке {who}."
+        answer, result = await settle(conn, OWNER_BLOCK, {"person_id": person_id, "text": text}, summary=summary)
+    return answer or JSONResponse(result)
 
 
 @handler
@@ -152,9 +220,19 @@ async def decide_proposal(request: Request) -> JSONResponse:
     data = await body(request)
     if not isinstance(data.get("accept"), bool):
         raise BadRequest("поле accept: нужно true или false")
+    person_id = request.path_params["person_id"]
     async with state_of(request).pool.acquire() as conn:
+        if data["accept"]:
+            # Согласие заводит страницу и подтверждает человека в реестре: ждёт владельца.
+            # Уже принятое решение повторять не о чем — оно применяется (ничего не меняя) сразу.
+            decided = await conn.fetchval("SELECT status FROM page_proposals WHERE person_id = $1", person_id)
+            summary = None if decided == "accepted" else (
+                f"Завести страницу памяти о человеке {await _person_title(conn, person_id)}. Ассистент будет "
+                "вести о нём сводку по переписке и опираться на неё в ответах.")
+            answer, result = await settle(conn, PAGE_ACCEPT, {"person_id": person_id}, summary=summary)
+            return answer or JSONResponse(result)
         try:
-            result = await pages_build.decide_proposal(conn, request.path_params["person_id"], data["accept"])
+            result = await pages_build.decide_proposal(conn, person_id, False)
         except pages_build.PagesError as exc:
             raise BadRequest(str(exc), status=_status_of(exc)) from None
         except people.PeopleError as exc:
@@ -219,10 +297,14 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     pages_build.on_wake(alarm.set)
     state.events.subscribe(events.MESSAGES_DELETED, on_deleted)
     state.spawn(worker(), name="pages-build")
+    global _state
+    _state = state
     try:
         yield
     finally:
         pages_build.off_wake(alarm.set)
+        if _state is state:
+            _state = None
 
 
 # --- инструменты агента ---------------------------------------------------------------------------------

@@ -56,6 +56,95 @@ INTEGER_KEYS = frozenset(NUMBERS) - {"min_pause_seconds", "part_pause_seconds"}
 CHOICES = {"drafting_default": ("allow", "deny")}
 DEFAULT_CHOICES = {"drafting_default": "allow"}
 
+# В какую сторону настройка ОСЛАБЛЯЕТ ограничение: +1 — когда число растёт, -1 — когда уменьшается,
+# 0 — на то, кому и сколько уходит, не влияет. Ослабление при своём боте согласований ждёт нажатия
+# владельца, ужесточение применяется сразу (см. confirm.py). Новая настройка без строки здесь
+# считается ослабляющей при любом изменении.
+LOOSER: dict[str, int] = {
+    "chat_window_seconds": -1,            # короче окно — больше сообщений в чат
+    "chat_window_max": +1,
+    "duplicate_window_seconds": -1,       # раньше можно повторить тот же текст
+    "daily_cap": +1,
+    "min_pause_seconds": -1,
+    "part_pause_seconds": -1,
+    "max_parts": +1,                      # длиннее сообщения
+    "draft_ttl_seconds": +1,              # карточка дольше ждёт нажатия
+    "drafts_per_hour": +1,                # больше карточек владельцу
+    "send_timeout_seconds": 0,            # только момент, когда исход признаётся неизвестным
+    "approval_max_age_seconds": +1,       # согласованное может уйти позже
+    "business_window_margin_seconds": -1,
+    "text_retention_days": +1,            # текст черновиков хранится дольше
+}
+# Разрешение готовить черновики: чем правее, тем больше позволено. None и "default" — «как в
+# общих правилах»: позволено не больше, чем при явном allow, и не меньше, чем при deny.
+DRAFTING_RANK = {"deny": 0, None: 1, "default": 1, "allow": 2}
+LABELS: dict[str, str] = {
+    "chat_window_seconds": "окно, за которое считаются сообщения в один чат (секунд)",
+    "chat_window_max": "сообщений в один чат за это окно",
+    "duplicate_window_seconds": "сколько секунд нельзя повторять тот же текст в тот же чат",
+    "daily_cap": "отправок с одного аккаунта в сутки",
+    "min_pause_seconds": "пауза между отправками (секунд)",
+    "part_pause_seconds": "пауза между частями длинного сообщения (секунд)",
+    "max_parts": "на сколько частей можно разрезать длинное сообщение",
+    "draft_ttl_seconds": "сколько секунд черновик ждёт вашего решения",
+    "drafts_per_hour": "черновиков в час на аккаунт",
+    "send_timeout_seconds": "сколько секунд ждать ответа об отправке",
+    "approval_max_age_seconds": "сколько секунд согласованный черновик может ждать отправки",
+    "business_window_margin_seconds": "запас до конца суточного окна бизнес-бота (секунд)",
+    "text_retention_days": "сколько дней хранится текст завершённых черновиков",
+    "drafting_default": "готовить черновики, если для чата и аккаунта не сказано иное",
+}
+WORDS = {"allow": "можно", "deny": "нельзя", "chat": "только в этом же чате",
+         "account": "во всех чатах аккаунта (только ваши собственные слова)"}
+
+
+def loosens(key: str, before: Any, after: Any, directions: dict[str, int]) -> bool:
+    """Ослабляет ли ограничение переход настройки от `before` к `after`."""
+    if before == after:
+        return False
+    if key == "drafting_default":
+        return DRAFTING_RANK.get(after, 2) > DRAFTING_RANK.get(before, 0)
+    if key == "search_scope":
+        return after != "chat"   # справка для автоответа берётся шире, чем из этого же чата
+    direction = directions.get(key)
+    if direction == 0:
+        return False
+    numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (before, after))
+    if direction is None or not numeric:
+        return True   # неизвестная настройка или не число: без владельца не меняем
+    return (after - before) * direction > 0
+
+
+def split_changes(
+    before: dict[str, Any], changes: dict[str, Any], directions: dict[str, int],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Делит изменения на (применить сразу, ждать владельца). Неизменившееся отбрасывается."""
+    now: dict[str, Any] = {}
+    later: dict[str, Any] = {}
+    for key, value in changes.items():
+        if before.get(key) == value:
+            continue
+        (later if loosens(key, before.get(key), value, directions) else now)[key] = value
+    return now, later
+
+
+def show(value: Any) -> str:
+    """Значение настройки словами для карточки владельцу."""
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    if isinstance(value, float) and value == int(value):
+        return str(int(value))
+    if isinstance(value, str):
+        return WORDS.get(value, f"«{value}»")
+    return str(value)
+
+
+def describe_changes(before: dict[str, Any], changes: dict[str, Any], labels: dict[str, str]) -> str:
+    """Строки «что было — что станет» для карточки. Сырых имён настроек и JSON в них нет."""
+    return "\n".join(
+        f"• {labels.get(key, key)}: было {show(before.get(key))}, станет {show(value)}"
+        for key, value in changes.items())
+
 REASONS = {
     "sending_disabled": "Отправка сообщений выключена в настройках сервера. Включить её можно только на "
                         "самом сервере (SHTURMAN_SENDING в файле .env), через ассистента — нельзя.",

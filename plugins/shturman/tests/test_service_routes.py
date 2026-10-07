@@ -99,6 +99,25 @@ def test_owner_ui_reaches_what_its_pages_need(method, path):
     assert allowed(UI, method, path)
 
 
+CONFIRMATIONS = [("GET", "/api/confirmations"), ("GET", "/api/confirmations/7"),
+                 ("POST", "/api/confirmations/7/cancel")]
+
+
+@pytest.mark.parametrize("method, path", CONFIRMATIONS + [("GET", "/api/executor/status")])
+def test_only_the_owner_pages_see_and_cancel_waiting_actions(method, path):
+    assert allowed(UI, method, path)
+    assert not allowed(TOOLS, method, path) and not allowed(BRIDGE, method, path)
+
+
+@pytest.mark.parametrize("method, path", [
+    ("POST", "/api/confirmations/7/confirm"), ("POST", "/api/confirmations/7/apply"),
+    ("PUT", "/api/confirmations/7"), ("DELETE", "/api/confirmations/7"), ("POST", "/api/confirmations"),
+])
+def test_nobody_can_confirm_an_action_through_the_plugin(method, path):
+    for routes in (BRIDGE, TOOLS, UI):
+        assert not allowed(routes, method, path)
+
+
 @pytest.mark.parametrize("method, path", INTERNAL + [("GET", "/api/status")])
 def test_bridge_reaches_its_routes(method, path):
     assert allowed(BRIDGE, method, path)

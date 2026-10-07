@@ -20,6 +20,13 @@
 функции `accept_business_*`. Подключение принадлежит тому пути, которым пришло первым: другой
 путь по нему ничего записать не может (код `foreign_connection`).
 
+Подтверждение владельцем (см. `confirm.py`). Когда у сервиса свой бот согласований:
+исключить чат можно сразу (это ужесточение), а вернуть чат в архив, стереть сообщения
+исключённого чата и запустить импорт выгрузки — только после нажатия владельца в боте; маршрут
+тогда отвечает 202 с `status: pending_confirmation`. Запрос «исключить и стереть» исключает чат
+сразу, а стирание ждёт. Удаление загруженного файла подтверждения не требует: в архив оно ничего
+не добавляет и из архива ничего не убирает.
+
 Текст сообщений и имена собеседников в журнал не пишутся.
 """
 
@@ -45,8 +52,8 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from . import bridge, db, events, store
-from .api_core import BadRequest, need_str, only_without_own_bot
+from . import bridge, confirm, db, events, store
+from .api_core import BadRequest, error_response, need_str, only_without_own_bot, settle
 from .app import AppState, state_of
 from .botapi_normalize import (
     MAX_ID, NormalizeError, SkipMessage, chat_record, normalize_message, seen_by, user_name,
@@ -54,9 +61,21 @@ from .botapi_normalize import (
 from .config import ConfigError
 from .importer import ImportStats, import_export, scan
 from .records import MessageRecord
+from .sanitize import clean_line
 from .telegram_export import ExportFormatError
 
 logger = logging.getLogger("shturman.ingest")
+
+# Действия, которые при своём боте согласований ждут нажатия владельца (см. confirm.py).
+# Исключение чата — ужесточение и применяется сразу; возврат чата, стирание его сообщений
+# и импорт выгрузки расширяют то, что видит ассистент, либо необратимо стирают данные.
+CHAT_EXCLUDE = "archive.chat_exclude"
+CHAT_INCLUDE = "archive.chat_include"
+CHAT_PURGE = "archive.chat_purge"
+IMPORT_RUN = "archive.import_run"
+
+# Состояние работающего сервиса: функции применения действий состояния не получают.
+_state: AppState | None = None
 
 MAX_JSON_BYTES = 512 * 1024           # объект Bot API с запасом; больше — не сообщение
 UPLOAD_ENV = "SHTURMAN_UPLOAD_MAX_BYTES"
@@ -88,10 +107,7 @@ def _handler(fn):
         try:
             return await fn(request)
         except BadRequest as exc:
-            payload = {"error": exc.message}
-            if exc.code:
-                payload["code"] = exc.code
-            return JSONResponse(payload, status_code=exc.status)
+            return error_response(exc)
         except ClientDisconnect:
             return JSONResponse({"error": "соединение оборвалось до конца запроса"}, status_code=400)
     wrapped.__name__ = fn.__name__
@@ -475,32 +491,107 @@ async def put_chat_excluded(request: Request) -> JSONResponse:
         raise BadRequest("чат не найден", 404)
 
     state = state_of(request)
-    registry: Registry | None = state.extras.get("imports")
+    _no_running_import(state, BadRequest)
+    async with state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT p.class, p.tg_id, p.username, c.excluded, COALESCE(c.title, p.name) AS title,
+                      (SELECT count(*) FROM messages m WHERE m.chat_id = c.id) AS messages
+               FROM chats c JOIN peers p ON p.id = c.peer_id WHERE c.id = $1""",
+            chat_id,
+        )
+        if row is None:
+            raise BadRequest("чат не найден", 404)
+        name = clean_line(row["title"], 64) or f"№ {chat_id}"
+        if not excluded:
+            if store.is_blocked_peer(row["class"], row["tg_id"], row["username"]):
+                raise ApiError(_LOCKED, 409, "locked")
+            # Возврат чата расширяет то, что сохраняется и что видит ассистент, — ждёт владельца.
+            summary = (f"Вернуть чат «{name}» в архив: сервис снова будет сохранять его сообщения, "
+                       "и ассистент сможет их читать.") if row["excluded"] else None
+            answer, out = await settle(conn, CHAT_INCLUDE, {"chat_id": chat_id}, summary=summary)
+            return answer or JSONResponse(out)
+        # Исключение — ужесточение: применяется сразу, чтобы чат можно было закрыть без ожидания.
+        await settle(conn, CHAT_EXCLUDE, {"chat_id": chat_id}, summary=None)
+        purged = 0
+        if purge:
+            # Стирание необратимо, поэтому ждёт владельца. Чат к этому моменту уже исключён.
+            summary = (f"Стереть из архива все сохранённые сообщения чата «{name}» (сообщений: {row['messages']}) "
+                       "и всё, что из них выведено: обязательства, строки страниц памяти, черновики. "
+                       "Вернуть стёртое нельзя. Сам чат уже исключён: новые сообщения из него не сохраняются."
+                       ) if row["messages"] else None
+            answer, purged = await settle(conn, CHAT_PURGE, {"chat_id": chat_id}, summary=summary,
+                                          applied_now={"id": chat_id, "excluded": True})
+            if answer is not None:
+                return answer
+    return JSONResponse({"id": chat_id, "excluded": True, "purged": purged or 0})
+
+
+_LOCKED = "служебный чат Telegram исключён всегда: в нём коды входа и токены"
+
+
+def _no_running_import(state: AppState | None, error: type[Exception]) -> None:
+    registry: Registry | None = state.extras.get("imports") if state is not None else None
     if registry is not None and registry.running() is not None:
         # Импорт пишет пачками и проверяет запрет в начале пачки: смена запрета посреди
         # импорта могла бы пропустить в архив сообщения только что исключённого чата.
-        raise ApiError("идёт импорт экспорта — измените исключения после его окончания", 409, "import_running")
+        raise error("идёт импорт экспорта — измените исключения после его окончания", 409, "import_running")
 
-    purged = 0
-    async with state.pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                """SELECT p.class, p.tg_id, p.username FROM chats c JOIN peers p ON p.id = c.peer_id
-                   WHERE c.id = $1 FOR UPDATE OF c""",
-                chat_id,
-            )
-            if row is None:
-                raise BadRequest("чат не найден", 404)
-            if not excluded and store.is_blocked_peer(row["class"], row["tg_id"], row["username"]):
-                raise ApiError("служебный чат Telegram исключён всегда: в нём коды входа и токены", 409, "locked")
-            await conn.execute("UPDATE chats SET excluded = $2 WHERE id = $1", chat_id, excluded)
-            if purge:
-                status = await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
-                purged = int(status.split()[-1])
-    if excluded:
-        state.events.publish(events.CHAT_EXCLUDED, {"chat_id": chat_id, "purged": bool(purge)})
-    logger.info("чат %s: исключён=%s, стёрто сообщений=%s", chat_id, excluded, purged)
-    return JSONResponse({"id": chat_id, "excluded": excluded, "purged": purged})
+
+def _publish_excluded(chat_id: int, *, purged: bool) -> confirm.After:
+    async def publish() -> None:
+        if _state is not None:
+            _state.events.publish(events.CHAT_EXCLUDED, {"chat_id": chat_id, "purged": purged})
+    return publish
+
+
+async def _chat_for_update(conn: asyncpg.Connection, chat_id: int) -> asyncpg.Record:
+    row = await conn.fetchrow(
+        """SELECT p.class, p.tg_id, p.username, c.excluded FROM chats c JOIN peers p ON p.id = c.peer_id
+           WHERE c.id = $1 FOR UPDATE OF c""", chat_id)
+    if row is None:
+        raise confirm.Refused("чат не найден", 404)
+    return row
+
+
+@confirm.applier(CHAT_EXCLUDE)
+async def _apply_chat_exclude(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    chat_id = int(payload["chat_id"])
+    _no_running_import(_state, confirm.Refused)
+    await _chat_for_update(conn, chat_id)
+    await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", chat_id)
+    logger.info("чат %s: исключён", chat_id)
+    return confirm.Done(result={"id": chat_id, "excluded": True, "purged": 0},
+                        after=_publish_excluded(chat_id, purged=False))
+
+
+@confirm.applier(CHAT_INCLUDE)
+async def _apply_chat_include(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    chat_id = int(payload["chat_id"])
+    _no_running_import(_state, confirm.Refused)
+    row = await _chat_for_update(conn, chat_id)
+    if store.is_blocked_peer(row["class"], row["tg_id"], row["username"]):
+        raise confirm.Refused(_LOCKED, 409, "locked")
+    confirm.must_not_widen(row["excluded"])     # строка чата заблокирована: исключён ли он сейчас
+    await conn.execute("UPDATE chats SET excluded = false WHERE id = $1", chat_id)
+    logger.info("чат %s: возвращён в архив", chat_id)
+    return confirm.Done(result={"id": chat_id, "excluded": False, "purged": 0})
+
+
+@confirm.applier(CHAT_PURGE)
+async def _apply_chat_purge(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    chat_id = int(payload["chat_id"])
+    _no_running_import(_state, confirm.Refused)
+    row = await _chat_for_update(conn, chat_id)
+    if not row["excluded"]:
+        # За время ожидания чат вернули в архив: стирать сообщения действующего чата нельзя.
+        raise confirm.Refused("чат больше не исключён: стереть сообщения можно только у исключённого чата")
+    # Без владельца стирать можно только «ничего»: исключённый чат новых сообщений не принимает.
+    confirm.must_not_widen(await conn.fetchval("SELECT EXISTS (SELECT 1 FROM messages WHERE chat_id = $1)", chat_id))
+    status = await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
+    purged = int(status.split()[-1])
+    logger.info("чат %s: стёрто сообщений=%s", chat_id, purged)
+    return confirm.Done(note=f"Стёрто сообщений: {purged}.", result=purged,
+                        after=_publish_excluded(chat_id, purged=True))
 
 
 # ---------------------------------------------------------------------------
@@ -876,19 +967,60 @@ async def run_import(request: Request) -> JSONResponse:
                                  or not 0 < owner_id <= MAX_ID):
         raise BadRequest("поле owner_id: нужен положительный идентификатор")
 
-    registry = _registry(request)
-    if registry.running() is not None:
-        raise ApiError("импорт уже идёт — дождитесь его окончания", 409, "import_running")
-    if upload.scan_task is not None:
-        raise ApiError("файл ещё просматривается — дождитесь списка чатов", 409, "scanning")
-    if upload.state == "done" or not upload.has_file():
-        raise ApiError("файл уже импортирован или удалён — загрузите его заново", 409, "no_file")
-
     state = state_of(request)
+    _check_runnable(_registry(request), upload, ApiError)
+    # Импорт добавляет в архив сообщения, подлинность которых сервис проверить не может: среди
+    # них могут быть и «ваши собственные», после которых ассистенту разрешено готовить черновики
+    # в этот чат. Поэтому при своём боте согласований импорт ждёт владельца.
+    size = max(1, round(upload.size / 1024 / 1024))
+    summary = (f"Импортировать в архив загруженную выгрузку Telegram (файл около {size} МБ, загружен "
+               f"{upload.uploaded_at:%d.%m.%Y в %H:%M} UTC). ")
+    if upload.scan is not None:
+        owner = upload.scan.get("owner") or {}
+        summary += (f"В выгрузке чатов: {len(upload.scan['chats'])}, сообщений: {upload.scan['total_messages']}"
+                    + (f"; владелец выгрузки — {clean_line(owner.get('name'), 60) or 'без имени'} "
+                       f"(идентификатор Telegram {owner.get('tg_user_id')})" if owner else "") + ". ")
+    else:
+        summary += "Состав файла перед импортом не просматривался. "
+    if exclude:
+        summary += f"Не принимать чатов: {len(exclude)}. "
+    summary += ("Сообщения из выгрузки попадут в архив, и ассистент сможет их читать. Проверить, что "
+                "выгрузка настоящая, сервис не может: подтверждайте, только если загружали её сами.")
+    payload = {"import_id": upload.id, "exclude": sorted(f"{kind}:{tg_id}" for kind, tg_id in exclude),
+               "owner_id": owner_id}
+    async with state.pool.acquire() as conn:
+        answer, view = await settle(conn, IMPORT_RUN, payload, summary=summary)
+    return answer or JSONResponse(view, status_code=202)
+
+
+def _check_runnable(registry: Registry, upload: Upload, error: type[Exception]) -> None:
+    if registry.running() is not None:
+        raise error("импорт уже идёт — дождитесь его окончания", 409, "import_running")
+    if upload.scan_task is not None:
+        raise error("файл ещё просматривается — дождитесь списка чатов", 409, "scanning")
+    if upload.state == "done" or not upload.has_file():
+        raise error("файл уже импортирован или удалён — загрузите его заново", 409, "no_file")
+
+
+@confirm.applier(IMPORT_RUN)
+async def _apply_import_run(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    confirm.must_not_widen(True)      # импорт всегда добавляет в архив: без владельца не выполняется
+    state = _state
+    registry: Registry | None = state.extras.get("imports") if state is not None else None
+    upload = registry.items.get(str(payload.get("import_id"))) if registry is not None else None
+    if state is None or upload is None:
+        raise confirm.Refused(
+            "загрузка не найдена — возможно, сервис перезапускался; загрузите файл заново", 404)
+    _check_runnable(registry, upload, confirm.Refused)
+    try:
+        exclude = _parse_exclude(payload.get("exclude"))
+    except BadRequest as exc:
+        raise confirm.Refused(exc.message, 400) from None
+    owner_id = payload.get("owner_id")
     upload.state, upload.error, upload.stats, upload.live = "running", None, None, None
     upload.started_at, upload.finished_at, upload.reader = datetime.now(timezone.utc), None, None
     upload.run_task = state.spawn(_run(state, upload, exclude, owner_id), name=f"import-{upload.id}")
-    return JSONResponse(upload.view(), status_code=202)
+    return confirm.Done(note="Импорт запущен.", result=upload.view())
 
 
 @_handler
@@ -929,6 +1061,8 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     if removed:
         logger.info("удалены файлы загрузок прошлого запуска: %s", removed)
     state.extras["imports"] = registry
+    global _state
+    _state = state
 
     async def janitor() -> None:
         while True:
@@ -939,6 +1073,8 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if _state is state:
+            _state = None
         # Фоновые работы к этому моменту остановлены. Файлы без записей о них не нужны.
         for upload in list(registry.items.values()):
             if upload.reader is not None:

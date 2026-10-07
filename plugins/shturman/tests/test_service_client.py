@@ -34,6 +34,26 @@ def test_call_returns_status_code(service):
     assert client(service).call("GET", "/api/status") == (202, {"state": "scanning"})
 
 
+def test_waiting_for_the_owner_is_never_mistaken_for_done(service):
+    """Сервис со своим ботом согласований не применил действие: тот, кто читает только тело
+    ответа (инструмент агента), должен увидеть «не выполнено», а не данные карточки."""
+    waiting = {"status": "pending_confirmation", "action_id": 7, "expires_at": "2026-10-07T12:00:00+00:00",
+               "summary": "Принять предложенное обязательство № 9 (Иван Петров → вам; срок 09.10.2026).",
+               "note": "Ждёт вашего подтверждения в боте согласований."}
+    service.replies[("POST", "/api/commitments/9/close")] = (202, waiting)
+    tools = client(service, service_routes.TOOLS)
+    assert tools.call("POST", "/api/commitments/9/close", json_body={}) == (202, waiting)   # как есть
+    assert service_client.is_pending(202, waiting) and not service_client.is_pending(200, waiting)
+    out = tools.request("POST", "/api/commitments/9/close", json_body={})
+    assert out == {"ok": False, "applied": False, "status": "pending_confirmation", "action_id": 7,
+                   "expires_at": "2026-10-07T12:00:00+00:00", "note": service_client.PENDING_NOTE}
+    assert "НЕ выполнено" in out["note"] and "Иван Петров" not in str(out)
+    # обычный ответ 202 («ещё считается») остаётся как был
+    service.replies[("GET", "/api/commitments")] = (202, {"state": "scanning"})
+    assert tools.request("GET", "/api/commitments") == {"state": "scanning"}
+    assert not service_client.is_pending(202, {"state": "scanning"})
+
+
 def test_route_outside_allowlist_never_reaches_the_network(service):
     with pytest.raises(NotAllowed) as caught:
         client(service, service_routes.TOOLS).request("PUT", "/api/outbox/policy", json_body={"x": 1})

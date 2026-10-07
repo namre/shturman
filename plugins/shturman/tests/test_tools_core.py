@@ -87,6 +87,17 @@ def test_commitment_refusal_from_service(service, client):
                    "notice": tools.UNTRUSTED_NOTICE}
 
 
+def test_action_waiting_for_the_owner_is_told_to_the_agent_as_not_done(service, client):
+    """Сервис со своим ботом согласований: «вернуть в работу» неодобренное обязательство ждёт владельца."""
+    service.replies[("POST", "/api/commitments/9/reopen")] = (202, {
+        "status": "pending_confirmation", "action_id": 4, "expires_at": "2026-10-07T12:00:00+00:00",
+        "summary": "Вернуть в работу обязательство № 9 (Иван Петров → вам).", "note": "Ждёт вашего подтверждения."})
+    out = tools.run("shturman_commitment_update", client, {"commitment_id": 9, "action": "reopen"})
+    assert out["ok"] is False and out["applied"] is False and out["status"] == "pending_confirmation"
+    assert "НЕ выполнено" in out["note"] and "Не повторяйте запрос" in out["note"]
+    assert "summary" not in out and "Иван Петров" not in str(out)     # имена из переписки агенту не идут
+
+
 def test_people_search_card_and_alias(service, client):
     tools.run("shturman_people", client, {"action": "search", "query": "Петров", "chat_id": 7})
     method, path, query, _ = last(service)
