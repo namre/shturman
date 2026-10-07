@@ -37,6 +37,7 @@ logger = logging.getLogger("shturman")
 
 MODULES = (
     "shturman.api_core",
+    "shturman.executor.service",   # раньше остальных: кто выполняет задания, решается до их постановки
     "shturman.ingest_api",
     "shturman.mcp_server",
     "shturman.embeddings",
