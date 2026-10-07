@@ -352,7 +352,7 @@ SELECT m.id, m.chat_id, m.text, m.sender_name, m.tg_message_id, c.title, c.type 
 FROM messages m
 JOIN chats c ON c.id = m.chat_id
 JOIN peers p ON p.id = c.peer_id
-WHERE m.id = $1 AND m.chat_id = $2 AND m.kind = 'message' AND m.deleted_at IS NULL
+WHERE m.id = $1 AND m.chat_id = $2 AND m.kind = 'message' AND m.deleted_at IS NULL AND m.agent_visible
 """
 _COUNTED = "('checking', 'relevant', 'not_relevant', 'failed', 'no_answer')"
 

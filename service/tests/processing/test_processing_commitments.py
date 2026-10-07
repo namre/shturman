@@ -525,7 +525,8 @@ async def test_what_is_skipped_and_watermark_moves_once(conn):
     out = await plan(conn)
     assert out["messages"] == {"new": 9, "eligible": 1, "skipped_old": 1, "skipped_excluded": 1,
                                "skipped_chat_type": 2, "skipped_bot": 1, "skipped_service": 1,
-                               "skipped_deleted": 1, "skipped_empty": 1, "assistant": 0, "deferred": 0}
+                               "skipped_deleted": 1, "skipped_empty": 1, "skipped_hidden": 0,
+                               "assistant": 0, "deferred": 0}
     assert (out["planned"], out["episodes"], out["cap_reached"], out["more"]) == (1, 1, False, False)
     job, = await claim(conn)
     assert job["payload"]["input"].count("Пришлю отчёт завтра") == 1

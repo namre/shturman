@@ -122,6 +122,7 @@ _VERDICT = f"""CASE WHEN c.excluded THEN 'skipped_excluded'
                     WHEN c.type IN ({_SKIP_TYPES_SQL}) THEN 'skipped_chat_type'
                     WHEN sp.is_bot IS TRUE THEN 'skipped_bot'
                     WHEN m.deleted_at IS NOT NULL THEN 'skipped_deleted'
+                    WHEN NOT m.agent_visible THEN 'skipped_hidden'
                     WHEN m.kind <> 'message' THEN 'skipped_service'
                     WHEN m.sent_at < $2 THEN 'skipped_old'
                     WHEN btrim(m.text) = '' THEN 'skipped_empty'
@@ -185,7 +186,7 @@ async def _context_for(conn: asyncpg.Connection, first: Msg, options: Options) -
     rows = await conn.fetch(
         f"""SELECT {_MSG_COLUMNS} FROM messages m
             WHERE m.chat_id = $1 AND (m.sent_at, m.id) < ($2, $3) AND m.sent_at > $2 - make_interval(hours => $4)
-              AND m.deleted_at IS NULL AND m.kind = 'message' AND m.text <> ''
+              AND m.deleted_at IS NULL AND m.agent_visible AND m.kind = 'message' AND m.text <> ''
             ORDER BY m.sent_at DESC, m.id DESC LIMIT $5""",
         first.chat_id, first.sent_at, first.id, options.context_hours, options.context_messages)
     return await _mark_service_sent(conn, [_msg(r) for r in reversed(rows)])
@@ -400,7 +401,8 @@ async def plan_run(
 
         # итоги — только по сообщениям до отметки; остальное отложено до следующего прогона
         counts = {"new": 0, "eligible": 0, "skipped_old": 0, "skipped_excluded": 0, "skipped_chat_type": 0,
-                  "skipped_bot": 0, "skipped_service": 0, "skipped_deleted": 0, "skipped_empty": 0}
+                  "skipped_bot": 0, "skipped_service": 0, "skipped_deleted": 0, "skipped_empty": 0,
+                  "skipped_hidden": 0}
         for row in await conn.fetch(
                 f"SELECT ({_VERDICT}) AS verdict, count(*) AS n {_FROM} WHERE m.id > $1 AND m.id <= $3 GROUP BY 1",
                 watermark, floor, new_watermark):
@@ -559,7 +561,9 @@ async def _load_episode(conn: asyncpg.Connection, ctx: dict[str, Any]) -> tuple[
     if chat is None or chat["excluded"]:
         return None
     rows = await conn.fetch(
-        f"""SELECT {_MSG_COLUMNS}, m.deleted_at IS NOT NULL AS deleted, m.kind FROM messages m
+        # Скрытое защитой от внедрённых инструкций — как удалённое: в запрос к модели не идёт.
+        f"""SELECT {_MSG_COLUMNS}, (m.deleted_at IS NOT NULL OR NOT m.agent_visible) AS deleted, m.kind
+            FROM messages m
             WHERE m.chat_id = $1 AND m.id = ANY($2::bigint[])""",
         chat_id, [i for i in [*ids, *context_ids] if isinstance(i, int)])
     by_id = {r["id"]: r for r in rows}

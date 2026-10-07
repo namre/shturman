@@ -12,8 +12,9 @@
 | hermes-telegram-business | Плагин бизнес-режима; ставится из мастера по SHA | MIT | https://github.com/NousResearch/hermes-telegram-business |
 | PostgreSQL 16 | Хранилище архива | PostgreSQL License | https://www.postgresql.org |
 | pgvector 0.8.7 | Векторный поиск в Postgres | PostgreSQL License | https://github.com/pgvector/pgvector |
-| text-embeddings-inference 1.9.4 | Сервер эмбеддингов (по желанию) | Apache-2.0 | https://github.com/huggingface/text-embeddings-inference |
+| text-embeddings-inference 1.9.4 | Сервер эмбеддингов и сервер классификатора защиты (оба по желанию) | Apache-2.0 | https://github.com/huggingface/text-embeddings-inference |
 | intfloat/multilingual-e5-small | Модель эмбеддингов (по желанию) | MIT | https://huggingface.co/intfloat/multilingual-e5-small |
+| Horizon-Labs/prompt-injection-guard-small, ревизия `3215a27` | Модель-классификатор защиты от внедрённых инструкций (по желанию); основа — `jhu-clsp/mmBERT-small` (MIT) | Apache-2.0 (по карточке модели; файла лицензии в репозитории модели нет) | https://huggingface.co/Horizon-Labs/prompt-injection-guard-small |
 | Python 3.12, образ `python:3.12.12-slim-bookworm` | Основа образа сервиса переписки | PSF License; пакеты Debian — под своими лицензиями | https://hub.docker.com/_/python |
 | git | История страниц памяти; ставится в образ сервиса как отдельная программа | GPL-2.0 | https://git-scm.com |
 

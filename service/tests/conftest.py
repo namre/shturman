@@ -131,3 +131,59 @@ async def make_client(conn, config):
         yield factory
     finally:
         await stack.aclose()
+
+
+# --- защита от внедрённых инструкций ---
+
+class FakeScorer:
+    """Подставной классификатор: слово «взлом» в тексте — внедрённая инструкция."""
+
+    name = "fake/guard"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.error: Exception | None = None
+
+    def score(self, texts):
+        self.calls.append(list(texts))
+        if self.error is not None:
+            raise self.error
+        return [0.97 if "взлом" in t.lower() else 0.02 for t in texts]
+
+
+@pytest.fixture(autouse=True)
+def _no_guard_left_behind():
+    """Работающая защита — состояние процесса: тест не должен оставить её следующему."""
+    from shturman import guard
+
+    guard.set_current(None)
+    yield
+    guard.set_current(None)
+
+
+@pytest_asyncio.fixture
+async def guarded(conn):
+    """Включённая защита с подставной моделью — как её ставит guard.service, но без фонового
+    обхода: тест сам вызывает `guard.sweep()`, когда он нужен."""
+    from types import SimpleNamespace
+
+    from shturman import guard
+    from shturman.events import MESSAGES_HIDDEN, Events
+    from shturman.guard import core
+
+    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=4)
+    scorer, events = FakeScorer(), Events()
+    hidden: list[int] = []
+
+    async def on_hidden(payload):
+        hidden.extend(payload["message_ids"])
+
+    events.subscribe(MESSAGES_HIDDEN, on_hidden)
+    active = core.Guard(pool, core.Settings(threshold=0.9), model=scorer, events=events)
+    guard.set_current(active)
+    try:
+        yield SimpleNamespace(guard=active, scorer=scorer, pool=pool, events=events, hidden=hidden)
+    finally:
+        guard.set_current(None)
+        await events.drain()
+        await pool.close()

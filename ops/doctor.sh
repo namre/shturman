@@ -143,6 +143,37 @@ print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n
     fail archive "сервис не отдал состояние"
   fi
 
+  # Защита от внедрённых инструкций: включена ли, отвечает ли модель и сколько входящих сообщений
+  # ассистент видит непроверенными. Только числа и состояния.
+  grd="$(docker inspect -f '{{.State.Status}}' shturman-guard 2>/dev/null || echo off)"
+  case "$st" in
+    *'"guard_enabled":true'*)
+      unchecked="$(num guard_unchecked)"; hidden="$(num guard_hidden)"; waiting="$(num guard_waiting_owner)"
+      case "$st" in
+        *'"guard_problem":"unreachable"'*)
+          fail guard "модель-классификатор не отвечает (контейнер: $grd) — входящие сообщения видны ассистенту НЕПРОВЕРЕННЫМИ: ${unchecked:-0}; docker logs --tail 50 shturman-guard" ;;
+        *'"guard_problem":"model_mismatch"'*)
+          fail guard "контейнер классификатора отдаёт не ту модель — входящие сообщения не проверяются: ${unchecked:-0}; запустите ./ops/guard.sh on" ;;
+        *'"guard_model_used":false'*)
+          warn guard "защита работает только на правилах, без модели — это заметно слабее (./ops/guard.sh on); скрыто: ${hidden:-0}" ;;
+        *)
+          if [ "$grd" != "running" ]; then
+            fail guard "контейнер классификатора в состоянии: $grd — запустите ./ops/guard.sh on"
+          elif [ "${unchecked:-0}" -gt 500 ]; then
+            warn guard "защита включена; ещё не проверено сообщений: $unchecked (очередь разбирается фоном), скрыто: ${hidden:-0}, ждут вашего решения: ${waiting:-0}"
+          else
+            pass guard "защита от внедрённых инструкций включена; скрыто: ${hidden:-0}, ждут вашего решения: ${waiting:-0}, не проверено: ${unchecked:-0}"
+          fi ;;
+      esac ;;
+    "") ;;
+    *)
+      if [ "$grd" = "off" ]; then
+        warn guard "защита от внедрённых инструкций выключена — входящие сообщения ассистент читает без проверки (./ops/guard.sh on, docs/guard.md)"
+      else
+        warn guard "контейнер классификатора запущен ($grd), но защита в сервисе выключена — запустите ./ops/guard.sh on или off"
+      fi ;;
+  esac
+
   emb="$(docker inspect -f '{{.State.Status}}' shturman-embeddings 2>/dev/null || echo off)"
   case "$emb" in
     running) pass embeddings "поиск по смыслу включён" ;;

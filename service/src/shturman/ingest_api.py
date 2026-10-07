@@ -45,7 +45,7 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from . import bridge, db, events, store
+from . import bridge, db, events, guard, store
 from .api_core import BadRequest, need_str, only_without_own_bot
 from .app import AppState, state_of
 from .botapi_normalize import (
@@ -291,7 +291,8 @@ async def _store_business_message(
         if edited and before is not None and before["text"] != record.text:
             record = _as_newer_edit(record, before["edited_at"])
         result = await store.upsert_messages(
-            conn, [(chat_id, record, outgoing)], source="business", owner_tg_id=owner_tg_id)
+            conn, [(chat_id, record, outgoing)], source="business", owner_tg_id=owner_tg_id,
+            hold=guard.holding())
     if result.new + result.known == 0:
         return None
     # «Изменилось» — появилась новая строка либо пришла правка новее сохранённой. Повторная
@@ -336,7 +337,9 @@ async def accept_business_message(
                     raise BadRequest("архив занят, повторите запрос", 503) from None
     if saved is None:
         return {"stored": False, "message_id": None, "reason": "excluded"}
-    if saved["changed"]:
+    # Новый входящий текст записан скрытым от ассистента; проверка решает, открыть ли его.
+    hidden = await guard.screen([saved["message_id"]])
+    if saved["changed"] and not hidden:
         state.events.publish(events.MESSAGE_LIVE, {
             "account_id": link["account_id"], "chat_id": saved["chat_id"],
             "message_id": saved["message_id"], "source": "business",

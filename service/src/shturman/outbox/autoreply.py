@@ -150,7 +150,8 @@ async def eligible(conn: asyncpg.Connection, tgt: Target) -> Decision:
 async def _trigger_state(conn: asyncpg.Connection, settings: dict[str, Any], tgt: Target, message_id: int) -> Decision:
     """Входящее ещё на месте, не изменено, не устарело и после него в чате ничего нет."""
     row = await conn.fetchrow(
-        """SELECT m.deleted_at IS NOT NULL AS gone, m.edited_at IS NOT NULL AS edited,
+        # Скрытое защитой от внедрённых инструкций — как исчезнувшее: на него не отвечают.
+        """SELECT (m.deleted_at IS NOT NULL OR NOT m.agent_visible) AS gone, m.edited_at IS NOT NULL AS edited,
                   m.sent_at < now() - make_interval(secs => $3) AS stale,
                   EXISTS (SELECT 1 FROM messages n
                           WHERE n.chat_id = m.chat_id AND n.kind = 'message' AND n.deleted_at IS NULL
@@ -262,7 +263,7 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
             return
         msg = await conn.fetchrow(
             """SELECT id, text, is_outgoing, sender_peer_id FROM messages
-               WHERE id = $1 AND chat_id = $2 AND kind = 'message' AND deleted_at IS NULL""",
+               WHERE id = $1 AND chat_id = $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible""",
             message_id, chat_id)
         if msg is None or not msg["text"].strip() or msg["is_outgoing"] is True:
             return
@@ -288,7 +289,7 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
         recent = await conn.fetch(
             """SELECT sent_at, is_outgoing, text FROM (
                    SELECT id, sent_at, is_outgoing, text FROM messages
-                   WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL
+                   WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible
                    ORDER BY sent_at DESC, id DESC LIMIT $3) t
                ORDER BY sent_at, id""",
             chat_id, message_id, settings["context_messages"])

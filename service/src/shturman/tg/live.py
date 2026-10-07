@@ -35,7 +35,7 @@ from telethon import events as tl_events
 from telethon.tl import types
 
 from .. import events as ev
-from .. import store
+from .. import guard, store
 from ..records import MessageRecord
 from . import normalize, sync
 from .normalize import PeerKey
@@ -129,7 +129,11 @@ class LiveIngest:
                     real_edit = bool(await sync.promote_hidden_edits(
                         conn, rows, {(chat_id, record.tg_message_id): hidden_edit}))
                 result = await store.upsert_messages(
-                    conn, [(chat_id, record, outgoing)], source="session", owner_tg_id=self.self_id)
+                    conn, [(chat_id, record, outgoing)], source="session", owner_tg_id=self.self_id,
+                    hold=guard.holding())
+        # Новый входящий текст записан скрытым от ассистента; проверка решает, открыть ли его.
+        # Проверяются и новые строки, и известные: правка меняет текст уже проверенного сообщения.
+        hidden = await guard.screen(result.new_ids + result.known_ids)
         if edited and not real_edit:
             return  # реакция или смена кнопок: для остальных модулей ничего не произошло
         if edited:
@@ -139,6 +143,8 @@ class LiveIngest:
         else:
             ids = result.new_ids
         for message_id in ids:
+            if message_id in hidden:
+                continue   # скрыто защитой: остальные модули о нём не узнают
             self.events.publish(ev.MESSAGE_LIVE, {
                 "account_id": self.account_id, "chat_id": chat_id, "message_id": message_id,
                 "source": "session", "outgoing": outgoing, "edited": edited, "via_bot": via_bot,

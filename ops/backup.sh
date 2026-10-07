@@ -24,7 +24,7 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 name="$dir/data-$stamp.tar.gz"
 # Файлы могут меняться на ходу (журналы Hermes): для tar это предупреждение, а не провал.
 tar -czf "$name" --warning=no-file-changed \
-  --exclude='data/hermes/logs' --exclude='data/postgres' --exclude='data/embeddings' \
+  --exclude='data/hermes/logs' --exclude='data/postgres' --exclude='data/embeddings' --exclude='data/guard' \
   --exclude='data/shturman/uploads' data || [ $? -eq 1 ]
 count="$(tar -tzf "$name" | wc -l)"
 [ "$count" -gt 0 ] || { echo "копия пустая: $name" >&2; exit 1; }

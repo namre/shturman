@@ -2,6 +2,8 @@
 compose.override.yaml
 local/
 data/
+# размеченный набор примеров для защиты от внедрённых инструкций — не данные экземпляра
+!service/tests/guard/data/
 *.session
 *.session-journal
 __pycache__/

@@ -61,6 +61,8 @@ TOOLS: Routes = _compile([
 UI: Routes = _compile([
     ("GET", r"/api/status"),
     ("GET", r"/api/embeddings/status"),
+    # защита от внедрённых инструкций: только числа и состояние; выключателя в API нет
+    ("GET", r"/api/guard/status"),
     ("GET", r"/api/processing/status"),
     # чаты и исключения
     ("GET", r"/api/chats"),

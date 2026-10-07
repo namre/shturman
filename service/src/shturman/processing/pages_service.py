@@ -218,6 +218,8 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
 
     pages_build.on_wake(alarm.set)
     state.events.subscribe(events.MESSAGES_DELETED, on_deleted)
+    # Скрытое защитой от внедрённых инструкций для страниц — то же, что удалённое.
+    state.events.subscribe(events.MESSAGES_HIDDEN, on_deleted)
     state.spawn(worker(), name="pages-build")
     try:
         yield
