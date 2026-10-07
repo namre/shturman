@@ -72,6 +72,14 @@ jobs:
           test "$(svc)" = "- https://assistant.example.com 127.0.0.1:8765:8765"
           export SHTURMAN_SETUP_URL=https://assistant.example.com:8443
           test "$(svc)" = "https://assistant.example.com:8443 https://assistant.example.com 127.0.0.1:8765:8765"
+          # Адрес API своей модели: пока строки в .env нет, контейнер переменную не получает вовсе.
+          # Иначе сервис считал бы адрес заданным на сервере, и страница настройки не давала бы его
+          # ввести. Со строкой — получает её значение.
+          llm() { docker compose config --format json | python3 -c 'import json, sys; e = json.load(sys.stdin)["services"]["shturman"]["environment"]; print(e.get("SHTURMAN_LLM_BASE_URL", "нет"))'; }
+          case "$(llm)" in None|нет) ;; *) echo "адрес модели не должен подставляться по умолчанию: $(llm)"; exit 1 ;; esac
+          export SHTURMAN_LLM_BASE_URL=https://openrouter.ai/api/v1
+          test "$(llm)" = "https://openrouter.ai/api/v1"
+          unset SHTURMAN_LLM_BASE_URL
         env:
           HERMES_UID: "1000"
           HERMES_GID: "1000"
@@ -101,6 +109,23 @@ jobs:
           grep -qx 'SHTURMAN_MODE=hermes' .env
           grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
           test "$(stat -c '%a' .env)" = "600"
+          # Неразборчивый адрес в .env ./ops/up.sh останавливает до любого обращения к Docker: сервис
+          # переписки с таким значением не запустился бы. Путь у адреса дашборда допустим, у адреса
+          # страницы настройки — нет; сам запуск стека здесь подменён отказом.
+          mkdir stub; printf '#!/bin/sh\necho "docker $*" >> "%s/docker-called"\nexit 1\n' "$tmp" > stub/docker; chmod +x stub/docker
+          for bad in 'SHTURMAN_PUBLIC_URL=assistant.example.com' 'SHTURMAN_PUBLIC_URL=https://user@assistant.example.com' \
+                     'SHTURMAN_SETUP_URL=https://assistant.example.com:8443/shturman-setup/' 'SHTURMAN_SETUP_URL=assistant.example.com:8443'; do
+            printf 'SHTURMAN_MODE=hermes\n%s\n' "$bad" > .env
+            code=0; PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1 || code=$?
+            [ "$code" -eq 1 ] || { echo "$bad: код $code вместо 1"; exit 1; }
+            grep -q "^${bad%%=*} в .env записан не как" out.txt || { echo "$bad: нет объяснения"; cat out.txt; exit 1; }
+            if [ -e docker-called ]; then echo "$bad: до Docker дело дойти не должно"; exit 1; fi
+          done
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com/dash/\nSHTURMAN_SETUP_URL=https://assistant.example.com:8443/\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "адрес с путём у дашборда и с косой чертой у страницы допустимы"; cat out.txt; exit 1; fi
+          test -e docker-called
+          rm -rf stub docker-called out.txt
           # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
           # профиль и не трогает ни чужой, ни профиль Hermes. Запуск стека здесь подменён.
           printf '#!/bin/sh\nexit 0\n' > ops/up.sh
@@ -124,6 +149,18 @@ jobs:
           ./ops/init-env.sh --auto > /dev/null
           grep -qx 'COMPOSE_PROFILES=hermes' .env
           test "$(stat -c '%a' .env)" = "600"
+      # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
+      # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
+      # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.
+      - name: ops — отпечаток плагина
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops plugins "$tmp"/; cd "$tmp"
+          printf '. ops/lib.sh\nplugin_print\n' > print.sh
+          a="$(bash print.sh)"; test "${#a}" = "64"
+          test "$(bash print.sh)" = "$a"
+          echo 'правка' > plugins/shturman/tests/new-file.txt; test "$(bash print.sh)" = "$a"
+          echo '# правка' >> plugins/shturman/cli.py; test "$(bash print.sh)" != "$a"
+          grep -q 'plugin_print' ops/up.sh && grep -q 'plugin-code' ops/doctor.sh
       # Адрес страницы настройки переписки. Она обязана стоять на отдельном адресе (origin), не на
       # адресе дашборда: на общем адресе ассистент в Hermes мог бы действовать на ней от имени
       # вошедшего владельца. По умолчанию — то же имя, порт 8443.
@@ -266,3 +303,15 @@ jobs:
       # Образ сервиса должен собираться и запускаться: без базы он обязан выйти с понятной ошибкой.
       - run: docker build -t shturman-service:ci service
       - run: docker run --rm shturman-service:ci --help
+      # Страница настройки и миграции — данные пакета (pyproject.toml, package-data): в образе они
+      # должны лежать рядом с кодом, иначе сервис запустится, а страница ответит ошибкой.
+      - name: образ — файлы страницы настройки и миграции на месте
+        run: |
+          docker run --rm --entrypoint python shturman-service:ci -c '
+          from importlib import resources
+          root = resources.files("shturman")
+          for name in ("index.html", "setup.js", "setup.css", "qr.js"):
+              assert (root / "setup_page" / "static" / name).read_bytes(), name
+          names = sorted(p.name for p in (root / "migrations").iterdir() if p.name.endswith(".sql"))
+          assert names and names[-1] >= "0016_setup_page.sql", names
+          print("страница:", "ok", "миграций:", len(names))'

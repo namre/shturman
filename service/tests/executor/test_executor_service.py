@@ -254,7 +254,9 @@ def test_bot_status_explains_problems_in_plain_words(capsys):
     commands.bot_status(lambda method, path: (200, broken))
     out = capsys.readouterr().out
     assert "опрос Telegram: не работает" in out and "уже опрашивает другая программа" in out
-    assert "shturman bot-bind" in out and "приостановлен" in out and "Business Mode" in out
+    # Пункт у @BotFather называется Secretary Mode (документация Telegram, 2026-10-07); прежнее имя — рядом.
+    assert "shturman bot-bind" in out and "приостановлен" in out
+    assert "Secretary Mode" in out and "Business Mode" in out
     commands.bot_status(lambda method, path: (200, {"bot": {"configured": False}, "llm": {"configured": False}}))
     out = capsys.readouterr().out
     assert "не настроен" in out

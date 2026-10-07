@@ -126,7 +126,12 @@ services:
       # ./ops/init-env.sh. Контейнеру Hermes эти переменные не передаются никогда.
       SHTURMAN_BOT_TOKEN: ${SHTURMAN_BOT_TOKEN:-}
       SHTURMAN_LLM_API_KEY: ${SHTURMAN_LLM_API_KEY:-}
-      SHTURMAN_LLM_BASE_URL: ${SHTURMAN_LLM_BASE_URL:-https://api.openai.com/v1}
+      # Адрес API модели — без значения по умолчанию и без подстановки: контейнер получает эту
+      # переменную, только если строка есть в .env. Адрес, заданный окружением, сервис считает
+      # заданным на сервере: страница настройки показывает его и менять не даёт. Подставляй мы сюда
+      # адрес по умолчанию, поле адреса на странице было бы закрыто всегда. Строки нет — сервис сам
+      # берёт https://api.openai.com/v1, а владелец может ввести другой адрес на странице.
+      SHTURMAN_LLM_BASE_URL:
       SHTURMAN_LLM_MODEL: ${SHTURMAN_LLM_MODEL:-}
       SHTURMAN_LLM_MODEL_EXTRACT: ${SHTURMAN_LLM_MODEL_EXTRACT:-}
       SHTURMAN_LLM_MODEL_REPLY: ${SHTURMAN_LLM_MODEL_REPLY:-}

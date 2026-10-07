@@ -69,7 +69,8 @@ if [ "$have_url" = no ] && [ "$clear" = no ]; then
   if [ -n "$cur" ]; then
     echo "SHTURMAN_SETUP_URL: $cur"
     if [ -n "$public_origin" ] && [ "$(url_origin "$cur")" = "$public_origin" ]; then
-      echo "ВНИМАНИЕ: это тот же адрес, что у дашборда, — страница настройки переписки отключена." >&2
+      echo "ВНИМАНИЕ: это тот же адрес, что у дашборда, — по нему сервис страницу настройки переписки" >&2
+      echo "не отдаёт (через туннель SSH она открывается: ./ops/setup-link.sh --local)." >&2
       def="$(setup_url_default "$public")"
       echo "Задайте другой: ./ops/set-setup-url.sh ${def:-https://имя:порт}" >&2
     elif [ "$MODE" != hermes ]; then

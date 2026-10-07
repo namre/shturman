@@ -163,6 +163,18 @@ ensure_setup_url() {
   echo "Адрес страницы настройки переписки записан по умолчанию: $def (сменить — ./ops/set-setup-url.sh)"
 }
 
+# Отпечаток файлов плагина «Штурмана» (без тестов): по нему видно, изменился ли код плагина.
+# Hermes читает плагин при запуске и держит его в памяти: после обновления репозитория работающий
+# Hermes исполняет прежний код, пока его не перезапустят. ./ops/up.sh записывает отпечаток кода,
+# с которым Hermes запущен, в local/plugin.sha256 (вне git, секретов в нём нет), а ./ops/doctor.sh
+# сверяет его с файлами на диске.
+# shellcheck disable=SC2034  # читают скрипты, которые подключают этот файл: up.sh и doctor.sh
+PLUGIN_MARK="local/plugin.sha256"
+plugin_print() {
+  find plugins/shturman -type f ! -path '*/tests/*' ! -path '*/__pycache__/*' -print0 2>/dev/null \
+    | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
 # Включён ли профиль Compose в .env.
 profile_on() {
   case ",$(env_get COMPOSE_PROFILES)," in *,"$1",*) return 0 ;; *) return 1 ;; esac
