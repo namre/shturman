@@ -1,6 +1,6 @@
 [project]
 name = "shturman-service"
-version = "0.0.4"
+version = "0.0.5"
 description = "Сервис переписки «Штурмана»: архив Telegram, импорт экспорта, поиск"
 requires-python = ">=3.11"
 license = { text = "MIT" }
