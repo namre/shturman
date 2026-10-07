@@ -115,36 +115,36 @@ async def test_unknown_connection_is_fetched_from_telegram_once(rig):
 
 # --- два пути доставки ---
 
-async def test_plugin_and_service_connections_coexist_and_cannot_cross(rig):
+async def test_with_own_bot_business_goes_only_through_it(rig):
     await bind(rig)
     rig.tg.push(business_connection=link())
     await rig.bot.poll_once()
-    # подключение бота в Hermes приходит от плагина по HTTP, как раньше
-    plugin_link = link(bc="bc-plugin")
-    assert (await rig.client.post("/api/ingest/business/connection", json={"connection": plugin_link})).status_code == 200
-    assert await connections(rig.conn) == [("bc-plugin", "plugin", True, True), (BC, "service", True, True)]
-
-    stored = await rig.client.post("/api/ingest/business/message", json={"message": bmsg(60, "Через Hermes", bc="bc-plugin")})
-    assert stored.json()["stored"] is True
     rig.tg.push(business_message=bmsg(61, "Через бота согласований"))
     await rig.bot.poll_once()
-    assert await texts(rig.conn) == ["Через Hermes", "Через бота согласований"]
 
-    # владелец токена API не может писать в архив по подключению бота согласований и перехватить его
+    # держатель токена API не может ни завести своё подключение, ни писать в архив, ни перехватить чужое
     for path, body in (
+        ("/api/ingest/business/connection", {"connection": link(bc="bc-plugin")}),
         ("/api/ingest/business/message", {"message": bmsg(70, "Поддельное сообщение")}),
         ("/api/ingest/business/connection", {"connection": link(enabled=False)}),
         ("/api/ingest/business/deleted", {"business_connection_id": BC, "chat": private(IVAN_USER), "message_ids": [61]}),
     ):
         refused = await rig.client.post(path, json=body)
-        assert refused.status_code == 409 and refused.json()["code"] == "foreign_connection"
-    # и наоборот: обновление по подключению плагина, пришедшее боту согласований, не принимается
+        assert refused.status_code == 403 and refused.json()["code"] == "own_bot"
+    assert await texts(rig.conn) == ["Через бота согласований"]
+    assert await connections(rig.conn) == [(BC, "service", True, True)]
+    assert await rig.conn.fetchval("SELECT count(*) FROM messages WHERE deleted_at IS NOT NULL") == 0
+
+    # подключение, оставшееся от бота в Hermes (записано до включения своего бота), своему боту не подчиняется
+    account = await rig.conn.fetchval("SELECT account_id FROM business_connections WHERE id = $1", BC)
+    await rig.conn.execute(
+        "INSERT INTO business_connections (id, account_id, can_reply, enabled, via) VALUES ('bc-plugin', $1, true, true, 'plugin')",
+        account)
     rig.tg.push(business_message=bmsg(71, "Не тот путь", bc="bc-plugin"))
     rig.tg.push(business_connection=link(bc="bc-plugin", enabled=False))
     await rig.bot.poll_once()
-    assert await texts(rig.conn) == ["Через Hermes", "Через бота согласований"]
+    assert await texts(rig.conn) == ["Через бота согласований"]
     assert await connections(rig.conn) == [("bc-plugin", "plugin", True, True), (BC, "service", True, True)]
-    assert await rig.conn.fetchval("SELECT count(*) FROM messages WHERE deleted_at IS NOT NULL") == 0
 
     # отправка идёт через того бота, через которого пришло подключение
     for bc in ("bc-plugin", BC):

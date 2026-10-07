@@ -76,13 +76,19 @@ async def get(conn: asyncpg.Connection, job_id: int) -> dict[str, Any] | None:
     return out
 
 
-async def complete(conn: asyncpg.Connection, job_id: int, result: dict[str, Any]) -> dict[str, Any] | None:
-    """Закрывает задание. Возвращает его строку (с контекстом) или None, если оно уже закрыто."""
+async def complete(
+    conn: asyncpg.Connection, job_id: int, result: dict[str, Any], *, executor: str | None = None,
+) -> dict[str, Any] | None:
+    """Закрывает задание. Возвращает его строку (с контекстом) или None, если оно уже закрыто.
+
+    executor — чьё задание разрешено закрыть. Плагин по HTTP закрывает только свои задания:
+    иначе держатель токена API мог бы подложить результат заданию своего исполнителя сервиса.
+    """
     row = await conn.fetchrow(
         """UPDATE jobs SET status = 'done', result = $2::jsonb, finished_at = now(), locked_until = NULL
-           WHERE id = $1 AND status = 'running'
+           WHERE id = $1 AND status = 'running' AND ($3::text IS NULL OR executor = $3)
            RETURNING *""",
-        job_id, json.dumps(result, ensure_ascii=False),
+        job_id, json.dumps(result, ensure_ascii=False), executor,
     )
     if row is None:
         return None
@@ -93,11 +99,16 @@ async def complete(conn: asyncpg.Connection, job_id: int, result: dict[str, Any]
 
 
 async def fail(
-    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None = 60
+    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None = 60,
+    executor: str | None = None,
 ) -> str:
-    """Отмечает неудачу. Пока попытки остались, задание возвращается в очередь. Возвращает новый статус."""
+    """Отмечает неудачу. Пока попытки остались, задание возвращается в очередь. Возвращает новый статус.
+
+    executor — чьё задание разрешено трогать (см. complete)."""
     row = await conn.fetchrow(
-        "SELECT attempts, max_attempts FROM jobs WHERE id = $1 AND status = 'running' FOR UPDATE", job_id
+        """SELECT attempts, max_attempts FROM jobs
+           WHERE id = $1 AND status = 'running' AND ($2::text IS NULL OR executor = $2) FOR UPDATE""",
+        job_id, executor,
     )
     if row is None:
         return "unknown"

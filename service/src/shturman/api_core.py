@@ -16,9 +16,9 @@ REAP_EVERY = 60  # секунд
 
 
 class BadRequest(Exception):
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(self, message: str, status: int = 400, code: str | None = None) -> None:
         super().__init__(message)
-        self.message, self.status = message, status
+        self.message, self.status, self.code = message, status, code
 
 
 MAX_BODY = 1024 * 1024  # байт: JSON-запросы внутреннего API заведомо меньше
@@ -65,7 +65,10 @@ def handler(fn):
         try:
             return await fn(request)
         except BadRequest as exc:
-            return JSONResponse({"error": exc.message}, status_code=exc.status)
+            payload = {"error": exc.message}
+            if exc.code:
+                payload["code"] = exc.code
+            return JSONResponse(payload, status_code=exc.status)
         except (ValueError, TypeError):
             # число не того вида в запросе — это ошибка запроса, а не сервиса
             return JSONResponse({"error": "неверное значение в запросе"}, status_code=400)
@@ -94,7 +97,9 @@ async def complete_job(request: Request) -> JSONResponse:
     if not isinstance(result, dict):
         raise BadRequest("поле result: нужен объект")
     async with state_of(request).pool.acquire() as conn:
-        ok = await bridge.deliver_result(conn, int(request.path_params["job_id"]), result)
+        ok = await bridge.deliver_result(
+            conn, int(request.path_params["job_id"]), result, executor="plugin",
+        )
     return JSONResponse({"ok": ok}, status_code=200 if ok else 409)
 
 
@@ -105,21 +110,24 @@ async def fail_job(request: Request) -> JSONResponse:
     async with state_of(request).pool.acquire() as conn:
         status = await bridge.deliver_failure(
             conn, int(request.path_params["job_id"]), str(data.get("error") or "ошибка без описания"),
-            retry_in=None if retry is None else int(retry),
+            retry_in=None if retry is None else int(retry), executor="plugin",
         )
     return JSONResponse({"status": status})
 
 
-def _only_without_own_bot() -> None:
-    """Со своим ботом сервиса нажатия и привязка владельца через плагин не принимаются:
-    иначе их мог бы подделать ассистент, у которого в Hermes есть терминал."""
+OWN_BOT = "own_bot"  # код отказа: по нему плагин понимает, что повторять запрос бесполезно
+
+
+def only_without_own_bot() -> None:
+    """Со своим ботом сервиса нажатия, привязка владельца и бизнес-поток через плагин
+    не принимаются: иначе их мог бы подделать ассистент, у которого в Hermes есть терминал."""
     if bridge.owns_bot():
-        raise BadRequest("это действие выполняется только через бота согласований", 403)
+        raise BadRequest("это действие выполняется только через бота согласований", 403, OWN_BOT)
 
 
 @handler
 async def telegram_callback(request: Request) -> JSONResponse:
-    _only_without_own_bot()
+    only_without_own_bot()
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
         out = await bridge.dispatch_callback(conn, need_str(data, "data", limit=64), need_int(data, "from_user_id"))
@@ -128,7 +136,7 @@ async def telegram_callback(request: Request) -> JSONResponse:
 
 @handler
 async def put_owner(request: Request) -> JSONResponse:
-    _only_without_own_bot()
+    only_without_own_bot()
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
         await bridge.set_owner(conn, need_int(data, "user_id"), need_int(data, "chat_id"))
@@ -137,7 +145,7 @@ async def put_owner(request: Request) -> JSONResponse:
 
 @handler
 async def delete_owner(request: Request) -> JSONResponse:
-    _only_without_own_bot()
+    only_without_own_bot()
     async with state_of(request).pool.acquire() as conn:
         await bridge.clear_owner(conn)
     return JSONResponse({"ok": True})

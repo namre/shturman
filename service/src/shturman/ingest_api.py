@@ -46,7 +46,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
 from . import bridge, db, events, store
-from .api_core import BadRequest, need_str
+from .api_core import BadRequest, need_str, only_without_own_bot
 from .app import AppState, state_of
 from .botapi_normalize import (
     MAX_ID, NormalizeError, SkipMessage, chat_record, normalize_message, seen_by, user_name,
@@ -79,8 +79,7 @@ class ApiError(BadRequest):
     """Ошибка с машинным кодом: по нему плагин решает, что делать дальше."""
 
     def __init__(self, message: str, status: int, code: str) -> None:
-        super().__init__(message, status)
-        self.code = code
+        super().__init__(message, status, code)
 
 
 def _handler(fn):
@@ -90,7 +89,7 @@ def _handler(fn):
             return await fn(request)
         except BadRequest as exc:
             payload = {"error": exc.message}
-            if isinstance(exc, ApiError):
+            if exc.code:
                 payload["code"] = exc.code
             return JSONResponse(payload, status_code=exc.status)
         except ClientDisconnect:
@@ -243,6 +242,9 @@ async def accept_business_connection(
 
 @_handler
 async def business_connection(request: Request) -> JSONResponse:
+    # Со своим ботом сервиса бизнес-режим идёт только через него: по HTTP держатель токена API
+    # мог бы записать подключение и подложить в архив сообщения от имени чужих людей.
+    only_without_own_bot()
     data = await _json(request)
     return JSONResponse(await accept_business_connection(
         state_of(request).pool, _need_dict(data, "connection")))
@@ -345,6 +347,7 @@ async def accept_business_message(
 
 @_handler
 async def business_message(request: Request) -> JSONResponse:
+    only_without_own_bot()
     data = await _json(request)
     message = _need_dict(data, "message")
     edited = _flag(data, "edited", default=False)
@@ -383,6 +386,7 @@ async def accept_business_deleted(state: AppState, data: Any, *, via: str = "plu
 
 @_handler
 async def business_deleted(request: Request) -> JSONResponse:
+    only_without_own_bot()
     return JSONResponse(await accept_business_deleted(state_of(request), await _json(request)))
 
 

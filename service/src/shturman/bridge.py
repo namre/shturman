@@ -266,10 +266,14 @@ async def request_business_send(
 
 # --- разбор ответов ---
 
-async def deliver_result(conn: asyncpg.Connection, job_id: int, result: dict[str, Any]) -> bool:
-    """Закрывает задание и передаёт результат модулю-владельцу. Одна транзакция."""
+async def deliver_result(
+    conn: asyncpg.Connection, job_id: int, result: dict[str, Any], *, executor: str | None = None,
+) -> bool:
+    """Закрывает задание и передаёт результат модулю-владельцу. Одна транзакция.
+
+    executor — чьё задание разрешено закрыть; по HTTP от плагина это всегда "plugin"."""
     async with conn.transaction():
-        job = await jobs.complete(conn, job_id, result)
+        job = await jobs.complete(conn, job_id, result, executor=executor)
         if job is None:
             return False
         fn = _result_handlers.get(job["handler"] or "")
@@ -278,9 +282,11 @@ async def deliver_result(conn: asyncpg.Connection, job_id: int, result: dict[str
     return True
 
 
-async def deliver_failure(conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None) -> str:
+async def deliver_failure(
+    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None, executor: str | None = None,
+) -> str:
     async with conn.transaction():
-        status = await jobs.fail(conn, job_id, error, retry_in=retry_in)
+        status = await jobs.fail(conn, job_id, error, retry_in=retry_in, executor=executor)
         if status == "failed":
             job = await jobs.get(conn, job_id)
             fn = _failure_handlers.get((job or {}).get("handler") or "")

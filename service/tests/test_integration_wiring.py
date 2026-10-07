@@ -144,6 +144,32 @@ async def test_with_own_bot_plugin_cannot_press_buttons_or_rebind_owner(make_cli
     assert (await client.get("/api/status")).json()["own_bot"] is True
 
 
+async def test_plugin_cannot_close_a_job_of_the_builtin_executor(make_client, conn, own_bot):
+    """Держатель токена API не подкладывает результат заданию своего исполнителя сервиса."""
+    client, _ = await make_client("shturman.api_core")
+    await bridge.notify_owner(conn, "Карточка")
+    job = (await jobs.claim(conn, [bridge.NOTIFY_OWNER], worker="builtin", executor="builtin"))[0]
+    forged = await client.post(f"/api/jobs/{job['id']}/complete", json={"result": {"message_id": 1}})
+    assert forged.status_code == 409
+    failed = await client.post(f"/api/jobs/{job['id']}/fail", json={"error": "подлог", "retry_in": None})
+    assert failed.json()["status"] == "unknown"
+    assert (await jobs.get(conn, job["id"]))["status"] == "running"
+    assert await bridge.deliver_result(conn, job["id"], {"message_id": 7}, executor="builtin") is True
+
+
+async def test_with_own_bot_plugin_cannot_feed_business_updates(make_client, conn, own_bot):
+    """Бизнес-поток со своим ботом идёт только через него: по HTTP подключение не записать."""
+    client, _ = await make_client("shturman.api_core", "shturman.ingest_api")
+    await bridge.set_owner(conn, 1000, 1000)
+    link = {"id": "forged", "user": {"id": 1000, "first_name": "В"}, "is_enabled": True}
+    for path, payload in (("/api/ingest/business/connection", {"connection": link}),
+                          ("/api/ingest/business/message", {"message": {}}),
+                          ("/api/ingest/business/deleted", {})):
+        answer = await client.post(path, json=payload)
+        assert answer.status_code == 403 and answer.json()["code"] == "own_bot"
+    assert await conn.fetchval("SELECT count(*) FROM business_connections") == 0
+
+
 async def test_sensitive_action_waits_for_owner_press_in_own_bot(conn, own_bot):
     done = []
 

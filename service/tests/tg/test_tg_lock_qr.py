@@ -45,7 +45,7 @@ async def test_same_account_from_another_data_dir_is_refused_by_database_lock(co
     await first.release()
     await second.add("account:1000")
     await second.release()
-    assert await conn.fetchval("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'") == 0
+    assert await conn.fetchval("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())") == 0
 
 
 async def test_lost_database_connection_is_reported(conn, tmp_path):

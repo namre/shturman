@@ -29,7 +29,8 @@ git вызывается как отдельная программа и с ко
 | ijson | Потоковое чтение экспорта | BSD-3-Clause | https://github.com/ICRAR/ijson |
 | starlette | Каркас HTTP | BSD-3-Clause | https://pypi.org/project/starlette/ |
 | uvicorn | Сервер HTTP | BSD-3-Clause | https://pypi.org/project/uvicorn/ |
-| httpx | Клиент сервера эмбеддингов | BSD-3-Clause | https://pypi.org/project/httpx/ |
+| httpx | Клиент сервера эмбеддингов, Bot API и модели | BSD-3-Clause | https://pypi.org/project/httpx/ |
+| socksio | Поддержка SOCKS-прокси для httpx | MIT | https://pypi.org/project/socksio/ |
 | mcp | SDK протокола MCP, сервер архива | MIT | https://pypi.org/project/mcp/ |
 | pydantic | Модели ответов инструментов (приходит с `mcp`) | MIT | https://pypi.org/project/pydantic/ |
 | Telethon 1.x | Клиент пользовательского аккаунта Telegram | MIT | https://codeberg.org/Lonami/Telethon |
