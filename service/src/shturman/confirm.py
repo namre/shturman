@@ -187,6 +187,31 @@ async def apply(conn: asyncpg.Connection, kind: str, payload: dict[str, Any]) ->
     return {"status": APPLIED, "note": done.note, "result": done.result}
 
 
+async def apply_owner(conn: asyncpg.Connection, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Применяет действие, которое совершил сам владелец каналом, недоступным ассистенту, —
+    на странице настройки сервиса (`setup_page/`), куда входят по одноразовой ссылке с сервера.
+
+    Карточка в боте для такого действия не нужна: подтверждение защищает от держателя токена
+    внутреннего API, а здесь вход свой. Поэтому действие применяется сразу и считается
+    подтверждённым (`unconfirmed()` — ложь), а отдельное сообщение владельцу об изменении
+    не отправляется: он сам его только что сделал, запись остаётся в журнале страницы.
+
+    Вызывать только из маршрутов страницы настройки, после проверки её сессии. Вне транзакции.
+    """
+    fn = _appliers.get(kind)
+    if fn is None:
+        raise KeyError(f"нет обработчика для действия {kind}")
+    confirmed, quiet = _unconfirmed.set(False), _from_card.set(True)
+    try:
+        async with conn.transaction():
+            done = _done(await fn(conn, payload))
+    finally:
+        _from_card.reset(quiet)
+        _unconfirmed.reset(confirmed)
+    await _run_after(done.after)
+    return {"status": APPLIED, "note": done.note, "result": done.result}
+
+
 def _waiting(row: Any, *, duplicate: bool) -> dict[str, Any]:
     return {"status": PENDING, "action_id": row["id"], "summary": row["summary"],
             "expires_at": row["expires_at"].isoformat(), "duplicate": duplicate,

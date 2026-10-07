@@ -1,4 +1,10 @@
-"""Настройки сервиса. Всё приходит из переменных окружения; значений по умолчанию для секретов нет."""
+"""Настройки сервиса. Приходят из переменных окружения; значений по умолчанию для секретов нет.
+
+Шесть значений владелец может ввести не в окружении, а на странице настройки (`setup_page/`):
+ключи приложения Telegram, токен бота согласований, ключ, адрес и имя своей модели. Они лежат
+в файле каталога данных и подставляются здесь, если окружение их не задало: окружение главнее.
+Главный выключатель отправки к ним не относится — он читается только из окружения.
+"""
 
 from __future__ import annotations
 
@@ -68,6 +74,12 @@ class Config:
     # одни правила: это заметно слабее модели.
     guard_url: str = ""
     guard_model: str = "Horizon-Labs/prompt-injection-guard-small"
+    # Внешний адрес страницы настройки (схема и имя, без пути), например https://assistant.example.com.
+    # Пусто — страница отвечает только под локальными именами из allowed_hosts (туннель SSH).
+    setup_origin: str = ""
+    # Какие из значений страницы настройки заданы окружением сервиса: страница их не меняет
+    # (имена — как в setup_page/secrets_store.py).
+    locked: frozenset[str] = frozenset()
 
     @property
     def own_bot(self) -> bool:
@@ -106,11 +118,13 @@ class Config:
                 raise ConfigError(f"{name}: слишком короткое значение, нужно не меньше 32 знаков")
         port = _int("SHTURMAN_PORT", 8765)
         hosts = tuple(h.strip() for h in _env("SHTURMAN_ALLOWED_HOSTS").split(",") if h.strip())
-        return cls(
+        data_dir = Path(_env("SHTURMAN_DATA_DIR", "/data"))
+        config = cls(
             dsn=dsn, api_token=api_token, mcp_token=mcp_token,
             host=_env("SHTURMAN_HOST", "127.0.0.1"), port=port,
-            data_dir=Path(_env("SHTURMAN_DATA_DIR", "/data")),
+            data_dir=data_dir,
             allowed_hosts=hosts or (f"127.0.0.1:{port}", f"localhost:{port}"),
+            setup_origin=_setup_origin(_env("SHTURMAN_SETUP_ORIGIN")),
             tg_api_id=_int("TELEGRAM_API_ID", 0), tg_api_hash=_env("TELEGRAM_API_HASH"),
             proxy_url=_env("EGRESS_PROXY_URL"),
             embeddings_url=_env("SHTURMAN_EMBEDDINGS_URL"),
@@ -119,7 +133,9 @@ class Config:
             timezone=_env("SHTURMAN_TIMEZONE", "Europe/Moscow"),
             nightly_at=_env("SHTURMAN_NIGHTLY_AT", "03:30"),
             # Отправка возможна только со своим ботом согласований: без него нажатие «Отправить»
-            # проходит через Hermes и может быть подделано ассистентом.
+            # проходит через Hermes и может быть подделано ассистентом. Токен бота здесь —
+            # именно из окружения: токен, введённый на странице настройки, отправку не включает,
+            # иначе её можно было бы включить со страницы (docs/decisions.md).
             sending=(_env("SHTURMAN_SENDING", "off").lower() in ("on", "1", "true", "yes")
                      and bool(_env("SHTURMAN_BOT_TOKEN"))),
             bot_token=_env("SHTURMAN_BOT_TOKEN"),
@@ -131,3 +147,38 @@ class Config:
             guard_model=_env("SHTURMAN_GUARD_MODEL", "Horizon-Labs/prompt-injection-guard-small"),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )
+        return with_page_values(config, os.environ)
+
+
+def with_page_values(config: Config, env) -> Config:
+    """Подставляет значения, введённые на странице настройки, туда, где окружение молчит."""
+    import dataclasses
+
+    from .setup_page import secrets_store
+
+    locked = secrets_store.locked_by_env(env)
+    stored = secrets_store.SecretStore(config.data_dir).load()
+    managed = [name for name in secrets_store.NAMES if name not in locked and stored.get(name)]
+    return dataclasses.replace(secrets_store.overlay(config, stored, managed), locked=locked)
+
+
+def _setup_origin(raw: str) -> str:
+    """Внешний адрес страницы настройки: только схема и имя узла (с портом, если он не обычный)."""
+    if not raw:
+        return ""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        raise ConfigError("SHTURMAN_SETUP_ORIGIN: нужен адрес вида https://assistant.example.com")
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise ConfigError("SHTURMAN_SETUP_ORIGIN: только схема и имя, без пути — например https://assistant.example.com")
+    try:
+        port = parts.port
+    except ValueError:
+        raise ConfigError("SHTURMAN_SETUP_ORIGIN: неверный порт") from None
+    default = {"http": 80, "https": 443}[parts.scheme]
+    host = parts.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
