@@ -117,8 +117,54 @@ def _call(method: str, path: str, raw: str | None) -> None:
         sys.exit("третий аргумент должен быть JSON")
     status, out = _local_api(method, path, payload)
     print(json.dumps(out, ensure_ascii=False, indent=2))
+    waiting = pending_text(out)
+    if waiting:
+        # Отдельно от JSON и простыми словами: оператор не должен принять ответ за «сделано».
+        print("\n" + waiting, file=sys.stderr)
     if status >= 400:
         sys.exit(1)
+
+
+def pending_text(out: dict) -> str | None:
+    """Пояснение к ответу «ждёт подтверждения владельца»; None — если ответ не об этом."""
+    if not isinstance(out, dict) or out.get("status") != "pending_confirmation":
+        return None
+    action = out.get("action_id")
+    lines = ["ЖДЁТ ПОДТВЕРЖДЕНИЯ В БОТЕ. Действие не выполнено: оно применится, только когда владелец "
+             "нажмёт «Да, сделать» под карточкой в боте согласований."]
+    if out.get("summary"):
+        lines.append(f"Что именно ждёт (действие № {action}): {out['summary']}")
+    if out.get("applied_now"):
+        lines.append("Часть запроса, которая только ужесточает правила, уже применена: "
+                     + json.dumps(out["applied_now"], ensure_ascii=False))
+    if out.get("expires_at"):
+        lines.append(f"Срок ответа — до {out['expires_at']}; потом запрос снимется сам.")
+    lines.append(f"Проверить: shturman call GET /api/confirmations/{action}   "
+                 f"Отменить: shturman call POST /api/confirmations/{action}/cancel")
+    return "\n".join(lines)
+
+
+def _await_confirmation(out: dict) -> None:
+    """Ждёт решения владельца по действию из ответа 202. Завершает команду, если ответ — не «да»."""
+    import time
+
+    action = out.get("action_id")
+    print("\nВход нужно подтвердить в боте согласований: откройте бота и нажмите «Да, сделать» под "
+          "карточкой. Жду вашего ответа (Ctrl+C — отменить запрос)…")
+    try:
+        while True:
+            time.sleep(3)
+            status, state = _local_api("GET", f"/api/confirmations/{action}")
+            if status >= 400:
+                sys.exit(state.get("error") or f"ошибка {status}")
+            if state.get("status") == "applied":
+                return
+            if state.get("status") != "pending":
+                words = {"rejected": "отклонён", "expired": "не подтверждён вовремя", "failed": "не выполнен"}
+                sys.exit(f"вход {words.get(state.get('status'), 'не подтверждён')} — запустите команду заново")
+    except KeyboardInterrupt:
+        _local_api("POST", f"/api/confirmations/{action}/cancel", {})
+        sys.exit("\nотменено")
 
 
 def _tg_login(role: str) -> None:
@@ -140,6 +186,13 @@ def _tg_login(role: str) -> None:
             sys.exit("отменено")
         body["confirm_owner"] = True
     status, out = _local_api("POST", "/api/tg/login", body)
+    if status == 202 and out.get("status") == "pending_confirmation":
+        # У сервиса свой бот согласований: подключение аккаунта сначала подтверждает владелец.
+        _await_confirmation(out)
+        status, out = _local_api("POST", "/api/tg/login", body)
+        if status == 202 and out.get("status") == "pending_confirmation":
+            _local_api("POST", f"/api/confirmations/{out.get('action_id')}/cancel", {})   # лишняя карточка
+            sys.exit("разрешение на вход уже израсходовано или истекло — запустите команду заново")
     if status >= 400:
         sys.exit(out.get("error") or f"ошибка {status}")
     login_id, shown = out["login_id"], None

@@ -26,11 +26,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Awaitable, Callable
 
 import asyncpg
 
 from . import jobs
+
+logger = logging.getLogger("shturman.bridge")
 
 LLM_STRUCTURED = "llm.structured"
 LLM_TEXT = "llm.text"
@@ -90,8 +93,11 @@ def on_callback(module: str) -> Callable[[CallbackHandler], CallbackHandler]:
 
     fn(conn, остальное, tg_id нажавшего) -> {"answer": "короткий текст-подсказка",
                                               "edit_text": "новый текст сообщения" | None,
-                                              "remove_buttons": bool}
-    Нажатие приходит только от владельца: это проверено до вызова.
+                                              "remove_buttons": bool,
+                                              "after_commit": async-функция без аргументов | None}
+    Нажатие приходит только от владельца: это проверено до вызова. `after_commit` выполняется
+    после фиксации транзакции нажатия — для событий и фоновой работы, которым нужны уже
+    записанные изменения.
     """
     def deco(fn: CallbackHandler) -> CallbackHandler:
         _callback_handlers[module] = fn
@@ -320,5 +326,11 @@ async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: i
         return refused
     async with conn.transaction():
         out = await fn(conn, rest, int(from_user_id))
+    after = out.get("after_commit")
+    if after is not None:
+        try:
+            await after()
+        except Exception as exc:  # нажатие уже разобрано и записано; сбой «после» его не отменяет
+            logger.error("нажатие разобрано, но работа после него не выполнена (%s)", type(exc).__name__)
     return {"answer": str(out.get("answer") or "")[:190], "edit_text": out.get("edit_text"),
             "remove_buttons": bool(out.get("remove_buttons"))}

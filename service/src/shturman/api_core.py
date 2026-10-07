@@ -16,9 +16,10 @@ REAP_EVERY = 60  # секунд
 
 
 class BadRequest(Exception):
-    def __init__(self, message: str, status: int = 400, code: str | None = None) -> None:
+    def __init__(self, message: str, status: int = 400, code: str | None = None,
+                 extra: dict[str, Any] | None = None) -> None:
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.extra = message, status, code, extra or {}
 
 
 MAX_BODY = 1024 * 1024  # байт: JSON-запросы внутреннего API заведомо меньше
@@ -65,15 +66,61 @@ def handler(fn):
         try:
             return await fn(request)
         except BadRequest as exc:
-            payload = {"error": exc.message}
-            if exc.code:
-                payload["code"] = exc.code
-            return JSONResponse(payload, status_code=exc.status)
+            return error_response(exc)
         except (ValueError, TypeError):
             # число не того вида в запросе — это ошибка запроса, а не сервиса
             return JSONResponse({"error": "неверное значение в запросе"}, status_code=400)
     wrapped.__name__ = fn.__name__
     return wrapped
+
+
+def error_response(exc: BadRequest) -> JSONResponse:
+    payload = {**exc.extra, "error": exc.message}
+    if exc.code:
+        payload["code"] = exc.code
+    return JSONResponse(payload, status_code=exc.status)
+
+
+# --- подтверждение владельцем (см. confirm.py) ---
+
+async def settle(
+    conn, kind: str, payload: dict[str, Any], *, summary: str | None,
+    applied_now: dict[str, Any] | None = None,
+) -> tuple[JSONResponse | None, Any]:
+    """Применяет действие или ставит его ждать нажатия владельца в боте согласований.
+
+    summary — что именно изменится, простыми словами: этот текст увидит владелец на карточке.
+    summary=None значит «это ужесточение»: действие применяется сразу в любом режиме.
+
+    Возвращает (ответ, результат). Ответ не None — действие ждёт подтверждения: его и нужно
+    вернуть вызывающему (HTTP 202, тело {"status": "pending_confirmation", "action_id", "summary",
+    "expires_at", "note"}; в applied_now — то, что из запроса применено сразу). Иначе действие
+    применено, и результат — то, что вернула функция применения (`confirm.Done.result`).
+
+    Вызывать вне транзакции (см. `confirm.apply`).
+    """
+    try:
+        if summary is None:
+            out = await confirm.apply(conn, kind, payload)
+        else:
+            out = await confirm.request(conn, kind, summary, payload)
+    except confirm.Refused as exc:
+        raise BadRequest(exc.message, exc.status, exc.code, exc.extra) from None
+    except confirm.TooManyPending:
+        raise BadRequest(
+            "Слишком много действий уже ждут вашего подтверждения в боте согласований. "
+            "Ответьте на карточки в боте или отмените лишние, затем повторите.", 429, "too_many_pending") from None
+    except confirm.NoOwner:
+        raise BadRequest(
+            "Это действие нужно подтвердить в боте согласований, а владелец к боту ещё не привязан: "
+            "подтвердить некому. Сначала привяжите владельца.", 409, "owner_unknown") from None
+    if out["status"] != confirm.PENDING:
+        return None, out.get("result")
+    answer = {"status": confirm.PENDING, "action_id": out["action_id"], "summary": out["summary"],
+              "expires_at": out["expires_at"], "note": out["note"]}
+    if applied_now:
+        answer["applied_now"] = applied_now
+    return JSONResponse(answer, status_code=202), None
 
 
 @handler
@@ -181,6 +228,16 @@ async def confirmations(request: Request) -> JSONResponse:
 
 
 @handler
+async def confirmation(request: Request) -> JSONResponse:
+    """Что стало с действием, которое ждало владельца: по номеру из ответа 202."""
+    async with state_of(request).ro_pool.acquire() as conn:
+        out = await confirm.get(conn, int(request.path_params["action_id"]))
+    if out is None:
+        raise BadRequest("такого действия нет", 404)
+    return JSONResponse(out)
+
+
+@handler
 async def cancel_confirmation(request: Request) -> JSONResponse:
     async with state_of(request).pool.acquire() as conn:
         ok = await confirm.cancel(conn, int(request.path_params["action_id"]))
@@ -190,6 +247,7 @@ async def cancel_confirmation(request: Request) -> JSONResponse:
 def routes() -> list[BaseRoute]:
     return [
         Route("/api/confirmations", confirmations, methods=["GET"]),
+        Route("/api/confirmations/{action_id:int}", confirmation, methods=["GET"]),
         Route("/api/confirmations/{action_id:int}/cancel", cancel_confirmation, methods=["POST"]),
         Route("/api/status", status, methods=["GET"]),
         Route("/api/owner", put_owner, methods=["PUT"]),

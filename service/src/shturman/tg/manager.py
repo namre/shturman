@@ -478,7 +478,9 @@ class TgManager:
             raise TgError("Вход не найден или уже завершён. Начните заново.", 404)
         return flow
 
-    async def start_login(self, role: str, *, confirm_owner: bool = False) -> LoginFlow:
+    async def check_login(self, role: str, *, confirm_owner: bool = False) -> None:
+        """Можно ли начать вход в этой роли. Ничего не меняет: маршрут зовёт эту проверку до того,
+        как просить владельца подтвердить вход, чтобы не показывать карточку впустую."""
         self.require_configured()
         if role not in ROLES:
             raise TgError("Поле role: нужно assistant или owner.")
@@ -496,16 +498,20 @@ class TgManager:
                     "Сначала привяжите к сервису своего бота (управляющий чат). Пока сервис не знает, "
                     "какой аккаунт — ваш основной, он не сможет отличить его от помощника, а помощнику "
                     "разрешена отправка сообщений. После привязки подключите помощника снова.", 409)
-        self._sweep_flows()
-        for flow in list(self.flows.values()):
-            if flow.role == role and not flow.done:
-                await flow.cancel()  # экран входа открыли заново — прежний код больше не нужен
         current = self.runtimes.get(role)
         if current is not None and current.status in ACTIVE:
             raise TgError(f"{ROLE_NAMES[role].capitalize()} уже подключён. Чтобы сменить его, сначала выйдите.", 409)
         async with self.pool.acquire() as conn:
             if await conn.fetchval("SELECT paused FROM tg_sessions WHERE slot = $1", role):
                 raise TgError("Аккаунт на паузе. Снимите паузу или выйдите из него.", 409)
+
+    async def start_login(self, role: str, *, confirm_owner: bool = False) -> LoginFlow:
+        await self.check_login(role, confirm_owner=confirm_owner)
+        self._sweep_flows()
+        for flow in list(self.flows.values()):
+            if flow.role == role and not flow.done:
+                await flow.cancel()  # экран входа открыли заново — прежний код больше не нужен
+        current = self.runtimes.get(role)
         if current is not None:
             await self._shutdown(current)
             self.runtimes.pop(role, None)
@@ -679,11 +685,24 @@ class TgManager:
         if rt is not None:
             await self._shutdown(rt)
 
-    async def resume(self, account_id: int) -> None:
+    async def _paused(self, account_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT paused FROM tg_sessions WHERE account_id = $1", account_id))
+
+    async def resume(self, account_id: int, *, unpause: bool = True) -> None:
+        """Снимает паузу и подключает аккаунт.
+
+        unpause=False — только переподключить аккаунт, который не на паузе: сама пауза не
+        снимается никогда. Если она стоит или появилась, пока шло подключение, — отказ, и
+        аккаунт остаётся отключённым. Так поступает маршрут, когда паузу вправе снять только
+        владелец в боте согласований."""
         self.require_configured()
         slot = (await self._slot_of(account_id))["slot"]
-        async with self.pool.acquire() as conn:
-            await conn.execute("UPDATE tg_sessions SET paused = false WHERE account_id = $1", account_id)
+        if unpause:
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE tg_sessions SET paused = false WHERE account_id = $1", account_id)
+        elif await self._paused(account_id):
+            raise TgError("Аккаунт на паузе: снять её может только владелец.", 409)
         current = self.runtimes.get(slot)
         if current is not None and current.status in ACTIVE:
             return
@@ -693,6 +712,12 @@ class TgManager:
             self.runtimes.pop(slot, None)
             raise TgError("Файла сессии нет: войдите в аккаунт заново.", 409)
         await self._launch(slot)
+        if not unpause and await self._paused(account_id):
+            # Паузу поставили, пока аккаунт подключался: её решение сильнее.
+            rt = self.runtimes.pop(slot, None)
+            if rt is not None:
+                await self._shutdown(rt)
+            raise TgError("Аккаунт на паузе: снять её может только владелец.", 409)
 
     async def set_options(
         self, account_id: int, *, auto_personal: bool | None, auto_groups: bool | None,

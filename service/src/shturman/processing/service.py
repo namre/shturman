@@ -34,6 +34,18 @@
 view для /api/commitments: open, overdue, today, week (с сегодня до воскресенья), next_week
 (с понедельника по воскресенье следующей недели), proposed, closed, all. Кроме person_id
 (people.id) принимается peer_id (peers.id — учётная запись Telegram).
+
+Подтверждение владельцем (см. `confirm.py`). Новое обязательство и новая страница становятся
+для ассистента фактом только с одобрения владельца. Когда у сервиса свой бот согласований,
+это одобрение нельзя дать по HTTP: ждут нажатия в боте
+  * принятие предложенного обязательства любым путём — `accept`, а также `reopen` из состояний
+    «ждёт решения», «отклонено», «не подтверждено» и `close` из «ждёт решения»;
+  * объединение и разделение записей о людях (меняют, кого ассистент считает одним человеком,
+    и подтверждают человека в реестре — после этого о нём заводится страница);
+  * алиас для человека, которого владелец ещё не подтверждал (алиас подтверждает запись).
+Без подтверждения остаются: закрыть, отменить, вернуть в работу и перенести уже принятое
+обязательство (обратимо, пишется в журнал обязательства, этим пользуется инструмент агента),
+отклонить предложение, добавить алиас подтверждённому человеку, убрать алиас.
 """
 
 from __future__ import annotations
@@ -50,15 +62,30 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from .. import events
-from ..api_core import BadRequest, body, handler, need_int, need_str
+from .. import confirm, events
+from ..api_core import BadRequest, body, handler, need_int, need_str, settle
 from ..app import AppState, state_of
+from ..sanitize import clean_line
 from . import commitments, people, pipeline
 
 logger = logging.getLogger("shturman.processing")
 
 NIGHTLY_DEFAULT = time(3, 30)
 TICK_SECONDS = 60
+
+COMMITMENT_DECIDE = "commitments.decide"
+PEOPLE_MERGE = "people.merge"
+PEOPLE_SPLIT = "people.split"
+PEOPLE_ALIAS = "people.alias"
+# Состояния, в которых обязательство владельцем не одобрено.
+UNDECIDED = ("proposed", "rejected", "expired")
+
+# Состояние работающего сервиса: функции применения действий его не получают.
+_state: AppState | None = None
+
+
+def _today_now() -> date | None:
+    return datetime.now(ZoneInfo(_state.config.timezone)).date() if _state is not None else None
 
 
 def nightly_time(config: Any) -> time:
@@ -184,12 +211,61 @@ async def change_commitment(request: Request) -> JSONResponse:
             result = await commitments.reschedule(
                 conn, commitment_id, need_str(data, "due", limit=120), tz=state.config.timezone, today=today)
         else:
-            command = {"close": commitments.close, "cancel": commitments.cancel, "reopen": commitments.reopen,
-                       "accept": commitments.accept, "reject": commitments.reject}.get(action)
+            command = _COMMANDS.get(action)
             if command is None:
                 raise BadRequest("неизвестное действие", status=404)
-            result = await command(conn, commitment_id, today=today)
+            item = await commitments.get_commitment(conn, commitment_id, today=today)
+            if item is not None and _approves(action, item["status"]):
+                # Действие делает неодобренное предложение принятым обязательством: это решение
+                # владельца, при своём боте согласований оно ждёт его нажатия.
+                answer, result = await settle(
+                    conn, COMMITMENT_DECIDE, {"commitment_id": commitment_id, "action": action},
+                    summary=_commitment_ask(action, item))
+                if answer is not None:
+                    return answer
+            else:
+                result = await command(conn, commitment_id, today=today)
     return _outcome(result)
+
+
+_COMMANDS = {"close": commitments.close, "cancel": commitments.cancel, "reopen": commitments.reopen,
+             "accept": commitments.accept, "reject": commitments.reject}
+
+
+def _approves(action: str, status: str) -> bool:
+    """Становится ли от этого действия принятым то, что владелец не одобрял."""
+    return ((action == "accept" and status == "proposed")
+            or (action == "reopen" and status in UNDECIDED)
+            or (action == "close" and status == "proposed"))
+
+
+def _commitment_ask(action: str, item: dict[str, Any]) -> str:
+    # Формулировка обязательства и слова о сроке взяты из чужих сообщений — в карточку они не
+    # попадают: только номер, стороны и дата. Текст владелец видит в сводке предложений и в кабинете.
+    who = clean_line(commitments.who_line(item), 120)
+    due = f"срок {date.fromisoformat(item['due_date']):%d.%m.%Y}" if item["due_date"] else "срок не определён"
+    state = commitments.STATUS_TEXT.get(item["status"], item["status"])
+    head = {
+        "accept": f"Принять предложенное обязательство № {item['id']}",
+        "reopen": f"Вернуть в работу обязательство № {item['id']}, которое вы не подтверждали (сейчас: {state})",
+        "close": f"Отметить выполненным обязательство № {item['id']}, которое вы ещё не подтверждали",
+    }[action]
+    return (f"{head} ({who}; {due}). Ассистент будет считать его договорённостью, которую вы подтвердили, "
+            "и показывать в сводках.")
+
+
+@confirm.applier(COMMITMENT_DECIDE)
+async def _apply_commitment(conn: Any, payload: dict[str, Any]) -> confirm.Done:
+    command = _COMMANDS.get(payload.get("action")) if payload.get("action") in ("accept", "reopen", "close") else None
+    if command is None:
+        raise confirm.Refused("неизвестное действие", 404)
+    confirm.must_not_widen(True)      # одобрение предложения — только с нажатия владельца
+    result = await command(conn, int(payload["commitment_id"]), today=_today_now())
+    if not result.get("ok"):
+        code = result.get("code")
+        raise confirm.Refused(result.get("error") or "не получилось", 404 if code == "not_found" else 409,
+                              code, extra=result)
+    return confirm.Done(result=result)
 
 
 # --- люди ---------------------------------------------------------------------------------------------
@@ -226,47 +302,142 @@ async def get_person(request: Request) -> JSONResponse:
 async def person_aliases(request: Request) -> JSONResponse:
     data = await body(request)
     alias = need_str(data, "alias", limit=120)
+    person_id = request.path_params["person_id"]
     async with state_of(request).pool.acquire() as conn:
-        await _need_visible(conn, request.path_params["person_id"])
-        try:
-            if request.method == "DELETE":
-                result = await people.remove_alias(conn, request.path_params["person_id"], alias)
-            else:
-                result = await people.add_alias(conn, request.path_params["person_id"], alias)
-        except people.PeopleError as exc:
-            raise _people_error(exc) from None
-        person = await people.get_person(conn, request.path_params["person_id"])
+        await _need_visible(conn, person_id)
+        if request.method == "DELETE":
+            try:
+                result = await people.remove_alias(conn, person_id, alias)
+            except people.PeopleError as exc:
+                raise _people_error(exc) from None
+        else:
+            # Алиас от владельца подтверждает человека в реестре, а о подтверждённом заводится
+            # страница. Для ещё не подтверждённой записи это — одобрение владельца: ждёт его.
+            row = await conn.fetchrow(
+                "SELECT confirmed, merged_into FROM people WHERE id = $1", await people.active_id(conn, person_id))
+            summary = None
+            if not people.fold(alias) and not people._clean_display(alias).startswith("@"):
+                raise BadRequest("Алиас должен содержать буквы.", status=409)   # до карточки, а не после
+            if row is not None and not row["confirmed"] and row["merged_into"] is None:
+                summary = (f"Добавить имя «{clean_line(alias, 120)}» к записи о человеке "
+                           f"{await _person_name(conn, person_id)}. Вы эту запись ещё не подтверждали: вместе с "
+                           "новым именем она станет подтверждённой, и о человеке будет заведена страница памяти.")
+            answer, result = await settle(conn, PEOPLE_ALIAS, {"person_id": person_id, "alias": alias},
+                                          summary=summary)
+            if answer is not None:
+                return answer
+        person = await people.get_person(conn, person_id)
     return JSONResponse({**result, "person": person})
+
+
+@confirm.applier(PEOPLE_ALIAS)
+async def _apply_alias(conn: Any, payload: dict[str, Any]) -> confirm.Done:
+    person_id = int(payload["person_id"])
+    await _visible_or_refuse(conn, person_id)
+    # Без нажатия владельца алиас добавляется только уже подтверждённому человеку
+    # (подтверждение назад не снимается, поэтому блокировка строки здесь не нужна).
+    confirm.must_not_widen(not await conn.fetchval(
+        "SELECT confirmed FROM people WHERE id = $1", await people.active_id(conn, person_id)))
+    try:
+        result = await people.add_alias(conn, person_id, str(payload.get("alias") or ""))
+    except people.PeopleError as exc:
+        raise confirm.Refused(str(exc), 409) from None
+    return confirm.Done(result=result)
 
 
 @handler
 async def merge_people(request: Request) -> JSONResponse:
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
-        try:
-            if data.get("proposal_id") is not None:
-                result = await people.decide_proposal(conn, need_int(data, "proposal_id"), accept=True)
-            else:
-                source_id, target_id = need_int(data, "source_id"), need_int(data, "target_id")
-                await _need_visible(conn, source_id)
-                await _need_visible(conn, target_id)
-                result = await people.merge_people(conn, source_id, target_id)
-        except people.PeopleError as exc:
-            raise _people_error(exc) from None
+        if data.get("proposal_id") is not None:
+            proposal_id = need_int(data, "proposal_id")
+            row = await conn.fetchrow(
+                "SELECT status, person_id, other_person_id FROM person_proposals WHERE id = $1", proposal_id)
+            if row is None or row["status"] != "pending":
+                # Решать нечего: ответ тот же, что и раньше («нет такого» или «уже решено»).
+                try:
+                    result = await people.decide_proposal(conn, proposal_id, accept=True)
+                except people.PeopleError as exc:
+                    raise _people_error(exc) from None
+                return JSONResponse({**result, "person": None})
+            payload, pair = {"proposal_id": proposal_id}, (row["person_id"], row["other_person_id"])
+        else:
+            source_id, target_id = need_int(data, "source_id"), need_int(data, "target_id")
+            await _need_visible(conn, source_id)
+            await _need_visible(conn, target_id)
+            if source_id == target_id:
+                raise BadRequest("Нельзя объединить запись саму с собой.", status=409)
+            payload, pair = {"source_id": source_id, "target_id": target_id}, (source_id, target_id)
+        names = [await _person_name(conn, person_id) for person_id in pair]
+        answer, result = await settle(
+            conn, PEOPLE_MERGE, payload,
+            summary=f"Объединить записи о людях: {names[0]} и {names[1]} станут одним человеком. Их учётные "
+                    "записи, имена и обязательства ассистент будет относить к одному человеку, и страница "
+                    "памяти у них будет общая.")
+        if answer is not None:
+            return answer
         person = await people.get_person(conn, result["person_id"]) if result.get("person_id") else None
     return JSONResponse({**result, "person": person})
+
+
+async def _person_name(conn: Any, person_id: int) -> str:
+    name = await conn.fetchval("SELECT display_name FROM people WHERE id = $1", person_id)
+    return f"«{clean_line(name, 60) or 'без имени'}» (запись № {person_id})"
+
+
+async def _visible_or_refuse(conn: Any, person_id: int) -> None:
+    if await people.visible_id(conn, person_id) is None:
+        raise confirm.Refused("такого человека нет в реестре", 404)
+
+
+@confirm.applier(PEOPLE_MERGE)
+async def _apply_merge(conn: Any, payload: dict[str, Any]) -> confirm.Done:
+    confirm.must_not_widen(True)      # объединение людей — только с нажатия владельца
+    try:
+        if payload.get("proposal_id") is not None:
+            result = await people.decide_proposal(conn, int(payload["proposal_id"]), accept=True)
+        else:
+            source_id, target_id = int(payload["source_id"]), int(payload["target_id"])
+            await _visible_or_refuse(conn, source_id)
+            await _visible_or_refuse(conn, target_id)
+            result = await people.merge_people(conn, source_id, target_id)
+    except people.PeopleError as exc:
+        raise confirm.Refused(str(exc), 409) from None
+    return confirm.Done(result=result)
+
+
+@confirm.applier(PEOPLE_SPLIT)
+async def _apply_split(conn: Any, payload: dict[str, Any]) -> confirm.Done:
+    confirm.must_not_widen(True)      # разделение заводит нового подтверждённого человека
+    person_id = int(payload["person_id"])
+    await _visible_or_refuse(conn, person_id)
+    try:
+        result = await people.split_person(conn, person_id, int(payload["peer_id"]))
+    except people.PeopleError as exc:
+        raise confirm.Refused(str(exc), 409) from None
+    return confirm.Done(result=result)
 
 
 @handler
 async def split_person(request: Request) -> JSONResponse:
     data = await body(request)
+    person_id, peer_id = request.path_params["person_id"], need_int(data, "peer_id")
     async with state_of(request).pool.acquire() as conn:
-        await _need_visible(conn, request.path_params["person_id"])
-        try:
-            result = await people.split_person(conn, request.path_params["person_id"], need_int(data, "peer_id"))
-        except people.PeopleError as exc:
-            raise _people_error(exc) from None
-    return JSONResponse(result)
+        await _need_visible(conn, person_id)
+        peer = await conn.fetchrow(
+            """SELECT p.name, p.username, p.tg_id FROM person_peers pp JOIN peers p ON p.id = pp.peer_id
+               WHERE pp.person_id = $1 AND pp.peer_id = $2""", person_id, peer_id)
+        if peer is None:    # спрашивать владельца не о чем
+            raise BadRequest("Эта учётная запись не привязана к этому человеку.", status=409)
+        account = clean_line(peer["name"], 60) or (
+            f"@{peer['username']}" if peer["username"] else f"Telegram {peer['tg_id']}")
+        answer, result = await settle(
+            conn, PEOPLE_SPLIT, {"person_id": person_id, "peer_id": peer_id},
+            summary=f"Отделить учётную запись Telegram «{account}» от записи "
+                    f"{await _person_name(conn, person_id)} в самостоятельного человека. Ассистент будет "
+                    "считать их разными людьми; для нового человека заводится запись в реестре, "
+                    "а за ней — страница памяти.")
+    return answer or JSONResponse(result)
 
 
 @handler
@@ -337,4 +508,10 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     state.events.subscribe(events.MESSAGES_DELETED, on_deleted)
     state.events.subscribe(events.CHAT_EXCLUDED, on_chat_excluded)
     state.spawn(nightly(), name="processing-nightly")
-    yield
+    global _state
+    _state = state
+    try:
+        yield
+    finally:
+        if _state is state:
+            _state = None
