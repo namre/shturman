@@ -6,25 +6,45 @@ Hermes подключает их раньше собственных, а Telegra
   1. Привязка владельца — только пока в мастере открыто окно привязки.
   2. Защита бизнес-режима — пока плагин бизнес-режима не загружен: без него ядро Hermes
      приняло бы сообщения собеседников владельца за его команды (issue hermes-agent #127430).
+     Сообщения бизнес-режима без текста (фото, голосовые, файлы) не пропускаются к ядру никогда:
+     плагин бизнес-режима их не берёт, а обработчик медиа в ядре подходит и к ним.
   3. Наблюдение за подключением бизнес-режима — отдельная группа, сообщений не перехватывает.
   4. Молчание до привязки — пока у бота нет владельца и не задан список разрешённых
      пользователей. Без этого стоковый Hermes отвечает любому написавшему английским
      сообщением с кодом привязки и командой для терминала.
+  5. Запись бизнес-сообщений в архив — отдельная группа, которая идёт раньше всех остальных;
+     обновление только кладётся в очередь пересылки в сервис переписки.
+  6. Кнопки сервиса переписки (данные начинаются с «sh:») — нажатие владельца передаётся сервису.
+
+Пункты 5 и 6 работают, только когда сервис переписки подключён; без него они ничего не делают.
+
+Порядок, от которого зависит запись в архив (python-telegram-bot 22.8, Hermes 0.21.5):
+  * группы обработчиков выполняются по возрастанию номера, в каждой срабатывает первый подошедший;
+  * защита (п. 2) стоит в группе 0 и ничего не останавливает: она просто занимает место
+    обработчика ядра в своей группе, остальные группы обновление получают;
+  * плагин бизнес-режима ставит перехват правки черновика в группу −1 и в этом случае
+    останавливает дальнейшую обработку (ApplicationHandlerStop);
+  * поэтому запись в архив стоит в группе −73: она выполняется до защиты и до плагина
+    бизнес-режима и не зависит от того, кто из них сработает.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
 
 from shturman_core.pairing import Pairing
 from shturman_core.state import Store
+from shturman_core.textlimits import cut_utf16
 
 logger = logging.getLogger("shturman.telegram")
 
 BUSINESS_PLUGIN = "telegram-business"
 OBSERVER_GROUP = 73   # любая группа, где нет обработчиков ядра (0 и 99) и плагина бизнес-режима (-1)
+ARCHIVE_GROUP = -73   # раньше всех: запись в архив не должна зависеть от остальных обработчиков
+SERVICE_BUTTON = r"^sh:"   # кнопки сервиса; префиксы ядра (ea: sc: cl: cp: mp: mm: mc: gt:) и bd: не задеты
 
 REPLIES = {
     "accepted": "Принято. Вернитесь в мастер настройки и подтвердите там, что это вы.",
@@ -35,6 +55,8 @@ REPLIES = {
     "cancelled": "Слишком много неверных кодов. Начните привязку в мастере настройки заново.",
     "unbound": "Этот бот ещё не настроен. Если вы его владелец, откройте мастер настройки "
                "и нажмите там «Открыть бота».",
+    "service_down": "Сервис переписки недоступен, попробуйте позже",
+    "button_refused": "Кнопка недоступна.",
 }
 
 UNBOUND_REPLY_INTERVAL = 3600      # одному чату подсказку не чаще раза в час
@@ -117,8 +139,11 @@ def wire(application, adapter) -> None:
     async def drop_business_message(update, context) -> None:
         return None
 
+    # Без текста — всегда: плагин бизнес-режима берёт только текстовые сообщения, а обработчик
+    # медиа в ядре Hermes (plugins/platforms/telegram/adapter.py:2933-2937) подходит и к фото,
+    # голосовым и файлам из бизнес-чатов.
     application.add_handler(MessageHandler(
-        filters.UpdateType.BUSINESS_MESSAGES & _BusinessUnguarded(), drop_business_message,
+        filters.UpdateType.BUSINESS_MESSAGES & (_BusinessUnguarded() | ~filters.TEXT), drop_business_message,
     ))
 
     # --- 2. привязка владельца ---
@@ -150,6 +175,92 @@ def wire(application, adapter) -> None:
             logger.warning("shturman: не удалось записать состояние бизнес-режима", exc_info=True)
 
     application.add_handler(TypeHandler(Update, observe), group=OBSERVER_GROUP)
+
+    # --- 5 и 6. сервис переписки ---
+    try:
+        _wire_service(application, store)
+    except Exception:
+        logger.warning("shturman: обработчики сервиса переписки не подключены", exc_info=True)
+
+
+def _wire_service(application, store) -> None:
+    """Запись бизнес-сообщений в архив и кнопки сервиса. Без подключённого сервиса ничего не делает."""
+    from telegram.ext import (
+        BusinessConnectionHandler, BusinessMessagesDeletedHandler, CallbackQueryHandler, MessageHandler, filters,
+    )
+
+    import shturman_bridge
+
+    runtime = shturman_bridge.runtime()
+    # Фабрику Hermes вызывает из connect() — цикл событий уже работает, фоновая работа стартует здесь.
+    runtime.attach(application, store)
+
+    async def archive(update, context) -> None:
+        runtime.forward(update)        # только очередь: шлюз не ждёт сервис
+
+    for handler in (
+        BusinessConnectionHandler(archive),
+        MessageHandler(filters.UpdateType.BUSINESS_MESSAGES, archive),
+        BusinessMessagesDeletedHandler(archive),
+    ):
+        application.add_handler(handler, group=ARCHIVE_GROUP)
+
+    async def answer(query, text: str | None) -> None:
+        try:
+            await query.answer(text=text or None)
+        except Exception as exc:  # нажатие могло устареть
+            logger.warning("shturman: не удалось ответить на нажатие кнопки (%s)", type(exc).__name__)
+
+    async def on_service_button(update, context) -> None:
+        query = update.callback_query
+        if query is None or not isinstance(query.data, str):
+            return
+        owner = store.read("owner")
+        presser = getattr(query.from_user, "id", None)
+        message = query.message
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if not owner.get("user_id") or presser != owner.get("user_id") \
+                or (chat_id is not None and chat_id != owner.get("chat_id")):
+            # Нажал не владелец (или не в управляющем чате): сервису это не передаётся.
+            runtime.stats.bump("callbacks_refused")
+            await answer(query, REPLIES["button_refused"])
+            return
+        if not runtime.ensure_started():
+            await answer(query, REPLIES["service_down"])
+            return
+        try:
+            out = await runtime.call("POST", "/api/callbacks/telegram",
+                                     {"data": query.data, "from_user_id": presser},
+                                     timeout=shturman_bridge.CALLBACK_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # сервис недоступен или отказал — кнопки остаются
+            logger.warning("shturman: нажатие кнопки не передано сервису (%s)", type(exc).__name__)
+            await answer(query, REPLIES["service_down"])
+            return
+        runtime.stats.bump("callbacks")
+        text = out.get("answer")
+        await answer(query, text[:200] if isinstance(text, str) else None)
+        new_text = out.get("edit_text")
+        remove = bool(out.get("remove_buttons"))
+        try:
+            if isinstance(new_text, str) and new_text.strip():
+                # Обычным текстом: в карточке есть чужой текст. Кнопки при правке текста Telegram
+                # снимает сам, поэтому «оставить» значит передать их заново.
+                await query.edit_message_text(
+                    text=cut_utf16(new_text), parse_mode=None,
+                    reply_markup=None if remove else getattr(message, "reply_markup", None))
+            elif remove:
+                await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:  # «не изменено», сообщение удалено и т. п. — решение сервисом уже принято
+            logger.warning("shturman: не удалось обновить сообщение с кнопками (%s)", type(exc).__name__)
+        # Решение могло поставить задание боту (отправку) — забрать его сразу, а не через паузу.
+        # Сервис ставит его чуть позже ответа, поэтому второй раз — через полсекунды.
+        runtime.wake()
+        asyncio.get_running_loop().call_later(0.6, runtime.wake)
+
+    # block=False: обращение к сервису не задерживает разбор следующих обновлений.
+    application.add_handler(CallbackQueryHandler(on_service_button, pattern=SERVICE_BUTTON, block=False))
 
 
 def _wire_pairing(application, store, MessageHandler, filters) -> None:

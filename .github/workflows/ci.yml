@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:0.8.7-pg16-bookworm
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: shturman_test
@@ -49,3 +49,9 @@ jobs:
         env:
           HERMES_UID: "1000"
           HERMES_GID: "1000"
+          POSTGRES_PASSWORD: ci-only
+          SHTURMAN_API_TOKEN: ci-only-api-token-0123456789abcdef0123
+          SHTURMAN_MCP_TOKEN: ci-only-mcp-token-0123456789abcdef0123
+      # Образ сервиса должен собираться и запускаться: без базы он обязан выйти с понятной ошибкой.
+      - run: docker build -t shturman-service:ci service
+      - run: docker run --rm shturman-service:ci --help

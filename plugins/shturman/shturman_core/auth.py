@@ -26,6 +26,7 @@ ACTIVATION_PREFIX = "a."
 SEND_REQUEST = "send"             # служебное значение `code`: «пришлите мне код»
 
 OWNER_SUBJECT = "owner"
+OWNER_UNBOUND = "owner_unbound"       # то же имя, что в state.OWNER_UNBOUND
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,9 @@ class Auth:
         if recovery:
             # Восстановление нужно, когда Telegram владельца потерян или захвачен. Прежняя
             # привязка и все прежние сессии перестают действовать; бота привязывают заново.
+            # Отметка для шлюза: по ней он сообщит сервису переписки, что владелец отвязан,
+            # даже если в этот момент не работал (shturman_core/ingest.py, sync_owner).
+            self.store.write(OWNER_UNBOUND, {"at": int(self.now())})
             self.store.delete("owner")
             self.store.delete("pairing")
             revoke_sessions(self.store)

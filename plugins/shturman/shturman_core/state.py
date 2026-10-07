@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 PLUGIN_NAME = "shturman"
+# Отметка «привязку владельца сбросил сам плагин» (вход по ссылке восстановления).
+OWNER_UNBOUND = "owner_unbound"
 
 
 def default_state_dir() -> Path:
@@ -31,6 +33,10 @@ def default_state_dir() -> Path:
     except Exception:
         home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     return home / "plugin-data" / PLUGIN_NAME
+
+
+class StoreReadError(Exception):
+    """Файл состояния есть (или каталог недоступен), но прочитать его сейчас не удалось."""
 
 
 class Store:
@@ -83,6 +89,31 @@ class Store:
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    def read_strict(self, name: str) -> dict[str, Any] | None:
+        """Как `read`, но различает «файла нет» и «не удалось прочитать».
+
+        None — файла точно нет: каталог состояния на месте, а файла в нём нет. `StoreReadError` —
+        прочитать не удалось (ошибка диска, каталог пропал, содержимое повреждено): по такому
+        ответу нельзя заключать, что записи нет. Нужен там, где отсутствие записи ведёт к
+        необратимому действию — например, к сообщению сервису «владелец отвязан».
+        """
+        path = self._path(name)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            if not self.root.is_dir():
+                raise StoreReadError("каталог состояния недоступен") from None
+            return None
+        except OSError as exc:
+            raise StoreReadError(type(exc).__name__) from None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            raise StoreReadError("файл состояния повреждён") from None
+        if not isinstance(data, dict):
+            raise StoreReadError("файл состояния повреждён")
+        return data
 
     def write(self, name: str, data: dict[str, Any]) -> None:
         self._ensure_root()

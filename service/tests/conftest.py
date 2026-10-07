@@ -89,3 +89,45 @@ async def conn():
         yield c
     finally:
         await c.close()
+
+
+API_TOKEN = "test-api-token-0123456789abcdef0123456789"
+MCP_TOKEN = "test-mcp-token-0123456789abcdef0123456789"
+API_AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
+MCP_AUTH = {"Authorization": f"Bearer {MCP_TOKEN}"}
+
+
+@pytest.fixture
+def config(tmp_path):
+    from shturman.config import Config
+
+    return Config(dsn=DSN, api_token=API_TOKEN, mcp_token=MCP_TOKEN, data_dir=tmp_path / "data",
+                  allowed_hosts=("test",))
+
+
+@pytest_asyncio.fixture
+async def make_client(conn, config):
+    """Поднимает сервис из указанных модулей в том же цикле, что и тест.
+
+    Использование:  client, state = await make_client("shturman.api_core")
+    Клиент уже ходит с токеном внутреннего API; для MCP передавайте headers=MCP_AUTH.
+    """
+    import contextlib
+
+    import httpx
+
+    from shturman.app import build_app
+
+    stack = contextlib.AsyncExitStack()
+
+    async def factory(*modules, cfg=None):
+        gate = build_app(cfg or config, migrate=False, modules=modules)
+        await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))
+        client = await stack.enter_async_context(httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=gate), base_url="http://test", headers=API_AUTH))
+        return client, gate.inner.state.shturman
+
+    try:
+        yield factory
+    finally:
+        await stack.aclose()

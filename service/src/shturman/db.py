@@ -26,14 +26,19 @@ def _migration_files() -> list[tuple[str, str]]:
 
 async def migrate(conn: asyncpg.Connection) -> list[str]:
     """Применяет недостающие миграции по порядку имён. Возвращает имена применённых."""
-    await conn.execute(_MIGRATIONS_TABLE)
-    done = {r["name"] for r in await conn.fetch("SELECT name FROM schema_migrations")}
-    applied: list[str] = []
-    for name, sql in _migration_files():
-        if name in done:
-            continue
-        async with conn.transaction():
-            await conn.execute(sql)
-            await conn.execute("INSERT INTO schema_migrations (name) VALUES ($1)", name)
-        applied.append(name)
-    return applied
+    # Блокировка на время миграции: два процесса, запущенные одновременно, не мешают друг другу.
+    await conn.execute("SELECT pg_advisory_lock(hashtext('shturman.migrate'))")
+    try:
+        await conn.execute(_MIGRATIONS_TABLE)
+        done = {r["name"] for r in await conn.fetch("SELECT name FROM schema_migrations")}
+        applied: list[str] = []
+        for name, sql in _migration_files():
+            if name in done:
+                continue
+            async with conn.transaction():
+                await conn.execute(sql)
+                await conn.execute("INSERT INTO schema_migrations (name) VALUES ($1)", name)
+            applied.append(name)
+        return applied
+    finally:
+        await conn.execute("SELECT pg_advisory_unlock(hashtext('shturman.migrate'))")

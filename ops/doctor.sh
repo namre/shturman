@@ -101,6 +101,63 @@ case "$biz" in
   *)         warn business-plugin "не установлен — бота в бизнес-режиме в Telegram НЕ подключать (issue #127430)" ;;
 esac
 
+# --- сервис переписки ---
+# Только счётчики и состояния: ни текста сообщений, ни токенов проверка не видит.
+svc=shturman-service
+if docker inspect "$svc" >/dev/null 2>&1; then
+  svc_state="$(docker inspect -f '{{.State.Status}}' "$svc" 2>/dev/null || echo missing)"
+  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8765/health 2>/dev/null)"
+  if [ "$svc_state" = "running" ] && [ "${code:-000}" = "200" ]; then pass service "сервис переписки работает"
+  else fail service "сервис переписки не отвечает (контейнер: $svc_state, HTTP ${code:-000}) — docker logs --tail 50 $svc"; fi
+
+  if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -Eq '^(0\.0\.0\.0|\*|\[::\]):(8765|5432)$'; then
+    fail service-bind "сервис переписки или база слушают внешний адрес — должны быть доступны только с сервера"
+  else
+    pass service-bind "сервис и база недоступны снаружи"
+  fi
+
+  pg_state="$(docker inspect -f '{{.State.Health.Status}}' shturman-postgres 2>/dev/null || echo missing)"
+  if [ "$pg_state" = "healthy" ]; then pass database "база архива работает"
+  else fail database "база архива в состоянии: $pg_state"; fi
+
+  mcp="$(hpy -c '
+from hermes_cli.config import load_config
+s = ((load_config() or {}).get("mcp_servers") or {}).get("shturman") or {}
+print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n 1)"
+  if [ "$mcp" = "yes" ]; then pass archive-mcp "архив подключён к Hermes"
+  else fail archive-mcp "архив не подключён к Hermes — запустите ./ops/up.sh"; fi
+
+  st="$(docker exec "$svc" shturman call GET /api/status 2>/dev/null | tr -d ' \n')"
+  num() { printf '%s' "$st" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p"; }
+  if [ -n "$st" ]; then
+    pass archive "сообщений: $(num messages), чатов: $(num chats), исключено чатов: $(num chats_excluded)"
+    waiting="$(num jobs_waiting)"; failed="$(num jobs_failed)"
+    if [ "${waiting:-0}" -gt 50 ]; then
+      warn jobs "в очереди $waiting заданий — Hermes их не забирает (бот не подключён или плагин не запущен)"
+    else pass jobs "очередь заданий: ${waiting:-0}, неудачных: ${failed:-0}"; fi
+    case "$st" in
+      *'"owner_known":true'*) pass service-owner "сервис знает владельца" ;;
+      *) warn service-owner "сервис ещё не знает владельца — кнопки согласования не работают, пока бот не привязан в мастере" ;;
+    esac
+  else
+    fail archive "сервис не отдал состояние"
+  fi
+
+  emb="$(docker inspect -f '{{.State.Status}}' shturman-embeddings 2>/dev/null || echo off)"
+  case "$emb" in
+    running) pass embeddings "поиск по смыслу включён" ;;
+    off)     warn embeddings "поиск по смыслу выключен — работает поиск по словам (./ops/embeddings.sh on)" ;;
+    *)       fail embeddings "контейнер эмбеддингов в состоянии: $emb" ;;
+  esac
+else
+  warn service "сервис переписки не развёрнут — запустите ./ops/up.sh"
+fi
+
+# --- место на диске ---
+free_mb="$(df -Pm . | awk 'NR==2 {print $4}')"
+if [ "${free_mb:-0}" -lt 2048 ]; then warn disk "свободно ${free_mb} МБ — меньше 2 ГБ"
+else pass disk "свободно $((free_mb / 1024)) ГБ"; fi
+
 echo
 if [ "$fails" -gt 0 ]; then echo "ИТОГ: FAIL ($fails)"; exit 1; fi
 echo "ИТОГ: OK"

@@ -5,29 +5,44 @@
 вызовы Hermes напрямую — этот файл их не видит и не хранит.
 
 Все маршруты закрыты общим входом дашборда: без сессии Hermes до них не допускает.
+
+Для страниц владельца здесь же лежит узкий проход к сервису переписки (`/service/...`):
+только перечисленные в `service_routes.UI` маршруты, токен сервиса подставляет сервер,
+в браузер он не попадает. Тела запросов (среди них — облачный пароль Telegram при входе
+в аккаунт) передаются потоком как есть: не читаются, не разбираются и нигде не записываются.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
-from shturman_core import botapi, personas, wizard  # noqa: E402
+from shturman_core import (  # noqa: E402
+    botapi, bridge_stats, cron_jobs, personas, service_client, service_routes, wizard,
+)
 from shturman_core.pairing import Pairing  # noqa: E402
 from shturman_core.state import Store  # noqa: E402
 
 router = APIRouter()
+logger = logging.getLogger("shturman.dashboard")
 
 PROBE_TIMEOUT = 90
+OWNER_PUSH_TIMEOUT = 3
+PROXY_CONNECT_TIMEOUT = 3
+PROXY_IO_TIMEOUT = 130          # просмотр большого экспорта сервис держит до минуты; загрузка идёт долго
+MAX_QUERY = 2000
 
 
 def _store() -> Store:
@@ -42,9 +57,17 @@ def _bot_token() -> str:
 
 # ------------------------------------------------------------------ состояние
 
+def _state() -> dict[str, Any]:
+    store = _store()
+    out = wizard.snapshot(store)
+    # Мост к сервису переписки: только числа и признаки, без обращения к самому сервису.
+    out["service"] = bridge_stats.status(store, configured=service_client.configured())
+    return out
+
+
 @router.get("/state")
 async def get_state() -> dict[str, Any]:
-    return wizard.snapshot(_store())
+    return _state()
 
 
 class MarkBody(BaseModel):
@@ -57,7 +80,7 @@ async def post_mark(body: MarkBody) -> dict[str, Any]:
         wizard.mark(_store(), body.key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return wizard.snapshot(_store())
+    return _state()
 
 
 # ------------------------------------------------------------- имя и характер
@@ -146,7 +169,23 @@ async def post_pairing_confirm() -> dict[str, Any]:
     owner = pairing.confirm()
     if owner is None:
         raise HTTPException(status_code=409, detail="Подтверждать нечего: время привязки вышло. Получите новую ссылку.")
+    await _push_owner(owner)
     return pairing.status()
+
+
+async def _push_owner(owner: dict[str, Any]) -> bool:
+    """Сообщает сервису переписки нового владельца сразу после привязки. Не получилось — не беда:
+    шлюз передаёт владельца при запуске и при каждой смене привязки."""
+    try:
+        client = service_client.ServiceClient.from_env(service_routes.BRIDGE, timeout=OWNER_PUSH_TIMEOUT)
+        if client is None:
+            return False
+        await asyncio.to_thread(client.request, "PUT", "/api/owner",
+                                json_body={"user_id": owner["user_id"], "chat_id": owner["chat_id"]})
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("shturman: владелец не передан сервису переписки (%s)", type(exc).__name__)
+        return False
 
 
 @router.post("/pairing/reject")
@@ -181,3 +220,148 @@ async def post_model_probe() -> dict[str, Any]:
     if result["ok"]:
         wizard.mark(_store(), "model_ok")
     return result
+
+
+# ------------------------------------------------------- сервис переписки
+
+@router.api_route("/service/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def service_proxy(path: str, request: Request) -> StreamingResponse:
+    """Проход к сервису переписки для страниц владельца. Разрешено только перечисленное
+    в `service_routes.UI`; владелец сервиса, очередь заданий, нажатия кнопок и приём
+    сообщений отсюда недоступны.
+
+    Тело запроса и тело ответа идут потоком и в память целиком не читаются: так передаётся
+    и многогигабайтный экспорт, и пароль — без следа в журнале.
+    """
+    target = "/api/" + path
+    if not service_routes.allowed(service_routes.UI, request.method, target):
+        raise HTTPException(status_code=404, detail="Такого адреса у сервиса переписки нет.")
+    query = request.url.query or ""
+    if len(query) > MAX_QUERY or not query.isascii() or any(ch.isspace() for ch in query):
+        raise HTTPException(status_code=400, detail="Неверные параметры запроса.")
+    base_url, token = service_client.settings()
+    if not base_url or not token:
+        raise HTTPException(status_code=503, detail="Сервис переписки не подключён.")
+
+    import httpx  # зависимость самого Hermes (pyproject.toml:44), отдельно не ставится
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    # Из запроса браузера берутся только вид и длина тела: ни куки, ни его заголовок Authorization
+    # сервису не передаются.
+    has_body = request.method in ("POST", "PUT", "DELETE")
+    for name in ("content-type", "content-length") if has_body else ():
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    client = httpx.AsyncClient(
+        trust_env=False,            # без прокси из окружения: адрес локальный
+        follow_redirects=False,     # токен не должен уйти по чужому адресу
+        timeout=httpx.Timeout(PROXY_IO_TIMEOUT, connect=PROXY_CONNECT_TIMEOUT),
+    )
+    try:
+        upstream = await client.send(
+            client.build_request(request.method, base_url + target + (f"?{query}" if query else ""),
+                                 headers=headers, content=request.stream() if has_body else None),
+            stream=True)
+    except Exception as exc:  # noqa: BLE001
+        await client.aclose()
+        # Только вид ошибки: ни тела запроса, ни заголовков в журнале быть не должно.
+        logger.warning("shturman: сервис переписки не ответил (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Сервис переписки недоступен.") from None
+    if upstream.status_code == 401 or 300 <= upstream.status_code < 400:
+        await upstream.aclose()
+        await client.aclose()
+        # 401 наружу не отдаём: дашборд принял бы его за конец сессии владельца.
+        raise HTTPException(status_code=502,
+                            detail="Сервис переписки не принял запрос плагина: проверьте его токен.")
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        body(), status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type") or "application/json",
+        headers={"Cache-Control": "no-store"})
+
+
+# ------------------------------------------------ сводки по расписанию
+
+class CronInstallBody(BaseModel):
+    morning_at: Optional[str] = None      # «ЧЧ:ММ», по умолчанию 08:27
+    weekly_at: Optional[str] = None       # «ЧЧ:ММ», по умолчанию 17:47
+    weekly_day: Optional[int] = None      # 0 — воскресенье … 6 — суббота; по умолчанию пятница
+
+
+_cron_lock = threading.Lock()
+
+
+def _cron_context() -> dict[str, Any]:
+    from hermes_cli.config import get_env_value_prefer_dotenv
+    from hermes_time import get_timezone_name
+
+    timezone = get_timezone_name()
+    return {
+        # Время задач считается по этим часам. Пусто — по часам сервера.
+        "timezone": timezone or None,
+        "timezone_configured": bool(timezone),
+        "home_channel_set": bool((get_env_value_prefer_dotenv("TELEGRAM_HOME_CHANNEL") or "").strip()),
+    }
+
+
+def _cron_status_sync() -> dict[str, Any]:
+    from cron.jobs import list_jobs
+
+    create, present = cron_jobs.plan(list_jobs(include_disabled=True))
+    return {"installed": present, "missing": [spec["name"] for spec in create], **_cron_context()}
+
+
+def _cron_install_sync(morning_at: Optional[str] = None, weekly_at: Optional[str] = None,
+                       weekly_day: Optional[int] = None) -> dict[str, Any]:
+    """Заводит сводку и обзор недели штатной функцией Hermes — той же, какой пользуются дашборд
+    и «чертежи» скиллов (cron/scheduler.py:3800, tools/blueprints.py:128-136). Повторный вызов
+    ничего не дублирует; уже существующую задачу не трогает."""
+    from cron.jobs import list_jobs
+    from cron.scheduler import create_job_with_scheduler_registration
+
+    context = _cron_context()
+    times = {"morning-brief": morning_at, "weekly-review": weekly_at}
+    weekday = cron_jobs.WEEKLY_DAY if weekly_day is None else weekly_day
+    with _cron_lock:
+        try:
+            create, present = cron_jobs.plan(
+                list_jobs(include_disabled=True), times={k: v for k, v in times.items() if v}, weekday=weekday)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if create and not context["home_channel_set"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Сначала привяжите бота в мастере настройки: сводке пока некуда приходить.")
+        created = []
+        for spec in create:
+            try:
+                job = create_job_with_scheduler_registration(**spec)
+            except Exception as exc:  # noqa: BLE001 — Hermes не принял задачу (например, не разобрал расписание)
+                logger.warning("shturman: задача %s не создана (%s)", spec["name"], type(exc).__name__)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Hermes не создал задачу «{spec['name']}» ({type(exc).__name__}). Созданные до неё остались.")
+            created.append({"name": spec["name"], "id": job.get("id"), "schedule": spec["schedule"]})
+    return {"created": created, "existing": present, **context}
+
+
+@router.get("/cron")
+async def get_cron() -> dict[str, Any]:
+    return await asyncio.to_thread(_cron_status_sync)
+
+
+@router.post("/cron/install")
+async def post_cron_install(body: Optional[CronInstallBody] = None) -> dict[str, Any]:
+    """Заводит в Hermes задачи «утренняя сводка» (каждый день) и «обзор недели» (по пятницам)
+    с доставкой в управляющий чат владельца."""
+    values = body.model_dump() if body is not None else {}
+    return await asyncio.to_thread(_cron_install_sync, **values)

@@ -16,11 +16,16 @@ from typing import Any, BinaryIO, Iterator
 
 import ijson
 
+from .records import MessageRecord
+
 # Типы чатов экспорта → класс сущности Telegram.
 _CHAT_CLASS = {
     "saved_messages": "user",
     "personal_chat": "user",
     "bot_chat": "user",
+    # Служебные диалоги Telegram Desktop: «Ответы» и «Коды подтверждения».
+    "replies": "user",
+    "verification_codes": "user",
     "private_group": "chat",
     "private_supergroup": "channel",
     "public_supergroup": "channel",
@@ -52,22 +57,8 @@ class ExportChat:
             raise ExportFormatError(f"неизвестный тип чата в экспорте: {self.type!r}") from None
 
 
-@dataclass
-class ExportMessage:
-    tg_message_id: int
-    sent_at: datetime
-    kind: str  # message | service
-    sender_class: str | None
-    sender_tg_id: int | None
-    sender_name: str | None
-    text: str
-    entities: list[dict[str, Any]] | None
-    reply_to_tg_id: int | None
-    forwarded_from: str | None
-    edited_at: datetime | None
-    media_type: str | None
-    media_path: str | None
-    service_action: str | None
+# Запись сообщения общая для всех источников; прежнее имя оставлено для читаемости разбора.
+ExportMessage = MessageRecord
 
 
 @dataclass

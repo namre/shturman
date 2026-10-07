@@ -9,3 +9,8 @@ __pycache__/
 .pytest_cache/
 .venv/
 node_modules/
+
+# Рабочие каталоги ИИ-агента
+.claude/worktrees/
+build/
+*.egg-info/
