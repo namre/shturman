@@ -19,7 +19,12 @@ case "$cmd" in
   show)
     # Режим установки — несекретная строка SHTURMAN_MODE в .env; остальное в .env не читается.
     mode="$(grep -E '^SHTURMAN_MODE=' .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    if [ -z "$mode" ] && [ ! -s .env ]; then
+      # Новая установка: вариант выбирает владелец, до его ответа ничего не разворачивается.
+      mode="unset"
+    fi
     case "${mode:-hermes}" in
+      unset)      echo "# режим установки: ещё не выбран — спросите владельца, какой из двух вариантов он ставит: «Ассистент в Telegram (Hermes)» или «Только архив и согласования» (README.md, «Как развернуть»)" ;;
       standalone) echo "# режим установки: standalone — без Hermes (runbook: docs/runbooks/deploy-standalone.md)" ;;
       hermes)     echo "# режим установки: hermes — с Hermes (runbook: docs/runbooks/deploy.md)" ;;
       *)          echo "# режим установки: неизвестное значение SHTURMAN_MODE в .env — ./ops/mode.sh" ;;

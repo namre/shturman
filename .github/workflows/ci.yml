@@ -74,6 +74,10 @@ jobs:
       - name: ops — режим установки и профили
         run: |
           tmp="$(mktemp -d)"; cp -r ops .env.example "$tmp"/; cd "$tmp"
+          # Вариант установки выбирает владелец: на новой установке без --mode скрипт не выбирает сам.
+          grep -q 'режим установки: ещё не выбран' <<< "$(./ops/state.sh show)"
+          if ./ops/init-env.sh --auto; then echo "вариант установки не должен выбираться молча"; exit 1; fi
+          test ! -e .env
           ./ops/init-env.sh --auto --mode standalone
           grep -qx 'SHTURMAN_MODE=standalone' .env
           grep -qx 'COMPOSE_PROFILES=' .env
