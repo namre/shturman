@@ -9,8 +9,11 @@
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 
+. ops/lib.sh
 mode="${1:-status}"
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
+# Профили Compose — режим установки плюс эмбеддинги: профиль Hermes при этом не теряется.
+install_mode="$(shturman_mode)" || exit 2
 
 set_env() {
   local tmp; tmp="$(mktemp .env.XXXXXX)"
@@ -50,18 +53,18 @@ case "$mode" in
       echo "Свободной памяти ${mem_mb} МБ — для модели нужно около 1200 МБ. Включаю, но следите за ./ops/doctor.sh." >&2
     fi
     umask 077
-    set_env COMPOSE_PROFILES embeddings
+    set_env COMPOSE_PROFILES "$(compose_profiles "$install_mode" on)"
     set_env SHTURMAN_EMBEDDINGS_URL http://embeddings:80
     echo "Поиск по смыслу включён в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   off)
     umask 077
-    set_env COMPOSE_PROFILES ""
+    env_put COMPOSE_PROFILES "$(compose_profiles "$install_mode" off)"
     set_env SHTURMAN_EMBEDDINGS_URL ""
     echo "Поиск по смыслу выключен в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   status)
-    if grep -Eq '^COMPOSE_PROFILES=.*embeddings' .env; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
+    if grep -Eq '^COMPOSE_PROFILES=(.*,)?embeddings(,|$)' .env; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
     docker exec shturman-service shturman call GET /api/embeddings/status 2>/dev/null \
       || echo "сервис переписки не отвечает — ./ops/doctor.sh" ;;
   *) echo "использование: $0 on|off|status" >&2; exit 2 ;;

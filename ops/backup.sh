@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Копия данных экземпляра перед обновлением или рискованным действием.
 # Складывает в local/backups (вне git, права 600) архив каталога data/ и выгрузку базы архива.
+# Вместе с data/ в архив кладётся файл .env. Работает одинаково в обоих режимах установки:
+# без Hermes каталога data/hermes просто нет, а токен бота согласований и ключ модели лежат
+# как раз в .env.
 # В копии ключи, настройки и переписка владельца: агент её не открывает и никуда не передаёт.
 # Файлы базы и кэш модели в архив каталога не входят: база сохраняется выгрузкой (pg_dump),
 # модель скачивается заново.
@@ -23,9 +26,13 @@ umask 077
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 name="$dir/data-$stamp.tar.gz"
 # Файлы могут меняться на ходу (журналы Hermes): для tar это предупреждение, а не провал.
+# .env кладётся в архив целиком, не читая: в нём режим установки и значения, введённые владельцем.
+members="data"
+[ -f .env ] && members="data .env"
+# shellcheck disable=SC2086
 tar -czf "$name" --warning=no-file-changed \
   --exclude='data/hermes/logs' --exclude='data/postgres' --exclude='data/embeddings' \
-  --exclude='data/shturman/uploads' data || [ $? -eq 1 ]
+  --exclude='data/shturman/uploads' $members || [ $? -eq 1 ]
 count="$(tar -tzf "$name" | wc -l)"
 [ "$count" -gt 0 ] || { echo "копия пустая: $name" >&2; exit 1; }
 echo "Копия готова: $name ($(du -h "$name" | cut -f1), файлов: $count)"
