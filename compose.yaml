@@ -97,6 +97,9 @@ services:
       SHTURMAN_SENDING: ${SHTURMAN_SENDING:-off}
       SHTURMAN_SEND_DAILY_CAP: ${SHTURMAN_SEND_DAILY_CAP:-50}
       SHTURMAN_EMBEDDINGS_URL: ${SHTURMAN_EMBEDDINGS_URL:-}
+      # Модель поиска по смыслу. Та же строка .env задаёт имя, под которым её отдаёт контейнер
+      # embeddings ниже; записывает ./ops/embeddings.sh on --model.
+      SHTURMAN_EMBEDDINGS_MODEL: ${SHTURMAN_EMBEDDINGS_MODEL:-intfloat/multilingual-e5-small}
       # Защита от внедрённых инструкций во входящих сообщениях: выключена, пока владелец не
       # включит (./ops/guard.sh on). Через API эти значения не меняются.
       SHTURMAN_GUARD: ${SHTURMAN_GUARD:-off}
@@ -132,15 +135,29 @@ services:
     logging: *logging
 
   embeddings:
-    # Локальные эмбеддинги для поиска по смыслу. Занимает около 1,2 ГБ памяти, поэтому выключено,
-    # пока владелец не включит: ./ops/embeddings.sh on. Через контейнер проходит текст всех
-    # сообщений, поэтому выхода в интернет у него нет вовсе (сеть backend закрытая), а модель
-    # заранее скачивает и сверяет по контрольной сумме ./ops/embeddings.sh.
+    # Локальные эмбеддинги для поиска по смыслу. Выключено, пока владелец не включит:
+    # ./ops/embeddings.sh on. Через контейнер проходит текст всех сообщений, поэтому выхода
+    # в интернет у него нет вовсе (сеть backend закрытая), а модель заранее скачивает и сверяет
+    # по контрольным суммам ./ops/embeddings.sh.
+    #
+    # Модель выбирает владелец: ./ops/embeddings.sh on --model e5-small|user2-small. Скрипт пишет
+    # в .env имя модели и её каталог; без этих строк запускается прежняя модель из прежнего
+    # каталога — экземпляру, развёрнутому до появления выбора, править .env не нужно.
+    #   intfloat/multilingual-e5-small (по умолчанию) — около 1,2 ГБ памяти;
+    #   deepvk/USER2-small — 0,2 ГБ на коротких сообщениях, до 0,7 ГБ на длинных.
+    #
+    # --max-batch-tokens 2048 задан для обеих моделей. У USER2-small окно 8192 токена, и при запуске
+    # TEI прогоняет пачку наибольшего размера: без ограничения прогрев не помещается в память
+    # и контейнер убивается. Заодно модель видит только первые 2048 токенов сообщения — сообщение
+    # Telegram предельной длины (4096 знаков) в них помещается. Для e5-small (окно 512 токенов)
+    # ограничение ничего не обрезает и лишь уменьшает внутреннюю пачку сервера.
     profiles: ["embeddings"]
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
     container_name: shturman-embeddings
     restart: unless-stopped
-    command: ["--model-id", "/data/model", "--served-model-name", "intfloat/multilingual-e5-small"]
+    command: ["--model-id", "/data/${SHTURMAN_EMBEDDINGS_MODEL_DIR:-model}",
+              "--served-model-name", "${SHTURMAN_EMBEDDINGS_MODEL:-intfloat/multilingual-e5-small}",
+              "--max-batch-tokens", "2048"]
     volumes:
       - ./data/embeddings:/data:ro
     networks: [backend]

@@ -241,7 +241,7 @@ async def test_without_url_module_is_idle_and_search_is_fulltext(make_client, co
     assert not [t for t in state._tasks if t.get_name() == "embeddings-worker"]
     status = (await client.get("/api/embeddings/status")).json()
     assert status == {"enabled": False, "model": E5, "embedded": 0, "pending": 2, "skipped": 0,
-                      "reachable": None, "problem": None}
+                      "stale": 0, "reachable": None, "problem": None}
     rows = await retrieval.find(state, conn, "смета")
     assert [r["tg_message_id"] for r in rows] == [1]
     assert "«смету»" in rows[0]["snippet"] and rows[0]["score"] > 0
@@ -491,7 +491,7 @@ async def test_service_runs_worker_and_reports_counts_only(make_client, config, 
             break
         await asyncio.sleep(0.02)
     assert status == {"enabled": True, "model": E5, "embedded": 2, "pending": 0, "skipped": 1,
-                      "reachable": True, "problem": None}
+                      "stale": 0, "reachable": True, "problem": None}
 
     tei.down = True
     status = (await client.get("/api/embeddings/status")).json()

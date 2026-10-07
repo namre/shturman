@@ -56,6 +56,13 @@ jobs:
           test "$(docker compose --profile hermes config --services | sort | tr '\n' ' ')" = "hermes postgres shturman "
           docker compose --profile hermes --profile embeddings --profile guard config --quiet
           test "$(docker compose --profile guard config --services | sort | tr '\n' ' ')" = "guard postgres shturman "
+          # Модель поиска по смыслу: без строк в .env — прежняя модель из прежнего каталога (экземпляру,
+          # развёрнутому раньше, править .env не нужно); со строками — выбранная. Сервис и контейнер
+          # получают одно и то же имя модели. Печатается только команда контейнера эмбеддингов.
+          emb() { docker compose --profile embeddings config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; print(" ".join(c["embeddings"]["command"]), c["shturman"]["environment"]["SHTURMAN_EMBEDDINGS_MODEL"])'; }
+          test "$(emb)" = "--model-id /data/model --served-model-name intfloat/multilingual-e5-small --max-batch-tokens 2048 intfloat/multilingual-e5-small"
+          export SHTURMAN_EMBEDDINGS_MODEL=deepvk/USER2-small SHTURMAN_EMBEDDINGS_MODEL_DIR=user2-small
+          test "$(emb)" = "--model-id /data/user2-small --served-model-name deepvk/USER2-small --max-batch-tokens 2048 deepvk/USER2-small"
         env:
           HERMES_UID: "1000"
           HERMES_GID: "1000"
@@ -89,6 +96,17 @@ jobs:
           grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
           if grep -q '^SHTURMAN_GUARD=' .env; then echo "выключатель защиты должен исчезнуть"; exit 1; fi
           ./ops/embeddings.sh off
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          # Модель поиска по смыслу — только из перечня; без ключа — записанная в .env, иначе e5-small.
+          # Скачивание модели здесь не запускается: проверяются разбор параметров и отказы.
+          grep -qx 'модель: e5-small (intfloat/multilingual-e5-small)' <<< "$(./ops/embeddings.sh status)"
+          if ./ops/embeddings.sh on --model bge-m3; then echo "модель не из перечня"; exit 1; fi
+          if ./ops/embeddings.sh off --model e5-small; then echo "--model только вместе с on"; exit 1; fi
+          printf 'SHTURMAN_EMBEDDINGS_MODEL=deepvk/USER2-small\n' >> .env
+          grep -qx 'модель: user2-small (deepvk/USER2-small)' <<< "$(./ops/embeddings.sh status)"
+          sed -i 's|^SHTURMAN_EMBEDDINGS_MODEL=.*|SHTURMAN_EMBEDDINGS_MODEL=acme/unknown|' .env
+          if ./ops/embeddings.sh on; then echo "незнакомая модель в .env не должна молча заменяться"; exit 1; fi
+          sed -i '/^SHTURMAN_EMBEDDINGS_MODEL=/d' .env
           grep -qx 'COMPOSE_PROFILES=hermes' .env
           ./ops/init-env.sh --auto > /dev/null
           grep -qx 'COMPOSE_PROFILES=hermes' .env

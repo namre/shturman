@@ -13,10 +13,13 @@
 | PostgreSQL 16 | Хранилище архива | PostgreSQL License | https://www.postgresql.org |
 | pgvector 0.8.7 | Векторный поиск в Postgres | PostgreSQL License | https://github.com/pgvector/pgvector |
 | text-embeddings-inference 1.9.4 | Сервер эмбеддингов и сервер классификатора защиты (оба по желанию) | Apache-2.0 | https://github.com/huggingface/text-embeddings-inference |
-| intfloat/multilingual-e5-small | Модель эмбеддингов (по желанию) | MIT | https://huggingface.co/intfloat/multilingual-e5-small |
+| intfloat/multilingual-e5-small, ревизия `614241f` | Модель эмбеддингов по умолчанию (по желанию) | MIT (по карточке модели) | https://huggingface.co/intfloat/multilingual-e5-small |
+| deepvk/USER2-small, ревизия `23f65b3` | Вторая модель эмбеддингов, по выбору владельца; основа — `deepvk/RuModernBERT-small` (Apache-2.0) | Apache-2.0 (по карточке модели) | https://huggingface.co/deepvk/USER2-small |
 | Horizon-Labs/prompt-injection-guard-small, ревизия `3215a27` | Модель-классификатор защиты от внедрённых инструкций (по желанию); основа — `jhu-clsp/mmBERT-small` (MIT) | Apache-2.0 (по карточке модели; файла лицензии в репозитории модели нет) | https://huggingface.co/Horizon-Labs/prompt-injection-guard-small |
 | Python 3.12, образ `python:3.12.12-slim-bookworm` | Основа образа сервиса переписки | PSF License; пакеты Debian — под своими лицензиями | https://hub.docker.com/_/python |
 | git | История страниц памяти; ставится в образ сервиса как отдельная программа | GPL-2.0 | https://git-scm.com |
+
+Модели эмбеддингов скачивает `./ops/embeddings.sh` — только ту, которую выбрал владелец, — по закреплённым ревизиям `614241f622f53c4eeff9890bdc4f31cfecc418b3` и `23f65b34cf7632032061f5cc66c14714e6d4cee4` с проверкой контрольной суммы каждого файла; в репозитории и в образе сервиса их нет. Лицензии сверены с карточками моделей на huggingface.co 2026-10-07.
 
 Модель защиты скачивает `./ops/guard.sh` по закреплённой ревизии `3215a27edd62c5ba0bd786c57a9d243b2158e70e` с проверкой контрольных сумм; в репозитории и в образе сервиса её нет. Лицензия Apache-2.0 названа только в карточке модели: файла лицензии в её репозитории нет, автор малоизвестен — при обновлении ревизии сверить заново.
 

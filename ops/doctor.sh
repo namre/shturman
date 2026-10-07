@@ -298,11 +298,44 @@ EOF3
     else pass model "модель $llm_model настроена, обращений ещё не было (первое — при ночной обработке)"; fi
   fi
 
+  # Поиск по смыслу: включён ли, какой моделью и сколько сообщений посчитано. После смены модели
+  # (./ops/embeddings.sh on --model) векторы пересчитываются заново — до конца пересчёта поиск
+  # по смыслу видит только уже посчитанные сообщения. Только имя модели и числа.
   emb="$(container_state shturman-embeddings off)"
-  case "$emb" in
-    running) pass embeddings "поиск по смыслу включён" ;;
-    off)     warn embeddings "поиск по смыслу выключен — работает поиск по словам (./ops/embeddings.sh on)" ;;
-    *)       fail embeddings "контейнер эмбеддингов в состоянии: $emb" ;;
+  # Сразу после запуска или смены модели контейнер ещё прогревает модель и не отвечает — это не
+  # неполадка. Пока он в состоянии running, ждём до полуминуты и спрашиваем сервис заново.
+  for _ in 1 2 3 4 5 6; do
+    case "$st" in *'"embeddings_problem":"unreachable"'*) ;; *) break ;; esac
+    [ "$emb" = "running" ] || break
+    sleep 5
+    st="$(docker exec "$svc" shturman call GET /api/status 2>/dev/null | tr -d ' \n')"
+    emb="$(container_state shturman-embeddings off)"
+  done
+  emb_model="$(printf '%s' "$st" | sed -n 's/.*"embeddings_model":"\([A-Za-z0-9._\/-]*\)".*/\1/p')"
+  emb_done="$(num embeddings_embedded)"; emb_left="$(num embeddings_left)"
+  case "$st" in
+    *'"embeddings_enabled":true'*)
+      case "$st" in
+        *'"embeddings_problem":"model_mismatch"'*)
+          fail embeddings "контейнер эмбеддингов отдаёт не ту модель, что записана в настройках (${emb_model:-?}) — векторы не считаются, поиск идёт по словам; запустите ./ops/embeddings.sh on" ;;
+        *'"embeddings_problem":"unreachable"'*)
+          fail embeddings "сервер эмбеддингов не отвечает (контейнер: $emb) — поиск идёт только по словам; docker logs --tail 50 shturman-embeddings" ;;
+        *)
+          if [ "$emb" != "running" ]; then
+            fail embeddings "контейнер эмбеддингов в состоянии: $emb — запустите ./ops/embeddings.sh on"
+          elif [ "${emb_left:-0}" -gt 0 ]; then
+            warn embeddings "поиск по смыслу включён, модель ${emb_model:-?}; идёт подсчёт векторов: готово ${emb_done:-0}, осталось ${emb_left} — до конца подсчёта по смыслу ищутся только готовые сообщения, по словам — все"
+          else
+            pass embeddings "поиск по смыслу включён, модель ${emb_model:-?}; сообщений с вектором: ${emb_done:-0}, осталось посчитать: 0"
+          fi ;;
+      esac ;;
+    "") ;;
+    *)
+      if [ "$emb" = "off" ]; then
+        warn embeddings "поиск по смыслу выключен — работает поиск по словам (./ops/embeddings.sh on)"
+      else
+        warn embeddings "контейнер эмбеддингов запущен ($emb), но поиск по смыслу в сервисе выключен — запустите ./ops/embeddings.sh on или off"
+      fi ;;
   esac
 elif [ "$MODE" = standalone ]; then
   fail service "сервис переписки не развёрнут — запустите ./ops/up.sh"
