@@ -9,6 +9,12 @@ SHTURMAN_TEST_DSN: база должна быть отдельной тесто�
 
 Рядом с сервисом поднимается «пульт» (порт сервиса + 1) — им сценарий делает то, что в жизни
 делает человек в Telegram: сканирует QR, нажимает «Запустить» в боте, подключает бизнес-режим.
+
+Третий порт (порт сервиса + 2) — подставной «дашборд»: пустая страница и service worker на том же
+имени узла, что и страница настройки, но на другом порту. С неё сценарий делает то, что делал бы
+скрипт ассистента на адресе дашборда Hermes: `fetch` к API страницы, чтение `localStorage`,
+подкладывание cookie, service worker. Страница открывается как http://localhost:<порт>, «дашборд» —
+как http://localhost:<порт + 2>: имя одно, origin разные.
 """
 
 from __future__ import annotations
@@ -30,20 +36,34 @@ import asyncpg  # noqa: E402
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from starlette.applications import Starlette  # noqa: E402
-from starlette.responses import JSONResponse  # noqa: E402
+from starlette.responses import HTMLResponse, JSONResponse, Response  # noqa: E402
 from starlette.routing import Route  # noqa: E402
 from telethon import errors  # noqa: E402
 
 import exec_fakes  # noqa: E402
 import tg_fakes  # noqa: E402
-from shturman import db  # noqa: E402
+from shturman import db, netguard  # noqa: E402
 from shturman.app import build_app  # noqa: E402
 from shturman.config import Config  # noqa: E402
 from shturman.executor import service as executor_service  # noqa: E402
 
 DSN = os.environ.get("SHTURMAN_TEST_DSN", "")
 PORT = int(os.environ.get("E2E_PORT", "8765"))
-ORIGIN = os.environ.get("E2E_ORIGIN", "")           # например http://shturman.test:8765 — как «внешний адрес»
+# «Внешний адрес» страницы и адрес подставного дашборда: одно имя, разные порты.
+ORIGIN = os.environ.get("E2E_ORIGIN", f"http://localhost:{PORT}")
+DASHBOARD = os.environ.get("E2E_DASHBOARD", f"http://localhost:{PORT + 2}")
+
+DASHBOARD_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<title>Подставной дашборд</title></head>
+<body><h1>Подставной дашборд</h1><p>Отсюда сценарий пробует добраться до страницы настройки.</p></body></html>"""
+
+# Service worker «дашборда»: забирает под себя все страницы, до которых дотянется, и запоминает их запросы.
+DASHBOARD_WORKER = """const seen = [];
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", (event) => { seen.push(event.request.url); });
+self.addEventListener("message", (event) => { event.source.postMessage({ seen }); });
+"""
 
 GOOD_TOKEN = exec_fakes.TOKEN                         # бот согласований стенда
 BUSY_TOKEN = "7000000002:BUSY-bot-token_polled-by-another-0123456789"   # «бот ассистента»: его уже опрашивают
@@ -102,7 +122,14 @@ async def main() -> None:
     config = Config(
         dsn=DSN, api_token="e2e-api-token-0123456789abcdef0123456789", mcp_token="e2e-mcp-token-0123456789abcdef0123456789",
         host="127.0.0.1", port=PORT, data_dir=data_dir,
-        allowed_hosts=(f"127.0.0.1:{PORT}", f"localhost:{PORT}"), setup_origin=ORIGIN)
+        allowed_hosts=(f"127.0.0.1:{PORT}", f"localhost:{PORT}"), setup_origin=ORIGIN, dashboard_origin=DASHBOARD)
+
+    async def resolve(host: str, port: int) -> list[str]:
+        """Имена узлов в сеть не уходят: любое «разрешается» в один адрес в интернете, а
+        inner.example — внутрь сервера (так сценарий проверяет фильтр адреса модели)."""
+        return ["127.0.0.1"] if host == "inner.example" else ["93.184.216.34"]
+
+    netguard.resolver = resolve
 
     telegram, llm = StandTelegram(), exec_fakes.FakeLlm("да")
     executor_service.TEST_OVERRIDES.update(
@@ -163,6 +190,14 @@ async def main() -> None:
                              "audit": [dict(r) for r in rows],
                              "llm_requests": len(llm.requests)})
 
+    async def dashboard_page(request):
+        return HTMLResponse(DASHBOARD_PAGE)
+
+    async def dashboard_worker(request):
+        return Response(DASHBOARD_WORKER, media_type="text/javascript")
+
+    dashboard = Starlette(routes=[Route("/", dashboard_page), Route("/sw.js", dashboard_worker)])
+
     control = Starlette(routes=[
         Route("/scan", scan, methods=["POST"]), Route("/start", start, methods=["POST"]),
         Route("/last-code", last_code), Route("/business", business, methods=["POST"]), Route("/seen", seen)])
@@ -179,8 +214,10 @@ async def main() -> None:
                                           access_log=False, proxy_headers=False, server_header=False, lifespan="off")),
             uvicorn.Server(uvicorn.Config(control, host="127.0.0.1", port=PORT + 1, log_level="warning",
                                           access_log=False)),
+            uvicorn.Server(uvicorn.Config(dashboard, host="127.0.0.1", port=PORT + 2, log_level="warning",
+                                          access_log=False)),
         ]
-        print(json.dumps({"ready": True, "url": f"http://127.0.0.1:{PORT}/shturman-setup/",
+        print(json.dumps({"ready": True, "url": f"{ORIGIN}/shturman-setup/", "dashboard": DASHBOARD,
                           "control": f"http://127.0.0.1:{PORT + 1}", "data_dir": str(data_dir),
                           "good_token": GOOD_TOKEN, "busy_token": BUSY_TOKEN, "password": PASSWORD,
                           "llm_key": LLM_KEY, "dsn": DSN}), flush=True)

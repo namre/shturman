@@ -1,8 +1,13 @@
 """Общее для тестов страницы настройки: сервис со страницей и «браузер» владельца.
 
 Telegram для аккаунтов — подставной клиент из tests/tg, Bot API и сервер модели — из
-tests/executor. «Браузер» — клиент httpx с банкой cookie, который, как настоящий браузер,
-ставит `Origin` и метку страницы; токенов внутреннего API у него нет.
+tests/executor. «Браузер» — клиент httpx, который, как настоящий браузер, ставит `Origin` и
+`Sec-Fetch-Site`, а как скрипт страницы — её метку и ключ сессии из «хранилища страницы»
+(`Browser.key`). Банка cookie у него есть, как у всякого браузера, но страница cookie не ставит
+и не читает. Токенов внутреннего API у него нет.
+
+Имена узлов в сеть не уходят: `netguard.resolver` подменён (`DNS`), и любое незнакомое имя
+«разрешается» в один и тот же адрес в интернете.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ for _extra in ("tg", "executor"):
 
 import exec_fakes  # noqa: E402
 import tg_fakes  # noqa: E402
+from shturman import netguard  # noqa: E402
 from shturman.executor import service as executor_service  # noqa: E402
 from shturman.setup_page import auth, service as setup_service  # noqa: E402
 
@@ -34,6 +40,8 @@ TOKEN = exec_fakes.TOKEN
 BUSY_TOKEN = "7000000002:BUSY-bot-token_polled-by-another-0123456789"
 LLM_KEY = "sk-SENTINEL-llm-key-DoNotLeak-0123456789"
 API_HASH = "0123456789abcdef0123456789abcdef"
+PUBLIC_IP = "93.184.216.34"          # «адрес в интернете» для любого имени узла в тестах
+DNS: dict[str, list[str]] = {}       # имя узла → адреса; тест дописывает, фикстура очищает
 
 
 class Telegram(exec_fakes.FakeTelegram):
@@ -51,21 +59,26 @@ class Telegram(exec_fakes.FakeTelegram):
 
 
 class Browser:
-    """Браузер владельца: cookie, `Origin`, метка страницы и значение защиты от подделки запроса."""
+    """Браузер владельца со страницей настройки: `Origin`, метка страницы и ключ сессии, который
+    страница держит в `localStorage` своего origin (`key`)."""
 
-    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
-        self.http = httpx.AsyncClient(transport=transport, base_url=ORIGIN)
-        self.csrf = ""
+    def __init__(self, transport: httpx.AsyncBaseTransport, origin: str = ORIGIN) -> None:
+        self.origin = origin
+        self.http = httpx.AsyncClient(transport=transport, base_url=origin)
+        self.key = ""
 
     def headers(self, **extra: str) -> dict[str, str]:
-        out = {"Origin": ORIGIN, "X-Shturman-Setup": "1", "Sec-Fetch-Site": "same-origin"}
-        if self.csrf:
-            out["X-Shturman-Csrf"] = self.csrf
+        out = {"Origin": self.origin, "X-Shturman-Setup": "1", "Sec-Fetch-Site": "same-origin"}
+        if self.key:
+            out["X-Shturman-Session"] = self.key
         out.update(extra)
         return out
 
     async def get(self, path: str, **kw: Any) -> httpx.Response:
-        return await self.http.get(API + path, headers={"Sec-Fetch-Site": "same-origin"}, **kw)
+        headers = {"Sec-Fetch-Site": "same-origin"}
+        if self.key:
+            headers["X-Shturman-Session"] = self.key
+        return await self.http.get(API + path, headers=headers, **kw)
 
     async def send(self, method: str, path: str, body: Any = None, **kw: Any) -> httpx.Response:
         return await self.http.request(method, API + path, json={} if body is None else body,
@@ -85,7 +98,7 @@ class Browser:
         token, _ = await auth.create_link(conn)
         response = await self.http.post(API + "/login/link", json={"token": token}, headers=self.headers())
         assert response.status_code == 200, response.text
-        self.csrf = response.json()["csrf"]
+        self.key = response.json()["key"]
         return response
 
     async def aclose(self) -> None:
@@ -101,6 +114,12 @@ async def stand(make_client, conn, config, monkeypatch):
     executor_service.TEST_OVERRIDES.update(
         bot_transport=telegram.transport(), llm_transport=llm.transport(), poll=0, idle=0.02, probe=0)
     monkeypatch.setattr(setup_service, "FAIL_DELAY", 0.0)
+    DNS.clear()
+
+    async def resolve(host: str, port: int) -> list[str]:
+        return DNS.get(host, [PUBLIC_IP])
+
+    monkeypatch.setattr(netguard, "resolver", resolve)
     browsers: list[Browser] = []
 
     async def start(*, modules=MODULES, world=None, **changes):
@@ -112,8 +131,8 @@ async def stand(make_client, conn, config, monkeypatch):
             manager.client_factory = world.factory
             manager.pacing = 0.0
 
-        def browser() -> Browser:
-            b = Browser(client._transport)
+        def browser(origin: str = ORIGIN) -> Browser:
+            b = Browser(client._transport, origin)
             browsers.append(b)
             return b
 

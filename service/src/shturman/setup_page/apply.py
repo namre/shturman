@@ -26,8 +26,8 @@ import asyncio
 import logging
 import re
 from typing import Any
-from urllib.parse import urlsplit
 
+from .. import netguard
 from ..executor import service as executor_service
 from ..executor.botapi import BotApi, BotApiError, NeverLeft, Refused
 from ..executor.llm import LlmClient, LlmError
@@ -199,18 +199,38 @@ async def probe_other_poller(config: Any, token: str) -> None:
         await api.aclose()
 
 
-def check_llm_fields(base_url: Any, model: Any) -> tuple[str, str]:
+_BAD_URL = ("Адрес API должен выглядеть как https://api.openai.com/v1: начинаться с https:// и не содержать "
+            "ничего после пути.")
+_INNER_URL = ("Этот адрес ведёт внутрь сервера или в домашнюю сеть, а со страницы настройки можно указать только "
+              "адрес в интернете. Локальную модель (Ollama и подобные) подключает оператор в настройках сервера: "
+              "там задаётся SHTURMAN_LLM_BASE_URL.")
+_NOT_HTTPS = ("Адрес API должен начинаться с https://. Адрес без шифрования (http://) со страницы настройки "
+              "указать нельзя: ключ ушёл бы открытым текстом. Локальную модель подключает оператор "
+              "в настройках сервера.")
+_URL_PROBLEMS = {"not_https": _NOT_HTTPS, "bad_address": _BAD_URL, "blocked_address": _INNER_URL}
+
+
+def check_llm_url(base_url: Any) -> str:
+    """Адрес API, введённый на странице: только https и только наружу (`netguard.check_url`).
+
+    Здесь — проверка по записи адреса; по разрешённому имени адрес проверяется при каждом
+    запросе (`netguard.PinnedTransport`). Возвращает адрес в одном виде — со схемой и именем
+    узла строчными буквами, без косой черты в конце: по нему же решается, сменился ли адрес."""
     url = clean(base_url).rstrip("/") or ss.DEFAULT_LLM_BASE_URL
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password \
-            or parts.query or parts.fragment:
-        raise Invalid("Адрес API должен выглядеть как https://api.openai.com/v1 — начинаться с https:// "
-                      "(или http:// для сервера в вашей сети) и не содержать ничего после пути.", "bad_base_url")
+    try:
+        parts = netguard.check_url(url)
+    except netguard.Blocked as exc:
+        raise Invalid(_URL_PROBLEMS.get(exc.code, _BAD_URL),
+                      "blocked_base_url" if exc.code == "blocked_address" else "bad_base_url") from None
+    return f"https://{parts.netloc.lower()}{parts.path}".rstrip("/")
+
+
+def check_llm_model(model: Any) -> str:
     name = clean(model)
     if not _MODEL.match(name):
         raise Invalid("Имя модели — как его пишет провайдер, латиницей, без пробелов: например gpt-4o-mini "
                       "или openai/gpt-4o-mini.", "bad_model")
-    return url, name
+    return name
 
 
 _LLM_PROBLEMS = {
@@ -225,6 +245,12 @@ _LLM_PROBLEMS = {
     "bad_response": "По этому адресу ответили не так, как отвечает API, совместимый с OpenAI. Проверьте адрес API.",
     "proxy_needs_socksio": _BOT_PROBLEMS["proxy_needs_socksio"],
     "bad_proxy_url": _BOT_PROBLEMS["bad_proxy_url"],
+    "blocked_address": _INNER_URL,
+    "not_https": _NOT_HTTPS,
+    "bad_address": _BAD_URL,
+    "dns_failed": "Сервер не нашёл такого адреса: имя узла не разрешается. Проверьте адрес API. Если сервер "
+                  "выходит в интернет только через прокси и сам имён не разрешает, адрес модели задают "
+                  "в настройках сервера.",
 }
 
 
@@ -236,14 +262,20 @@ def llm_problem_text(code: str | None) -> str | None:
                 "в интернет (или настроен прокси).")
     if code.startswith("http_5"):
         return "Сервер провайдера ответил ошибкой. Попробуйте позже."
+    if code.startswith("http_3"):
+        return ("По этому адресу отвечают перенаправлением на другой адрес. Сервис по перенаправлениям не ходит: "
+                "укажите конечный адрес API.")
     return _LLM_PROBLEMS.get(code, "Провайдер ответил отказом. Проверьте ключ, адрес и имя модели.")
 
 
-async def check_llm(config: Any, *, api_key: str, base_url: str, model: str) -> str:
-    """Задаёт модели самый короткий вопрос. Возвращает имя модели, которым ответил провайдер."""
+async def check_llm(config: Any, *, api_key: str, base_url: str, model: str, restricted: bool) -> str:
+    """Задаёт модели самый короткий вопрос. Возвращает имя модели, которым ответил провайдер.
+
+    restricted — адрес введён на странице: пробный запрос уходит только на адрес в интернете,
+    проверенный в момент соединения, и по перенаправлениям не идёт."""
     client = LlmClient(base_url=base_url, api_key=api_key, model=model, proxy_url=config.proxy_url,
                        transport=executor_service.TEST_OVERRIDES.get("llm_transport"), timeout=30.0, slots=1,
-                       sleep=_no_wait)
+                       sleep=_no_wait, restricted=restricted)
     try:
         _, used = await client.chat([{"role": "user", "content": "Ответь одним словом: да"}], max_tokens=16)
     except LlmError as exc:

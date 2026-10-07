@@ -3,6 +3,13 @@
 Действия со страницы применяются сразу, без карточки в боте, поэтому каждое изменяющее действие
 оставляет здесь запись, а последние записи видны на самой странице.
 
+Записи двух родов. Важные — входы, смена ключей и бота, привязка владельца, вход в аккаунты
+Telegram и выход из них, смена модели — хранятся отдельно от обычных: у каждого рода свой предел
+(`KEEP_IMPORTANT`, `KEEP`). Тот, кто получил доступ к странице и хочет замести следы, тысячами
+обычных действий (включить и выключить чат) вытеснит обычные записи, но не запись о своём входе
+и не запись о смене ключей. На странице важные записи показаны отдельным списком — по той же
+причине: из вида их потоком мелких действий тоже не убрать.
+
 Чего в журнале нет и быть не должно: значений токенов, ключей, кодов, паролей, ссылок входа и
 привязки, QR-ссылок, текстов переписки, названий чатов и имён людей. Поле `detail` собирает код
 из чисел, ролей и признаков — значения из запроса в него не подставляются.
@@ -18,7 +25,8 @@ import asyncpg
 logger = logging.getLogger("shturman.setup")
 
 OK, REFUSED, FAILED = "ok", "refused", "failed"
-KEEP = 2000           # столько последних записей хранится
+KEEP = 2000             # столько последних обычных записей хранится
+KEEP_IMPORTANT = 2000   # и столько же важных — отдельно: обычные их не вытесняют
 DETAIL_LIMIT = 300
 
 # Вид действия → как он называется на странице. Новое действие дописывается сюда же: запись
@@ -56,6 +64,17 @@ ACTIONS = {
 }
 
 
+# Записи, по которым видно, кто и как получил доступ и что сменил в самом доступе. Хранятся
+# отдельно от обычных и показываются на странице отдельным списком. Неудачные попытки входа сюда
+# не входят намеренно: их может слать посторонний, и они не должны вытеснять остальное.
+IMPORTANT = frozenset({
+    "login.link", "login.code", "logout.all",
+    "bot.token", "bot.token_removed", "bot.bind_link",
+    "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout",
+    "llm.save", "llm.removed",
+})
+
+
 # Как называется действие, если оно не состоялось (итог не «ok»).
 NOT_DONE = {
     "bot.token": "Токен бота согласований не сохранён",
@@ -75,13 +94,33 @@ async def write(pool: asyncpg.Pool, action: str, outcome: str = OK, detail: str 
         logger.error("журнал страницы настройки: запись не сделана (%s)", type(exc).__name__)
 
 
+def _row(r: Any) -> dict[str, Any]:
+    title = (NOT_DONE.get(r["action"]) if r["outcome"] != OK else None) or ACTIONS.get(r["action"], r["action"])
+    return {"at": r["at"].isoformat(), "action": r["action"], "title": title, "outcome": r["outcome"],
+            "detail": r["detail"]}
+
+
 async def recent(conn: asyncpg.Connection, limit: int = 30) -> list[dict[str, Any]]:
     rows = await conn.fetch(
         "SELECT at, action, outcome, detail FROM setup_audit ORDER BY id DESC LIMIT $1", limit)
-    return [{"at": r["at"].isoformat(), "action": r["action"], "title": (NOT_DONE.get(r["action"]) if r["outcome"] != OK else None) or ACTIONS.get(r["action"], r["action"]),
-             "outcome": r["outcome"], "detail": r["detail"]} for r in rows]
+    return [_row(r) for r in rows]
+
+
+async def recent_important(conn: asyncpg.Connection, limit: int = 10) -> list[dict[str, Any]]:
+    """Последние важные записи — сколько бы обычных ни было сделано после них."""
+    rows = await conn.fetch(
+        """SELECT at, action, outcome, detail FROM setup_audit WHERE action = ANY($1::text[])
+           ORDER BY id DESC LIMIT $2""", sorted(IMPORTANT), limit)
+    return [_row(r) for r in rows]
 
 
 async def trim(conn: asyncpg.Connection) -> None:
-    await conn.execute(
-        "DELETE FROM setup_audit WHERE id <= (SELECT max(id) FROM setup_audit) - $1", KEEP)
+    """Оставляет последние `KEEP` обычных записей и последние `KEEP_IMPORTANT` важных — порознь."""
+    important = sorted(IMPORTANT)
+    for keep, mine in ((KEEP, False), (KEEP_IMPORTANT, True)):
+        await conn.execute(
+            """DELETE FROM setup_audit
+               WHERE (action = ANY($1::text[])) = $2
+                 AND id <= COALESCE((SELECT id FROM setup_audit WHERE (action = ANY($1::text[])) = $2
+                                     ORDER BY id DESC OFFSET $3 LIMIT 1), 0)""",
+            important, mine, keep)

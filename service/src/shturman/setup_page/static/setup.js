@@ -1,8 +1,11 @@
 /* Страница настройки «Штурмана». Обычный скрипт без сборки и без библиотек.
  *
- * Страница ничего не хранит: ни в localStorage, ни в адресе. Значение одноразовой ссылки входа
- * берётся из части адреса после «#» (на сервер при открытии она не уходит), отправляется один раз
- * телом POST и сразу убирается из адресной строки. Сессию держит cookie, недоступная скриптам.
+ * Вход. Значение одноразовой ссылки берётся из части адреса после «#» (на сервер при открытии
+ * она не уходит), отправляется один раз телом POST и сразу убирается из адресной строки. В ответ
+ * сервер один раз отдаёт ключ сессии. Страница хранит его в localStorage своего адреса и шлёт
+ * заголовком X-Shturman-Session с каждым запросом. Cookie нет вовсе: страница стоит на том же
+ * имени узла, что и дашборд ассистента, но на другом порту, а cookie по портам не разделяются.
+ * localStorage разделяется: соседний порт его не видит. Кроме ключа сессии, в хранилище ничего нет.
  *
  * Секреты (токен, ключ, пароль, код) уходят только в теле запроса и обратно не приходят: сервер
  * отвечает «задано / не задано». Поле с секретом очищается сразу после отправки.
@@ -11,13 +14,27 @@
   "use strict";
 
   var API = "api/";
-  var csrf = "";
-  var S = null;                 // последнее состояние разделов с сервера
+  var KEY_NAME = "shturman-setup-session";
+  var key = "";                 // ключ сессии; пусто — входа нет
+  var S = null;                 // последнее состояние с сервера
+  var FIRST_CHATS = 15, MORE_CHATS = 30;
+
+  /* Хранилище может быть недоступно (закрытый режим браузера): тогда вход живёт до закрытия вкладки. */
+  function loadKey() {
+    try { return localStorage.getItem(KEY_NAME) || ""; } catch (e) { return ""; }
+  }
+  function saveKey(value) {
+    key = value || "";
+    try {
+      if (key) localStorage.setItem(KEY_NAME, key); else localStorage.removeItem(KEY_NAME);
+    } catch (e) { /* останется в памяти страницы */ }
+  }
   var ui = {
     botEditing: false, botToken: "", bind: null, keysEditing: false,
     login: null, loginLink: "", chatAccount: null, chats: [], chatsTotal: 0, chatsEnabled: 0,
     chatsLoading: false, chatsKey: "", scans: {}, scanning: {}, exclude: {}, upload: null,
-    signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null
+    signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
+    messages: null, importOpened: false
   };
 
   /* ------------------------------------------------------------ мелочи */
@@ -109,14 +126,14 @@
 
   function headers(json) {
     var h = { "X-Shturman-Setup": "1" };
-    if (csrf) h["X-Shturman-Csrf"] = csrf;
+    if (key) h["X-Shturman-Session"] = key;
     if (json) h["Content-Type"] = "application/json";
     return h;
   }
 
   /* Возвращает {ok, status, data, error}. Не бросает. При устаревшем входе показывает экран входа. */
   function call(method, path, body, quiet) {
-    var options = { method: method, credentials: "same-origin", cache: "no-store", redirect: "error", headers: headers(body !== undefined) };
+    var options = { method: method, credentials: "omit", cache: "no-store", redirect: "error", referrerPolicy: "no-referrer", headers: headers(body !== undefined) };
     if (body !== undefined) options.body = JSON.stringify(body);
     return fetch(API + path, options).then(function (res) {
       return res.text().then(function (raw) {
@@ -125,7 +142,7 @@
         var out = { ok: res.ok, status: res.status, data: data, error: null };
         if (!res.ok) {
           out.error = (data && typeof data.error === "string" && data.error) || GENERIC[res.status] || GENERIC[res.status >= 500 ? 500 : 403];
-          if (res.status === 401 && data.code === "unauthenticated" && !quiet) loginScreen("Вход устарел. Войдите заново.");
+          if (res.status === 401 && data.code === "unauthenticated" && !quiet) { saveKey(""); loginScreen("Вход устарел. Войдите заново."); }
         }
         return out;
       });
@@ -161,7 +178,7 @@
     expired: "Срок действия кода вышел. Запросите новый.",
     none: "Этот код уже использован или не запрашивался. Запросите новый.",
     locked: "Слишком много неверных попыток. Вход по коду временно закрыт — попробуйте позже или войдите по новой ссылке.",
-    no_owner: "Владелец к боту согласований ещё не привязан, поэтому код прислать некому. Войти можно только по одноразовой ссылке.",
+    no_owner: "Код прислать некому: бот согласований не настроен. Войдите по одноразовой ссылке — попросите того, кто ставил ассистента, или выполните на сервере ./ops/setup-link.sh",
     wait: "Недавняя отправка не удалась. Попробуйте ещё раз через минуту.",
     send_failed: "Не удалось отправить код: бот сейчас не может написать вам в Telegram. Попробуйте через минуту."
   };
@@ -178,11 +195,12 @@
 
   function loginScreen(message) {
     stopLoop();
-    csrf = ""; S = null;
+    S = null;
     show("screen-app", false);
     show("screen-login", true);
     call("GET", "session", undefined, true).then(function (r) {
-      if (r.ok && r.data.authenticated) { csrf = r.data.csrf; startApp(); return; }
+      if (r.ok && r.data.authenticated && key) { startApp(); return; }
+      if (r.ok && key) saveKey("");                  // сервер ключа не признал: стираем
       var canCode = r.ok && r.data.code_login;
       if (message) { loginMessage(message, true); return; }
       loginView(canCode ? "login-start" : "login-nolink");
@@ -205,8 +223,8 @@
       busy(button, true);
       call("POST", "login/link", { token: token }, true).then(function (r) {
         busy(button, false);
-        if (r.ok) { csrf = r.data.csrf; startApp(); return; }
-        loginMessage(r.error, false);
+        if (r.ok && r.data.key) { saveKey(r.data.key); startApp(); return; }
+        loginMessage(r.error || GENERIC[500], false);
       });
     });
 
@@ -245,7 +263,7 @@
       call("POST", "login/code", { code: digits }, true).then(function (r) {
         busy(button, false);
         input.value = "";
-        if (r.ok) { csrf = r.data.csrf; startApp(); return; }
+        if (r.ok && r.data.key) { saveKey(r.data.key); startApp(); return; }
         var reason = r.data.code;
         if (reason === "locked" || reason === "none" || reason === "expired") {
           loginMessage(CODE_REASONS[reason], reason !== "locked");
@@ -264,7 +282,7 @@
   function startLoop() {
     stopLoop();
     loop = setInterval(function () {
-      if (document.hidden || !csrf) return;
+      if (document.hidden || !key) return;
       var now = Date.now(), every = now < ui.fastUntil || ui.login || ui.bind ? 2000 : 6000;
       if (now - ui.lastState >= every) refresh();
       if (now - ui.lastOverview >= 30000) refreshOverview();
@@ -305,13 +323,51 @@
   function render() {
     if (!S) return;
     text("foot-version", "Штурман " + S.version);
-    renderBot(S.bot);
     renderKeys(S.tg);
     renderAccounts(S.tg);
     renderChats(S.tg);
     renderImports(S.imports);
+    renderBot(S.bot);
     renderBusiness(S.bot);
     renderLlm(S.llm);
+    renderProgress();
+  }
+
+  /* Строка «что уже сделано» и замки на шагах: следующий шаг открыт, когда готов предыдущий. */
+  function lockStep(id, locked, done) {
+    var card = $(id);
+    card.classList.toggle("locked", !!locked);
+    card.classList.toggle("is-done", !!done);
+  }
+
+  function renderProgress() {
+    var tg = S.tg, keys = tg.keys.configured;
+    var accounts = (tg.accounts || []).filter(function (a) { return a.account_id !== null; });
+    var chats = accounts.reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
+    var imported = (S.imports.items || []).some(function (i) { return i.state === "done"; });
+    var steps = [
+      ["Ключи приложения", keys, keys ? "готово" : "сделайте сейчас"],
+      ["Вход в аккаунт", accounts.length > 0, accounts.length ? "готово" : keys ? "сделайте сейчас" : "после шага 1"],
+      ["Выбор чатов", chats > 0, chats ? "выбрано: " + chats : accounts.length ? "сделайте сейчас" : "после шага 2"]
+    ];
+    lockStep("s-keys", false, keys);
+    lockStep("s-accounts", !keys, accounts.length > 0);
+    lockStep("s-chats", !accounts.length, chats > 0);
+    renderIfChanged("progress", [steps, imported], function () {
+      var nodes = steps.map(function (s, i) {
+        var now = !s[1] && s[2] === "сделайте сейчас";
+        return el("li", { class: s[1] ? "done" : now ? "now" : "wait" }, [
+          el("span", { class: "p-mark", "aria-hidden": "true", text: s[1] ? "✓" : String(i + 1) }),
+          el("span", { class: "p-name", text: s[0] }),
+          el("span", { class: "p-state", text: s[2] })
+        ]);
+      });
+      if (imported) nodes.push(el("li", { class: "done" }, [
+        el("span", { class: "p-mark", "aria-hidden": "true", text: "✓" }),
+        el("span", { class: "p-name", text: "Выгрузка" }), el("span", { class: "p-state", text: "импортирована" })
+      ]));
+      return nodes;
+    });
   }
 
   /* ----------------------------------------------- 1. бот согласований */
@@ -331,6 +387,7 @@
     show("bot-actions", b.configured && b.source === "page" && !ui.botEditing);
     show("shot-newbot", !b.configured || ui.botEditing);
 
+    show("s-business", b.configured);
     var canBind = b.configured && !!b.username && !ui.botEditing;
     show("bind", canBind);
     if (!canBind) { ui.bind = null; return; }
@@ -420,6 +477,7 @@
     show("keys-form", editing);
     show("keys-form-cancel", ui.keysEditing);
     show("keys-actions", k.configured && k.source === "page" && !ui.keysEditing);
+    show("keys-shot", editing);                       // схема нужна, только пока ключи вводят
   }
 
   function wireKeys() {
@@ -429,7 +487,7 @@
       var body = { api_id: id.value.trim(), api_hash: hash.value.trim() };
       hash.value = "";
       act($("keys-save"), "keys-error", "PUT", "tg/keys", body, function () {
-        id.value = ""; ui.keysEditing = false; toast("Ключи приложения сохранены.");
+        id.value = ""; ui.keysEditing = false; toast("Ключи сохранены. Теперь шаг 2 — вход в аккаунт.");
       });
     });
     $("keys-change").addEventListener("click", function () { ui.keysEditing = true; render(); $("keys-id").focus(); });
@@ -460,11 +518,11 @@
       nodes.push(el("label", { class: "check" }, [consent, el("span", { text: "Понимаю: на сервере появится сессия моего основного аккаунта. Если Telegram сочтёт её подозрительной, ограничения коснутся основного номера. Завершить сессию можно в Telegram: «Настройки» → «Устройства»." })]));
     }
     if (role === "assistant" && !tg.owner_known) {
-      nodes.push(el("p", { class: "note info", text: "Сначала привяжите себя к боту согласований — раздел 1. Пока сервис не знает, какой аккаунт ваш основной, он не сможет отличить его от помощника." }));
+      nodes.push(el("p", { class: "note info", text: "Сначала подключите свой основной аккаунт — шаг 2. Пока сервис не знает, какой аккаунт ваш, он не сможет отличить его от помощника." }));
       return nodes;
     }
     nodes.push(el("div", { class: "row" }, [el("button", {
-      class: "btn", type: "button", text: again ? "Войти заново" : "Подключить",
+      class: "btn", type: "button", text: again ? "Войти заново" : role === "owner" ? "Показать QR-код для входа" : "Подключить помощника",
       onclick: function () {
         if (consent && !consent.checked) { toast("Отметьте, что понимаете: на сервере появится сессия основного аккаунта.", true); consent.focus(); return; }
         startLogin(role, this);
@@ -505,22 +563,34 @@
 
   function renderAccounts(tg) {
     var ready = tg.keys.configured;
-    var connected = (tg.accounts || []).filter(function (a) { return a.status === "running"; }).length;
-    pill("accounts", !ready ? "" : connected ? "Подключено: " + connected : "Не подключены", connected ? "done" : "");
+    var owner = accountOf(tg, "owner"), helper = accountOf(tg, "assistant");
+    pill("accounts", !ready ? "" : owner && owner.status === "running" ? "Готово" : owner ? "Нужно внимание" : "Не выполнен",
+         owner && owner.status === "running" ? "done" : owner ? "todo" : "");
+    pill("assistant", helper && helper.status === "running" ? "Подключён" : "", helper ? "done" : "");
     show("accounts-nokeys", !ready);
     show("accounts-body", ready);
+    show("assistant-nokeys", !ready);
+    show("role-assistant-state", ready);
     if (!ready) return;
+    if (!ui.login && tg.logins && tg.logins.length) {        // страницу обновили посреди входа
+      ui.login = { id: tg.logins[0].login_id, role: tg.logins[0].role };
+      placeLogin(ui.login.role);
+      pollLogin();
+    }
     ["owner", "assistant"].forEach(function (role) {
       var account = accountOf(tg, role);
       renderIfChanged("role-" + role + "-state", [account, tg.owner_known, !!ui.login], function () {
-        return ui.login && ui.login.role === role && !account ? [el("p", { class: "small waiting", text: "Идёт вход — смотрите ниже." })] : accountNodes(account, role, tg);
+        return ui.login && ui.login.role === role && !account ? [el("p", { class: "small waiting", text: "Идёт вход — код ниже." })] : accountNodes(account, role, tg);
       });
     });
-    if (!ui.login && tg.logins && tg.logins.length) {        // страницу обновили посреди входа
-      ui.login = { id: tg.logins[0].login_id, role: tg.logins[0].role };
-      pollLogin();
-    }
     show("tg-login", !!ui.login);
+  }
+
+  /* Блок с QR один на оба аккаунта: он переезжает туда, где начали вход. */
+  function placeLogin(role) {
+    var slot = $("login-slot-" + role), box = $("tg-login");
+    if (slot && box.parentNode !== slot) slot.appendChild(box);
+    if (role === "assistant") $("extras").open = true;
   }
 
   function startLogin(role, button) {
@@ -530,6 +600,7 @@
       if (!r.ok) { toast(r.error, true); return; }
       ui.login = { id: r.data.login_id, role: role };
       ui.loginLink = "";
+      placeLogin(role);
       showLogin(r.data);
       render();
       $("tg-login").scrollIntoView({ block: "nearest" });
@@ -556,7 +627,7 @@
     }
     if (flow.status === "completed") {
       closeLogin();
-      toast("Аккаунт подключён. Теперь выберите чаты — раздел 4.");
+      toast("Аккаунт подключён. Теперь шаг 3 — выберите чаты.");
       fast(20);
       refresh(); refreshOverview();
     } else if (!pending && !password) {
@@ -616,7 +687,6 @@
 
   var KIND_NAMES = { personal: "личный", group: "группа", channel: "канал" };
   var KIND_BULK = { personal: "личные чаты", group: "группы", channel: "каналы" };
-  var PAGE = 50;
 
   function runningAccounts(tg) {
     return (tg.accounts || []).filter(function (a) { return a.account_id !== null && a.status === "running"; });
@@ -625,7 +695,7 @@
   function renderChats(tg) {
     var accounts = runningAccounts(tg), all = (tg.accounts || []).filter(function (a) { return a.account_id !== null; });
     var total = all.reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
-    pill("chats", all.length ? "Выбрано: " + total : "", total ? "done" : all.length ? "todo" : "");
+    pill("chats", all.length ? (total ? "Выбрано: " + total : "Выберите чаты") : "", total ? "done" : all.length ? "todo" : "");
     show("chats-none", !all.length);
     show("chats-body", !!all.length);
     if (!all.length) { ui.chatAccount = null; return; }
@@ -645,7 +715,7 @@
       });
     });
     var online = current.status === "running";
-    note("chats-offline", "warn", online ? "" : "Этот аккаунт сейчас не подключён, поэтому список чатов недоступен. Состояние аккаунта — в разделе 3.");
+    note("chats-offline", "warn", online ? "" : "Этот аккаунт сейчас не подключён, поэтому список чатов недоступен. Его состояние — на шаге 2.");
     ["chats-options", "chats-counter", "chats-list"].forEach(function (id) { show(id, online); });
     document.querySelector("#chats-body .toolbar").hidden = !online;
     show("chats-refresh", online);
@@ -673,7 +743,7 @@
     var key = chatsQueryKey(), offset = reset ? 0 : ui.chats.length;
     ui.chatsLoading = true;
     ui.chatsKey = key;
-    var query = "?offset=" + offset + "&limit=" + PAGE + "&q=" + encodeURIComponent($("chats-q").value.trim()) +
+    var query = "?offset=" + offset + "&limit=" + (reset ? FIRST_CHATS : MORE_CHATS) + "&q=" + encodeURIComponent($("chats-q").value.trim()) +
       "&kind=" + encodeURIComponent($("chats-kind").value) + ($("chats-only").checked ? "&only=enabled" : "") +
       (refreshList ? "&refresh=1" : "");
     call("GET", "tg/accounts/" + ui.chatAccount + "/dialogs" + query).then(function (r) {
@@ -749,7 +819,9 @@
     ui.chats.forEach(function (item) { list.appendChild(chatRow(item)); });
     if (!ui.chats.length) note("chats-error", "info", "Ничего не найдено. Измените поиск или вид чатов.");
     drawCounter();
-    show("chats-more", ui.chats.length < ui.chatsTotal);
+    var left = ui.chatsTotal - ui.chats.length;
+    show("chats-more", left > 0);
+    if (left > 0) text("chats-more", "Показать ещё " + Math.min(left, MORE_CHATS) + " (осталось " + left + ")");
     var kind = $("chats-kind").value, bulk = $("chats-bulk");
     show(bulk, !!kind && !$("chats-q").value.trim() && !$("chats-only").checked && ui.chatsTotal > 0);
     if (kind) text(bulk, "Читать все " + KIND_BULK[kind] + " (" + ui.chatsTotal + ")");
@@ -879,6 +951,7 @@
     var done = items.some(function (i) { return i.state === "done"; }), active = items.some(function (i) { return i.state === "running"; });
     pill("import", active ? "Идёт импорт" : done ? "Импортировано" : items.length ? "Файл загружен" : "", done && !active ? "done" : items.length ? "todo" : "");
     if (active) fast(10);
+    if (items.length && !ui.importOpened) { ui.importOpened = true; $("import-details").open = true; }
     items.forEach(function (item) {
       if (item.file_kept && (item.state === "uploaded" || item.state === "scanning") && !ui.scans[item.import_id]) fetchScan(item.import_id);
     });
@@ -900,7 +973,7 @@
       text("import-progress-text", "Загружаю файл: 0% из " + megabytes(file.size));
       xhr.open("POST", API + "imports");
       xhr.setRequestHeader("X-Shturman-Setup", "1");
-      xhr.setRequestHeader("X-Shturman-Csrf", csrf);
+      xhr.setRequestHeader("X-Shturman-Session", key);
       xhr.setRequestHeader("Content-Type", "application/json");
       xhr.upload.onprogress = function (e) {
         if (!e.lengthComputable) return;
@@ -919,7 +992,7 @@
       xhr.onload = function () {
         var data = {};
         try { data = JSON.parse(xhr.responseText || "{}"); } catch (e) { data = {}; }
-        if (xhr.status === 401) { finish(""); loginScreen("Вход устарел. Войдите заново и загрузите файл ещё раз."); return; }
+        if (xhr.status === 401) { finish(""); saveKey(""); loginScreen("Вход устарел. Войдите заново и загрузите файл ещё раз."); return; }
         if (xhr.status !== 201) { finish(data.error || GENERIC[xhr.status] || GENERIC[500]); return; }
         finish("");
         toast("Файл загружен. Считаю чаты…");
@@ -962,7 +1035,7 @@
 
   function renderLlm(llm) {
     var locked = llm.key.source === "server";
-    pill("llm", llm.configured ? "Настроена" : "Необязательно", llm.configured ? "done" : "");
+    pill("llm", llm.configured ? "Настроена" : "", llm.configured ? "done" : "");
     show("llm-server", locked);
     show("llm-form", !locked);
     show("llm-remove", llm.key.source === "page");
@@ -978,8 +1051,8 @@
     url.disabled = !llm.base_url.editable; model.disabled = !llm.model.editable;
     if (document.activeElement !== url) url.value = llm.base_url.value === "https://api.openai.com/v1" && llm.base_url.editable ? "" : llm.base_url.value;
     if (document.activeElement !== model) model.value = llm.model.value || "";
-    text("llm-key-hint", llm.key.set ? "Ключ уже сохранён. Оставьте поле пустым, чтобы сменить только адрес или модель, либо вставьте новый ключ." : "Ключ провайдера с API, совместимым с OpenAI: OpenAI, OpenRouter или свой сервер.");
-    if (!llm.base_url.editable) text("llm-url-hint", "Задан в настройках сервера.");
+    text("llm-key-hint", llm.key.set ? "Ключ уже сохранён. Оставьте поле пустым, чтобы сменить только модель. Если меняете адрес — вставьте ключ заново." : "Ключ провайдера с API, совместимым с OpenAI: OpenAI, OpenRouter и подобные.");
+    if (!llm.base_url.editable) text("llm-url-hint", "Задан в настройках сервера: здесь его не поменять.");
     if (!llm.model.editable) text("llm-model-hint", "Задано в настройках сервера.");
   }
 
@@ -1007,8 +1080,8 @@
 
   function renderSummary(data) {
     var a = data.archive || {};
-    pill("summary", "", a.messages ? "done" : "");
     $("sending-note").hidden = !!a.sending;
+    text("collected", number(a.messages));
     renderIfChanged("tiles", a, function () {
       return [
         ["Сообщений в архиве", a.messages], ["Чатов", a.chats], ["Исключено чатов", a.chats_excluded], ["Аккаунтов", a.accounts]
@@ -1031,28 +1104,39 @@
         fact("Отправка сообщений", a.sending ? "Включена в настройках сервера." : "Выключена. Включается только в настройках сервера, не здесь.")
       ];
     });
-    renderIfChanged("audit", data.audit, function () {
-      if (!data.audit || !data.audit.length) return [el("li", {}, [el("span", { class: "detail", text: "Пока ничего не менялось." })])];
-      return data.audit.map(function (row) {
-        var bad = row.outcome !== "ok";
-        return el("li", {}, [
-          el("time", { datetime: row.at, text: when(row.at) }),
-          el("span", { class: "what" + (bad ? " bad" : ""), text: row.title }),
-          row.detail ? el("span", { class: "detail", text: row.detail }) : null
-        ]);
+    [["audit-key", data.audit_key], ["audit", data.audit]].forEach(function (pair) {
+      var rows = pair[1];
+      renderIfChanged(pair[0], rows, function () {
+        if (!rows || !rows.length) return [el("li", {}, [el("span", { class: "detail", text: "Пока ничего не менялось." })])];
+        return rows.map(function (row) {
+          var bad = row.outcome !== "ok";
+          return el("li", {}, [
+            el("time", { datetime: row.at, text: when(row.at) }),
+            el("span", { class: "what" + (bad ? " bad" : ""), text: row.title }),
+            row.detail ? el("span", { class: "detail", text: row.detail }) : null
+          ]);
+        });
       });
     });
   }
 
   function wireSession() {
     $("logout").addEventListener("click", function () {
-      call("POST", "logout", {}, true).then(function () { loginScreen(""); });
+      call("POST", "logout", {}, true).then(function () { saveKey(""); loginScreen(""); });
     });
     $("logout-all").addEventListener("click", function () {
-      if (!confirm("Завершить все сессии этой страницы — на всех устройствах?\n\nВойти снова можно будет по коду от бота или по новой ссылке.")) return;
-      call("POST", "logout-all", {}, true).then(function () { loginScreen(""); });
+      if (!confirm("Завершить все сессии этой страницы — на всех устройствах?\n\nВойти снова можно будет по новой ссылке: ./ops/setup-link.sh")) return;
+      call("POST", "logout-all", {}, true).then(function () { saveKey(""); loginScreen(""); });
     });
-    document.addEventListener("visibilitychange", function () { if (!document.hidden && csrf) { refresh(); refreshOverview(); } });
+    document.addEventListener("visibilitychange", function () { if (!document.hidden && key) { refresh(); refreshOverview(); } });
+    // Вышли в соседней вкладке — выходим и здесь; вошли — подхватываем вход.
+    window.addEventListener("storage", function (event) {
+      if (event.key !== null && event.key !== KEY_NAME) return;
+      var stored = loadKey();
+      if (stored === key) return;
+      key = stored;
+      loginScreen("");
+    });
   }
 
   /* ------------------------------------------------------------- запуск */
@@ -1070,7 +1154,7 @@
   // Ссылку могли вставить в адресную строку уже открытой страницы: тогда меняется только часть после «#».
   window.addEventListener("hashchange", function () {
     if (!takeLinkToken()) return;
-    if (csrf) {
+    if (key) {
       // Вход уже выполнен: ссылка не нужна. Убираем её из адреса, не расходуя.
       try { history.replaceState(null, "", location.pathname + location.search); } catch (e) { /* не критично */ }
       return;
@@ -1078,6 +1162,20 @@
     offerLink();
   });
 
-  if (takeLinkToken()) offerLink();
-  else loginScreen("");
+  key = loadKey();
+  if (!takeLinkToken()) loginScreen("");
+  else if (!key) offerLink();
+  else {
+    // Ссылку открыли там, где вход, возможно, уже есть. Если он действует — ссылка не нужна:
+    // убираем её из адреса, не расходуя. Если устарел — предлагаем войти по ссылке.
+    call("GET", "session", undefined, true).then(function (r) {
+      if (r.ok && r.data.authenticated) {
+        try { history.replaceState(null, "", location.pathname + location.search); } catch (e) { /* не критично */ }
+        startApp();
+        return;
+      }
+      if (r.ok) saveKey("");
+      offerLink();
+    });
+  }
 })();

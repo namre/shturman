@@ -106,7 +106,7 @@ def test_repr_of_settings_has_no_secrets(tmp_path):
 def from_env(monkeypatch, tmp_path, **env) -> Config:
     for name in ("SHTURMAN_BOT_TOKEN", "SHTURMAN_SENDING", "SHTURMAN_LLM_API_KEY", "SHTURMAN_LLM_MODEL",
                  "SHTURMAN_LLM_BASE_URL", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "SHTURMAN_SETUP_ORIGIN",
-                 "SHTURMAN_ALLOWED_HOSTS", "SHTURMAN_PORT"):
+                 "SHTURMAN_DASHBOARD_ORIGIN", "SHTURMAN_ALLOWED_HOSTS", "SHTURMAN_PORT"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SHTURMAN_DSN", DSN)
     monkeypatch.setenv("SHTURMAN_API_TOKEN", API_TOKEN)
@@ -134,6 +134,8 @@ def test_a_token_entered_on_the_page_never_turns_sending_on(monkeypatch, tmp_pat
     ("https://assistant.example.com:443", "https://assistant.example.com"),
     ("https://assistant.example.com:8443", "https://assistant.example.com:8443"),
     ("http://shturman.test:8080", "http://shturman.test:8080"),
+    ("https://assistant.example.com.:8443", "https://assistant.example.com:8443"),
+    ("HTTPS://пример.example", "https://xn--e1afmkfd.example"),
 ])
 def test_setup_origin_is_normalised(monkeypatch, tmp_path, raw, expected):
     assert from_env(monkeypatch, tmp_path, SHTURMAN_SETUP_ORIGIN=raw).setup_origin == expected
@@ -160,7 +162,7 @@ async def test_values_saved_on_the_page_never_come_back(stand, conn, caplog):
     seen += [await s.page.get("/state"), await s.page.get("/overview"), await s.page.get("/session"),
              await s.api.get("/api/status"), await s.api.get("/api/executor/status")]
     for response in seen:
-        assert not any(secret in response.text for secret in SECRETS), response.url
+        assert not any(secret in response.text for secret in SECRETS + (s.page.key,)), response.url
     state = (await s.page.get("/state")).json()
     assert state["bot"]["set"] is True and state["bot"]["source"] == "page" and state["bot"]["editable"] is True
     assert state["tg"]["keys"] == {"configured": True, "source": "page", "editable": True}
