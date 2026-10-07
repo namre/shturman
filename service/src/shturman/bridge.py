@@ -110,6 +110,31 @@ def button(text: str, module: str, rest: str) -> dict[str, str]:
     return {"text": text, "data": callback_data(module, rest)}
 
 
+# --- кто выполняет задания ---
+
+# Виды заданий, которые сервис выполняет сам (свой бот, свой ключ модели). Задаёт модуль
+# исполнителя при запуске; остальное забирает плагин в Hermes.
+_builtin_kinds: frozenset[str] = frozenset()
+
+
+def set_builtin(kinds) -> None:
+    global _builtin_kinds
+    _builtin_kinds = frozenset(kinds)
+
+
+def builtin_kinds() -> frozenset[str]:
+    return _builtin_kinds
+
+
+def executor_for(kind: str) -> str:
+    return "builtin" if kind in _builtin_kinds else "plugin"
+
+
+def owns_bot() -> bool:
+    """Свой бот сервиса активен: нажатия и привязка владельца идут только через него."""
+    return NOTIFY_OWNER in _builtin_kinds
+
+
 # --- владелец ---
 
 OwnerChangeHandler = Callable[[asyncpg.Connection, int], Awaitable[None]]
@@ -182,7 +207,7 @@ async def notify_owner(
     """Сообщение владельцу в управляющий чат. Текст — без разметки, не длиннее 4096 знаков."""
     return await jobs.enqueue(
         conn, NOTIFY_OWNER, {"text": fit_message(text), "buttons": buttons, "silent": silent},
-        handler=handler, context=context, dedup_key=dedup_key,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(NOTIFY_OWNER),
     )
 
 
@@ -193,7 +218,7 @@ async def edit_owner_message(
     return await jobs.enqueue(
         conn, NOTIFY_EDIT,
         {"message_id": int(message_id), "text": fit_message(text), "remove_buttons": remove_buttons},
-        max_attempts=2,
+        max_attempts=2, executor=executor_for(NOTIFY_EDIT),
     )
 
 
@@ -207,7 +232,7 @@ async def request_structured(
         conn, LLM_STRUCTURED,
         {"instructions": instructions, "input": input, "json_schema": json_schema,
          "schema_name": schema_name, "task": task, "max_tokens": max_tokens},
-        handler=handler, context=context, dedup_key=dedup_key,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_STRUCTURED),
     )
 
 
@@ -218,7 +243,7 @@ async def request_text(
 ) -> int | None:
     return await jobs.enqueue(
         conn, LLM_TEXT, {"messages": messages, "task": task, "max_tokens": max_tokens},
-        handler=handler, context=context, dedup_key=dedup_key,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_TEXT),
     )
 
 
@@ -228,11 +253,14 @@ async def request_business_send(
     context: dict[str, Any] | None = None, dedup_key: str | None = None,
 ) -> int | None:
     """Отправка от имени владельца через бизнес-бота. Ставится только после согласования."""
+    # Отправляет тот бот, через которого пришло подключение: свой бот сервиса или бот в Hermes.
+    via = await conn.fetchval("SELECT via FROM business_connections WHERE id = $1", business_connection_id)
     return await jobs.enqueue(
         conn, BUSINESS_SEND,
         {"business_connection_id": business_connection_id, "chat_id": int(chat_id),
          "text": text, "reply_to_message_id": reply_to_message_id},
         handler=handler, context=context, dedup_key=dedup_key, max_attempts=1,
+        executor="builtin" if via == "service" else "plugin",
     )
 
 

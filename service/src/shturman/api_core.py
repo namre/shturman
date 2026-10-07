@@ -9,7 +9,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from . import bridge, jobs
+from . import bridge, confirm, jobs
 from .app import AppState, state_of
 
 REAP_EVERY = 60  # секунд
@@ -110,8 +110,16 @@ async def fail_job(request: Request) -> JSONResponse:
     return JSONResponse({"status": status})
 
 
+def _only_without_own_bot() -> None:
+    """Со своим ботом сервиса нажатия и привязка владельца через плагин не принимаются:
+    иначе их мог бы подделать ассистент, у которого в Hermes есть терминал."""
+    if bridge.owns_bot():
+        raise BadRequest("это действие выполняется только через бота согласований", 403)
+
+
 @handler
 async def telegram_callback(request: Request) -> JSONResponse:
+    _only_without_own_bot()
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
         out = await bridge.dispatch_callback(conn, need_str(data, "data", limit=64), need_int(data, "from_user_id"))
@@ -120,6 +128,7 @@ async def telegram_callback(request: Request) -> JSONResponse:
 
 @handler
 async def put_owner(request: Request) -> JSONResponse:
+    _only_without_own_bot()
     data = await body(request)
     async with state_of(request).pool.acquire() as conn:
         await bridge.set_owner(conn, need_int(data, "user_id"), need_int(data, "chat_id"))
@@ -128,6 +137,7 @@ async def put_owner(request: Request) -> JSONResponse:
 
 @handler
 async def delete_owner(request: Request) -> JSONResponse:
+    _only_without_own_bot()
     async with state_of(request).pool.acquire() as conn:
         await bridge.clear_owner(conn)
     return JSONResponse({"ok": True})
@@ -148,13 +158,31 @@ async def status(request: Request) -> JSONResponse:
                       (SELECT value IS NOT NULL FROM settings WHERE key = 'owner') AS owner_known"""
         )
     out = dict(row)
+    config = state_of(request).config
+    out.update(sending=config.sending, own_bot=bridge.owns_bot(),
+               own_llm=bridge.LLM_TEXT in bridge.builtin_kinds())
     out["last_message_seen_at"] = out["last_message_seen_at"].isoformat() if out["last_message_seen_at"] else None
     out["owner_known"] = bool(out["owner_known"])
     return JSONResponse(out)
 
 
+@handler
+async def confirmations(request: Request) -> JSONResponse:
+    async with state_of(request).ro_pool.acquire() as conn:
+        return JSONResponse({"required": confirm.required(), "pending": await confirm.list_pending(conn)})
+
+
+@handler
+async def cancel_confirmation(request: Request) -> JSONResponse:
+    async with state_of(request).pool.acquire() as conn:
+        ok = await confirm.cancel(conn, int(request.path_params["action_id"]))
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
 def routes() -> list[BaseRoute]:
     return [
+        Route("/api/confirmations", confirmations, methods=["GET"]),
+        Route("/api/confirmations/{action_id:int}/cancel", cancel_confirmation, methods=["POST"]),
         Route("/api/status", status, methods=["GET"]),
         Route("/api/owner", put_owner, methods=["PUT"]),
         Route("/api/owner", delete_owner, methods=["DELETE"]),
@@ -175,6 +203,7 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
             async with state.pool.acquire() as conn:
                 await bridge.reap_lost(conn)
                 await jobs.scrub_finished(conn)
+                await confirm.expire(conn)
 
     state.spawn(reaper(), name="jobs-reaper")
     yield
