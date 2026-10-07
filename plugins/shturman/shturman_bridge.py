@@ -37,6 +37,7 @@ from shturman_core import service_routes
 from shturman_core.bridge_stats import Heartbeat, Stats
 from shturman_core.executor import AUX_TASKS, Buttons, Executor, NotSent
 from shturman_core.ingest import Ingest
+from shturman_core.own_bot import OwnBot
 from shturman_core.service_client import ServiceClient, ServiceUnavailable
 from shturman_core.state import OWNER_UNBOUND, Store, StoreReadError
 
@@ -179,6 +180,8 @@ class Runtime:
         self.application: Any = None
         self.store: Store | None = None
         self.stats = Stats()
+        # Режим «согласования и бизнес-поток ведёт бот сервиса»: общий для пересылки и кнопок.
+        self.own_bot = OwnBot(self.call, stats=self.stats)
         self.executor: Executor | None = None
         self.ingest: Ingest | None = None
         self._ctx: Any = None
@@ -262,7 +265,7 @@ class Runtime:
                 owner_version=lambda: (store.mtime("owner"), store.mtime(OWNER_UNBOUND)),
                 unbound_marker=lambda: store.read_strict(OWNER_UNBOUND) is not None,
                 clear_marker=lambda: store.delete(OWNER_UNBOUND),
-                fetch_connection=bot.business_connection, stats=self.stats)
+                fetch_connection=bot.business_connection, stats=self.stats, own_bot=self.own_bot)
         self._loop = self._home_loop = loop
         jobs = {
             "shturman:jobs-bot": lambda: self.executor.run_lane("bot"),
@@ -293,6 +296,7 @@ class Runtime:
         self._reset()
         self.executor = self.ingest = None
         self._client = None
+        self.own_bot.reset()               # после нового запуска состояние сервиса узнаётся заново
         if self._pool is not None:
             self._pool.shutdown(wait=False, cancel_futures=True)
             self._pool = None
@@ -359,6 +363,10 @@ class Runtime:
         """Кладёт обновление бизнес-режима в очередь пересылки. Исключений не выпускает."""
         try:
             if not self.ensure_started() or self.ingest is None:
+                return
+            if self.own_bot.active:
+                # Бизнес-поток ведёт бот сервиса: сервис получает обновления сам и наши не примет.
+                # Обработчики защиты (shturman_telegram) от этого не зависят и работают как прежде.
                 return
             try:
                 bound = bool(((self.store or Store()).read_strict("owner") or {}).get("user_id"))

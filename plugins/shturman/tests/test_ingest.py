@@ -29,11 +29,21 @@ class FakeService:
         self.excluded: set[int] = set()      # сообщения из исключённых чатов
         self.heal_on_connection = True       # повторно присланное подключение сервис включает
         self.broken: set[int] = set()        # сообщения, которые сервис не может разобрать
+        self.own_bot: bool | None = None     # у сервиса свой бот согласований; None — сервис прежней версии
+        self.status_calls = 0                # вопросы «включён ли свой бот» — отдельно от `calls`
 
     async def __call__(self, method, path, json_body=None, *, timeout=None):
+        if path == "/api/status":
+            # Отдельный счётчик: `calls` остаётся перечнем того, что плагин передаёт сервису.
+            self.status_calls += 1
+            if self.down:
+                raise ServiceUnavailable("нет связи")
+            return {"messages": 0} if self.own_bot is None else {"messages": 0, "own_bot": self.own_bot}
         self.calls.append((method, path, json_body))
         if self.down:
             raise ServiceUnavailable("нет связи")
+        if self.own_bot:
+            raise ServiceError("это действие выполняется только через бота согласований", status=403, code="own_bot")
         if path == "/api/owner":
             self.owner = json_body if method == "PUT" else None
             return {"ok": True}
@@ -415,3 +425,185 @@ def test_excluded_chat_and_message_without_number_have_their_own_counters():
     assert (stats.counters["not_stored_excluded"], stats.counters["not_stored_other"],
             stats.counters["forwarded_messages"]) == (1, 1, 1)
     assert fetched == [] and stats.business_disabled is False
+
+
+# --- у сервиса свой бот согласований: пересылка стоит, повторов нет ---
+
+OWN_BOT_LINES = ("ведёт бот сервиса", "бот сервиса переписки выключен")
+
+
+def mode_lines(caplog):
+    return [r.getMessage() for r in caplog.records if any(part in r.getMessage() for part in OWN_BOT_LINES)]
+
+
+def steps(ingest, count=50):
+    async def go():
+        for _ in range(count):
+            await ingest.step()
+    asyncio.run(go())
+
+
+def test_own_bot_known_from_status_means_no_owner_push_and_no_forwarding(clock, caplog):
+    caplog.set_level("INFO")
+    ingest, service, stats, fetched, _ = make(now=clock)
+    service.own_bot = True
+    ingest.put_message(message(1), edited=False)            # успело попасть в очередь до первого вопроса
+    steps(ingest)
+    assert service.calls == [] and service.status_calls == 1         # ни привязки, ни пересылки, ни повторов
+    assert ingest.own_bot.active and stats.own_bot is True
+    assert len(ingest) == 0 and stats.queue == 0
+    assert ingest.put_message(message(2), edited=False) is False and ingest.put_connection(CONN) is False
+    assert ingest.put_deleted({"business_connection_id": "bc1", "message_ids": [1]}) is False
+    steps(ingest)
+    assert service.calls == [] and fetched == [] and len(ingest) == 0
+    # Это не потеря и не отказ: счётчики сбоев не растут.
+    assert all(stats.counters[name] == 0 for name in ("dropped", "rejected", "forwarded_messages"))
+    assert len(mode_lines(caplog)) == 1 and "секретный" not in caplog.text
+
+
+def test_refused_owner_push_is_not_repeated(clock, caplog):
+    """Найденная ошибка: на 403 own_bot от PUT /api/owner плагин повторял запрос каждые несколько секунд."""
+    caplog.set_level("INFO")
+    ingest, service, stats, _, version = make(now=clock)
+    service.own_bot = False
+    drain(ingest)                                            # обычный режим: владелец передан
+    assert service.paths() == ["/api/owner"] and stats.own_bot is False
+    service.own_bot = True                                   # сервис перезапущен со своим ботом
+    version["v"] = 2                                         # привязка сменилась — плагин передаёт владельца
+    steps(ingest, 200)
+    assert service.paths() == ["/api/owner", "/api/owner"]   # один отказ — и тишина
+    assert service.status_calls == 1 and ingest.own_bot.active and stats.own_bot is True
+    assert len(mode_lines(caplog)) == 1
+
+
+def test_refused_update_stops_forwarding_without_counting_it_as_lost(clock):
+    ingest, service, stats, fetched, _ = make(now=clock)
+    service.known.add("bc1")
+    drain(ingest)
+    service.own_bot = True
+    for mid in (1, 2, 3):
+        ingest.put_message(message(mid), edited=False)
+    steps(ingest)
+    assert service.paths() == ["/api/owner", MESSAGE]         # отказ на первое — остальные не уходят
+    assert len(ingest) == 0 and stats.queue == 0 and fetched == []
+    assert stats.counters["rejected"] == 0 and stats.counters["dropped"] == 0
+    assert stats.business_disabled is None
+
+
+def test_own_bot_is_rechecked_rarely_and_leaving_it_resumes_everything(clock, caplog):
+    from shturman_core.own_bot import RECHECK
+
+    caplog.set_level("INFO")
+    ingest, service, stats, _, _ = make(now=clock)
+    service.own_bot = True
+    service.known.add("bc1")
+    steps(ingest)
+    clock.tick(RECHECK - 1)
+    steps(ingest)
+    assert service.status_calls == 1                         # раньше срока сервис не спрашивается
+    clock.tick(2)
+    steps(ingest)
+    assert service.status_calls == 2 and ingest.own_bot.active and service.calls == []
+    service.own_bot = False                                  # владелец выключил своего бота
+    steps(ingest)
+    assert ingest.own_bot.active and service.calls == []     # до следующей проверки плагин этого не знает
+    clock.tick(RECHECK + 1)
+    steps(ingest)
+    assert service.status_calls == 3 and not ingest.own_bot.active and stats.own_bot is False
+    assert service.paths() == ["/api/owner"]                 # владелец передан заново, один раз
+    assert ingest.put_message(message(7), edited=False) is True
+    drain(ingest)
+    assert service.paths() == ["/api/owner", MESSAGE] and stats.counters["forwarded_messages"] == 1
+    lines = mode_lines(caplog)
+    assert len(lines) == 2 and OWN_BOT_LINES[0] in lines[0] and OWN_BOT_LINES[1] in lines[1]
+
+
+def test_unreachable_service_does_not_end_the_mode(clock):
+    from shturman_core.own_bot import RECHECK, RECHECK_UNREACHABLE
+
+    ingest, service, stats, _, _ = make(now=clock)
+    service.own_bot = True
+    steps(ingest)
+    service.down = True
+    clock.tick(RECHECK + 1)
+    steps(ingest)
+    assert service.status_calls == 2 and ingest.own_bot.active and stats.own_bot is True
+    assert stats.reachable is False and service.calls == []
+    service.down = False
+    clock.tick(RECHECK_UNREACHABLE + 1)                      # после сбоя связи вопрос повторяется раньше
+    steps(ingest)
+    assert service.status_calls == 3 and ingest.own_bot.active and stats.reachable is True
+
+
+def test_recovery_link_during_own_bot_is_delivered_after_it():
+    clock = {"t": 0.0}
+    ingest, service, state = make_state(now=lambda: clock["t"])
+    service.own_bot = True
+    steps(ingest)
+    state.set(owner={}, marker=True)                         # вход по ссылке восстановления
+    steps(ingest)
+    assert service.calls == [] and state.marker is True      # сервису не до того; отметка не снята
+    service.own_bot = False
+    clock["t"] += 10_000
+    steps(ingest)
+    assert owner_calls(service) == [("DELETE", None)] and state.marker is False
+
+
+def test_unbind_refused_by_own_bot_keeps_the_mark_and_is_not_repeated():
+    clock = {"t": 0.0}
+    ingest, service, state = make_state(now=lambda: clock["t"])
+    drain(ingest)
+    service.own_bot = True
+    state.set(owner={}, marker=True)
+    steps(ingest)
+    assert owner_calls(service) == [("PUT", OWNER), ("DELETE", None)]     # один отказ, без повторов
+    assert state.marker is True and ingest.own_bot.active
+    service.own_bot = False
+    clock["t"] += 10_000
+    steps(ingest)
+    assert owner_calls(service)[2:] == [("DELETE", None)] and state.marker is False
+
+
+def test_run_loop_in_own_bot_mode_is_quiet(caplog):
+    caplog.set_level("INFO")
+    ingest, service, stats, _, _ = make(idle=0.001)
+    service.own_bot = True
+
+    async def scenario():
+        task = asyncio.create_task(ingest.run())
+        for mid in range(20):
+            await asyncio.sleep(0.005)
+            ingest.put_message(message(mid), edited=False)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert service.calls == [] and service.status_calls == 1
+    assert len(mode_lines(caplog)) == 1
+    assert [r for r in caplog.records if r.name.startswith("shturman")] == \
+        [r for r in caplog.records if r.name == "shturman.own_bot"]          # другого шума в журнале нет
+
+
+def test_old_service_without_own_bot_field_works_as_before(clock):
+    ingest, service, stats, _, _ = make(now=clock)
+    ingest.put_connection(CONN)
+    drain(ingest)
+    assert service.paths() == ["/api/owner", CONNECTION]
+    assert not ingest.own_bot.active and stats.own_bot is None        # поля нет — неизвестно, но режима нет
+
+
+def test_only_a_real_refusal_with_the_code_turns_the_mode_on():
+    from shturman_core.own_bot import OwnBot, is_refusal
+
+    assert is_refusal(ServiceError("нет", status=403, code="own_bot"))
+    assert not is_refusal(ServiceError("нет", status=403, code="not_owner"))
+    assert not is_refusal(ServiceError("нет", status=403))
+    assert not is_refusal(ServiceUnavailable("сбой", status=502, code="own_bot"))
+    assert not is_refusal(ValueError("own_bot"))
+    mode = OwnBot(stats=Stats())
+    assert mode.refused(ServiceError("нет", status=409, code="owner_unknown")) is False and not mode.active
+    assert mode.refused(ServiceError("нет", status=403, code="own_bot")) is True and mode.active
+    assert asyncio.run(mode.refresh(force=True)) is True               # спросить некого — признак не меняется
+    mode.reset()
+    assert not mode.active and mode.stats.own_bot is None

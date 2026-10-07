@@ -49,6 +49,9 @@ class Stats:
         self.business_disabled: bool | None = None
         # Главный выключатель отправки в сервисе (None — узнать не удалось).
         self.sending: bool | None = None
+        # У сервиса включён свой бот согласований: привязку владельца, нажатия кнопок и бизнес-поток
+        # ведёт он, плагин их не пересылает (None — узнать не удалось).
+        self.own_bot: bool | None = None
         self.version = 0                          # растёт при любом изменении
 
     def bump(self, name: str, amount: int = 1) -> None:
@@ -86,6 +89,7 @@ class Stats:
             "queue": self.queue,
             "business_disabled": self.business_disabled,
             "sending": self.sending,
+            "own_bot": self.own_bot,
             "counters": dict(self.counters),
         }
 
@@ -138,5 +142,7 @@ def status(store: Store, *, configured: bool, now: Callable[[], float] = time.ti
         "business_disabled": flag("business_disabled"),
         # Главный выключатель отправки в сервисе: false — «отправка выключена».
         "sending": flag("sending"),
+        # Согласования и бизнес-поток ведёт свой бот сервиса: плагин их не пересылает, и это не сбой.
+        "own_bot": flag("own_bot"),
         "counters": {name: _int(raw.get(name)) or 0 for name in COUNTERS},
     }

@@ -52,7 +52,7 @@ def test_not_configured_or_never_started(store, clock):
     assert bridge_stats.status(store, configured=False, now=clock) == {
         "configured": False, "executor_running": False, "reachable": None, "checked_at": None,
         "started_at": None, "last_job_at": None, "queue": 0, "business_disabled": None, "sending": None,
-        "counters": {name: 0 for name in COUNTERS}}
+        "own_bot": None, "counters": {name: 0 for name in COUNTERS}}
     Heartbeat(store, Stats(now=clock), now=clock).tick()
     assert bridge_stats.status(store, configured=False, now=clock)["executor_running"] is False
 
@@ -152,6 +152,28 @@ def test_status_shows_sending_switch_and_disabled_business_connection(store, clo
     clock.tick(bridge_stats.STALE_AFTER + 1)
     stale = bridge_stats.status(store, configured=True, now=clock)
     assert stale["sending"] is None and stale["business_disabled"] is None         # исполнитель стоит — не знаем
+
+
+def test_status_shows_that_the_service_runs_its_own_bot(store, clock):
+    stats = Stats(now=clock)
+    heartbeat = Heartbeat(store, stats, now=clock)
+    heartbeat.tick()
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is None      # ещё неизвестно
+    stats.set_flag("own_bot", True)
+    assert heartbeat.tick() is True                                                # вход в режим — повод записать
+    status = bridge_stats.status(store, configured=True, now=clock)
+    assert status["own_bot"] is True and store.read("bridge")["own_bot"] is True
+    assert status["counters"] == {name: 0 for name in COUNTERS}                    # прежние поля на месте
+    stats.set_flag("own_bot", False)
+    heartbeat.tick()
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is False
+    clock.tick(bridge_stats.STALE_AFTER + 1)
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is None      # исполнитель стоит
+
+
+def test_state_written_before_the_field_existed_reads_as_unknown(store, clock):
+    store.write("bridge", {"heartbeat_at": int(clock()), "counters": {}})
+    assert bridge_stats.status(store, configured=True, now=clock)["own_bot"] is None
 
 
 # --- чтение состояния: «файла нет» и «не удалось прочитать» — разные ответы ---
