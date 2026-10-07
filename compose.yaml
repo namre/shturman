@@ -1,14 +1,24 @@
 # «Штурман» — эталонный стек: стоковый Hermes, сервис переписки и его база (docs/deployment.md).
-# Локальные эмбеддинги — отдельным профилем, включаются командой ./ops/embeddings.sh on.
-# Защита от внедрённых инструкций — тоже отдельным профилем: ./ops/guard.sh on.
 #
-# Запускать через ./ops/up.sh — он подставляет владельца каталога данных.
+# Что именно запускается, решают профили Compose:
+#   hermes      — контейнер Hermes. Включён в режиме SHTURMAN_MODE=hermes (по умолчанию);
+#                 в режиме standalone («только архив и согласования», docs/standalone.md)
+#                 профиль выключен: контейнер не создаётся, образ не скачивается;
+#   embeddings  — локальные эмбеддинги, включаются командой ./ops/embeddings.sh on;
+#   guard       — модель защиты от внедрённых инструкций, включается командой ./ops/guard.sh on.
+# Профили записывает в .env (COMPOSE_PROFILES) и выставляет при запуске ./ops/up.sh — по режиму
+# из SHTURMAN_MODE. Режим выбирает ./ops/init-env.sh --mode, меняет ./ops/mode.sh.
+#
+# Запускать через ./ops/up.sh — он подставляет владельца каталога данных и профили.
+# Голая команда `docker compose up` без COMPOSE_PROFILES поднимет только сервис и базу.
 # Локальные изменения — в compose.override.yaml и .env, этот файл на сервере не править.
 
 name: shturman
 
 services:
   hermes:
+    # Только в режиме с Hermes (SHTURMAN_MODE=hermes).
+    profiles: ["hermes"]
     # Официальный образ без изменений. Версию владелец может поднять сам: HERMES_VERSION в .env.
     image: nousresearch/hermes-agent:${HERMES_VERSION:-v2026.9.24}
     container_name: shturman-hermes
@@ -64,7 +74,8 @@ services:
     logging: *logging
 
   shturman:
-    # Сервис переписки: архив, сессии Telegram, MCP-сервер для агента. Собирается из ./service.
+    # Сервис переписки: архив, сессии Telegram, MCP-сервер архива, свой бот согласований
+    # и свой доступ к модели. Работает в обоих режимах. Собирается из ./service.
     build: ./service
     image: shturman-service:local
     container_name: shturman-service
@@ -92,13 +103,27 @@ services:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}
+      # Свой бот согласований и свой доступ к модели (API, совместимый с OpenAI). В режиме
+      # standalone это единственные бот и модель экземпляра; значения владелец вводит сам:
+      # ./ops/init-env.sh. Контейнеру Hermes эти переменные не передаются никогда.
+      SHTURMAN_BOT_TOKEN: ${SHTURMAN_BOT_TOKEN:-}
+      SHTURMAN_LLM_API_KEY: ${SHTURMAN_LLM_API_KEY:-}
+      SHTURMAN_LLM_BASE_URL: ${SHTURMAN_LLM_BASE_URL:-https://api.openai.com/v1}
+      SHTURMAN_LLM_MODEL: ${SHTURMAN_LLM_MODEL:-}
+      SHTURMAN_LLM_MODEL_EXTRACT: ${SHTURMAN_LLM_MODEL_EXTRACT:-}
+      SHTURMAN_LLM_MODEL_REPLY: ${SHTURMAN_LLM_MODEL_REPLY:-}
+      SHTURMAN_LLM_MODEL_WATCH: ${SHTURMAN_LLM_MODEL_WATCH:-}
+      SHTURMAN_LLM_TOKENS_PARAM: ${SHTURMAN_LLM_TOKENS_PARAM:-}
     volumes:
       # Сессии Telegram, страницы памяти, загруженные выгрузки. Контейнеру Hermes этот каталог не подключён.
       - ./data/shturman:/data
-    # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста.
+    # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста,
+    # а в режиме standalone — клиент владельца (Codex CLI, Claude Code) с этого же сервера
+    # или через SSH-туннель (./ops/connect.sh). Наружу порт не публикуется ни в одном режиме.
     ports:
       - "127.0.0.1:8765:8765"
-    # backend — к базе, эмбеддингам и классификатору защиты; egress — выход к Telegram (сессии аккаунтов).
+    # backend — к базе, эмбеддингам и классификатору защиты; egress — выход к Telegram
+    # (сессии аккаунтов, свой бот) и к провайдеру модели, если у сервиса свой доступ к ней.
     networks: [backend, egress]
     security_opt:
       - no-new-privileges:true

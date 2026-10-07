@@ -250,9 +250,11 @@ shturman import result.json            импортировать; --exclude use
 shturman search "смета по фасадам"     поиск по словам с учётом русских словоформ; --limit N
 shturman call GET /api/status          запрос к внутреннему API работающего сервиса; методы GET, POST, PUT, DELETE, тело — JSON третьим аргументом
 shturman tg-login assistant|owner      вход в аккаунт по QR в терминале; выполняет человек
+shturman bot-bind                      одноразовая ссылка привязки владельца к боту согласований
+shturman bot-status                    состояние бота согласований и своей модели сервиса; без секретов
 ```
 
-Для `scan` и `import` на сервере есть обёртка `./ops/import-export.sh`, для `tg-login` — `./ops/tg-login.sh`.
+Для `scan` и `import` на сервере есть обёртка `./ops/import-export.sh`, для `tg-login` — `./ops/tg-login.sh`, для `bot-bind` — `./ops/bot-bind.sh` (кто её запускает и что делать со ссылкой — `docs/standalone.md`).
 
 ## Переменные окружения сервиса
 
@@ -270,7 +272,12 @@ shturman tg-login assistant|owner      вход в аккаунт по QR в т�
 | `SHTURMAN_NIGHTLY_AT` | `03:30` | Время ночной обработки, «ЧЧ:ММ» | Да |
 | `SHTURMAN_EMBEDDINGS_URL` | пусто | Адрес сервера эмбеддингов; пусто — поиск только по словам. Записывает `./ops/embeddings.sh` | Да |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | пусто | Приложение Telegram владельца; без них сессии аккаунтов не работают | Да |
-| `EGRESS_PROXY_URL` | пусто | Исходящий прокси для Telegram | Да |
+| `EGRESS_PROXY_URL` | пусто | Исходящий прокси для Telegram и провайдера модели | Да |
+| `SHTURMAN_BOT_TOKEN` | пусто | Токен своего бота согласований. Вводит владелец: `./ops/init-env.sh`. Контейнеру Hermes не передаётся | Да |
+| `SHTURMAN_LLM_API_KEY`, `SHTURMAN_LLM_MODEL` | пусто | Свой доступ сервиса к модели: ключ и имя модели. Работает, только когда заданы оба | Да |
+| `SHTURMAN_LLM_BASE_URL` | `https://api.openai.com/v1` | Адрес API, совместимого с OpenAI | Да |
+| `SHTURMAN_LLM_MODEL_EXTRACT`, `SHTURMAN_LLM_MODEL_REPLY`, `SHTURMAN_LLM_MODEL_WATCH` | пусто | Другая модель для отдельной задачи: разбор обязательств, автоответ, наблюдатель | Да |
+| `SHTURMAN_LLM_TOKENS_PARAM` | пусто | Жёстко заданное имя предела длины ответа: `max_tokens` или `max_completion_tokens` | Да |
 | `SHTURMAN_DATA_DIR` | `/data` | Каталог данных: `sessions/`, `pages/`, `uploads/` | Задана в образе |
 | `SHTURMAN_HOST`, `SHTURMAN_PORT` | `127.0.0.1`, `8765` | Адрес и порт сервиса. В образе адрес `0.0.0.0`: порт наружу публикует только Compose и только на локальный адрес сервера | Заданы в образе |
 | `SHTURMAN_ALLOWED_HOSTS` | `127.0.0.1:8765, localhost:8765` | Имена, под которыми к сервису можно обращаться (сверка заголовков `Host` и `Origin` на `/mcp`) | Нет |

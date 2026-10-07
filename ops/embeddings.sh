@@ -10,8 +10,11 @@
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 
+. ops/lib.sh
 mode="${1:-status}"
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
+# Профили Compose — режим установки плюс эмбеддинги: профиль Hermes при этом не теряется.
+install_mode="$(shturman_mode)" || exit 2
 
 set_env() {
   local tmp; tmp="$(mktemp .env.XXXXXX)"
@@ -76,7 +79,7 @@ case "$mode" in
     echo "Поиск по смыслу выключен в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
   status)
-    if grep -Eq '^COMPOSE_PROFILES=.*embeddings' .env; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
+    if grep -Eq '^COMPOSE_PROFILES=(.*,)?embeddings(,|$)' .env; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
     docker exec shturman-service shturman call GET /api/embeddings/status 2>/dev/null \
       || echo "сервис переписки не отвечает — ./ops/doctor.sh" ;;
   *) echo "использование: $0 on|off|status" >&2; exit 2 ;;

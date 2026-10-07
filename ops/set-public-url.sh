@@ -3,8 +3,11 @@
 # Значение не секретное. Остальное содержимое .env скрипт не читает и не печатает.
 #   ./ops/set-public-url.sh https://assistant.example.com
 # После изменения — ./ops/up.sh, чтобы Hermes подхватил адрес.
+# Только для режима с Hermes: без него у экземпляра нет ни дашборда, ни внешнего адреса.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
+if [ -f .env ]; then require_hermes "дашборда и внешнего адреса"; fi
 
 url="${1:-}"
 case "$url" in

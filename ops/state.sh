@@ -17,6 +17,13 @@ now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 cmd="${1:-show}"
 case "$cmd" in
   show)
+    # Режим установки — несекретная строка SHTURMAN_MODE в .env; остальное в .env не читается.
+    mode="$(grep -E '^SHTURMAN_MODE=' .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    case "${mode:-hermes}" in
+      standalone) echo "# режим установки: standalone — без Hermes (runbook: docs/runbooks/deploy-standalone.md)" ;;
+      hermes)     echo "# режим установки: hermes — с Hermes (runbook: docs/runbooks/deploy.md)" ;;
+      *)          echo "# режим установки: неизвестное значение SHTURMAN_MODE в .env — ./ops/mode.sh" ;;
+    esac
     echo "# состояние ($file)"; if [ -s "$file" ]; then sort "$file"; else echo "(пусто — развёртывание не начато)"; fi
     echo; echo "# последние записи журнала"; tail -n 10 "$journal" ;;
   get)
