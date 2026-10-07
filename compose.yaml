@@ -1,5 +1,6 @@
 # «Штурман» — эталонный стек: стоковый Hermes, сервис переписки и его база (docs/deployment.md).
 # Локальные эмбеддинги — отдельным профилем, включаются командой ./ops/embeddings.sh on.
+# Защита от внедрённых инструкций — тоже отдельным профилем: ./ops/guard.sh on.
 #
 # Запускать через ./ops/up.sh — он подставляет владельца каталога данных.
 # Локальные изменения — в compose.override.yaml и .env, этот файл на сервере не править.
@@ -84,6 +85,10 @@ services:
       SHTURMAN_SENDING: ${SHTURMAN_SENDING:-off}
       SHTURMAN_SEND_DAILY_CAP: ${SHTURMAN_SEND_DAILY_CAP:-50}
       SHTURMAN_EMBEDDINGS_URL: ${SHTURMAN_EMBEDDINGS_URL:-}
+      # Защита от внедрённых инструкций во входящих сообщениях: выключена, пока владелец не
+      # включит (./ops/guard.sh on). Через API эти значения не меняются.
+      SHTURMAN_GUARD: ${SHTURMAN_GUARD:-off}
+      SHTURMAN_GUARD_URL: ${SHTURMAN_GUARD_URL:-}
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}
@@ -93,7 +98,7 @@ services:
     # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста.
     ports:
       - "127.0.0.1:8765:8765"
-    # backend — к базе и эмбеддингам; egress — выход к Telegram (сессии аккаунтов).
+    # backend — к базе, эмбеддингам и классификатору защиты; egress — выход к Telegram (сессии аккаунтов).
     networks: [backend, egress]
     security_opt:
       - no-new-privileges:true
@@ -119,6 +124,31 @@ services:
       resources:
         limits:
           memory: 1536m
+    logging: *logging
+
+  guard:
+    # Модель-классификатор для защиты от внедрённых инструкций (docs/guard.md). Занимает около
+    # 0,6 ГБ памяти, поэтому выключено, пока владелец не включит: ./ops/guard.sh on. Через контейнер
+    # проходит текст всех входящих сообщений, поэтому выхода в интернет у него нет вовсе (сеть
+    # backend закрытая), а модель заранее скачивает и сверяет по контрольной сумме ./ops/guard.sh.
+    # --max-batch-tokens: у модели окно в 8192 токена, и при запуске TEI прогоняет пачку наибольшего
+    # размера — без этого ограничения прогрев не помещается в память. Сервис сам режет длинный
+    # текст на окна по 1000 знаков, так что 1024 токенов хватает с запасом.
+    profiles: ["guard"]
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
+    container_name: shturman-guard
+    restart: unless-stopped
+    command: ["--model-id", "/data/model", "--served-model-name", "Horizon-Labs/prompt-injection-guard-small",
+              "--max-batch-tokens", "1024"]
+    volumes:
+      - ./data/guard:/data:ro
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 1024m
     logging: *logging
 
 networks:

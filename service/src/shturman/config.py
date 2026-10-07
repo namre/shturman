@@ -61,8 +61,13 @@ class Config:
     llm_api_key: str = field(default="", repr=False)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = ""
-    # Защита от внедрённых инструкций: включена, если установлена модель-классификатор.
-    guard: bool = True
+    # Защита от внедрённых инструкций во входящих сообщениях (guard/, docs/guard.md). По умолчанию
+    # выключена; включает её ./ops/guard.sh on — он же скачивает модель и поднимает контейнер с ней.
+    guard: bool = False
+    # Адрес контейнера с моделью-классификатором (TEI). Пусто при включённой защите — работают
+    # одни правила: это заметно слабее модели.
+    guard_url: str = ""
+    guard_model: str = "Horizon-Labs/prompt-injection-guard-small"
 
     @property
     def own_bot(self) -> bool:
@@ -72,10 +77,6 @@ class Config:
     @property
     def own_llm(self) -> bool:
         return bool(self.llm_api_key and self.llm_model)
-
-    @property
-    def guard_dir(self) -> Path:
-        return self.data_dir / "guard"
 
     @property
     def sessions_dir(self) -> Path:
@@ -125,6 +126,8 @@ class Config:
             llm_api_key=_env("SHTURMAN_LLM_API_KEY"),
             llm_base_url=_env("SHTURMAN_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
             llm_model=_env("SHTURMAN_LLM_MODEL"),
-            guard=_env("SHTURMAN_GUARD", "on").lower() not in ("off", "0", "false", "no"),
+            guard=_env("SHTURMAN_GUARD", "off").lower() in ("on", "1", "true", "yes"),
+            guard_url=_env("SHTURMAN_GUARD_URL").rstrip("/"),
+            guard_model=_env("SHTURMAN_GUARD_MODEL", "Horizon-Labs/prompt-injection-guard-small"),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )

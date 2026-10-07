@@ -53,10 +53,14 @@ UNTRUSTED_FIELDS = ["what", "source_quote", "due_expression", "debtor.name", "cr
 # маршрутам, — если его чат исключён из архива или удалено сообщение, из которого оно выведено
 # (с обещанием или со сроком). Строки при этом могут ещё лежать в базе: их убирает подписчик
 # события и обход `purge_orphans`, но показывать их нельзя уже сейчас.
+# То же — если сообщение-источник скрыто защитой от внедрённых инструкций (`agent_visible`):
+# выведенное из текста, который сочли попыткой управлять ассистентом, не показывается, пока
+# владелец не откроет сообщение. Такие строки не стираются: решение владельца их вернёт.
 # Псевдонимы: c — commitments, ch — chats, m — сообщение-источник.
-VISIBLE = """NOT ch.excluded AND m.deleted_at IS NULL
+VISIBLE = """NOT ch.excluded AND m.deleted_at IS NULL AND m.agent_visible
              AND NOT EXISTS (SELECT 1 FROM messages dm
-                             WHERE dm.id = c.due_message_id AND dm.deleted_at IS NOT NULL)"""
+                             WHERE dm.id = c.due_message_id
+                               AND (dm.deleted_at IS NOT NULL OR NOT dm.agent_visible))"""
 
 _SELECT = """
 SELECT c.*, ch.title AS chat_title, ch.type AS chat_type,

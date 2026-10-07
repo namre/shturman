@@ -346,7 +346,8 @@ async def create(
         reply_to_tg_id = None
         if reply_to_message_id is not None:
             reply_to_tg_id = await conn.fetchval(
-                "SELECT tg_message_id FROM messages WHERE id = $1 AND chat_id = $2 AND deleted_at IS NULL",
+                """SELECT tg_message_id FROM messages
+                   WHERE id = $1 AND chat_id = $2 AND deleted_at IS NULL AND agent_visible""",
                 reply_to_message_id, chat_id)
             if reply_to_tg_id is None:
                 raise refuse(policy.deny("reply_not_found"))

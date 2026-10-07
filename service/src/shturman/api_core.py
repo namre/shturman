@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
 from . import bridge, confirm, jobs
+from .guard import service as guard_service
 from .app import AppState, state_of
 
 REAP_EVERY = 60  # секунд
@@ -212,7 +213,11 @@ async def status(request: Request) -> JSONResponse:
                       (SELECT count(*) FROM jobs WHERE status = 'failed') AS jobs_failed,
                       (SELECT value IS NOT NULL FROM settings WHERE key = 'owner') AS owner_known"""
         )
+        guard = await guard_service.overview(conn, state_of(request).config)
     out = dict(row)
+    # Защита от внедрённых инструкций: включена ли, чем проверяет, и счётчики (проверено, скрыто,
+    # показано владельцем, не проверено). Только числа и состояние.
+    out.update(guard)
     config = state_of(request).config
     out.update(sending=config.sending, own_bot=bridge.owns_bot(),
                own_llm=bridge.LLM_TEXT in bridge.builtin_kinds())

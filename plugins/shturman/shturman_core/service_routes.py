@@ -68,6 +68,8 @@ TOOLS: Routes = _compile([
 UI: Routes = _compile([
     ("GET", r"/api/status"),
     ("GET", r"/api/embeddings/status"),
+    # защита от внедрённых инструкций: только числа и состояние; выключателя в API нет
+    ("GET", r"/api/guard/status"),
     ("GET", r"/api/processing/status"),
     ("GET", r"/api/executor/status"),        # свой бот и своя модель сервиса: только признаки и счётчики
     # действия, которые ждут подтверждения владельца в боте: посмотреть и отменить (не подтвердить)
