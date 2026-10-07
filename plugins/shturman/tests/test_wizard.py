@@ -116,8 +116,50 @@ def test_wizard_no_longer_connects_the_assistant_bot_in_business_mode():
                  "Установить защиту", "Business Mode", "business_skipped\" }", "BusinessStep", "LaterStep",
                  "В следующих версиях", "Скоро"):
         assert gone not in _CODE, gone
-    assert "В бизнес-режиме Telegram его не подключают." in _CODE
-    assert "К нему подключается бизнес-режим Telegram." in _CODE
+
+
+def _correspondence_step() -> str:
+    return _CODE[_CODE.index("function CorrespondenceStep"):_CODE.index("function correspondenceSummary")]
+
+
+def test_correspondence_step_is_short_and_does_not_explain_two_bots():
+    """Первая настройка — без бота согласований и без бизнес-режима: в шаге о них одна мелкая строка
+    внизу, блока «Два бота» нет."""
+    step = _correspondence_step()
+    for gone in ("Два бота", "shturman-bots", "не перепутайте", "Бот-ассистент", "К нему подключается",
+                 "по коду от бота", "токен второго бота", "Почему отдельная страница"):
+        assert gone not in _CODE, gone
+    assert "чтобы ваш вход в Telegram не проходил через ассистента" in step
+    assert "Шагов там три: ключи приложения Telegram, вход в аккаунт по QR-коду, выбор чатов." in step
+    # бот согласований упомянут один раз, мелкой строкой, как то, что понадобится позже
+    assert step.count("согласований") == 1 and _CODE.count("бот согласований") == 1
+    fine = step[step.index("shturman-fine"):]
+    assert "Разрешить ассистенту отправлять сообщения можно позже" in fine and "«Дополнительно»" in fine
+    # бизнес-режим — только в спокойном предупреждении для экземпляра прежней схемы
+    assert step.count("бизнес-режим") == 1 and "st.business.connected ?" in step
+    assert "Ничего не сломано" in step
+
+
+def test_correspondence_step_shows_three_facts_of_the_simple_path():
+    facts = _CODE[_CODE.index("function CorrFacts"):_CODE.index("function CorrespondenceStep")]
+    assert re.findall(r'fact\("([^"]+)"', facts) == ["Ключи Telegram", "Аккаунт Telegram", "Чаты"]
+    for gone in ("own_bot", "owner_bound", "own_model", "origin_set"):
+        assert gone not in _CODE, gone
+
+
+def test_correspondence_step_names_every_state_in_plain_words():
+    problem = _CODE[_CODE.index("function CorrProblem"):_CODE.index("function CorrFacts")]
+    for state in ("no_origin", "same_origin", "outdated", "disabled", "no_service"):
+        assert f'state === "{state}"' in problem, state
+    assert "Страница настройки переписки недоступна — обновите экземпляр" in problem
+    assert "ей задан тот же адрес, что у ассистента" in problem and "./ops/set-setup-url.sh" in _CODE
+    assert "пока нет адреса в интернете" in problem
+
+
+def test_done_step_has_one_correspondence_row():
+    done = _CODE[_CODE.index("function DoneStep"):_CODE.index("const STEPS = [")]
+    assert done.count('row("Переписка"') == 1
+    assert re.findall(r'row\("([^"]+)"', done) == ["Помощник", "Представляется", "Модель", "Бот и вход", "Переписка"]
 
 
 def test_wizard_does_not_ask_for_show_or_proxy_the_setup_page():
@@ -130,13 +172,18 @@ def test_wizard_does_not_ask_for_show_or_proxy_the_setup_page():
                         "/pairing/confirm", "/pairing/reject", "/mark", "/correspondence"}
     link = _CODE[_CODE.index("Открыть настройку переписки") - 300:_CODE.index("Открыть настройку переписки")]
     assert "href: c.url" in link and 'target: "_blank"' in link and 'rel: "noopener noreferrer"' in link
+    # Кнопка есть только в состоянии «всё в порядке» и только с адресом, который отдал сервер.
+    assert 'const open = !!(c && c.state === "ok" && c.url);' in _CODE
+    assert _CODE.count("href: c.url") == 1 and "window.open" not in _CODE and "location.href" not in _CODE
     # Каждая ссылка, открывающая новую вкладку, закрывает ей доступ к этой.
     assert _CODE.count('target: "_blank"') == _CODE.count('rel: "noopener noreferrer"') > 0
 
 
 def test_wizard_tells_how_to_get_in_without_issuing_the_link():
-    assert "./ops/setup-link.sh" in _CODE and "по коду от бота согласований" in _CODE
-    assert "Страница настройки переписки недоступна — обновите экземпляр" in _CODE
+    step = _correspondence_step()
+    assert "По одноразовой ссылке — её выдаёт тот, кто ставил ассистента, или вы сами командой " in step
+    assert "./ops/setup-link.sh" in _CODE and "Ссылка действует 30 минут." in step
+    assert "Мастер эту ссылку не выдаёт и не показывает" in step
 
 
 def test_old_marks_keep_the_merged_step_done():

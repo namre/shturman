@@ -91,10 +91,20 @@ services:
       SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
       SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
       SHTURMAN_NIGHTLY_AT: ${SHTURMAN_NIGHTLY_AT:-03:30}
-      # Внешний адрес экземпляра — для страницы настройки переписки (/shturman-setup/), которую
-      # сервис отдаёт сам, за собственным входом. Пусто (режим без Hermes, адрес не задан) —
-      # страница открывается только с самого сервера или через туннель SSH: ./ops/setup-link.sh.
-      SHTURMAN_SETUP_ORIGIN: ${SHTURMAN_PUBLIC_URL:-}
+      # Страница настройки переписки (/shturman-setup/): сервис отдаёт её сам, за собственным входом,
+      # и только на ОТДЕЛЬНОМ адресе — не на том, где дашборд Hermes. Ассистент может добавлять свои
+      # страницы на адрес дашборда; на общем адресе он действовал бы на странице настройки от имени
+      # вошедшего владельца (docs/architecture.md, «Почему у страницы настройки свой адрес»).
+      #   SHTURMAN_SETUP_ORIGIN     — внешний адрес страницы (схема, имя, порт; без пути). По умолчанию —
+      #                               то же имя, что у дашборда, порт 8443: его записывают
+      #                               ./ops/set-public-url.sh и ./ops/up.sh, меняет ./ops/set-setup-url.sh.
+      #                               Пусто — страница открывается только с сервера или через туннель
+      #                               SSH (./ops/setup-link.sh);
+      #   SHTURMAN_DASHBOARD_ORIGIN — адрес дашборда: сервису он нужен, только чтобы сверить, что
+      #                               адреса разные. Совпали — сервис запускается, но страницу снаружи
+      #                               не отдаёт.
+      SHTURMAN_SETUP_ORIGIN: ${SHTURMAN_SETUP_URL:-}
+      SHTURMAN_DASHBOARD_ORIGIN: ${SHTURMAN_PUBLIC_URL:-}
       # Отправка сообщений выключена, пока владелец не включит её сам в .env (docs/service.md);
       # без своего бота согласований (SHTURMAN_BOT_TOKEN) значение on не действует.
       # Через API это значение не меняется.
@@ -129,7 +139,8 @@ services:
     # а в режиме standalone — клиент владельца (Codex CLI, Claude Code) с этого же сервера
     # или через SSH-туннель (./ops/connect.sh). Наружу порт не публикуется ни в одном режиме.
     # В режиме с Hermes обратный прокси на хосте отдаёт наружу один префикс этого порта —
-    # /shturman-setup/ (config/Caddyfile.example); /api/* и /mcp наружу не выходят.
+    # /shturman-setup/ — и только на отдельном адресе страницы настройки (другой порт или другое
+    # имя), не на адресе дашборда (config/Caddyfile.example); /api/* и /mcp наружу не выходят.
     ports:
       - "127.0.0.1:8765:8765"
     # backend — к базе, эмбеддингам и классификатору защиты; egress — выход к Telegram

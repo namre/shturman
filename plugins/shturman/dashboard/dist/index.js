@@ -6,10 +6,12 @@
  * вызовы Hermes (SDK.api). В /api/plugins/shturman идёт только то, чего в дашборде нет: выбор
  * помощника, привязка владельца, проверка модели, отметки шагов, состояние настройки переписки.
  *
- * Сбор переписки и бот согласований настраиваются не здесь, а на отдельной странице, которую
- * отдаёт сервис переписки (/shturman-setup/), мимо Hermes. Мастер показывает её состояние
- * и обычную ссылку на неё. Ссылку входа он не запрашивает и не показывает и ничего на эту
- * страницу не передаёт. Бота-ассистента в бизнес-режиме Telegram мастер не подключает.
+ * Переписка настраивается не здесь, а на отдельной странице, которую отдаёт сервис переписки,
+ * мимо Hermes и на своём адресе — не на адресе дашборда. Мастер показывает её состояние
+ * и обычную ссылку на неё (адрес приходит с сервера уже проверенным). Ссылку входа он
+ * не запрашивает и не показывает и ничего на эту страницу не передаёт. Бота-ассистента
+ * в бизнес-режиме Telegram мастер не подключает; о боте согласований он только упоминает:
+ * тот понадобится позже, если владелец решит разрешить отправку.
  */
 (function () {
   "use strict";
@@ -611,8 +613,6 @@
       h("h2", null, "Бот в Telegram"),
       h("p", { className: "shturman-lead" },
         "Это бот-ассистент: через него вы разговариваете с ассистентом. Он же присылает код для входа на эту страницу."),
-      h("p", { className: "shturman-muted" },
-        "Второй бот — бот согласований — настраивается позже, на шаге «Переписка»."),
 
       h("div", { className: "shturman-split" },
         h("div", { className: "shturman-col" },
@@ -689,10 +689,13 @@
 
   /* ============================================================ шаг 4: переписка
    *
-   * Сама настройка идёт на отдельной странице сервиса переписки. Здесь — объяснение, состояние
-   * (признаки и числа из /correspondence) и обычная ссылка. Ссылки входа здесь нет. */
+   * Сама настройка идёт на отдельной странице сервиса переписки: ключи приложения Telegram,
+   * вход в аккаунт по QR-коду, выбор чатов. Здесь — короткое объяснение, состояние (признаки
+   * и числа из /correspondence) и обычная ссылка. Ссылки входа здесь нет. */
 
   const SETUP_LINK_CMD = "./ops/setup-link.sh";
+  const SETUP_URL_CMD = "./ops/set-setup-url.sh";
+  const INSTALLER = "того, кто ставил ассистента";
   const count = (n) => Number(n || 0).toLocaleString("ru-RU");
 
   async function loadCorrespondence() {
@@ -704,37 +707,59 @@
 
   const refreshCorrespondence = () => run("corr.load", async () => { await loadCorrespondence(); return ""; });
 
-  /* Настроен ли сбор переписки: есть аккаунт Telegram или подключён бизнес-режим. */
-  const collecting = (c) => !!(c && c.state === "ok" && c.setup && (c.setup.accounts > 0 || c.setup.business_connected));
+  /* Собирается ли переписка: подключён аккаунт Telegram или в архиве уже есть сообщения. На
+   * экземпляре, где настроен бот согласований, переписку собирает и бизнес-режим. */
+  const collecting = (c) => !!(c && c.setup && (c.setup.accounts > 0 || c.setup.business_connected === true ||
+    (c.archive && c.archive.messages > 0)));
 
-  const CORR_PROBLEMS = {
-    outdated: "Страница настройки переписки недоступна — обновите экземпляр. У сервиса переписки на вашем сервере " +
-      "прежняя версия, в которой этой страницы ещё нет. Попросите того, кто ставил ассистента, обновить его.",
-    disabled: "Страница настройки переписки выключена в сервисе переписки. Попросите того, кто ставил ассистента, разобраться.",
-    unreachable: "Сервис переписки сейчас не отвечает, поэтому состояние показать не могу. Попросите того, " +
-      "кто ставил ассистента, запустить проверку.",
-    no_service: "Сервис переписки не подключён к ассистенту. Попросите того, кто ставил ассистента, запустить проверку.",
-  };
+  /* Почему кнопки нет. Вид заметки и её текст — по состоянию из /correspondence. */
+  function CorrProblem({ state }) {
+    if (state === "no_origin") {
+      return h(Note, { kind: "info" },
+        "У страницы настройки пока нет адреса в интернете, поэтому кнопки здесь нет. Попросите " + INSTALLER +
+        " выполнить ", h("code", null, SETUP_LINK_CMD), ": команда даст ссылку и подскажет, как открыть её со своего компьютера.");
+    }
+    if (state === "same_origin") {
+      return h(Note, { kind: "warn" },
+        "Страница настройки переписки отключена: ей задан тот же адрес, что у ассистента, а на общем адресе ваш вход " +
+        "в Telegram проходил бы через ассистента. Попросите " + INSTALLER + " задать странице отдельный адрес командой ",
+        h("code", null, SETUP_URL_CMD), " и перезапустить ассистента.");
+    }
+    if (state === "outdated") {
+      return h(Note, { kind: "warn" },
+        "Страница настройки переписки недоступна — обновите экземпляр. У сервиса переписки на вашем сервере " +
+        "прежняя версия. Попросите " + INSTALLER + " обновить его.");
+    }
+    if (state === "disabled") {
+      return h(Note, { kind: "warn" },
+        "Страница настройки переписки выключена в сервисе переписки. Попросите " + INSTALLER + " запустить проверку.");
+    }
+    if (state === "no_service") {
+      return h(Note, { kind: "warn" },
+        "Сервис переписки не подключён к ассистенту. Попросите " + INSTALLER + " запустить проверку.");
+    }
+    return h(Note, { kind: "warn" },
+      "Сервис переписки сейчас не отвечает, поэтому состояние показать не могу. Попросите " + INSTALLER + " запустить проверку.");
+  }
 
+  /* Три строки первой настройки: ключи, аккаунт, чаты (сколько их в архиве и сколько сообщений). */
   function CorrFacts({ c }) {
     const s = c.setup;
     const fact = (label, ok, text) => h("div", { className: "shturman-sumrow" },
       h("span", { className: "shturman-sumlabel" }, label),
       h("span", { className: ok ? "is-ok" : "shturman-muted" }, text));
-    const yes = (v, on, off) => (v === true ? on : v === false ? off : "Неизвестно");
-    const messages = c.archive && c.archive.messages;
+    const a = c.archive || {};
+    const messages = a.messages > 0 ? a.messages : 0;
+    const chats = a.chats > 0 ? a.chats : 0;
     return h("div", { className: "shturman-summary shturman-facts" },
-      fact("Бот согласований", s.own_bot === true, yes(s.own_bot, "Есть", "Ещё не создан")),
-      fact("Владелец привязан", s.owner_bound === true, yes(s.owner_bound, "Да", "Нет")),
-      fact("Ключи Telegram", s.tg_keys === true, yes(s.tg_keys, "Заданы", "Не заданы")),
-      fact("Аккаунты Telegram", s.accounts > 0, s.accounts > 0 ? count(s.accounts) : "Не подключены"),
-      fact("Бизнес-режим", s.business_connected === true, yes(s.business_connected, "Подключён", "Не подключён")),
-      fact("Сообщений в архиве", messages > 0, messages === null || messages === undefined ? "Неизвестно" : count(messages)));
+      fact("Ключи Telegram", s.tg_keys === true, s.tg_keys === true ? "Заданы" : s.tg_keys === false ? "Не заданы" : "Неизвестно"),
+      fact("Аккаунт Telegram", s.accounts > 0, s.accounts > 1 ? "Подключено: " + count(s.accounts) : s.accounts === 1 ? "Подключён" : "Не подключён"),
+      fact("Чаты", messages > 0 || chats > 0,
+        messages > 0 || chats > 0 ? "В архиве: " + count(chats) + ", сообщений: " + count(messages) : "Не выбраны"));
   }
 
   function CorrespondenceStep({ st, next }) {
     const c = mem.corr;
-    const botName = (st.bot && st.bot.username) || "";
 
     // Владелец уходит на страницу настройки в другую вкладку; когда возвращается — состояние свежее.
     useEffect(() => {
@@ -749,72 +774,52 @@
       next();
     }
 
-    const ok = !!(c && c.state === "ok");
+    const open = !!(c && c.state === "ok" && c.url);
     const ready = collecting(c);
 
     return h("div", { className: "shturman-step" },
       h("h2", null, "Переписка"),
       h("p", { className: "shturman-lead" },
-        "Чтобы ассистент помнил, о чём вы договаривались, ему нужен архив вашей переписки в Telegram. " +
-        "Сбор переписки и согласования настраиваются на отдельной защищённой странице."),
+        "Чтобы ассистент помнил, о чём вы договаривались, ему нужен архив вашей переписки в Telegram."),
+      h("p", null,
+        "Настройка — на отдельной защищённой странице, чтобы ваш вход в Telegram не проходил через ассистента. " +
+        "Шагов там три: ключи приложения Telegram, вход в аккаунт по QR-коду, выбор чатов."),
 
-      st.business.connected ? h(Note, { kind: "warn" },
-        "Сейчас в бизнес-режиме Telegram подключён бот-ассистент — так делали в прежних версиях. Теперь схема другая: " +
-        "бизнес-режим подключается к боту согласований. Когда будете готовы, отключите бота-ассистента в Telegram " +
-        "(Настройки → «Telegram для бизнеса» → «Чат-боты») и подключите бота согласований на странице настройки переписки.") : null,
+      st.business.connected ? h(Note, { kind: "info" },
+        "Сейчас в бизнес-режиме Telegram подключён бот-ассистент — так делали в прежних версиях. Ничего не сломано, " +
+        "но теперь его так не подключают. Когда будет удобно, отключите его в Telegram: Настройки → " +
+        "«Telegram для бизнеса» → «Чат-боты».") : null,
 
       h("div", { className: "shturman-split" },
         h("div", { className: "shturman-col" },
 
-          h(Section, { title: "Почему отдельная страница" },
+          h("section", { className: "shturman-section" },
             h("div", { className: "shturman-stack" },
-              h("p", null, "Там вы входите в свой аккаунт Telegram, вводите токен второго бота, выбираете чаты и загружаете " +
-                "историю. Ассистент не должен видеть ваш вход в Telegram, поэтому эту страницу показывает не он, а отдельный " +
-                "сервис на вашем сервере — со своим входом."),
               !c ? h("p", { className: "shturman-muted" }, "Узнаю состояние…") : null,
-              c && !ok ? h(Note, { kind: "warn" }, CORR_PROBLEMS[c.state] || CORR_PROBLEMS.unreachable) : null,
-              ok && c.url && c.setup.origin_set === false ? h(Note, { kind: "warn" },
-                "Сервис переписки ещё не знает внешний адрес ассистента, и вход на странице не сработает. " +
-                "Попросите того, кто ставил ассистента, перезапустить его (", h("code", null, "./ops/up.sh"), ").") : null,
-              ok && c.url ? h("div", null,
+              c && !open ? h(CorrProblem, { state: c.state }) : null,
+              open ? h("div", null,
                 h("a", { className: "shturman-btn shturman-btn-primary", href: c.url,
                          target: "_blank", rel: "noopener noreferrer" }, "Открыть настройку переписки")) : null,
-              ok && c.url ? h("p", { className: "shturman-muted" },
-                "Страница откроется в новой вкладке. Эта вкладка останется открытой — вернитесь сюда, когда закончите.") : null,
-              ok && !c.url ? h(Note, { kind: "info" },
-                "У ассистента не задан внешний адрес, поэтому страница открывается только с самого сервера. " +
-                "Попросите того, кто ставил ассистента, выполнить ", h("code", null, SETUP_LINK_CMD + " --local"),
-                ": команда даст ссылку и подскажет, как открыть её со своего компьютера.") : null)),
+              open ? h("p", { className: "shturman-muted" },
+                "Страница откроется в новой вкладке. Вернитесь сюда, когда закончите.") : null)),
 
-          h(Section, { title: "Как туда войти" },
-            h("ol", { className: "shturman-list" },
-              h("li", null, h("strong", null, "Первый раз — по одноразовой ссылке. "),
-                "Её выдаёт тот, кто ставил ассистента: ИИ-агент по вашей просьбе или вы сами командой ",
-                h("code", null, SETUP_LINK_CMD), " на сервере. Ссылка действует 30 минут и срабатывает один раз."),
-              h("li", null, h("strong", null, "Потом — по коду от бота согласований. "),
-                "Когда бот согласований создан и привязан к вам, страница входа присылает код в Telegram.")),
-            h("p", { className: "shturman-muted" },
-              "Мастер ссылку входа не выдаёт и не показывает: так она не проходит через ассистента."))),
+          h(Section, { title: "Как войти" },
+            h("div", { className: "shturman-stack" },
+              h("p", null, "По одноразовой ссылке — её выдаёт тот, кто ставил ассистента, или вы сами командой ",
+                h("code", null, SETUP_LINK_CMD), ". Ссылка действует 30 минут."),
+              h("p", { className: "shturman-muted" },
+                "Мастер эту ссылку не выдаёт и не показывает: так она не проходит через ассистента.")))),
 
         h("div", { className: "shturman-col shturman-col-aside" },
           h("section", { className: "shturman-section" },
             h("h3", null, "Что уже настроено"),
-            ok ? h(CorrFacts, { c })
+            c && c.setup ? h(CorrFacts, { c })
                : h("p", { className: "shturman-muted" }, c ? "Состояние недоступно." : "Узнаю состояние…"),
             h("div", null, h(Btn, { kind: "ghost", busy: running("corr.load"), onClick: refreshCorrespondence }, "Обновить"))))),
 
-      h("section", { className: "shturman-section" },
-        h("h3", null, "Два бота — не перепутайте"),
-        h("div", { className: "shturman-bots" },
-          h("div", { className: "shturman-bot" },
-            h("span", { className: "shturman-card-name" }, "Бот-ассистент"),
-            h("span", null, "С ним вы разговариваете" + (botName ? ": @" + botName : "") + ". Его вы подключили на шаге «Бот в Telegram»."),
-            h("span", { className: "shturman-muted" }, "В бизнес-режиме Telegram его не подключают.")),
-          h("div", { className: "shturman-bot" },
-            h("span", { className: "shturman-card-name" }, "Бот согласований"),
-            h("span", null, "Присылает карточки с кнопками: показать черновик, подтвердить действие. На сообщения не отвечает. " +
-              "Это отдельный бот — его вы создаёте на странице настройки переписки."),
-            h("span", { className: "shturman-muted" }, "К нему подключается бизнес-режим Telegram.")))),
+      h("p", { className: "shturman-muted shturman-fine" },
+        "Разрешить ассистенту отправлять сообщения можно позже — для этого понадобится отдельный бот согласований; " +
+        "он настраивается на той же странице, в разделе «Дополнительно»."),
 
       h(JobError, { names: ["corr.load"] }),
       h("div", { className: "shturman-actions" },
@@ -825,17 +830,15 @@
   function correspondenceSummary(c) {
     if (!c) return [null, "Узнаю состояние…"];
     if (c.state === "outdated") return [false, "Страница настройки недоступна — обновите экземпляр"];
-    if (c.state !== "ok") return [null, "Состояние недоступно: сервис переписки не отвечает"];
+    if (c.state === "same_origin") return [false, "Страница настройки отключена: ей нужен отдельный адрес"];
+    if (!c.setup) return [null, "Состояние недоступно: сервис переписки не отвечает"];
+    if (!collecting(c)) return [false, "Не настроена — шаг «Переписка»"];
     const s = c.setup;
-    const messages = c.archive && c.archive.messages;
+    const messages = c.archive && c.archive.messages > 0 ? c.archive.messages : 0;
     const parts = [];
-    if (s.own_bot) parts.push(s.owner_bound ? "бот согласований привязан" : "бот согласований не привязан");
-    if (s.accounts > 0) parts.push("аккаунтов Telegram: " + count(s.accounts));
-    if (s.business_connected) parts.push("бизнес-режим подключён");
-    if (messages > 0) parts.push("сообщений в архиве: " + count(messages));
-    if (!collecting(c)) {
-      return [false, "Сбор не настроен — шаг «Переписка»" + (parts.length ? " (" + parts.join(", ") + ")" : "")];
-    }
+    if (s.accounts > 1) parts.push("аккаунтов Telegram: " + count(s.accounts));
+    else if (s.accounts === 1) parts.push("аккаунт Telegram подключён");
+    parts.push("сообщений в архиве: " + count(messages));
     const text = parts.join(", ");
     return [true, text.charAt(0).toUpperCase() + text.slice(1)];
   }
@@ -885,7 +888,7 @@
     if (id === "persona") return !!m.persona_saved;
     if (id === "model") return !!m.model_ok;
     if (id === "bot") return !!(st.pairing.owner && m.bot_applied);
-    // Прежние шаги «Бизнес-режим» и «Переписка и память» слиты в один. Кто прошёл их до
+    // Прежние шаги «Бизнес-режим» и «Переписка и память» заменены одним. Кто прошёл их до
     // обновления (отметка business_skipped, подключённый бизнес-режим, завершённый мастер),
     // для того шаг остаётся пройденным.
     if (id === "correspondence") {
