@@ -1062,6 +1062,39 @@ class TgManager:
                                  account_id, type(exc).__name__)
         return message_id
 
+    async def download_voice(self, account_id: int, peer_class: str, tg_id: int, tg_message_id: int,
+                             *, max_bytes: int) -> tuple[bytes, int | None]:
+        """Файл голосового или «кружка» — для расшифровки (voice/). Возвращает байты файла и
+        длительность в секундах. Запросы идут с той же паузой, что и чтение истории.
+
+        Бросает AccountUnavailable (сессии нет), MediaUnavailable (сообщения или вложения нет,
+        это не голосовое, файл больше max_bytes), FloodWait."""
+        rt = self._running(account_id)
+        key: PeerKey = (peer_class, int(tg_id))
+        try:
+            await rt.pacer.wait(rt.stop)
+            peer = await rt.client.get_input_entity(normalize.to_peer(key))
+            found = await rt.client.get_messages(peer, ids=[int(tg_message_id)])
+            message = found[0] if found else None
+            media = getattr(message, "media", None)
+            if message is None or normalize.media_type(media) not in ("voice_message", "video_message"):
+                raise gateway.MediaUnavailable("сообщения нет или в нём нет голосового")
+            size = getattr(getattr(media, "document", None), "size", None) or 0
+            if size > max_bytes:
+                raise gateway.MediaUnavailable(f"файл больше предела ({size} байт)")
+            await rt.pacer.wait(rt.stop)
+            data = await rt.client.download_media(message, file=bytes)
+        except sync.FLOOD as exc:
+            rt.pacer.flood(exc.seconds)
+            raise gateway.FloodWait(exc.seconds) from None
+        except sync.Stopped:
+            raise gateway.AccountUnavailable("аккаунт останавливается") from None
+        except (errors.UnauthorizedError, errors.AuthKeyError, ConnectionError) as exc:
+            raise gateway.AccountUnavailable(f"сессия аккаунта недоступна ({type(exc).__name__})") from None
+        if not isinstance(data, (bytes, bytearray)) or not data or len(data) > max_bytes:
+            raise gateway.MediaUnavailable("файл не скачался")
+        return bytes(data), normalize.media_duration(media)
+
     async def set_typing(self, account_id: int, peer_class: str, tg_id: int, on: bool) -> None:
         if not self.can_send(account_id):
             return  # основной аккаунт владельца ничем не выдаёт своё присутствие

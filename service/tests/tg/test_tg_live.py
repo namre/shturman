@@ -645,3 +645,34 @@ async def test_history_backfill_is_visible_at_once_and_checked_in_the_background
     await guarded.guard.sweep()
     rows = await stage.rows("SELECT tg_message_id, agent_visible, guard_label FROM messages ORDER BY 1")
     assert [tuple(r) for r in rows] == [(1, True, "ok"), (2, False, "suspect")]
+
+
+# --- скачивание голосового для расшифровки (voice/) ---
+
+def voice_media(duration=42, size=5000, round_=False):
+    attr = (types.DocumentAttributeVideo(duration=duration, w=240, h=240, round_message=True) if round_
+            else types.DocumentAttributeAudio(duration=duration, voice=True))
+    return types.MessageMediaDocument(
+        document=types.Document(id=7, access_hash=7, file_reference=b"", date=T0, mime_type="audio/ogg",
+                                size=size, dc_id=2, attributes=[attr]),
+        voice=not round_, round=round_)
+
+
+async def test_voice_file_is_downloaded_by_message_number_through_the_read_only_session(stage):
+    from telethon.tl import functions as fn
+
+    from shturman.tg import gateway
+
+    rt = await stage.start()
+    stage.world.add(msg(50, ("user", IVAN), "", sender=IVAN, media=voice_media()),
+                    msg(51, ("user", IVAN), "просто текст", sender=IVAN),
+                    msg(52, ("user", IVAN), "", sender=IVAN, media=voice_media(size=10 ** 9)))
+    stage.world.files = {50: b"OggS-voice"}
+    data, seconds = await stage.manager.download_voice(rt.account_id, "user", IVAN, 50, max_bytes=20_000_000)
+    assert (data, seconds) == (b"OggS-voice", 42)
+    assert stage.client.of(fn.upload.GetFileRequest)               # файл — разрешённым запросом чтения
+    for mid in (51, 52, 999):                                        # не голосовое, слишком большое, нет такого
+        with pytest.raises(gateway.MediaUnavailable):
+            await stage.manager.download_voice(rt.account_id, "user", IVAN, mid, max_bytes=20_000_000)
+    with pytest.raises(gateway.AccountUnavailable):
+        await stage.manager.download_voice(rt.account_id + 99, "user", IVAN, 50, max_bytes=20_000_000)

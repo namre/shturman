@@ -163,6 +163,8 @@ wait_dashboard() {
 docker compose config --quiet
 # Образ сервиса переписки собирается здесь же, из каталога service/.
 docker compose build --quiet shturman
+# Контейнер распознавания речи — тоже из этого репозитория (каталог asr/), если он включён.
+if profile_on asr; then docker compose build --quiet asr; fi
 if [ "$MODE" != hermes ] && docker inspect "$c" >/dev/null 2>&1; then
   # Остался от режима с Hermes. Убирается только контейнер: данные Hermes (data/hermes) не трогаем.
   echo "Режим без Hermes: останавливаю и убираю контейнер $c (его данные остаются в data/hermes)…"

@@ -88,6 +88,7 @@ class World:
         self.unknown: set[tuple[str, int]] = set()   # собеседники без ключа доступа
         self.fail: dict[type, list[BaseException]] = {}   # ошибки по классу запроса, по очереди
         self.lost: dict[tuple[str, int], BaseException] = {}   # чаты, к которым доступа больше нет
+        self.files: dict[int, bytes] = {}     # содержимое вложений по номеру сообщения
         self.next_id = 9000
         self.clients: list[FakeClient] = []
         self.connect_error: BaseException | None = None
@@ -241,6 +242,21 @@ class FakeClient:
         if key[0] == "chat":
             return types.InputPeerChat(key[1])
         return types.InputPeerChannel(key[1], key[1] * 7)
+
+    async def get_messages(self, entity: Any, ids: list[int]) -> list[Any]:
+        if isinstance(entity, types.InputPeerChannel):
+            request = functions.channels.GetMessagesRequest(
+                types.InputChannel(entity.channel_id, entity.access_hash), [types.InputMessageID(i) for i in ids])
+        else:
+            request = functions.messages.GetMessagesRequest([types.InputMessageID(i) for i in ids])
+        result = await self(request)
+        return [None if isinstance(m, types.MessageEmpty) else m for m in result.messages]
+
+    async def download_media(self, message: Any, file: Any = None) -> Any:
+        doc = message.media.document
+        await self(functions.upload.GetFileRequest(
+            types.InputDocumentFileLocation(doc.id, doc.access_hash, doc.file_reference, ""), 0, 512 * 1024))
+        return self.world.files.get(message.id)
 
     async def iter_dialogs(self):
         await self(functions.messages.GetDialogsRequest(

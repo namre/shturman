@@ -237,7 +237,11 @@ async def overview(state: AppState) -> dict[str, Any]:
         guard = await guard_service.overview(conn, state.config)
         search = await embeddings.overview(conn, state)
         setup = await setup_summary.overview(conn, state)
+        from .voice import service as voice_service
+        voice = await voice_service.overview(conn, state)
     out = dict(row)
+    # Расшифровка голосовых: включена ли, отвечает ли контейнер, счётчики очереди.
+    out.update(voice)
     # Защита от внедрённых инструкций: включена ли, чем проверяет, и счётчики (проверено, скрыто,
     # показано владельцем, не проверено). Только числа и состояние.
     out.update(guard)

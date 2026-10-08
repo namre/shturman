@@ -70,6 +70,12 @@ READ_REQUESTS: frozenset[type] = frozenset({
     functions.channels.GetMessagesRequest,
     functions.PingRequest,
     functions.auth.LogOutRequest,                # выход: завершает эту сессию, больше ничего
+    # Скачивание голосового или «кружка» для расшифровки (voice/): сам файл частями и, если он
+    # лежит в другом дата-центре, перенос авторизации этой же сессии туда — так делает любой
+    # клиент Telegram при открытии вложения. Прочитанным это ничего не отмечает.
+    functions.upload.GetFileRequest,
+    functions.auth.ExportAuthorizationRequest,
+    functions.auth.ImportAuthorizationRequest,
 })
 
 # Вход по QR и облачный пароль. Запроса кода по номеру телефона здесь нет намеренно.

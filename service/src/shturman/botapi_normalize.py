@@ -270,6 +270,22 @@ def _media_type(message: dict[str, Any]) -> str | None:
     return None
 
 
+def _voice_ref(message: dict[str, Any]) -> dict[str, Any]:
+    """Голосовое или «кружок»: длительность и file_id — по нему сервис потом скачает файл
+    через getFile своего бота и расшифрует (voice/). У остальных вложений — ничего."""
+    for key in ("voice", "video_note"):
+        media = _dict(message.get(key))
+        if media is None:
+            continue
+        file_id = media.get("file_id")
+        duration = _int(media.get("duration"))
+        return {
+            "media_ref": file_id if isinstance(file_id, str) and 0 < len(file_id) <= 300 else None,
+            "media_duration": duration if duration is not None and 0 <= duration < 10**7 else None,
+        }
+    return {}
+
+
 def _service_action(message: dict[str, Any]) -> str | None:
     allowed = _dict(message.get("write_access_allowed"))
     if allowed is not None:
@@ -341,6 +357,7 @@ def normalize_message(message: Any) -> Normalized:
         media_type=None if action else _media_type(message),
         media_path=None,
         service_action=action,
+        **({} if action else _voice_ref(message)),
     )
     by_business_bot = _dict(message.get("sender_business_bot")) is not None
     return Normalized(

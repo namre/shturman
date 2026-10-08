@@ -44,6 +44,7 @@ ALLOWED_UPDATES = (
 POLL_SECONDS = 25                 # сколько Telegram держит запрос getUpdates открытым
 _TOKEN = re.compile(r"^\d{3,20}:[A-Za-z0-9_-]{20,128}$")
 _PLACEHOLDER = b"/bot/"
+_FILE_PLACEHOLDER = b"/file/bot/"
 # Запрос не покинул сервер: соединение не установлено либо не нашлось свободного (имена httpx).
 _NEVER_LEFT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
@@ -126,13 +127,19 @@ class _TokenTransport(httpx.AsyncBaseTransport):
     def __init__(self, inner: httpx.AsyncBaseTransport, token: str) -> None:
         self._inner = inner
         self._prefix = b"/bot" + token.encode("ascii") + b"/"
+        self._file_prefix = b"/file/bot" + token.encode("ascii") + b"/"
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         path = request.url.raw_path
-        if not path.startswith(_PLACEHOLDER):
+        if path.startswith(_PLACEHOLDER):
+            real_path = self._prefix + path[len(_PLACEHOLDER):]
+        elif path.startswith(_FILE_PLACEHOLDER):
+            # Скачивание файла по file_path из getFile: /file/bot<токен>/<путь>.
+            real_path = self._file_prefix + path[len(_FILE_PLACEHOLDER):]
+        else:
             raise httpx.UnsupportedProtocol("адрес запроса не принадлежит Bot API")
         real = httpx.Request(
-            request.method, request.url.copy_with(raw_path=self._prefix + path[len(_PLACEHOLDER):]),
+            request.method, request.url.copy_with(raw_path=real_path),
             headers=request.headers, stream=request.stream, extensions=request.extensions,
         )
         return await self._inner.handle_async_request(real)
@@ -214,6 +221,38 @@ class BotApi:
         raise OutcomeUnknown(f"http_{status}")
 
     # --- методы ---
+
+    async def download_file(self, file_id: str, *, max_bytes: int) -> bytes:
+        """Файл по file_id: getFile, затем скачивание. Bot API отдаёт файлы до 20 МБ.
+        Бросает Refused (файла нет, слишком большой), NeverLeft и OutcomeUnknown."""
+        info = await self.call("getFile", {"file_id": file_id})
+        path = info.get("file_path") if isinstance(info, dict) else None
+        size = info.get("file_size") if isinstance(info, dict) else None
+        if not isinstance(path, str) or not path or ".." in path or path.startswith("/"):
+            raise Refused(400, "file_unavailable")
+        if isinstance(size, int) and size > max_bytes:
+            raise Refused(400, "file_too_big")
+        assert self._client is not None
+        failure: BotApiError | None = None
+        try:
+            async with self._client.stream("GET", "/file/bot/" + path) as response:
+                if response.status_code != 200:
+                    failure = Refused(response.status_code, "file_unavailable") if 400 <= response.status_code < 500 \
+                        else OutcomeUnknown(f"http_{response.status_code}")
+                else:
+                    data = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        data += chunk
+                        if len(data) > max_bytes:
+                            failure = Refused(400, "file_too_big")
+                            break
+        except _NEVER_LEFT as exc:
+            failure = NeverLeft(type(exc).__name__)
+        except (httpx.HTTPError, OSError, RuntimeError) as exc:
+            failure = OutcomeUnknown(type(exc).__name__)
+        if failure is not None:
+            raise failure
+        return bytes(data)
 
     async def get_me(self) -> dict[str, Any]:
         out = await self.call("getMe")
