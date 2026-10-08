@@ -7,8 +7,8 @@
 # модели), лежат в data/shturman/setup и попадают в архив вместе с каталогом; введённые
 # в терминале — в .env.
 # В копии ключи, настройки и переписка владельца: агент её не открывает и никуда не передаёт.
-# Файлы базы и кэш модели в архив каталога не входят: база сохраняется выгрузкой (pg_dump),
-# модель скачивается заново.
+# Файлы базы и модели (эмбеддинги, защита, распознавание речи) в архив каталога не входят: база
+# сохраняется выгрузкой (pg_dump), модели скачиваются заново командой «on» своего скрипта.
 #   ./ops/backup.sh            — сделать копию и проверить, что она читается
 #   ./ops/backup.sh --list     — показать имеющиеся копии
 #   ./ops/backup.sh --help     — эта справка; ничего не создаётся
@@ -42,7 +42,7 @@ members="data"
 [ -f .env ] && members="data .env"
 # shellcheck disable=SC2086
 tar -czf "$name" --warning=no-file-changed \
-  --exclude='data/hermes/logs' --exclude='data/postgres' --exclude='data/embeddings' --exclude='data/guard' \
+  --exclude='data/hermes/logs' --exclude='data/postgres' --exclude='data/embeddings' --exclude='data/guard' --exclude='data/asr' \
   --exclude='data/shturman/uploads' $members || [ $? -eq 1 ]
 count="$(tar -tzf "$name" | wc -l)"
 [ "$count" -gt 0 ] || { echo "копия пустая: $name" >&2; exit 1; }
