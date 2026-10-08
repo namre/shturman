@@ -1021,10 +1021,11 @@
     } else if (item.state === "done") {
       var st = item.stats || {};
       nodes.push(el("p", { class: "note ok", text: "Импорт завершён. Новых сообщений: " + number(st.messages_new) + ", уже были в архиве: " + number(st.messages_known) + ", чатов: " + number(st.chats) + (st.chats_excluded ? ", пропущено исключённых чатов: " + number(st.chats_excluded) : "") + "." }));
+      if (item.kind === "zip") nodes.push(el("p", { class: st.media_no_space ? "note warn" : "small", text: mediaSummary(st) }));
       nodes.push(el("p", { class: "small", text: "Файл с сервера удалён. Удалите выгрузку и со своего компьютера, если она больше не нужна: в ней вся переписка открытым текстом." }));
     } else if (item.state === "running") {
       var p = item.progress || {};
-      nodes.push(el("p", { class: "small waiting", role: "status", text: "Идёт импорт: " + (p.percent || 0) + "%" + (p.messages_read ? ", прочитано сообщений: " + number(p.messages_read) : "") + ". Страницу можно закрыть — импорт продолжится." }));
+      nodes.push(el("p", { class: "small waiting", role: "status", text: "Идёт импорт: " + (p.percent || 0) + "%" + (p.messages_read ? ", прочитано сообщений: " + number(p.messages_read) : "") + (p.media_files ? ", файлов взято на разбор: " + number(p.media_files) : "") + ". Страницу можно закрыть — импорт продолжится." }));
       nodes.push(el("progress", { max: "100", value: String(p.percent || 0), "aria-label": "Ход импорта" }));
     } else if (!scan || item.state === "scanning") {
       nodes.push(el("p", { class: "small waiting", role: "status", text: "Читаю файл и считаю чаты. Для большого файла это около минуты…" }));
@@ -1074,8 +1075,16 @@
     return el("div", { class: "import-item" }, nodes);
   }
 
+  function mediaSummary(st) {
+    var taken = st.media_files || 0, skipped = st.media_skipped || 0;
+    if (st.media_no_space) return "Файлов из архива взято на разбор: " + number(taken) + ". Остальные не взяты: на диске сервера кончилось место. Сообщения при этом импортированы.";
+    if (!taken && !skipped) return "Файлы из архива не брались: расшифровка голосовых и разбор фото и документов выключены или подходящих файлов в архиве нет.";
+    return "Файлов из архива взято на разбор: " + number(taken) + (skipped ? ", не взято: " + number(skipped) + " (нет в архиве, слишком большие или уже не нужны)" : "") + ". Разобрав файл, сервис его удаляет.";
+  }
+
   function renderImports(imports) {
     var items = imports.items || [];
+    if (imports.max_bytes) text("import-limit", megabytes(imports.max_bytes));
     var done = items.some(function (i) { return i.state === "done"; }), active = items.some(function (i) { return i.state === "running"; });
     pill("import", active ? "Идёт импорт" : done ? "Импортировано" : items.length ? "Файл загружен" : "", done && !active ? "done" : items.length ? "todo" : "");
     if (active) fast(10);
@@ -1090,9 +1099,9 @@
     $("import-form").addEventListener("submit", function (event) {
       event.preventDefault();
       var input = $("import-file"), file = input.files && input.files[0];
-      if (!file) { note("import-error", "warn", "Выберите файл result.json из папки выгрузки."); return; }
+      if (!file) { note("import-error", "warn", "Выберите архив папки выгрузки (zip) или файл result.json."); return; }
       var limit = S && S.imports.max_bytes;
-      if (limit && file.size > limit) { note("import-error", "warn", "Файл больше, чем сервис принимает (" + megabytes(limit) + "). Выгрузите чаты без вложений или частями."); return; }
+      if (limit && file.size > limit) { note("import-error", "warn", "Файл больше, чем сервис принимает (" + megabytes(limit) + "). Выгрузите заново без видео или с меньшим пределом размера файлов, частями — или загрузите один result.json."); return; }
       note("import-error", "warn", "");
       var xhr = new XMLHttpRequest();
       ui.upload = xhr;
@@ -1102,7 +1111,7 @@
       xhr.open("POST", API + "imports");
       xhr.setRequestHeader("X-Shturman-Setup", "1");
       xhr.setRequestHeader("X-Shturman-Session", key);
-      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.setRequestHeader("Content-Type", /\.zip$/i.test(file.name) ? "application/zip" : "application/json");
       xhr.upload.onprogress = function (e) {
         if (!e.lengthComputable) return;
         var percent = Math.floor(e.loaded * 100 / e.total);

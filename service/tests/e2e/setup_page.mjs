@@ -373,6 +373,27 @@ await page.waitForFunction(() => document.querySelector("#import-items").textCon
 const importText = await page.textContent("#import-items");
 const importNums = /Новых сообщений: (\d+), уже были в архиве: (\d+)/.exec(importText);
 check("выгрузка: импорт прошёл сразу, без карточки в боте", !!importNums && Number(importNums[1]) + Number(importNums[2]) === 2, importText.slice(0, 200));
+
+// Та же выгрузка архивом zip папки: result.json внутри папки, рядом — фото.
+const zipFile = path.join(OUT, "export.zip");
+execFileSync(process.env.E2E_PYTHON || "python3", ["-c", [
+  "import sys, zipfile",
+  "with zipfile.ZipFile(sys.argv[2], 'w', zipfile.ZIP_DEFLATED) as z:",
+  "    z.write(sys.argv[1], 'ChatExport_2026-10-01/result.json')",
+  "    z.writestr('ChatExport_2026-10-01/photos/photo_1.jpg', b'jpeg')"].join("\n"), exportFile, zipFile]);
+check("выгрузка: поле принимает и zip, и result.json", (await page.getAttribute("#import-file", "accept")) === ".json,.zip");
+const importHint = await page.textContent("#import-hint") + " " + await page.textContent("#import-howto");
+check("выгрузка: подсказка — лучше архив папки, как сжать, предел размера",
+      importHint.includes("архив всей папки выгрузки (zip)") && importHint.includes("«Сжатая ZIP-папка»") &&
+      importHint.includes("«Сжать»") && /Предел размера — [\d,]+ ГБ/.test(importHint), importHint.slice(0, 120));
+await page.setInputFiles("#import-file", zipFile);
+await page.click("#import-upload");
+await page.waitForSelector(".import-chats li", { timeout: 30000 });
+check("выгрузка архивом: архив загружен, result.json из него разобран, показаны чаты", (await page.locator(".import-chats li").count()) === 3);
+await shot(page, "24c-import-zip-desktop-light");
+await page.locator(".import-item button", { hasText: "Импортировать" }).click();
+await page.waitForFunction(() => document.querySelector("#import-items").textContent.includes("Файлы из архива"), null, { timeout: 30000 });
+check("выгрузка архивом: после импорта сказано про файлы из архива", (await page.textContent("#import-items")).includes("разбор фото и документов выключены"));
 await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
 await page.waitForFunction(() => document.querySelector("#collected").textContent.trim() !== "0", null, { timeout: 20000 });
 check("счётчик «собрано сообщений» не нулевой", true);
