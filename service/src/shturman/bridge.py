@@ -183,11 +183,13 @@ async def clear_owner(conn: asyncpg.Connection) -> None:
 
 async def set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
     async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.owner.binding'))")
         previous = await get_owner(conn)
         await _set_owner(conn, user_id, chat_id)
         if previous is not None and int(previous["user_id"]) != int(user_id):
             await _owner_changed(conn, int(user_id))
-        if previous is None or int(previous["user_id"]) != int(user_id):
+        from . import authority
+        if authority.is_owner() and (previous is None or int(previous["user_id"]) != int(user_id)):
             # Владелец привязан (заново): его собственные бизнес-подключения снова принимают
             # сообщения. Если Telegram подключение отключил, отправка через него всё равно откажет.
             await conn.execute(

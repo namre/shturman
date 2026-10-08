@@ -85,3 +85,14 @@ async def test_draft_callback_without_verified_context_is_refused_before_databas
     from shturman.outbox import drafts
     result = await drafts.on_button(None, 's:1:nonce', OWNER)
     assert result['answer'] == 'Кнопка недоступна.'
+
+
+@pytest.mark.asyncio
+async def test_legacy_owner_hint_is_idempotent_but_cannot_rebind_or_clear(make_client, conn):
+    from shturman import bridge
+    client, state = await make_client('shturman.api_core')
+    assert (await client.put('/api/owner', json={'user_id': OWNER, 'chat_id': OWNER})).status_code == 200
+    assert (await client.put('/api/owner', json={'user_id': OWNER, 'chat_id': OWNER})).status_code == 200
+    assert (await client.put('/api/owner', json={'user_id': OWNER + 1, 'chat_id': OWNER + 1})).status_code == 403
+    assert (await client.delete('/api/owner')).status_code == 403
+    assert await bridge.get_owner(conn) == {'user_id': OWNER, 'chat_id': OWNER}

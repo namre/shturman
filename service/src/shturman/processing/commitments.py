@@ -693,6 +693,7 @@ async def build_digests(
         for pos, (kind, target, body) in enumerate(chunk, start=1):
             lines.append(f"{pos}. {body}")
             accept_data, reject_data = (f"a:{target}", f"r:{target}") if kind == "c" else (f"ca:{target}", f"cr:{target}")
+            accept_data += ":" + prints[(kind, target)][:24]
             buttons.append([bridge.button(f"{pos} ✓", CALLBACK_MODULE, accept_data),
                             bridge.button(f"{pos} ✗", CALLBACK_MODULE, reject_data)])
             table = "commitments" if kind == "c" else "commitment_changes"
@@ -755,6 +756,7 @@ async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]
     """Нажатие кнопки под сводкой. Данные: a:<id> принять, r:<id> отклонить,
     ca:<id> применить изменение, cr:<id> оставить как есть."""
     action, _, raw = rest.partition(":")
+    raw, _, shown_fingerprint = raw.partition(":")
     if action not in ("a", "r", "ca", "cr") or not raw.isdigit():
         return {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
     target = int(raw)
@@ -765,7 +767,7 @@ async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]
         if row["status"] != "proposed":
             answer = f"Уже решено: {STATUS_TEXT[row['status']]}."
         elif action == "a":
-            if not row["digest_fingerprint"]:
+            if not row["digest_fingerprint"] or shown_fingerprint != row["digest_fingerprint"][:24]:
                 return {"answer": "Карточка устарела. Запросите новое подтверждение.", "edit_text": None, "remove_buttons": True}
             outcome = await accept(conn, target, expected_fingerprint=row["digest_fingerprint"])
             answer = "Принято." if outcome["ok"] else outcome["error"]
@@ -780,7 +782,7 @@ async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]
         if row["status"] != "proposed":
             answer = "Уже решено."
         elif action == "ca":
-            if not row["digest_fingerprint"]:
+            if not row["digest_fingerprint"] or shown_fingerprint != row["digest_fingerprint"][:24]:
                 return {"answer": "Карточка устарела. Запросите новое подтверждение.", "edit_text": None, "remove_buttons": True}
             out = await apply_change(conn, target, expected_fingerprint=row["digest_fingerprint"])
             answer = {"fulfilled": "Закрыто.", "cancelled": "Отменено.", "rescheduled": "Срок перенесён."}.get(

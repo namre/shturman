@@ -70,6 +70,9 @@ async def register(conn, data, *, allow_loopback=False, client_id=None):
     if not isinstance(name, str) or not 1 <= len(name) <= 100 or any(ord(c) < 32 for c in name):
         raise OAuthError("invalid_client_metadata")
     uris = redirects(data.get("redirect_uris"), allow_loopback)
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.remote_mcp.registration'))")
+    await conn.execute("DELETE FROM remote_mcp_clients c WHERE c.expires_at<now() AND NOT EXISTS "
+                       "(SELECT 1 FROM remote_mcp_grants g WHERE g.client_id=c.id AND g.expires_at>now() AND g.revoked_at IS NULL)")
     if await conn.fetchval("SELECT count(*) FROM remote_mcp_clients") >= 500:
         raise OAuthError("temporarily_unavailable", 429)
     cid = client_id or secret()

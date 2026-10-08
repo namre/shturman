@@ -262,7 +262,7 @@ def build_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
+async def _prepare_work(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
     """Собирает справку и просит у модели текст ответа. Ничего не отправляет."""
     state = mod.state
     from ..replies import workflow
@@ -345,6 +345,15 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
     if task_id is not None and channel == "session" and not prepare_only:
         mod.start_typing(tgt.account_id, chat_id, tgt.peer_class, tgt.tg_id,
                          float(min(settings["typing_seconds"], settings["max_age_seconds"])))
+
+
+async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
+    await _prepare_work(mod, chat_id, message_id)
+    # A successfully inspected but ineligible queued task must not occupy recovery's
+    # bounded first batch forever. Exceptions leave it queued for retry.
+    async with mod.state.pool.acquire() as conn:
+        await conn.execute("UPDATE reply_tasks SET status='cancelled',error_code='not_eligible',updated_at=now() "
+                           "WHERE trigger_message_id=$1 AND status='queued'", message_id)
 
 
 async def _later(mod: runtime.Outbox, chat_id: int, message_id: int, delay: float) -> None:

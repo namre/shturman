@@ -68,3 +68,21 @@ async def test_read_without_disclosure_continues_same_task_pending(transition,mo
     assert task['id']==7 and task['requires_approval']
     assert task['source_refs']==[{'receipt_id':42}]
     queue.assert_awaited_once_with(conn,task)
+
+@pytest.mark.asyncio
+async def test_recovery_closes_only_successfully_inspected_queued_tasks(monkeypatch):
+    from contextlib import asynccontextmanager
+    conn=SimpleNamespace(execute=AsyncMock())
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+    mod=SimpleNamespace(state=SimpleNamespace(pool=SimpleNamespace(acquire=acquire)))
+    monkeypatch.setattr(autoreply,'_prepare_work',AsyncMock())
+    await autoreply._prepare(mod,3,9)
+    assert "status='queued'" in conn.execute.call_args.args[0]
+    assert conn.execute.call_args.args[1]==9
+    conn.execute.reset_mock()
+    monkeypatch.setattr(autoreply,'_prepare_work',AsyncMock(side_effect=RuntimeError('transient')))
+    with pytest.raises(RuntimeError):
+        await autoreply._prepare(mod,3,9)
+    conn.execute.assert_not_called()

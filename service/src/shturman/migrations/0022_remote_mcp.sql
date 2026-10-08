@@ -4,7 +4,7 @@ CREATE TABLE remote_mcp_clients (
     created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz
 );
 CREATE TABLE remote_mcp_requests (
-    id bigserial PRIMARY KEY, client_id text NOT NULL REFERENCES remote_mcp_clients(id),
+    id bigserial PRIMARY KEY, client_id text NOT NULL REFERENCES remote_mcp_clients(id) ON DELETE CASCADE,
     cookie_hash text NOT NULL UNIQUE, nonce_hash text NOT NULL, redirect_uri text NOT NULL,
     state text NOT NULL, challenge text NOT NULL, resource text NOT NULL,
     status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','denied','delivered')),
@@ -12,13 +12,13 @@ CREATE TABLE remote_mcp_requests (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE remote_mcp_grants (
-    id bigserial PRIMARY KEY, client_id text NOT NULL REFERENCES remote_mcp_clients(id),
+    id bigserial PRIMARY KEY, client_id text NOT NULL REFERENCES remote_mcp_clients(id) ON DELETE CASCADE,
     owner_id bigint NOT NULL, resource text NOT NULL,
     revoked_at timestamptz, expires_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE remote_mcp_codes (
-    hash text PRIMARY KEY, request_id bigint NOT NULL REFERENCES remote_mcp_requests(id),
+    hash text PRIMARY KEY, request_id bigint NOT NULL REFERENCES remote_mcp_requests(id) ON DELETE CASCADE,
     expires_at timestamptz NOT NULL, used_at timestamptz
 );
 CREATE TABLE remote_mcp_tokens (

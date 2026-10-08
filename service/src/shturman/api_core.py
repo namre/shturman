@@ -9,7 +9,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from . import bridge, confirm, embeddings, jobs
+from . import authority, bridge, confirm, embeddings, jobs
 from .guard import service as guard_service
 from .app import AppState, state_of
 
@@ -186,14 +186,27 @@ async def telegram_callback(request: Request) -> JSONResponse:
 async def put_owner(request: Request) -> JSONResponse:
     only_without_own_bot()
     data = await body(request)
-    async with state_of(request).pool.acquire() as conn:
-        await bridge.set_owner(conn, need_int(data, "user_id"), need_int(data, "chat_id"))
+    user_id, chat_id = need_int(data, "user_id"), need_int(data, "chat_id")
+    if user_id <= 0 or chat_id != user_id:
+        raise BadRequest("первичная запись владельца требует его личного Telegram-чата", 400)
+    async with state_of(request).pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.owner.binding'))")
+        current = await bridge.get_owner(conn)
+        if current is not None and not authority.is_owner():
+            if current == {"user_id": user_id, "chat_id": chat_id}:
+                return JSONResponse({"ok": True})  # legacy startup may repeat its unchanged hint
+            raise BadRequest("владельца меняют только через независимого управляющего бота", 403, "owner_required")
+        # A legacy first hint preserves Hermes bootstrap/notifications; it establishes
+        # no principal, source grant, permission approval or business re-enable.
+        await bridge.set_owner(conn, user_id, chat_id)
     return JSONResponse({"ok": True})
 
 
 @handler
 async def delete_owner(request: Request) -> JSONResponse:
     only_without_own_bot()
+    if not authority.is_owner():
+        raise BadRequest("владельца отвязывают только через независимый канал владельца", 403, "owner_required")
     async with state_of(request).pool.acquire() as conn:
         await bridge.clear_owner(conn)
     return JSONResponse({"ok": True})

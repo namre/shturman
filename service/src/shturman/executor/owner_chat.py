@@ -207,7 +207,7 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
             from ..replies import workflow
             await workflow.owner_granted(conn, state, task["id"])
             return {"text": (f"Разрешение сохранено для точного источника, запроса, чата {task['chat_id']}"
-                             + (f" и темы {task['topic_tg_id']}" if task['topic_tg_id'] is not None else " без ограничения темы")
+                             + (f" и темы {task['topic_tg_id']}" if task['topic_tg_id'] is not None else " для сообщений без темы")
                              + ". "
                              + ("Действует для будущих заданий в этой области до истечения срока. " if command == "sourcepolicy" else "")
                              + ("Чтение не разрешает раскрывать содержимое собеседнику." if mode == "read" else
