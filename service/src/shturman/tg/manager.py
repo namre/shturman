@@ -308,7 +308,7 @@ class TgManager:
             await lock.release()
             raise
         rt.lock, rt.policy, rt.client = lock, policy, client
-        rt.pacer = sync.Pacer(self.pacing)
+        rt.pacer = sync.Pacer(self.pacing, jitter=True)
 
     async def _launch(self, slot: str) -> AccountRuntime:
         rt = AccountRuntime(slot=slot)
@@ -564,7 +564,7 @@ class TgManager:
             raise TgError(f"Сессия занята другим процессом: {exc}.", 409) from None
         try:
             rt.lock, rt.policy = lock, RequestPolicy(role, login=True, sending=self.config.sending)
-            rt.pacer = sync.Pacer(self.pacing)
+            rt.pacer = sync.Pacer(self.pacing, jitter=True)
             rt.client = self.client_factory(role, path, rt.policy, rt.on_reconnect)
         except NotConfigured as exc:
             await lock.release()
