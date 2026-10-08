@@ -177,11 +177,15 @@ class Approvals:
         return body["action_id"]
 
     async def press(self, action_id: int, yes: bool = True, user: int | None = None) -> dict:
-        from shturman import bridge
+        from shturman import authority, bridge
 
         nonce = await self.conn.fetchval("SELECT nonce FROM pending_actions WHERE id = $1", action_id)
         data = f"sh:cf:{'y' if yes else 'n'}:{action_id}:{nonce}"
-        return await bridge.dispatch_callback(self.conn, data, self.owner if user is None else user)
+        actual_user = self.owner if user is None else user
+        if bridge.owns_bot() and actual_user == self.owner:
+            with authority.owner_context(self.owner, chat_id=self.owner, action="test.telegram.confirm"):
+                return await bridge.dispatch_callback(self.conn, data, actual_user)
+        return await bridge.dispatch_callback(self.conn, data, actual_user)
 
     async def lapse(self, action_id: int) -> None:
         await self.conn.execute(
@@ -284,3 +288,4 @@ async def guarded(conn):
         guard.set_current(None)
         await events.drain()
         await pool.close()
+

@@ -46,8 +46,10 @@ class Events:
 
     def publish(self, topic: str, payload: dict[str, Any]) -> None:
         """Раздаёт событие подписчикам, не дожидаясь их. Ошибка подписчика не мешает остальным."""
+        from . import authority
         for fn in self._subs.get(topic, ()):
-            task = asyncio.get_running_loop().create_task(self._run(topic, fn, payload))
+            task = asyncio.get_running_loop().create_task(self._run(topic, fn, payload),
+                                                        context=authority.background_context())
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
 
@@ -62,4 +64,9 @@ class Events:
     async def drain(self) -> None:
         """Дожидается обработки всех разосланных событий (для тестов и остановки)."""
         while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+            batch = list(self._tasks)
+            await asyncio.gather(*batch, return_exceptions=True)
+            # A gather of already completed tasks can return without yielding
+            # to their queued done callbacks. Remove this completed batch here.
+            self._tasks.difference_update(batch)
+

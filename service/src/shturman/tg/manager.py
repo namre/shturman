@@ -34,7 +34,7 @@ import asyncpg
 from telethon import errors
 from telethon.tl import functions, types
 
-from .. import bridge, store
+from .. import authority, bridge, control_peers, store
 from .. import events as ev
 from ..config import Config
 from ..events import Events
@@ -245,7 +245,7 @@ class TgManager:
             await asyncio.gather(*list(self._background), return_exceptions=True)
 
     def _spawn(self, coro: Any, name: str) -> None:
-        task = asyncio.get_running_loop().create_task(coro, name=name)
+        task = asyncio.get_running_loop().create_task(coro, name=name, context=authority.background_context())
         self._background.add(task)
         task.add_done_callback(self._background.discard)
 
@@ -321,7 +321,7 @@ class TgManager:
             rt.status, rt.error = FAILED, str(exc)
             rt.ready.set()
             return rt
-        rt.task = asyncio.get_running_loop().create_task(self._supervise(rt), name=f"tg-{slot}")
+        rt.task = asyncio.get_running_loop().create_task(self._supervise(rt), name=f"tg-{slot}", context=authority.background_context())
         return rt
 
     def _lock_lost(self, rt: AccountRuntime) -> None:
@@ -436,8 +436,9 @@ class TgManager:
         rt.ready.set()
         loop = asyncio.get_running_loop()
         worker = loop.create_task(
-            rt.history.run(rt.wake, rt.reconnected, tops=lambda: self._tops(rt)), name=f"tg-{rt.slot}-history")
-        gone = asyncio.ensure_future(client.disconnected)
+            rt.history.run(rt.wake, rt.reconnected, tops=lambda: self._tops(rt)), name=f"tg-{rt.slot}-history",
+            context=authority.background_context())
+        gone = authority.background_context().run(asyncio.ensure_future, client.disconnected)
         try:
             await asyncio.wait({worker, gone}, return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -603,7 +604,7 @@ class TgManager:
             raise LoginRejected(str(exc)) from None
         rt.policy.login = False
         self.runtimes[rt.slot] = rt
-        rt.task = asyncio.get_running_loop().create_task(self._supervise(rt), name=f"tg-{rt.slot}")
+        rt.task = asyncio.get_running_loop().create_task(self._supervise(rt), name=f"tg-{rt.slot}", context=authority.background_context())
         logger.info("аккаунт %s (%s): вход выполнен", rt.account_id, rt.slot)
         return rt.account_id
 
@@ -699,7 +700,8 @@ class TgManager:
             raise TgError(str(exc), 503) from None
         terminated = False
         try:
-            await rt.client.connect()
+            await asyncio.get_running_loop().create_task(
+                rt.client.connect(), name=f"tg-{rt.slot}-connect", context=authority.background_context())
             if await rt.client.get_me() is not None:
                 terminated = bool(await rt.client.log_out())
         except Exception as exc:
@@ -849,13 +851,15 @@ class TgManager:
                    FROM chats c JOIN peers p ON p.id = c.peer_id
                    LEFT JOIN tg_sync_chats s ON s.chat_id = c.id
                    WHERE c.account_id = $1""", account_id)
+            protected = await control_peers.blocked_ids(conn)
         known = {(r["class"], r["tg_id"]): r for r in rows}
         if only_enabled:
             dialogs = [d for d in dialogs if d.key in known and known[d.key]["enabled"]]
         items = []
         for d in dialogs[offset:offset + limit]:
             row = known.get(d.key)
-            blocked = store.is_blocked_peer(d.chat.peer_class, d.chat.tg_id, d.chat.username)
+            blocked = (store.is_blocked_peer(d.chat.peer_class, d.chat.tg_id, d.chat.username)
+                       or (d.chat.peer_class == "user" and d.chat.tg_id in protected))
             items.append({
                 "peer_class": d.chat.peer_class, "tg_id": d.chat.tg_id, "type": d.chat.type,
                 "title": d.chat.name, "username": d.chat.username,
@@ -966,7 +970,7 @@ class TgManager:
 
     async def send_text(
         self, account_id: int, peer_class: str, tg_id: int, text: str, *,
-        reply_to_tg_id: int | None = None,
+        reply_to_tg_id: int | None = None, topic_tg_id: int | None = None,
     ) -> int:
         # Роль проверяется первой, до любого обращения к клиенту: у основного аккаунта
         # владельца пути отправки нет.
@@ -983,11 +987,16 @@ class TgManager:
             raise gateway.SendForbidden("отправка от этого аккаунта запрещена")
         if not isinstance(text, str) or not text.strip() or bridge.utf16_len(text) > TEXT_LIMIT:
             raise ValueError(f"текст сообщения должен быть непустым и не длиннее {TEXT_LIMIT} знаков")
+        if topic_tg_id is not None and (isinstance(topic_tg_id, bool) or not isinstance(topic_tg_id, int)
+                                        or topic_tg_id <= 0 or peer_class != "channel"):
+            raise ValueError("тема допустима только в группе-форуме с положительным номером")
         key: PeerKey = (peer_class, int(tg_id))
         peer = await rt.client.get_input_entity(normalize.to_peer(key))
         request = functions.messages.SendMessageRequest(
             peer=peer, message=text, no_webpage=True,
-            reply_to=types.InputReplyToMessage(reply_to_msg_id=int(reply_to_tg_id)) if reply_to_tg_id else None,
+            reply_to=(types.InputReplyToMessage(reply_to_msg_id=int(reply_to_tg_id or topic_tg_id),
+                                                top_msg_id=topic_tg_id)
+                      if reply_to_tg_id or topic_tg_id else None),
         )
         try:
             result = await rt.client(request)

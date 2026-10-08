@@ -47,6 +47,17 @@
 # В режиме без Hermes («только архив и согласования») прокси не ставится: страница настройки
 # переписки открывается с самого сервера или через туннель SSH.
 
+# Hermes использует сеть хоста: localhost:2019 для него НЕ закрытый admin API.
+# Перед запуском оператор создаёт /run/caddy-admin с владельцем caddy и режимом 0700
+# (например, через systemd RuntimeDirectory=caddy-admin и RuntimeDirectoryMode=0700).
+# Пользователь Caddy должен отличаться от пользователя Hermes; этот каталог и сокет
+# нельзя монтировать в Hermes. Защита определяется правами каталога, а не скрытым именем.
+# Перечитывание сохраняется: caddy reload --address unix//run/caddy-admin/admin.sock --config ...
+# Команду выполняет оператор с доступом к сокету. Не возвращайте TCP admin для reload.
+{
+	admin unix//run/caddy-admin/admin.sock
+}
+
 assistant.example.com {
 	encode gzip
 

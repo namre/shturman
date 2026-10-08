@@ -252,6 +252,9 @@ jobs:
           if grep -Ev '^[[:space:]]*#' "$f" | grep -Eq 'header_up[[:space:]]+Host|^[[:space:]]*log([[:space:]]|$)'; then echo "Host не подменяется, журнал не включается"; exit 1; fi
           # Настройку проверяет сам Caddy той версии, с которой она проверена.
           docker run --rm -v "$PWD/$f:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -v "$PWD/config/Caddyfile.remote-mcp.example:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: реальные маршруты Caddy и отсутствие TCP admin
+        run: python service/tests/proxy_smoke.py
       # Справка и неизвестные ключи. На -h и --help каждый скрипт печатает своё назначение и выходит
       # с кодом 0 до любых действий: в каталоге без .env и данных он ничего не создаёт и не зовёт
       # ни Docker, ни curl (вместо них подставлены заглушки, которые записывают вызов). На

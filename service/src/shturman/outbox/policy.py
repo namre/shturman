@@ -146,6 +146,7 @@ def describe_changes(before: dict[str, Any], changes: dict[str, Any], labels: di
         for key, value in changes.items())
 
 REASONS = {
+    "prepare_only": "Этот черновик подготовлен без права отправки. Для отправки подготовьте новый черновик.",
     "sending_disabled": "Отправка сообщений выключена в настройках сервера. Включить её можно только на "
                         "самом сервере (SHTURMAN_SENDING в файле .env), через ассистента — нельзя.",
     "first_contact": "Ассистент не пишет первым: в этом чате ещё нет ни одного вашего сообщения. "
@@ -504,7 +505,7 @@ async def check_limits(
 async def check_send(
     conn: asyncpg.Connection, tg: TgGateway | None, rules: dict[str, Any], tgt: Target, *,
     channel: str, text: str, text_hash: str, origin: str = "agent",
-    autoreply_daily_cap: int | None = None, draft_id: int | None = None,
+    autoreply_daily_cap: int | None = None, draft_id: int | None = None, task_bound: bool = False,
 ) -> Decision:
     """Полная проверка перед отправкой: выключатель, чат, канал, текст, частота. Первая причина
     отказа — ответ."""
@@ -518,7 +519,7 @@ async def check_send(
     ):
         if not decision.ok:
             return decision
-    if origin == "agent":
+    if origin == "agent" and not task_bound:
         decision = await check_first_contact(conn, rules, tgt, channel)
         if not decision.ok:
             return decision
@@ -564,3 +565,4 @@ async def touch_account(conn: asyncpg.Connection, account_id: int, *, blocked_fo
                                             EXCLUDED.blocked_until), updated_at = now()""",
             account_id, float(blocked_for),
         )
+

@@ -835,9 +835,16 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     _zone(state.config.timezone)  # неизвестный часовой пояс — ошибка при запуске, а не в ответе
     hide_argument_values()        # к запуску сервиса все модули уже добавили свои инструменты
     # Менеджер сессий одноразовый: на каждый запуск сервиса создаётся новый.
+    # Дополнительный Host принимает только транспорт MCP. Gate заранее требует
+    # OAuth на этом адресе и не пропускает его к внутреннему API.
+    from urllib.parse import urlsplit
+    hosts = list(state.config.allowed_hosts)
+    remote_origin = getattr(state.config, "remote_mcp_origin", "")
+    if remote_origin:
+        hosts.append(urlsplit(remote_origin).netloc)
     mcp.streamable_http_app(
         streamable_http_path="/mcp", stateless_http=True, json_response=True,
-        transport_security=transport_security(state.config.allowed_hosts),
+        transport_security=transport_security(hosts),
     )
     _active = state
     logger.info("MCP-сервер архива: путь /mcp, разрешённые имена: %s",
@@ -856,3 +863,4 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
         stop.set()
         await asyncio.gather(task, return_exceptions=True)
         _active = None
+

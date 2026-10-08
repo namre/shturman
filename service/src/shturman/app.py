@@ -47,6 +47,7 @@ MODULES = (
     "shturman.api_core",
     "shturman.executor.service",   # раньше остальных: кто выполняет задания, решается до их постановки
     "shturman.guard.service",      # раньше источников сообщений: живой поток пишется уже под защитой
+    "shturman.sources.service",    # ограниченные источники для автоматических задач
     "shturman.ingest_api",
     "shturman.mcp_server",
     "shturman.embeddings",
@@ -55,6 +56,8 @@ MODULES = (
     "shturman.processing.pages_service",
     "shturman.processing.mcp_tools",
     "shturman.outbox.service",
+    "shturman.replies.service",    # продолжение задач после Telegram-решений владельца
+    "shturman.remote_mcp",
     "shturman.setup_page.service",  # последним: страница настройки пользуется остальными модулями
 )
 
@@ -71,7 +74,8 @@ class AppState:
 
     def spawn(self, coro: Coroutine[Any, Any, Any], *, name: str) -> asyncio.Task:
         """Запускает фоновую работу, которая остановится вместе с сервисом."""
-        task = asyncio.get_running_loop().create_task(coro, name=name)
+        from . import authority
+        task = asyncio.get_running_loop().create_task(coro, name=name, context=authority.background_context())
         self._tasks.add(task)
         task.add_done_callback(self._done)
         return task
@@ -95,9 +99,11 @@ class Gate:
     Префикс страницы настройки (`/shturman-setup`) токеном не открывается вовсе: у него свой
     вход и своя защита (`setup`), а заголовок `Authorization` там ничего не значит."""
 
-    def __init__(self, app: ASGIApp, config: Config, *, setup: ASGIApp | None = None) -> None:
+    def __init__(self, app: ASGIApp, config: Config, *, setup: ASGIApp | None = None,
+                 remote: ASGIApp | None = None) -> None:
         self.app = app
         self.setup = setup
+        self.remote = remote
         self._tokens = {
             "/api": f"Bearer {config.api_token}".encode(),
             "/mcp": f"Bearer {config.mcp_token}".encode(),
@@ -113,6 +119,10 @@ class Gate:
                 await send({"type": "websocket.close", "code": 1008})
             return
         path = scope.get("path", "")
+        hosts = [v.decode("latin1") for k, v in scope.get("headers", []) if k.lower() == b"host"]
+        if self.remote is not None and any(self.remote.handles(path, host) for host in hosts):
+            await self.remote(scope, receive, send)
+            return
         if path == "/health":
             await self.app(scope, receive, send)
             return
@@ -177,6 +187,9 @@ def build_app(
         state = AppState(config=config, pool=pool, ro_pool=ro_pool)
         app.state.shturman = state
         try:
+            from . import control_peers
+            async with pool.acquire() as conn:
+                await control_peers.reconcile(conn)
             async with contextlib.AsyncExitStack() as stack:
                 for module in modules:
                     if hasattr(module, "lifespan"):
@@ -191,7 +204,9 @@ def build_app(
 
     app = Starlette(routes=routes, lifespan=lifespan)
     shield = next((m.make_shield(app, config) for m in modules if hasattr(m, "make_shield")), None)
-    gate = Gate(app, config, setup=shield)
+    from .remote_mcp import Gateway
+    remote = Gateway(app, config) if config.remote_mcp_origin else None
+    gate = Gate(app, config, setup=shield, remote=remote)
     gate.inner = app  # для тестов: запуск жизненного цикла и доступ к состоянию
     return gate
 

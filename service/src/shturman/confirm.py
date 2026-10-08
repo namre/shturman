@@ -57,7 +57,7 @@ from typing import Any, Awaitable, Callable
 
 import asyncpg
 
-from . import bridge
+from . import authority, bridge
 
 logger = logging.getLogger("shturman.confirm")
 
@@ -125,8 +125,8 @@ def kinds() -> frozenset[str]:
 
 
 def required() -> bool:
-    """Нужно ли ждать нажатия владельца: только когда у сервиса свой бот."""
-    return bridge.owns_bot()
+    """Agent requests require independent owner authority in every installation mode."""
+    return not authority.is_owner()
 
 
 def _card(summary: str) -> str:
@@ -177,7 +177,7 @@ async def apply(conn: asyncpg.Connection, kind: str, payload: dict[str, Any]) ->
     fn = _appliers.get(kind)
     if fn is None:
         raise KeyError(f"нет обработчика для действия {kind}")
-    token = _unconfirmed.set(required())
+    token = _unconfirmed.set(not authority.is_owner())
     try:
         async with conn.transaction():
             done = _done(await fn(conn, payload))
@@ -198,6 +198,7 @@ async def apply_owner(conn: asyncpg.Connection, kind: str, payload: dict[str, An
 
     Вызывать только из маршрутов страницы настройки, после проверки её сессии. Вне транзакции.
     """
+    authority.requires_owner()
     fn = _appliers.get(kind)
     if fn is None:
         raise KeyError(f"нет обработчика для действия {kind}")
@@ -222,8 +223,10 @@ async def request(conn: asyncpg.Connection, kind: str, summary: str, payload: di
     """Применяет действие сразу либо ставит его ждать нажатия владельца."""
     if kind not in _appliers:
         raise KeyError(f"нет обработчика для действия {kind}")
-    if not required():
-        return await apply(conn, kind, payload)
+    if authority.is_owner():
+        return await apply_owner(conn, kind, payload)
+    if not bridge.owns_bot():
+        raise NoOwner()
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     summary = summary.strip()
     if not summary:
@@ -231,6 +234,10 @@ async def request(conn: asyncpg.Connection, kind: str, summary: str, payload: di
     if len(summary) > SUMMARY_LIMIT:
         summary = summary[:SUMMARY_LIMIT - 1] + "…"
     async with conn.transaction():
+        # A single lock covers the global pending quota across different kinds
+        # and payloads. Per-payload deduplication alone allows quota races.
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                           "shturman.confirm.pending")
         # Один и тот же запрос, пришедший дважды (в том числе одновременно), — одна карточка.
         await conn.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", f"shturman.confirm:{kind}:{body}")
@@ -280,6 +287,9 @@ async def _card_failed(conn: asyncpg.Connection, job: dict[str, Any], error: str
 
 @bridge.on_callback(CALLBACK_MODULE)
 async def _pressed(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str, Any]:
+    principal = authority.requires_owner()
+    if principal.user_id != user_id or principal.source != "telegram":
+        raise Refused("Кнопка требует проверенного владельца Telegram.", 403, "owner_required")
     gone = {"answer": "Действие уже недоступно.", "edit_text": None, "remove_buttons": True}
     choice, _, tail = rest.partition(":")
     raw_id, _, nonce = tail.partition(":")

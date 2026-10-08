@@ -51,6 +51,34 @@ case "$(docker inspect -f '{{.Config.Image}}' "$c")" in
   *:latest|*:main|*:stable) warn hermes-version "образ без явной версии — укажите HERMES_VERSION" ;;
 esac
 
+# --- управление прокси ---
+# Только проверка соединения из контейнера; конфигурацию Caddy (она может содержать секреты)
+# не запрашиваем. Host network делает даже loopback TCP admin доступным агенту.
+caddy_tcp="$(hpy -c '
+import socket
+reachable = False
+for address in ("127.0.0.1", "::1"):
+    try:
+        with socket.create_connection((address, 2019), timeout=1):
+            reachable = True
+    except OSError:
+        pass
+print("reachable" if reachable else "closed")' | tail -n 1)"
+case "$caddy_tcp" in
+  reachable) fail proxy-admin "из Hermes доступен TCP порт 2019 — закройте Caddy admin на защищённый Unix socket (config/Caddyfile.example)" ;;
+  closed) pass proxy-admin-tcp "стандартный TCP admin недоступен из Hermes; нестандартные admin endpoints и права Unix socket проверяет оператор" ;;
+  *) warn proxy-admin "не удалось проверить доступность TCP admin из Hermes" ;;
+esac
+if [ -d /run/caddy-admin ]; then
+  if [ "$(stat -c '%a' /run/caddy-admin 2>/dev/null)" = 700 ]; then
+    pass proxy-admin-dir "каталог Unix socket закрыт режимом 0700; его владелец должен отличаться от пользователя Hermes"
+  else
+    fail proxy-admin-dir "каталог /run/caddy-admin должен иметь режим 0700 и отдельного владельца Caddy"
+  fi
+else
+  warn proxy-admin-dir "стандартный защищённый каталог сокета не найден; проверьте независимую защиту admin API прокси"
+fi
+
 # --- дашборд ---
 code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:9119/api/status 2>/dev/null)"
 if [ "${code:-000}" = "200" ]; then pass dashboard "отвечает на локальном адресе"

@@ -77,8 +77,8 @@ COMMITMENT_DECIDE = "commitments.decide"
 PEOPLE_MERGE = "people.merge"
 PEOPLE_SPLIT = "people.split"
 PEOPLE_ALIAS = "people.alias"
-# Состояния, в которых обязательство владельцем не одобрено.
-UNDECIDED = ("proposed", "rejected", "expired")
+# Статус не доказывает согласия: в том числе cancelled/open могут быть наследием обхода.
+UNDECIDED = ("proposed", "rejected", "expired", "cancelled")
 
 # Состояние работающего сервиса: функции применения действий его не получают.
 _state: AppState | None = None
@@ -119,7 +119,7 @@ def _outcome(result: dict[str, Any]) -> JSONResponse:
     if result.get("ok"):
         return JSONResponse(result)
     code = result.get("code")
-    status = 404 if code == "not_found" else 409 if code == "bad_status" else 422
+    status = 404 if code == "not_found" else 409 if code in ("bad_status", "changed_meanwhile", "approval_required") else 422
     return JSONResponse(result, status_code=status)
 
 
@@ -206,25 +206,28 @@ async def change_commitment(request: Request) -> JSONResponse:
     state = state_of(request)
     today = _today(request)
     async with state.pool.acquire() as conn:
+        payload = {"commitment_id": commitment_id, "action": action}
         if action == "reschedule":
             data = await body(request)
+            payload["due"] = need_str(data, "due", limit=120)
             result = await commitments.reschedule(
-                conn, commitment_id, need_str(data, "due", limit=120), tz=state.config.timezone, today=today)
+                conn, commitment_id, payload["due"], tz=state.config.timezone, today=today, actor="agent")
         else:
             command = _COMMANDS.get(action)
             if command is None:
                 raise BadRequest("неизвестное действие", status=404)
+            result = await command(conn, commitment_id, today=today, actor="agent")
+        if result.get("code") == "approval_required":
             item = await commitments.get_commitment(conn, commitment_id, today=today)
-            if item is not None and _approves(action, item["status"]):
-                # Действие делает неодобренное предложение принятым обязательством: это решение
-                # владельца, при своём боте согласований оно ждёт его нажатия.
-                answer, result = await settle(
-                    conn, COMMITMENT_DECIDE, {"commitment_id": commitment_id, "action": action},
-                    summary=_commitment_ask(action, item))
-                if answer is not None:
-                    return answer
-            else:
-                result = await command(conn, commitment_id, today=today)
+            if item is None:
+                return _outcome({"ok": False, "code": "not_found"})
+            payload["fingerprint"] = item["approval_fingerprint"]
+            summary = _commitment_ask(action, item)
+            if action == "reschedule":
+                summary += " Новый срок: " + clean_line(payload["due"], 120)
+            answer, result = await settle(conn, COMMITMENT_DECIDE, payload, summary=summary)
+            if answer is not None:
+                return answer
     return _outcome(result)
 
 
@@ -232,11 +235,9 @@ _COMMANDS = {"close": commitments.close, "cancel": commitments.cancel, "reopen":
              "accept": commitments.accept, "reject": commitments.reject}
 
 
-def _approves(action: str, status: str) -> bool:
+def _approves(action: str, status: str, owner_approved: bool = False) -> bool:
     """Становится ли от этого действия принятым то, что владелец не одобрял."""
-    return ((action == "accept" and status == "proposed")
-            or (action == "reopen" and status in UNDECIDED)
-            or (action == "close" and status == "proposed"))
+    return action == "reschedule" or (not owner_approved and action in ("accept", "reopen", "close"))
 
 
 def _commitment_ask(action: str, item: dict[str, Any]) -> str:
@@ -249,18 +250,26 @@ def _commitment_ask(action: str, item: dict[str, Any]) -> str:
         "accept": f"Принять предложенное обязательство № {item['id']}",
         "reopen": f"Вернуть в работу обязательство № {item['id']}, которое вы не подтверждали (сейчас: {state})",
         "close": f"Отметить выполненным обязательство № {item['id']}, которое вы ещё не подтверждали",
+        "reschedule": f"Перенести срок обязательства № {item['id']}",
     }[action]
-    return (f"{head} ({who}; {due}). Ассистент будет считать его договорённостью, которую вы подтвердили, "
+    return (f"{head} ({who}; {due}). Содержание: «{clean_line(item['what'], 1200)}». "
+            "Ассистент будет считать его договорённостью, которую вы подтвердили, "
             "и показывать в сводках.")
 
 
 @confirm.applier(COMMITMENT_DECIDE)
 async def _apply_commitment(conn: Any, payload: dict[str, Any]) -> confirm.Done:
-    command = _COMMANDS.get(payload.get("action")) if payload.get("action") in ("accept", "reopen", "close") else None
+    action = payload.get("action")
+    command = _COMMANDS.get(action) if action in ("accept", "reopen", "close") else None
+    if action == "reschedule":
+        command = commitments.reschedule
     if command is None:
         raise confirm.Refused("неизвестное действие", 404)
     confirm.must_not_widen(True)      # одобрение предложения — только с нажатия владельца
-    result = await command(conn, int(payload["commitment_id"]), today=_today_now())
+    kwargs = {"today": _today_now(), "expected_fingerprint": payload.get("fingerprint"), "actor": "owner"}
+    if action == "reschedule":
+        kwargs.update(wording=str(payload["due"]), tz=_state.config.timezone if _state is not None else "UTC")
+    result = await command(conn, int(payload["commitment_id"]), **kwargs)
     if not result.get("ok"):
         code = result.get("code")
         raise confirm.Refused(result.get("error") or "не получилось", 404 if code == "not_found" else 409,
@@ -515,3 +524,4 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     finally:
         if _state is state:
             _state = None
+

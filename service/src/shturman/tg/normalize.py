@@ -269,6 +269,44 @@ def text_entities(text: str, entities: Iterable[Any] | None) -> list[dict[str, A
     return out or None
 
 
+def addressing_entities(text: str, entities: Iterable[Any] | None) -> list[dict[str, Any]]:
+    """Полная разметка TL, включая вложенные цитаты и код; смещения — UTF-16.
+
+    Вид разметки экспорта выше намеренно остаётся прежним. Здесь нельзя сворачивать
+    вложенность: упоминание внутри жирной цитаты не становится обращением.
+    """
+    units = text.encode("utf-16-le", errors="surrogatepass")
+    out = []
+    for ent in entities or ():
+        offset, length = int(getattr(ent, "offset", -1)), int(getattr(ent, "length", 0))
+        fragment = _utf16_slice(units, offset, length)
+        if fragment is None:
+            continue
+        name = type(ent).__name__
+        item = {"type": _ENTITY_TYPES.get(name) or _snake(name, "MessageEntity"),
+                "offset": offset, "length": length, "text": fragment}
+        if name in ("MessageEntityMentionName", "InputMessageEntityMentionName"):
+            uid = getattr(ent, "user_id", None)
+            if isinstance(uid, types.InputUser):
+                uid = uid.user_id
+            if isinstance(uid, int) and not isinstance(uid, bool) and uid > 0:
+                item["user_id"] = uid
+        if name == "MessageEntityTextUrl":
+            item["href"] = ent.url
+        out.append(item)
+    return out
+
+
+def topic_id(message: Any) -> int | None:
+    """Корень темы форума; обычный ответ вне форума темой не является."""
+    reply = getattr(message, "reply_to", None)
+    if not isinstance(reply, types.MessageReplyHeader) or not reply.forum_topic \
+            or reply.reply_to_peer_id is not None:
+        return None
+    value = reply.reply_to_top_id or reply.reply_to_msg_id
+    return int(value) if value is not None and value > 0 else None
+
+
 # --- вложения и служебные действия ---
 
 def media_type(media: Any) -> str | None:
@@ -402,6 +440,11 @@ def message_record(message: Any, entities: Entities, *, self_id: int) -> Message
         media_type=None if service else media_type(message.media),
         media_path=None,  # файлы в этом срезе не скачиваются
         service_action=service_action(message.action) if service else None,
+        telegram_entities=[] if service else addressing_entities(text, message.entities),
+        topic_tg_id=None if service else topic_id(message),
+        is_forwarded=message.fwd_from is not None,
+        telegram_via_bot=getattr(message, "via_bot_id", None) is not None,
+        telegram_sender_bot=bool(sender_entity.bot) if isinstance(sender_entity, types.User) else None,
     )
 
 
@@ -444,3 +487,4 @@ def message_from_update(update: Any, *, self_id: int) -> Any:
     if isinstance(message, (types.Message, types.MessageService)):
         return message
     return None
+

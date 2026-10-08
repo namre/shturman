@@ -1,25 +1,8 @@
-"""Автоответ доверенным людям (уровень 2а). По умолчанию выключен.
+"""Completion-only automatic replies with durable tasks and brokered source receipts.
 
-Правила (`docs/service.md`), каждое — отдельная проверка в коде:
-  * доверенные — только по числовому идентификатору Telegram;
-  * только личные чаты, только входящие (по флагу события), не от ботов и не через ботов,
-    не на правки;
-  * всем, кто не в списке, сервис не отвечает вообще;
-  * пауза между ответами и дневной предел на аккаунт;
-  * пока ответ готовится — «печатает…» с обновлением каждые 4 секунды (только аккаунт-помощник);
-  * один ответ, длинный режется по абзацам.
-
-Ответ готовится БЕЗ инструментов: сервис сам собирает справку (последние сообщения этого чата и
-найденное в архиве), помечает её как чужой текст и просит у модели только текст. Адресат берётся
-из события и архива и никогда — из ответа модели. Запоздавший ответ не отправляется.
-
-Пока главный выключатель отправки (`config.sending`, только из окружения сервиса) выключен,
-автоответ не начинается вовсе: модель не спрашивается.
-
-Чего здесь нет: распознавания ответа, оборванного на полуслове пределом токенов. Плагин не
-сообщает, почему модель остановилась, а гадать по последнему знаку ненадёжно. Вместо этого запас
-токенов считается от предела длины ответа с запасом (`max_tokens_for`), а сам предел ограничен
-так, чтобы запаса хватало. Пустой ответ считается сбоем («no_answer»), а не решением молчать.
+Private trusted chats and authenticated owner-selected group scopes keep their normal
+automatic path. Additional reading and disclosure require separate owner decisions.
+prepare_only produces pending drafts without authorizing any send.
 """
 
 # Сбор «пачки» сообщений (отмена прежнего таймера и взвод нового) основан на
@@ -157,10 +140,13 @@ async def update(conn: asyncpg.Connection, changes: dict[str, Any]) -> dict[str,
 
 # --- кому можно отвечать ---
 
-async def eligible(conn: asyncpg.Connection, tgt: Target) -> Decision:
+async def eligible(conn: asyncpg.Connection, tgt: Target, message_id: int | None = None) -> Decision:
     """Можно ли автоответить в этот чат. Любое сомнение — «нет»."""
     if tgt.excluded or store.is_blocked_peer(tgt.peer_class, tgt.tg_id, tgt.username):
         return policy.deny("chat_excluded")
+    from . import scopes
+    if scopes.is_group(tgt):
+        return await scopes.group_candidate(conn, tgt, message_id) if message_id is not None else _no("not_private")
     if tgt.peer_class != "user" or not tgt.is_private:
         return _no("not_private")
     if not await conn.fetchval(
@@ -179,7 +165,7 @@ async def _trigger_state(conn: asyncpg.Connection, settings: dict[str, Any], tgt
         """SELECT (m.deleted_at IS NOT NULL OR NOT m.agent_visible) AS gone, m.edited_at IS NOT NULL AS edited,
                   m.sent_at < now() - make_interval(secs => $3) AS stale,
                   EXISTS (SELECT 1 FROM messages n
-                          WHERE n.chat_id = m.chat_id AND n.kind = 'message' AND n.deleted_at IS NULL
+                          WHERE n.chat_id = m.chat_id AND n.topic_tg_id IS NOT DISTINCT FROM m.topic_tg_id AND n.kind = 'message' AND n.deleted_at IS NULL
                             AND (n.sent_at, n.id) > (m.sent_at, m.id)) AS newer
            FROM messages m WHERE m.id = $1 AND m.chat_id = $2""",
         message_id, tgt.chat_id, float(settings["max_age_seconds"]))
@@ -194,7 +180,7 @@ async def _trigger_state(conn: asyncpg.Connection, settings: dict[str, Any], tgt
 async def still_allowed(conn: asyncpg.Connection, mod: runtime.Outbox, settings: dict[str, Any],
                         tgt: Target, row: Mapping[str, Any]) -> Decision:
     """Повторная проверка всех условий перед самой отправкой: мир мог измениться."""
-    decision = await eligible(conn, tgt)
+    decision = await eligible(conn, tgt, row["trigger_message_id"])
     if not decision.ok:
         return decision
     if row["trigger_message_id"] is None:
@@ -235,7 +221,7 @@ def build_messages(
                  "начало переписки или собеседник спрашивает, кто ему отвечает, представься так: "
                  f"«{settings['intro']}» Если нужно решение владельца — напиши, что он ответит сам.")
     system = "\n".join([
-        "Ты помогаешь владельцу аккаунта Telegram. Ему написал человек из списка доверенных. "
+        "Ты помогаешь владельцу аккаунта Telegram. Получено сообщение в разрешённом чате. "
         "Подготовь один ответ на его последнее сообщение.",
         "",
         "Правила:",
@@ -249,8 +235,8 @@ def build_messages(
         "3. Ты не можешь отправлять файлы, переводить деньги, назначать встречи, писать другим людям. "
         "Не обещай этого.",
         f"4. {voice}",
-        f"5. Если отвечать не нужно или нельзя ответить, не нарушив правил, верни ровно: {NO_REPLY}",
-        f"6. Верни только текст ответа: без пояснений и разметки, не длиннее {settings['max_reply_chars']} знаков.",
+        "5. Если ответ не нужен, выбери decline; если нужны данные — need_source либо ask_owner.",
+        f"6. Текст ответа не длиннее {settings['max_reply_chars']} знаков.",
     ])
 
     def stamp(row: Mapping[str, Any]) -> str:
@@ -279,12 +265,15 @@ def build_messages(
 async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
     """Собирает справку и просит у модели текст ответа. Ничего не отправляет."""
     state = mod.state
-    if state.config.sending is not True:
-        return   # отправка выключена на сервере: модель даже не спрашиваем
+    from ..replies import workflow
+    from . import scopes
+    if not workflow.preparing(state):
+        return
+    prepare_only = getattr(state.config, "prepare_only", False) is True
     async with state.pool.acquire() as conn, conn.transaction():
         settings = await load(conn)
         tgt = await policy.target(conn, chat_id)
-        if tgt is None or not (await eligible(conn, tgt)).ok:
+        if tgt is None or not (await eligible(conn, tgt, message_id)).ok:
             return
         msg = await conn.fetchrow(
             """SELECT id, text, is_outgoing, sender_peer_id FROM messages
@@ -292,7 +281,7 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
             message_id, chat_id)
         if msg is None or not msg["text"].strip() or msg["is_outgoing"] is True:
             return
-        if msg["sender_peer_id"] is not None and msg["sender_peer_id"] != tgt.peer_id:
+        if tgt.is_private and msg["sender_peer_id"] is not None and msg["sender_peer_id"] != tgt.peer_id:
             return  # в личном чате входящее может быть только от самого собеседника
         if not (await _trigger_state(conn, settings, tgt, message_id)).ok:
             return
@@ -301,50 +290,59 @@ async def _prepare(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
         channel, decision = policy.pick_channel(tgt, None)
         if channel is None:
             return
-        for decision in (
-            policy.check_switch(rules),
-            await policy.check_target(conn, rules, tgt),
-            await policy.check_channel(conn, mod.tg, rules, tgt, channel),
-            await policy.check_limits(conn, rules, tgt, "", origin="autoreply",
-                                      autoreply_daily_cap=settings["daily_cap"]),
-        ):
+        checks = [await policy.check_target(conn, rules, tgt)]
+        if not prepare_only:
+            checks += [policy.check_switch(rules),
+                       await policy.check_channel(conn, mod.tg, rules, tgt, channel),
+                       await policy.check_limits(conn, rules, tgt, "", origin="autoreply",
+                                                 autoreply_daily_cap=settings["daily_cap"])]
+        for decision in checks:
             if not decision.ok:
                 logger.info("автоответ в чат %s не готовится: %s", chat_id, decision.code)
                 return
+        topic = await scopes.topic_for_message(conn, message_id, chat_id)
         recent = await conn.fetch(
-            """SELECT sent_at, is_outgoing, text FROM (
+            """SELECT id, sent_at, is_outgoing, text FROM (
                    SELECT id, sent_at, is_outgoing, text FROM messages
                    WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible
+                     AND topic_tg_id IS NOT DISTINCT FROM $4::bigint
                    ORDER BY sent_at DESC, id DESC LIMIT $3) t
                ORDER BY sent_at, id""",
-            chat_id, message_id, settings["context_messages"])
+            chat_id, message_id, min(settings["context_messages"], 20), topic)
         hits: list[dict[str, Any]] = []
         query = _search_query(msg["text"])
         if query and settings["search_hits"]:
-            wide = settings["search_scope"] == "account"
+            wide = False  # Additional chats require a bounded broker grant; never implicit RAG.
             scope = {"account_id": tgt.account_id} if wide else {"chat_id": chat_id}
             try:
                 async with conn.transaction():   # сбой поиска не должен срывать сам ответ
                     found = await retrieval.find(
                         state, conn, query, limit=settings["search_hits"] * (6 if wide else 1) + 1, **scope)
-                # Из других чатов — только собственные исходящие. Сообщения третьих лиц из чужих
-                # чатов в запрос не попадают: ни их содержание, ни спрятанные в них указания.
+                # Only this exact chat/topic has an implicit baseline read scope.
+                allowed_ids = set(await conn.fetchval("SELECT array_agg(id) FROM messages WHERE chat_id=$1 "
+                    "AND topic_tg_id IS NOT DISTINCT FROM $2::bigint AND id=ANY($3::bigint[])",
+                    chat_id, topic, [h["id"] for h in found]) or [])
                 hits = [h for h in found
+                        if h["id"] in allowed_ids
                         if h["id"] != message_id and (h["chat_id"] == chat_id or h["is_outgoing"] is True)
-                        ][: settings["search_hits"]]
+                        ][: min(settings["search_hits"], 9)]
             except asyncpg.PostgresError:
                 logger.warning("автоответ в чат %s: поиск по архиву не удался, отвечаем без него", chat_id)
         try:
             tz = ZoneInfo(state.config.timezone)
         except Exception:
             tz = ZoneInfo("UTC")
-        job_id = await bridge.request_text(
-            conn, handler=HANDLER,
-            messages=build_messages(settings, tgt, channel, msg["text"], list(recent), hits, tz),
-            max_tokens=max_tokens_for(settings["max_reply_chars"]),
-            context={"chat_id": chat_id, "message_id": message_id},
-            dedup_key=f"autoreply:{message_id}")
-    if job_id is not None and channel == "session":
+        # Receipts bind every baseline fragment to its current visible archived text.
+        ref_rows = [{'id': message_id, 'text': msg['text']}] + list(recent) + hits
+        refs = []
+        for item in ref_rows:
+            ref = {'kind': 'chat', 'source_id': str(chat_id), 'message_id': item['id'],
+                   'revision': workflow.digest(item['text']), 'visibility': 'agent_visible', 'topic_tg_id': topic}
+            if ref not in refs:
+                refs.append(ref)
+        task_id = await workflow.start(conn, state, chat_id=chat_id, message_id=message_id,
+            messages=build_messages(settings, tgt, channel, msg['text'], list(recent), hits, tz), refs=refs)
+    if task_id is not None and channel == "session" and not prepare_only:
         mod.start_typing(tgt.account_id, chat_id, tgt.peer_class, tgt.tg_id,
                          float(min(settings["typing_seconds"], settings["max_age_seconds"])))
 
@@ -365,11 +363,17 @@ async def on_message(mod: runtime.Outbox, payload: dict[str, Any]) -> None:
     chat_id, message_id = payload.get("chat_id"), payload.get("message_id")
     if not isinstance(chat_id, int) or not isinstance(message_id, int):
         return
-    if mod.state.config.sending is not True:
-        return   # главный выключатель: автоответ не начинается вовсе
-    async with mod.state.pool.acquire() as conn:
+    from ..replies import workflow
+    from . import scopes
+    if not workflow.preparing(mod.state):
+        return
+    async with mod.state.pool.acquire() as conn, conn.transaction():
         tgt = await policy.target(conn, chat_id)
-        if tgt is None or tgt.account_id != payload.get("account_id") or not (await eligible(conn, tgt)).ok:
+        if tgt is None or tgt.account_id != payload.get("account_id") or not (await eligible(conn, tgt, message_id)).ok:
+            return
+        if scopes.is_group(tgt) and payload.get("source") != "session":
+            return
+        if await workflow.register(conn, mod.state, chat_id, message_id) is None:
             return
         delay = float((await load(conn))["debounce_seconds"])
     # Несколько сообщений подряд дают один ответ: прежний таймер снимается, взводится новый.
@@ -428,36 +432,9 @@ async def _reply_ready(conn: asyncpg.Connection, job: dict[str, Any], result: di
     tgt = await policy.target(conn, chat_id)   # адресат — из архива, не из ответа модели
     if tgt is None:
         return
-    reply = result.get("text")
-    cleaned = textlib.clean_outgoing(reply) if isinstance(reply, str) else ""
-    draft_id = None
-    if not cleaned:
-        # Пустой ответ — не решение «не отвечать», а сбой: считается отдельно.
-        await log_outcome(conn, tgt, "no_answer")
-        await _warn_if_model_is_silent(conn)
-    elif "БЕЗ_ОТВЕТА" in cleaned.upper():
-        await log_outcome(conn, tgt, "declined")
-    else:
-        settings, rules = await load(conn), await policy.load(conn, mod.state.config)
-        channel, _ = policy.pick_channel(tgt, None)
-        decision = policy.check_switch(rules)
-        if decision.ok and channel is None:
-            decision = _no("not_private")
-        if decision.ok and len(cleaned) > settings["max_reply_chars"] + 500:
-            decision = policy.deny("text_too_long", parts=rules["max_parts"])
-        if decision.ok:
-            decision = policy.check_text(rules, channel, cleaned)
-        if decision.ok:
-            decision = await still_allowed(conn, mod, settings, tgt, {"trigger_message_id": message_id})
-        if decision.ok:
-            draft_id = await drafts.create_autoreply(
-                conn, tgt, channel=channel, text=cleaned, trigger_message_id=message_id)
-        await log_outcome(conn, tgt, "replied" if draft_id is not None else "dropped",
-                          None if draft_id is not None else (decision.code if not decision.ok else "repeat"))
-    if draft_id is None:
-        mod.stop_typing(tgt.account_id, chat_id)   # ответа не будет
-    else:
-        mod.kick()
+    await log_outcome(conn, tgt, "dropped", "legacy_unbound_job")
+    await conn.execute("UPDATE jobs SET payload='{}'::jsonb,result=NULL WHERE id=$1", job['id'])
+    mod.stop_typing(tgt.account_id, chat_id)
 
 
 @bridge.on_failure(HANDLER)
@@ -473,3 +450,4 @@ async def _reply_failed(conn: asyncpg.Connection, job: dict[str, Any], error: st
     await log_outcome(conn, tgt, "failed")
     if mod is not None:
         mod.stop_typing(tgt.account_id, chat_id)
+

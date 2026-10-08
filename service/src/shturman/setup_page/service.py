@@ -188,7 +188,11 @@ def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
                     if session is None:
                         raise BadRequest("Вход устарел. Войдите заново.", 401, "unauthenticated")
                     request.state.setup_session = session
-                return await fn(request)
+                if public:
+                    return await fn(request)
+                from .. import authority
+                with authority.setup_context(session.id, action=request.url.path):
+                    return await fn(request)
             except BadRequest as exc:
                 return error_response(exc)
             except apply.Invalid as exc:

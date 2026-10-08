@@ -1,13 +1,17 @@
 """Исключения чатов и импорт выгрузки: что ждёт нажатия владельца в своём боте согласований.
 
 Исключить чат — ужесточение: применяется сразу в любом режиме. Вернуть чат, стереть его сообщения
-и импортировать выгрузку — со своим ботом только после «да» владельца.
+и импортировать выгрузку — после решения владельца в независимом канале. Без своего
+бота внутренний API не получает права расширять доступ; владелец может сделать это
+на аутентифицированной странице настройки.
 """
 
 import asyncio
 import json
 
-from shturman import bridge, events
+import pytest
+
+from shturman import authority, bridge, confirm, events
 from shturman.importer import import_export
 
 from conftest import IVAN, OWNER, as_file
@@ -61,12 +65,24 @@ async def test_returning_a_chat_waits_for_the_owner(make_client, conn, sample_ex
     assert "Вернуть чат «Иван Петров» в архив" in summary and "смету" not in summary
 
 
-async def test_without_own_bot_a_chat_is_returned_at_once(make_client, conn, sample_export):
+async def test_without_own_bot_api_cannot_return_a_chat(make_client, conn, sample_export):
     client, _, chat_id, _ = await setup(make_client, conn, sample_export)
     await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", chat_id)
     r = await client.put(f"/api/chats/{chat_id}/excluded", json={"excluded": False})
-    assert r.status_code == 200 and r.json() == {"id": chat_id, "excluded": False, "purged": 0}
-    assert await excluded(conn, chat_id) is False
+    assert (r.status_code, r.json()["code"]) == (409, "owner_unknown")
+    assert await excluded(conn, chat_id) is True
+
+
+async def test_authenticated_setup_owner_can_return_a_chat_without_bot(make_client, conn, sample_export):
+    _, _, chat_id, _ = await setup(make_client, conn, sample_export)
+    await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", chat_id)
+    with pytest.raises(confirm.Refused, match="владелец"):
+        await confirm.apply_owner(conn, "archive.chat_include", {"chat_id": chat_id})
+    assert await excluded(conn, chat_id) is True
+    # The setup handler establishes this context after verifying its own session.
+    with authority.setup_context("authenticated-test-session", action="archive.chat_include"):
+        out = await confirm.apply_owner(conn, "archive.chat_include", {"chat_id": chat_id})
+    assert out["status"] == "applied" and await excluded(conn, chat_id) is False
 
 
 async def test_returning_a_chat_that_is_not_excluded_asks_nothing(make_client, conn, sample_export, own_bot, approvals):
@@ -111,10 +127,19 @@ async def test_purge_waits_for_the_owner_while_the_chat_is_closed_at_once(make_c
     assert await conn.fetchval("SELECT count(*) FROM messages") == 2      # остальные чаты не тронуты
 
 
-async def test_without_own_bot_purge_is_immediate(make_client, conn, sample_export):
+async def test_without_own_bot_purge_is_refused_but_exclusion_applies(make_client, conn, sample_export):
     client, _, chat_id, _ = await setup(make_client, conn, sample_export)
     r = await client.put(f"/api/chats/{chat_id}/excluded", json={"excluded": True, "purge": True})
-    assert r.status_code == 200 and r.json() == {"id": chat_id, "excluded": True, "purged": 6}
+    assert (r.status_code, r.json()["code"]) == (409, "owner_unknown")
+    assert await excluded(conn, chat_id) is True and await messages(conn, chat_id) == 6
+
+
+async def test_authenticated_setup_owner_can_purge_excluded_messages(make_client, conn, sample_export):
+    _, _, chat_id, _ = await setup(make_client, conn, sample_export)
+    await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", chat_id)
+    with authority.setup_context("authenticated-test-session", action="archive.chat_purge"):
+        out = await confirm.apply_owner(conn, "archive.chat_purge", {"chat_id": chat_id})
+    assert out["status"] == "applied" and out["result"] == 6
     assert await messages(conn, chat_id) == 0
 
 
@@ -140,10 +165,6 @@ async def test_approved_purge_is_refused_if_the_chat_came_back_meanwhile(make_cl
 async def test_tightening_path_cannot_return_a_chat_or_erase_messages(make_client, conn, sample_export, own_bot):
     """Действие, применяемое без нажатия владельца, само проверяет под блокировкой, что ничего не
     расширяет и не стирает: состояние могло измениться после того, как маршрут его прочитал."""
-    import pytest
-
-    from shturman import confirm
-
     client, _, chat_id, _ = await setup(make_client, conn, sample_export)
     await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", chat_id)
     for kind in ("archive.chat_include", "archive.chat_purge"):
@@ -198,11 +219,24 @@ async def test_import_waits_for_the_owner(make_client, conn, sample_export, own_
     await approvals.gate(send, stored, ("uploaded", 0), ("done", 7))
 
 
-async def test_without_own_bot_import_starts_at_once(make_client, conn, sample_export):
+async def test_without_own_bot_api_cannot_start_import(make_client, conn, sample_export):
     client, _ = await make_client(*MODULES)
     import_id = await upload(client, sample_export)
     r = await client.post(f"/api/imports/{import_id}/run", json={})
-    assert r.status_code == 202 and r.json()["state"] == "running" and "status" not in r.json()
+    assert (r.status_code, r.json()["code"]) == (409, "owner_unknown")
+    assert (await client.get(f"/api/imports/{import_id}")).json()["state"] == "uploaded"
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+
+
+async def test_authenticated_setup_owner_can_start_import_without_bot(make_client, conn, sample_export):
+    client, _ = await make_client(*MODULES)
+    import_id = await upload(client, sample_export)
+    payload = {"import_id": import_id, "exclude": [], "owner_id": None}
+    with pytest.raises(confirm.Refused, match="владелец"):
+        await confirm.apply_owner(conn, "archive.import_run", payload)
+    with authority.setup_context("authenticated-test-session", action="archive.import_run"):
+        out = await confirm.apply_owner(conn, "archive.import_run", payload)
+    assert out["status"] == "applied" and out["result"]["state"] == "running"
     assert (await wait_state(client, import_id, "done", "failed"))["state"] == "done"
     assert await conn.fetchval("SELECT count(*) FROM messages") == 8
 
@@ -234,3 +268,4 @@ async def test_bad_import_request_is_refused_before_any_card(make_client, conn, 
     assert (await client.post(f"/api/imports/{import_id}/run", json={"exclude": ["кто-то"]})).status_code == 400
     assert (await client.post(f"/api/imports/{'a' * 32}/run", json={})).status_code == 404
     assert await approvals.pending() == 0
+

@@ -109,6 +109,9 @@ services:
       # без своего бота согласований (SHTURMAN_BOT_TOKEN) значение on не действует.
       # Через API это значение не меняется.
       SHTURMAN_SENDING: ${SHTURMAN_SENDING:-off}
+      SHTURMAN_PREPARE_ONLY: ${SHTURMAN_PREPARE_ONLY:-off}
+      SHTURMAN_SOURCES_FILE: ${SHTURMAN_SOURCES_FILE:-}
+      SHTURMAN_REMOTE_MCP_ORIGIN: ${SHTURMAN_REMOTE_MCP_ORIGIN:-}
       SHTURMAN_SEND_DAILY_CAP: ${SHTURMAN_SEND_DAILY_CAP:-50}
       SHTURMAN_EMBEDDINGS_URL: ${SHTURMAN_EMBEDDINGS_URL:-}
       # Модель поиска по смыслу. Та же строка .env задаёт имя, под которым её отдаёт контейнер

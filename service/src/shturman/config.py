@@ -87,6 +87,15 @@ class Config:
     # Какие из значений страницы настройки заданы окружением сервиса: страница их не меняет
     # (имена — как в setup_page/secrets_store.py).
     locked: frozenset[str] = frozenset()
+    # Operator-provisioned read-only source definitions. Credentials stay in the
+    # service's private storage, outside the Hermes mount and model context.
+    sources_file: str = ""
+    prepare_only: bool = False
+    # Optional OAuth read-only archive endpoint. Daily permissions are decided
+    # in Telegram; external-client sign-in is a one-time browser flow.
+    remote_mcp_origin: str = ""
+    remote_mcp_allow_loopback: bool = False
+    remote_mcp_clients: tuple[dict, ...] = ()
 
     @property
     def own_bot(self) -> bool:
@@ -149,6 +158,10 @@ class Config:
             dsn=dsn, api_token=api_token, mcp_token=mcp_token,
             host=_env("SHTURMAN_HOST", "127.0.0.1"), port=port,
             data_dir=data_dir,
+            sources_file=_env("SHTURMAN_SOURCES_FILE"),
+            prepare_only=_env("SHTURMAN_PREPARE_ONLY", "off").lower() in ("on", "1", "true", "yes"),
+            remote_mcp_origin=normalize_origin(_env("SHTURMAN_REMOTE_MCP_ORIGIN"),
+                                               "SHTURMAN_REMOTE_MCP_ORIGIN"),
             allowed_hosts=hosts or (f"127.0.0.1:{port}", f"localhost:{port}"),
             setup_origin=_setup_origin(_env("SHTURMAN_SETUP_ORIGIN")),
             dashboard_origin=normalize_origin(_env("SHTURMAN_DASHBOARD_ORIGIN"), "SHTURMAN_DASHBOARD_ORIGIN",

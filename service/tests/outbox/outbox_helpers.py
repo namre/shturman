@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest_asyncio
 
-from shturman import bridge, jobs, store
+from shturman import authority, bridge, jobs, store
 from shturman.events import MESSAGE_LIVE
 from shturman.outbox import autoreply, drafts, policy
 from shturman.records import ChatRecord, MessageRecord
@@ -39,7 +39,7 @@ class FakeTg:
     def can_send(self, account_id: int) -> bool:
         return account_id in self.sendable
 
-    async def send_text(self, account_id, peer_class, tg_id, text, *, reply_to_tg_id=None):
+    async def send_text(self, account_id, peer_class, tg_id, text, *, reply_to_tg_id=None, topic_tg_id=None):
         self.calls += 1
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -49,7 +49,7 @@ class FakeTg:
                 raise exc
         self._next_id += 1
         self.sent.append({"account_id": account_id, "peer_class": peer_class, "tg_id": tg_id, "text": text,
-                          "reply_to_tg_id": reply_to_tg_id, "id": self._next_id, "at": time.monotonic()})
+                          "reply_to_tg_id": reply_to_tg_id, "topic_tg_id": topic_tg_id, "id": self._next_id, "at": time.monotonic()})
         return self._next_id
 
     async def set_typing(self, account_id, peer_class, tg_id, on):
@@ -63,13 +63,15 @@ async def env(make_client, conn, config):
     client, state = await make_client("shturman.api_core", "shturman.outbox.service", cfg=cfg)
     tg = FakeTg()
     state.extras["tg"] = tg
-    await bridge.set_owner(conn, OWNER, OWNER)
+    with authority.owner_context(OWNER, chat_id=OWNER, action="test.fixture.bind"):
+        await bridge.set_owner(conn, OWNER, OWNER)
     owner_acc = await store.ensure_account(conn, OWNER, "Владелец", "owner")
     helper_acc = await store.ensure_account(conn, HELPER, "Помощник", "assistant")
     tg.sendable.add(helper_acc)
     # В тестах паузы нулевые: проверяется порядок действий, а не ожидание.
-    await policy.update(conn, {"min_pause_seconds": 0, "part_pause_seconds": 0})
-    await autoreply.update(conn, {"pause_seconds": 0, "debounce_seconds": 0})
+    with authority.owner_context(OWNER, chat_id=OWNER, action="test.fixture.policy"):
+        await policy.update(conn, {"min_pause_seconds": 0, "part_pause_seconds": 0})
+        await autoreply.update(conn, {"pause_seconds": 0, "debounce_seconds": 0})
     return SimpleNamespace(client=client, state=state, mod=state.extras["outbox"], tg=tg, conn=conn,
                            owner_acc=owner_acc, helper_acc=helper_acc)
 
@@ -152,9 +154,12 @@ def button(notes: list[dict], label: str) -> str:
 
 async def press(env, data: str, user: int = OWNER) -> dict:
     """Нажатие кнопки тем же путём, каким его передаёт плагин."""
-    response = await env.client.post("/api/callbacks/telegram", json={"data": data, "from_user_id": user})
-    assert response.status_code == 200, response.text
-    return response.json()
+    # Model/API actor claims are not proof. This helper simulates the independent
+    # owner's real button; forged callback tests use the HTTP client directly.
+    if user == OWNER:
+        with authority.owner_context(OWNER, chat_id=OWNER, action="test.telegram.callback"):
+            return await bridge.dispatch_callback(env.conn, data, user)
+    return await bridge.dispatch_callback(env.conn, data, user)
 
 
 async def new_draft(env, chat_id, text="Добрый день! Смету пришлю в пятницу.", **extra):
@@ -178,3 +183,4 @@ async def live(env, chat_id, message_id, *, account_id, source="session", **flag
 
 async def settle(env) -> None:
     await drafts.settle(env.mod)
+
