@@ -21,7 +21,7 @@ sys.path.insert(0, str(PLUGIN))
 from shturman_core.pairing import Pairing  # noqa: E402
 from shturman_core.state import Store  # noqa: E402
 
-PASSWORD = "Obl@chnyj-Parol-2FA-7391"
+SECRET = "Zametka-Vladelca-7391-ne-dlya-zhurnala"
 PREFIX = "/api/plugins/shturman"
 
 
@@ -68,30 +68,51 @@ def test_allowed_request_passes_with_the_service_token_and_nothing_from_the_brow
     ("POST", "ingest/business/deleted"), ("POST", "outbox/drafts"), ("POST", "processing/run"),
     ("GET", "status/%2e%2e/owner"), ("PUT", "status/%2e%2e/owner"), ("GET", "status/"), ("GET", ""),
     ("GET", "unknown"), ("POST", "status"), ("GET", "%2e%2e/mcp"), ("GET", "tg/login/a%2fb"),
+    # страница настройки переписки: проход дашборда к ней не ведёт никаким написанием пути
+    ("GET", "%2e%2e/shturman-setup/"), ("GET", "../shturman-setup/"), ("POST", "%2e%2e/shturman-setup/api/login"),
+    ("GET", "status/%2e%2e/%2e%2e/shturman-setup/"), ("GET", "shturman-setup/"), ("GET", "%2fshturman-setup/"),
+    ("GET", "setup"), ("POST", "setup/link"), ("POST", "setup-link"), ("POST", "setup/logout-all"),
+    # вход в аккаунт Telegram, управление аккаунтами, выбор чатов, импорт выгрузки: с версии 0.0.6
+    # только на странице настройки переписки — через дашборд не идёт ни QR, ни пароль, ни выгрузка
+    ("POST", "tg/login"), ("GET", "tg/login/abc"), ("POST", "tg/login/abc/password"), ("POST", "tg/login/abc/cancel"),
+    ("POST", "tg/accounts/7/logout"), ("POST", "tg/accounts/7/pause"), ("POST", "tg/accounts/7/resume"),
+    ("POST", "tg/accounts/7/sync"), ("PUT", "tg/accounts/7/options"), ("GET", "tg/accounts/7/dialogs"),
+    ("GET", "tg/accounts/7/sync"), ("POST", "imports"), ("GET", "imports"), ("GET", "imports/" + "a" * 32),
+    ("DELETE", "imports/" + "a" * 32), ("GET", "imports/" + "a" * 32 + "/scan"), ("POST", "imports/" + "a" * 32 + "/run"),
 ])
 def test_everything_outside_the_allowlist_is_refused_before_the_service(web, service_env, method, path):
     response = web.request(method, f"{PREFIX}/service/{path}", json={"user_id": 1, "chat_id": 1})
     assert response.status_code in (404, 405) and service_env.requests == []
 
 
-def test_password_passes_through_once_and_leaves_no_trace_in_logs(web, service_env, caplog):
-    service = service_env
-    service.replies[("POST", "/api/tg/login/abc/password")] = (200, {"state": "done"})
+def test_telegram_password_never_travels_through_the_dashboard(web, service_env, caplog):
+    """Облачный пароль Telegram вводится только на странице настройки переписки. Если его всё же
+    отправят в проход дашборда, запрос отклоняется до сервиса и в журнал не попадает."""
     with caplog.at_level(logging.DEBUG):
-        response = web.post(f"{PREFIX}/service/tg/login/abc/password", json={"password": PASSWORD})
-    assert response.status_code == 200 and response.json() == {"state": "done"}
-    assert service.requests[-1]["json"] == {"password": PASSWORD}
+        response = web.post(f"{PREFIX}/service/tg/login/abc/password", json={"password": SECRET})
+    assert response.status_code == 404 and service_env.requests == []
+    assert SECRET not in caplog.text and SECRET not in response.text
+
+
+def test_request_body_passes_through_once_and_leaves_no_trace_in_logs(web, service_env, caplog):
+    """Тело запроса (здесь — заметки владельца на странице памяти) передаётся как есть и не пишется в журнал."""
+    service = service_env
+    service.replies[("PUT", "/api/pages/7/owner-block")] = (200, {"ok": True})
+    with caplog.at_level(logging.DEBUG):
+        response = web.put(f"{PREFIX}/service/pages/7/owner-block", json={"text": SECRET})
+    assert response.status_code == 200 and response.json() == {"ok": True}
+    assert service.requests[-1]["json"] == {"text": SECRET}
     assert service.requests[-1]["headers"]["content-type"] == "application/json"
-    assert PASSWORD not in caplog.text and service.token not in caplog.text
+    assert SECRET not in caplog.text and service.token not in caplog.text
 
 
-def test_service_outage_with_a_password_in_flight_logs_nothing_secret(web, monkeypatch, caplog):
+def test_service_outage_with_a_request_in_flight_logs_nothing_secret(web, monkeypatch, caplog):
     monkeypatch.setenv("SHTURMAN_SERVICE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("SHTURMAN_API_TOKEN", "t" * 40)
     with caplog.at_level(logging.DEBUG):
-        response = web.post(f"{PREFIX}/service/tg/login/abc/password", json={"password": PASSWORD})
+        response = web.put(f"{PREFIX}/service/pages/7/owner-block", json={"text": SECRET})
     assert response.status_code == 502 and response.json() == {"detail": "Сервис переписки недоступен."}
-    assert PASSWORD not in caplog.text and "t" * 40 not in caplog.text
+    assert SECRET not in caplog.text and "t" * 40 not in caplog.text
     for record in caplog.records:
         assert record.exc_info is None           # без трассировок: в них могли бы оказаться данные запроса
 
@@ -101,8 +122,8 @@ def test_service_errors_are_passed_to_the_page_as_they_are(web, service_env):
         409, {"error": "идёт импорт экспорта — измените исключения после его окончания", "code": "import_running"})
     response = web.put(f"{PREFIX}/service/chats/7/excluded", json={"excluded": True})
     assert response.status_code == 409 and response.json()["code"] == "import_running"
-    service_env.replies[("GET", "/api/imports/" + "a" * 32 + "/scan")] = (202, {"state": "scanning"})
-    assert web.get(f"{PREFIX}/service/imports/{'a' * 32}/scan?wait=1").status_code == 202
+    service_env.replies[("POST", "/api/pages/build")] = (202, {"state": "building"})
+    assert web.post(f"{PREFIX}/service/pages/build?wait=1", json={}).status_code == 202
 
 
 def test_waiting_for_the_owner_reaches_the_page_as_it_is(web, service_env):
@@ -137,23 +158,32 @@ def test_without_service_the_passage_is_closed_politely(web, service):
     assert response.status_code == 503 and service.requests == []
 
 
-def test_upload_is_streamed_to_the_service_byte_for_byte(web, service_env):
+def test_a_large_body_is_streamed_to_the_service_byte_for_byte(web, service_env):
+    """Выгрузка Telegram Desktop через дашборд больше не загружается (только на странице настройки
+    переписки), но проход по-прежнему передаёт тело потоком и без изменений — здесь на маршруте,
+    который в проходе остался."""
     service = service_env
-    service.replies[("POST", "/api/imports")] = (201, {"import_id": "a" * 32, "size_bytes": 3_000_000, "state": "uploaded"})
+    service.replies[("PUT", "/api/pages/7/owner-block")] = (200, {"ok": True})
     chunk = bytes(range(256)) * 400                      # 102 400 байт
 
     def body():
         for _ in range(30):
             yield chunk
 
-    response = web.post(f"{PREFIX}/service/imports", content=body(), headers={"Content-Type": "application/json"})
-    assert response.status_code == 201 and response.json()["import_id"] == "a" * 32
+    response = web.put(f"{PREFIX}/service/pages/7/owner-block", content=body(), headers={"Content-Type": "application/json"})
+    assert response.status_code == 200 and response.json() == {"ok": True}
     assert service.requests[-1]["raw"] == chunk * 30
 
-    exact = b'{"about": "result.json"}' * 1000
-    web.post(f"{PREFIX}/service/imports", content=exact, headers={"Content-Type": "application/json"})
+    exact = b'{"text": "owner note"}' * 1000
+    web.put(f"{PREFIX}/service/pages/7/owner-block", content=exact, headers={"Content-Type": "application/json"})
     sent = service.requests[-1]
     assert sent["raw"] == exact and sent["headers"]["content-length"] == str(len(exact))
+
+
+def test_an_export_upload_through_the_dashboard_is_refused_before_the_service(web, service_env):
+    response = web.post(f"{PREFIX}/service/imports", content=b'{"about": "result.json"}' * 100,
+                        headers={"Content-Type": "application/json"})
+    assert response.status_code == 404 and service_env.requests == []
 
 
 @pytest.mark.parametrize("query", ["a=" + "x" * 2100, "a=%20ok&b=к"])
@@ -195,3 +225,145 @@ def test_confirming_the_owner_works_without_the_service(web, monkeypatch):
     started = Pairing(store).start()
     Pairing(store).try_bind(started["code"], user_id=42, chat_id=42, name="Иван")
     assert web.post(f"{PREFIX}/pairing/confirm").json()["owner"]["user_id"] == 42
+
+
+# --- шаг мастера «Переписка»: состояние страницы настройки переписки ---------------------------
+
+PUBLIC = "https://assistant.example.com"
+SETUP = "https://assistant.example.com:8443"            # то же имя, другой порт — так по умолчанию
+PAGE = SETUP + "/shturman-setup/"
+SETUP_NOTHING = {"enabled": True, "origin": SETUP, "reason": None, "origin_set": True, "tg_keys": False,
+                 "accounts": 0, "own_bot": False, "owner_bound": False, "business_connected": False,
+                 "own_model": False}
+SETUP_EVERYTHING = {"enabled": True, "origin": SETUP, "reason": None, "origin_set": True, "tg_keys": True,
+                    "accounts": 2, "own_bot": True, "owner_bound": True, "business_connected": True,
+                    "own_model": True}
+
+
+@pytest.fixture
+def public(monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", PUBLIC)
+
+
+def test_correspondence_with_a_service_of_the_previous_version(web, service_env, public):
+    """Сервис 0.0.5 объекта setup не отдаёт: мастер открывается и говорит «обновите экземпляр»."""
+    service_env.replies[("GET", "/api/status")] = (200, {"messages": 1200, "chats": 14, "own_bot": False})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out == {"state": "outdated", "url": None, "setup": None, "archive": {"messages": 1200, "chats": 14}}
+
+
+def test_correspondence_with_a_service_built_before_the_separate_address(web, service_env, public):
+    """Объект setup есть, полей origin и reason нет: та сборка отдавала страницу на адресе дашборда.
+    Мастер говорит «обновите» и ссылку не даёт — в том числе на адрес дашборда."""
+    before = {k: v for k, v in SETUP_NOTHING.items() if k not in ("origin", "reason")}
+    service_env.replies[("GET", "/api/status")] = (200, {"messages": 5, "chats": 1, "setup": before})
+    response = web.get(f"{PREFIX}/correspondence")
+    assert response.json() == {"state": "outdated", "url": None, "setup": None, "archive": {"messages": 5, "chats": 1}}
+    assert "shturman-setup" not in response.text
+
+
+def test_correspondence_when_nothing_is_configured(web, service_env, public):
+    service_env.replies[("GET", "/api/status")] = (200, {"messages": 0, "chats": 0, "setup": SETUP_NOTHING})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out == {"state": "ok", "url": PAGE,
+                   "setup": {"tg_keys": False, "business_connected": False, "accounts": 0},
+                   "archive": {"messages": 0, "chats": 0}}
+
+
+def test_correspondence_when_everything_is_configured(web, service_env, public):
+    service_env.replies[("GET", "/api/status")] = (
+        200, {"messages": 300000, "chats": 87, "setup": SETUP_EVERYTHING})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "ok" and out["url"] == PAGE
+    assert out["setup"] == {"tg_keys": True, "business_connected": True, "accounts": 2}
+    assert out["archive"] == {"messages": 300000, "chats": 87}
+
+
+def test_correspondence_when_the_page_shares_the_dashboard_address(web, service_env, public):
+    """Адрес страницы совпал с адресом дашборда: сервис страницу отключил, мастер кнопку не показывает."""
+    same = dict(SETUP_NOTHING, enabled=False, origin=None, reason="same_origin")
+    service_env.replies[("GET", "/api/status")] = (200, {"messages": 0, "chats": 0, "setup": same})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "same_origin" and out["url"] is None and out["setup"]["accounts"] == 0
+
+
+def test_correspondence_never_links_to_the_dashboard_address(web, service_env, public):
+    """Даже если сервис прислал адрес дашборда как адрес страницы, ссылки на него не будет."""
+    for origin in (PUBLIC, PUBLIC + "/", "https://ASSISTANT.example.com:443"):
+        service_env.replies[("GET", "/api/status")] = (200, {"setup": dict(SETUP_NOTHING, origin=origin)})
+        response = web.get(f"{PREFIX}/correspondence")
+        assert response.json()["state"] == "same_origin" and response.json()["url"] is None
+        assert "shturman-setup" not in response.text
+
+
+def test_correspondence_without_a_page_address(web, service_env, public):
+    """Адрес страницы не задан: кнопки нет, страница открывается через туннель, состояние видно."""
+    none = dict(SETUP_NOTHING, origin=None, reason="no_origin", tg_keys=True, accounts=1)
+    service_env.replies[("GET", "/api/status")] = (200, {"messages": 40, "chats": 2, "setup": none})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out == {"state": "no_origin", "url": None,
+                   "setup": {"tg_keys": True, "business_connected": False, "accounts": 1},
+                   "archive": {"messages": 40, "chats": 2}}
+
+
+@pytest.mark.parametrize("origin", [
+    "http://assistant.example.com:8443", "javascript:alert(1)", "https://assistant.example.com:8443/evil",
+    "https://user@assistant.example.com:8443", "https://assistant.example.com:8443\"><script>", 8443,
+])
+def test_correspondence_puts_only_a_checked_address_into_the_link(web, service_env, public, origin):
+    service_env.replies[("GET", "/api/status")] = (200, {"setup": dict(SETUP_NOTHING, origin=origin)})
+    response = web.get(f"{PREFIX}/correspondence")
+    assert response.json()["url"] is None and response.json()["state"] == "no_origin"
+    assert "script" not in response.text and "evil" not in response.text and "javascript" not in response.text
+
+
+def test_correspondence_asks_the_service_one_read_only_question_and_leaks_nothing(web, service_env, public):
+    link = "/shturman-setup/#" + "k" * 43
+    service_env.replies[("GET", "/api/status")] = (
+        200, {"messages": 5, "chats": 1, "setup": dict(SETUP_NOTHING, login_link=link, own_bot="да", tg_keys="да")})
+    response = web.get(f"{PREFIX}/correspondence", headers={"Cookie": "hermes_session=abc"})
+    assert response.status_code == 200
+    assert [(r["method"], r["path"]) for r in service_env.requests] == [("GET", "/api/status")]
+    assert "cookie" not in service_env.requests[0]["headers"]
+    assert service_env.token not in response.text and "k" * 43 not in response.text
+    assert response.json()["setup"]["tg_keys"] is None           # строка вместо признака — не признак
+    assert "own_bot" not in response.json()["setup"]             # бот согласований в сводку не входит
+    # Мастер только спрашивает: записать что-либо этим адресом нельзя.
+    for method in ("POST", "PUT", "DELETE"):
+        assert web.request(method, f"{PREFIX}/correspondence").status_code == 405
+
+
+def test_correspondence_without_the_service(web, public):
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "no_service" and out["setup"] is None and out["url"] is None
+
+
+def test_correspondence_when_the_service_does_not_answer(web, monkeypatch, public, caplog):
+    monkeypatch.setenv("SHTURMAN_SERVICE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("SHTURMAN_API_TOKEN", "t" * 40)
+    with caplog.at_level(logging.DEBUG):
+        out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "unreachable" and out["setup"] is None and out["url"] is None
+    assert "t" * 40 not in caplog.text
+
+
+def test_correspondence_when_the_service_rejects_the_plugin_token(web, service_env, public):
+    service_env.token = "другой" * 8
+    assert web.get(f"{PREFIX}/correspondence").json()["state"] == "unreachable"
+
+
+def test_correspondence_in_emergency_mode_still_gives_the_page_address(web, service_env, monkeypatch):
+    """Аварийный режим: дашборд запущен без внешнего адреса, а у страницы настройки адрес свой —
+    он от дашборда не зависит, и ссылка остаётся."""
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    service_env.replies[("GET", "/api/status")] = (200, {"setup": SETUP_NOTHING})
+    out = web.get(f"{PREFIX}/correspondence").json()
+    assert out["state"] == "ok" and out["url"] == PAGE
+
+
+def test_state_still_does_not_call_the_service_and_knows_nothing_of_the_plugin_to_install(web, service_env):
+    state = web.get(f"{PREFIX}/state").json()
+    assert state["business"] == {"connected": False, "can_reply": False, "updated_at": None}
+    assert service_env.requests == []
+    assert web.post(f"{PREFIX}/mark", json={"key": "correspondence_seen"}).status_code == 200
+    assert web.post(f"{PREFIX}/mark", json={"key": "business_skipped"}).status_code == 200      # прежняя отметка

@@ -1,7 +1,7 @@
 ---
 name: weekly-review
 description: "Обзор недели владельцу по архиву переписки: что закрыто, что открыто и просрочено, что ждёт ответа, что впереди."
-version: 0.0.5
+version: 0.0.6
 author: Shturman
 license: MIT
 metadata:

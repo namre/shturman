@@ -1,7 +1,7 @@
 ---
 name: morning-brief
 description: "Утренняя сводка владельцу по архиву переписки: сроки на сегодня, просроченное, неотвеченное со вчерашнего вечера, предложения, ждущие решения."
-version: 0.0.5
+version: 0.0.6
 author: Shturman
 license: MIT
 metadata:

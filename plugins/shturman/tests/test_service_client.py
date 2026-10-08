@@ -165,3 +165,17 @@ def test_without_token_the_service_is_simply_absent(monkeypatch):
 ])
 def test_base_url_is_normalized_or_rejected(raw, expected):
     assert normalize_base_url(raw) == expected
+
+
+def test_the_setup_page_is_never_requested_by_any_client(service):
+    """Клиент любой роли не отправит запрос на страницу настройки переписки: отказ до сети."""
+    from shturman_core import service_routes
+    from shturman_core.service_client import NotAllowed, ServiceClient
+
+    for routes in (service_routes.UI, service_routes.BRIDGE, service_routes.TOOLS):
+        client = ServiceClient(service.url, service.token, allow=routes)
+        for method in ("GET", "POST"):
+            for path in ("/shturman-setup/", "/shturman-setup/api/login", "/api/../shturman-setup/"):
+                with pytest.raises(NotAllowed):
+                    client.request(method, path)
+    assert service.requests == []

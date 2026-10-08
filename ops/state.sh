@@ -6,8 +6,18 @@
 #   ./ops/state.sh set KEY VALUE   — записать ключ
 #   ./ops/state.sh done STEP       — отметить шаг выполненным (с отметкой времени)
 #   ./ops/state.sh log "текст"     — дописать строку в журнал
+#   ./ops/state.sh -h | --help     — эта справка; каталог local при этом не создаётся
+# Одноразовые ссылки (activation-link, bot-bind, setup-link) сюда не записывать.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
+# Справка — только первым параметром: значением ключа или текстом журнала может быть что угодно.
+ops_help "${1:-}"
+case "${1:-show}" in
+  show|get|set|done|log) ;;
+  -*) ops_unknown "$1" ;;
+  *) echo "неизвестная команда: $1 — справка: ./ops/state.sh --help" >&2; exit 2 ;;
+esac
 dir="local"; file="$dir/state"; journal="$dir/journal.log"
 mkdir -p "$dir"; touch "$file" "$journal"
 
@@ -18,7 +28,7 @@ cmd="${1:-show}"
 case "$cmd" in
   show)
     # Режим установки — несекретная строка SHTURMAN_MODE в .env; остальное в .env не читается.
-    mode="$(grep -E '^SHTURMAN_MODE=' .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    mode="$(env_get SHTURMAN_MODE)"
     if [ -z "$mode" ] && [ ! -s .env ]; then
       # Новая установка: вариант выбирает владелец, до его ответа ничего не разворачивается.
       mode="unset"

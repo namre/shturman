@@ -10,14 +10,12 @@ from . import personas
 from .pairing import Pairing
 from .state import Store
 
-# Плагин бизнес-режима ставится из официального репозитория по полному SHA коммита.
-# Проверено 2026-10-06: это вершина main, в неё входит исправление проверки владельца черновика
-# (коммит 77dec03 от 2026-08-15), которого нет в ревизии из каталога Hermes 0.21.5.
-BUSINESS_PLUGIN_NAME = "telegram-business"
-BUSINESS_PLUGIN_SOURCE = "NousResearch/hermes-telegram-business"
-BUSINESS_PLUGIN_REF = "98c60afc00d36c885bb040ebe973b1aa908886c0"
-
-MARKS = ("persona_saved", "model_ok", "bot_applied", "business_skipped", "completed")
+# Отметки шагов. `correspondence_seen` — владелец прошёл шаг «Переписка» (сама настройка идёт
+# на отдельной странице сервиса, мастер о ней знает только по состоянию).
+# `business_skipped` мастер больше не ставит: шага «Бизнес-режим» с версии 0.0.6 нет. Отметка
+# остаётся в перечне, чтобы состояние экземпляров, прошедших мастер раньше, читалось как прежде:
+# для них она значит то же, что `correspondence_seen`.
+MARKS = ("persona_saved", "model_ok", "bot_applied", "business_skipped", "correspondence_seen", "completed")
 _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 
 PROBE_PROMPT = "Ответь одним словом: работает"
@@ -59,15 +57,13 @@ def snapshot(store: Store, *, now: Callable[[], float] = time.time) -> dict[str,
         "completed": bool(wizard.get("completed_at")),
         "bot": wizard.get("bot") or None,
         "pairing": Pairing(store, now=now).status(),
+        # Подключён ли в бизнес-режиме Telegram бот-ассистент (бот Hermes). С версии 0.0.6 так
+        # не делают: бизнес-режим подключается к боту согласований сервиса. Признак нужен, чтобы
+        # мастер сказал об этом владельцу экземпляра, где бот-ассистент уже подключён.
         "business": {
             "connected": bool(business.get("connected")),
             "can_reply": bool(business.get("can_reply")),
             "updated_at": business.get("updated_at"),
-            "plugin": {
-                "name": BUSINESS_PLUGIN_NAME,
-                "identifier": BUSINESS_PLUGIN_SOURCE,
-                "ref": BUSINESS_PLUGIN_REF,
-            },
         },
     }
 

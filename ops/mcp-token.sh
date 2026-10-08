@@ -17,14 +17,19 @@
 # Из .env читается одна строка — SHTURMAN_MCP_TOKEN. Скрипт ничего не записывает.
 # Сменить токен (если он мог попасть к постороннему): удалить строку SHTURMAN_MCP_TOKEN из .env,
 # затем ./ops/init-env.sh --auto и ./ops/up.sh — прежний токен перестанет действовать.
+#
+#   -h, --help — эта справка; токен при этом не читается и не печатается.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
+. ops/lib.sh
+ops_help "$@"
 
 mode="${1:-show}"
 case "$mode" in
   --pipe|show) ;;
-  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) ops_unknown "$mode" ;;
 esac
+[ $# -le 1 ] || ops_unknown "$2"
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 token="$(grep -E '^SHTURMAN_MCP_TOKEN=' .env | tail -n 1 | cut -d= -f2- || true)"

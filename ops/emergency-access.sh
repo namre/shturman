@@ -10,9 +10,14 @@
 #   ./ops/emergency-access.sh off   — вернуть обычный режим (то же, что ./ops/up.sh)
 #
 # Файл .env не меняется: адрес отключается только на время этого запуска.
+# Страница настройки переписки (/shturman-setup/) в аварийном режиме открывается так же, через
+# туннель: ./ops/setup-link.sh --local.
+#   -h, --help — эта справка; ничего не перезапускается.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
+[ $# -le 1 ] || ops_unknown "$2"
 
 case "${1:-}" in
   on)
@@ -35,7 +40,8 @@ case "${1:-}" in
     exit 1 ;;
   off)
     exec ./ops/up.sh ;;
+  -*) ops_unknown "$1" ;;
   *)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    ops_usage >&2
     exit 2 ;;
 esac

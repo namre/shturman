@@ -169,7 +169,7 @@
 }
 .shturman-msg-in { align-self: flex-start; border-bottom-left-radius: 4px; }
 .shturman-msg-out { align-self: flex-end; border-bottom-right-radius: 4px; border-style: dashed; }
-.shturman-msg.is-marked, .shturman-key.is-marked, .shturman-row.is-marked { border-color: var(--color-warning); border-style: solid; }
+.shturman-msg.is-marked, .shturman-key.is-marked { border-color: var(--color-warning); border-style: solid; }
 
 .shturman-hl {
   position: relative; display: inline-block; margin-top: 4px; padding: 2px 8px;
@@ -181,11 +181,6 @@
   position: relative; text-align: center; padding: 8px 10px; font-size: 13px; font-weight: 600;
   border: 1px solid var(--color-border); border-radius: 8px;
 }
-.shturman-row {
-  position: relative; display: flex; justify-content: space-between; gap: 8px;
-  padding: 8px 10px; font-size: 13px; border: 1px solid var(--color-border); border-radius: 8px;
-}
-.shturman-row-arrow { color: var(--color-muted-foreground); }
 .shturman-addr {
   padding: 6px 10px; font-size: 12px; font-family: var(--font-mono, monospace);
   border: 1px solid var(--color-border); border-radius: 999px; color: var(--color-muted-foreground);
@@ -195,16 +190,21 @@
 .shturman-input-fake { padding: 6px 8px; border: 1px solid var(--color-border); border-radius: 8px; }
 .shturman-startbar { margin-top: 12px; }
 
-/* --- «скоро» и итог --- */
+/* --- шаг «Переписка» и итог --- */
 
-.shturman-soon {
-  display: flex; flex-direction: column; gap: 8px; padding: 20px;
-  border: 1px dashed var(--color-border); border-radius: var(--radius, 10px);
+.shturman code {
+  font-family: var(--font-mono, monospace); font-size: 0.92em; white-space: nowrap;
+  padding: 1px 6px; border: 1px solid var(--color-border); border-radius: 4px;
 }
-.shturman-tag {
-  align-self: flex-start; font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
-  padding: 2px 8px; border: 1px solid var(--color-border); border-radius: 6px; color: var(--color-muted-foreground);
-}
+.shturman-list { margin: 0; padding-left: 22px; list-style: decimal outside; display: flex; flex-direction: column; gap: 10px; }
+.shturman-list li { display: list-item; }
+/* Мелкая строка под шагом: то, что понадобится позже. */
+.shturman-fine { font-size: 13px; border-top: 1px dashed var(--color-border); padding-top: 12px; }
+/* Признаки настройки: подпись слева, значение справа — и в узкой колонке тоже. Подпись не сжимается,
+   переносится значение. */
+.shturman-facts .shturman-sumrow { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; }
+.shturman-facts .shturman-sumlabel { white-space: nowrap; }
+.shturman-facts .shturman-sumrow > span:last-child { text-align: right; }
 
 .shturman-summary { border: 1px solid var(--color-border); border-radius: var(--radius, 10px); background: var(--color-card); }
 .shturman-sumrow {

@@ -52,10 +52,24 @@ def _age(seconds: Any) -> str:
     return f"{seconds // 3600} ч назад"
 
 
+def _bot_configured() -> bool:
+    """Задан ли токен бота: в окружении либо на странице настройки (файл в каталоге данных).
+    Само значение не читается дальше проверки «есть ли»."""
+    if os.environ.get("SHTURMAN_BOT_TOKEN", "").strip():
+        return True
+    from pathlib import Path
+
+    from ..setup_page import secrets_store
+
+    data_dir = Path(os.environ.get("SHTURMAN_DATA_DIR", "/data").strip() or "/data")
+    return secrets_store.SecretStore(data_dir).has(secrets_store.BOT_TOKEN)
+
+
 async def bot_bind(dsn: str) -> None:
     """Создаёт одноразовую ссылку привязки владельца и печатает её."""
-    if not os.environ.get("SHTURMAN_BOT_TOKEN", "").strip():
-        sys.exit("бот согласований не настроен: не задан SHTURMAN_BOT_TOKEN")
+    if not _bot_configured():
+        sys.exit("бот согласований не настроен: токен не задан ни в настройках сервера "
+                 "(SHTURMAN_BOT_TOKEN), ни на странице настройки")
     conn = await db.connect(dsn)
     try:
         bot = await binding.get_state(conn, "bot")
@@ -104,7 +118,8 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
         if bot.get("bind_paused"):
             print("  приём кодов привязки приостановлен: было много неверных кодов. Подождите 10 минут.")
         if bot.get("business_capable") is False:
-            print("  бизнес-режим: у бота он выключен (в @BotFather: Bot Settings → Business Mode)")
+            print("  бизнес-режим: у бота он выключен (в @BotFather: Bot Settings → Secretary Mode; "
+                  "раньше пункт назывался Business Mode)")
         counters = bot.get("counters") or {}
         if counters:
             print("  счётчики: " + ", ".join(f"{k}={v}" for k, v in sorted(counters.items())))

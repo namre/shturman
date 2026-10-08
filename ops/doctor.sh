@@ -2,9 +2,17 @@
 # Проверка здоровья экземпляра. Ничего не меняет и не читает секретов.
 # Вывод: строки "PASS|WARN|FAIL|SKIP  имя: подробности". Код возврата 1, если есть FAIL.
 # SKIP — проверка к режиму установки не относится (режим без Hermes, docs/standalone.md).
+# Из .env читаются только несекретные строки: режим установки и два адреса — дашборда и страницы
+# настройки переписки. По внешним адресам проверка делает по одному запросу GET к странице
+# /shturman-setup/ и смотрит только на код ответа и заголовок-метку; на адреса её API не ходит.
+# Ещё читается local/plugin.sha256 — отпечаток кода плагина, с которым запущен Hermes (его пишет
+# ./ops/up.sh; секретов в нём нет).
+# Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
+ops_no_args "$@"
 
 fails=0
 pass() { printf 'PASS  %s: %s\n' "$1" "$2"; }
@@ -64,6 +72,12 @@ p = (load_config() or {}).get("plugins") or {}
 print("yes" if "shturman" in (p.get("enabled") or []) and "shturman" not in (p.get("disabled") or []) else "no")' | tail -n 1)"
 if [ "$plugin_on" = "yes" ]; then pass plugin "плагин shturman включён"
 else fail plugin "плагин shturman не включён — запустите ./ops/up.sh"; fi
+# Hermes читает плагин при запуске и держит его в памяти. Если файлы плагина с тех пор изменились
+# (репозиторий обновили, а ./ops/up.sh не запускали), работает прежний код. Отпечаток кода,
+# с которым Hermes запущен, записывает ./ops/up.sh; до первого его запуска строки нет.
+if [ -f "$PLUGIN_MARK" ] && [ "$(head -n 1 "$PLUGIN_MARK")" != "$(plugin_print)" ]; then
+  warn plugin-code "файлы плагина shturman изменились после последнего ./ops/up.sh — Hermes исполняет прежний код плагина (прежний мастер и прежний проход к сервису): запустите ./ops/up.sh"
+fi
 if [ -n "$public_url" ]; then
   pass public-url "$public_url"
   # Список способов входа Hermes отдаёт без сессии только когда вход включён, то есть при заданном адресе.
@@ -82,11 +96,11 @@ else
   warn public-url "внешний адрес не задан — дашборд доступен только с самого сервера (./ops/set-public-url.sh)"
 fi
 
-owner_bound=no; wizard_done=no; plugin_own_bot=unknown
+owner_bound=no; wizard_done=no; plugin_own_bot=unknown; hermes_business=no
 while IFS='=' read -r k v; do
   case "$k" in
     owner_bound) owner_bound="$v" ;; wizard_completed) wizard_done="$v" ;;
-    bridge_own_bot) plugin_own_bot="$v" ;;
+    bridge_own_bot) plugin_own_bot="$v" ;; hermes_business) hermes_business="$v" ;;
   esac
 done <<EOF2
 $(hpy /opt/data/plugins/shturman/cli.py status)
@@ -103,7 +117,12 @@ else warn bot-owner "владелец не привязан — бот нико�
 if [ "$wizard_done" = "yes" ]; then pass wizard "мастер настройки пройден"
 else warn wizard "мастер настройки не завершён"; fi
 
-# --- плагин бизнес-режима ---
+# --- бизнес-режим Telegram ---
+# В первую настройку бизнес-режим не входит. Он понадобится, только когда владелец решит включать
+# отправку, и подключается тогда к боту согласований сервиса; бота-ассистента в бизнес-режиме
+# не подключают, официальный плагин бизнес-режима мастер не ставит. На экземпляре, где он уже
+# установлен, проверка его не трогает и только сообщает об этом: от сообщений собеседников ядро
+# Hermes в любом случае закрывает плагин shturman.
 # Состояние берём из настроек и каталога плагинов, а не из таблицы `hermes plugins list`:
 # в ней статус «not enabled» содержит слово «enabled».
 biz="$(hpy -c '
@@ -115,10 +134,13 @@ installed = os.path.isdir(os.path.join(os.environ.get("HERMES_HOME", "/opt/data"
 enabled = name in (p.get("enabled") or []) and name not in (p.get("disabled") or [])
 print("enabled" if installed and enabled else "installed" if installed else "absent")' | tail -n 1)"
 case "$biz" in
-  enabled)   pass business-plugin "установлен и включён" ;;
-  installed) fail business-plugin "установлен, но не включён — бизнес-режим в Telegram подключать нельзя" ;;
-  *)         warn business-plugin "не установлен — бота в бизнес-режиме в Telegram НЕ подключать (issue #127430)" ;;
+  enabled)   pass business-plugin "официальный плагин бизнес-режима на этом экземпляре установлен и включён (так делали до 0.0.6) — проверка его не трогает" ;;
+  installed) pass business-plugin "официальный плагин бизнес-режима на этом экземпляре установлен, но не включён — проверка его не трогает" ;;
+  *)         pass business-plugin "бизнес-режим Telegram у бота-ассистента не подключён и не нужен" ;;
 esac
+if [ "$hermes_business" = "yes" ]; then
+  warn business-hermes "бот-ассистент сейчас подключён в бизнес-режиме Telegram (схема до 0.0.6). Ничего не сломано; что с этим делать, решает владелец — UPGRADING.md, «0.0.5 → 0.0.6»"
+fi
 
 else
   skip hermes "пропущено: режим без Hermes — контейнер, дашборд, вход, мастер, плагины Hermes не проверяются"
@@ -194,12 +216,184 @@ print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n
           fi
           case "$st" in
             *'"owner_known":true'*) pass service-owner "сервис знает владельца" ;;
-            *) warn service-owner "сервис ещё не знает владельца — кнопки согласования не работают, пока бот не привязан в мастере" ;;
+            *) warn service-owner "сервис ещё не знает владельца — карточки с обязательствами не приходят, пока бот-ассистент не привязан в мастере" ;;
           esac ;;
       esac
     fi
   else
     fail archive "сервис не отдал состояние"
+  fi
+
+  # --- страница настройки переписки ---
+  # Её отдаёт сам сервис по пути /shturman-setup/, за собственным входом и только на ОТДЕЛЬНОМ
+  # адресе (другой порт или другое имя): на адресе дашборда ассистент может исполнять свой код
+  # и действовал бы на странице от имени вошедшего владельца. Проверяется четыре вещи: страница
+  # отвечает локально (setup-page), у неё свой адрес (setup-origin), по нему отвечает именно сервис
+  # (setup-page-public), а по адресу дашборда она не отдаётся (setup-isolation).
+  # Из состояния сервиса берутся только признаки и числа: ни токенов, ни имён, ни ссылок входа.
+  # Запросы идут только на саму страницу (GET …/shturman-setup/): на адреса её API проверка не
+  # ходит. Кто ответил, узнаётся по заголовку-метке X-Shturman-Setup-Page, а не по телу ответа.
+  # Из .env читаются два несекретных адреса: SHTURMAN_SETUP_URL и SHTURMAN_PUBLIC_URL.
+  setup_known=no; setup_enabled=unknown; setup_fields=no; setup_reason=unknown; setup_keys=unknown
+  setup_accounts=0; setup_business=unknown
+  while IFS='=' read -r k v; do
+    case "$k" in
+      setup_known) setup_known="$v" ;; setup_enabled) setup_enabled="$v" ;; setup_fields) setup_fields="$v" ;;
+      setup_reason) setup_reason="$v" ;; setup_keys) setup_keys="$v" ;; setup_accounts) setup_accounts="$v" ;;
+      setup_business) setup_business="$v" ;;
+    esac
+  done <<EOF4
+$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+s = d.get("setup") if isinstance(d, dict) else None
+if not isinstance(s, dict):
+    print("setup_known=no")
+    sys.exit(0)
+yn = lambda v: "yes" if v is True else "no" if v is False else "unknown"
+num = lambda v: str(v) if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 10**6 else "0"
+reason = s.get("reason")
+print("setup_known=yes")
+print("setup_enabled=" + yn(s.get("enabled")))
+# Поля origin и reason появились вместе с отдельным адресом страницы; сервис прежней сборки их не отдаёт.
+print("setup_fields=" + ("yes" if "origin" in s or "reason" in s else "no"))
+print("setup_reason=" + (reason if reason in ("same_origin", "no_origin") else "none" if reason is None else "unknown"))
+print("setup_keys=" + yn(s.get("tg_keys")))
+print("setup_accounts=" + num(s.get("accounts")))
+print("setup_business=" + yn(s.get("business_connected")))' 2>/dev/null)
+EOF4
+  word() { case "$1" in yes) printf '%s' "$2" ;; no) printf '%s' "$3" ;; *) printf 'неизвестно' ;; esac; }
+  # Один запрос GET <адрес>/shturman-setup/. После вызова: probe_code — код ответа, probe_mark —
+  # есть ли заголовок-метка страницы (yes/no), probe_err — код завершения curl. Тело ответа
+  # не сохраняется.
+  setup_probe() {
+    local hdr rc=0
+    hdr="$(mktemp)"
+    probe_code="$(curl -s -o /dev/null -D "$hdr" -m 8 -w '%{http_code}' "$1/shturman-setup/" 2>/dev/null)" || rc=$?
+    probe_err="$rc"
+    if tr -d '\r' < "$hdr" | grep -Eqi '^x-shturman-setup-page:[[:space:]]*1[[:space:]]*$'; then probe_mark=yes; else probe_mark=no; fi
+    rm -f "$hdr"
+  }
+  if [ -z "$st" ]; then
+    :   # сервис не отдал состояние — об этом уже сказано строкой archive
+  elif [ "$setup_known" != "yes" ]; then
+    warn setup-page "страницы настройки переписки у этого сервиса нет: это сервис прежней версии — обновите экземпляр (UPGRADING.md) и запустите ./ops/up.sh"
+  else
+    # Адреса: записанный в .env, тот, с которым сервис запущен на самом деле, и адрес дашборда.
+    # Сравниваются целиком — схема, имя и порт: одно имя на разных портах — разные адреса.
+    setup_url="$(url_origin "$(env_get SHTURMAN_SETUP_URL)")"
+    svc_setup="$(url_origin "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$svc" 2>/dev/null \
+      | sed -n 's/^SHTURMAN_SETUP_ORIGIN=//p' | tail -n 1)")"
+    dash_url=""
+    if [ "$MODE" = hermes ]; then dash_url="${public_url:-}"; dash_url="${dash_url:-$(env_get SHTURMAN_PUBLIC_URL)}"; fi
+    dash_origin="$(url_origin "$dash_url")"
+    same=no
+    if [ "$setup_reason" = same_origin ]; then same=yes; fi
+    if [ -n "$dash_origin" ] && { [ "$setup_url" = "$dash_origin" ] || [ "$svc_setup" = "$dash_origin" ]; }; then same=yes; fi
+
+    # 1. Страница отвечает на локальном адресе, и отвечает именно сервис.
+    setup_probe http://127.0.0.1:8765
+    setup_marked=no
+    if [ "${probe_code:-000}" = "200" ] && [ "$probe_mark" = yes ]; then
+      setup_marked=yes
+      pass setup-page "страница настройки переписки отвечает на локальном адресе (вход — по одноразовой ссылке: ./ops/setup-link.sh, по просьбе владельца)"
+    elif [ "${probe_code:-000}" = "200" ]; then
+      warn setup-page "страница настройки переписки отвечает на локальном адресе, но без метки X-Shturman-Setup-Page — это сервис прежней сборки: обновите экземпляр (UPGRADING.md) и запустите ./ops/up.sh. Без метки проверки по внешним адресам не выполняются"
+    elif [ "$setup_enabled" != "yes" ] && [ "$same" != yes ]; then
+      # При совпавших адресах сервис тоже сообщает enabled=false, но на локальном адресе страницу
+      # отдаёт — её отсутствие там уже неполадка (ветка ниже).
+      warn setup-page "страница настройки переписки в сервисе не запущена (HTTP ${probe_code:-000} на локальном адресе) — docker logs --tail 50 $svc"
+    else
+      fail setup-page "страница настройки переписки не отвечает на 127.0.0.1:8765/shturman-setup/ (HTTP ${probe_code:-000}) — docker logs --tail 50 $svc"
+    fi
+
+    # 2. У страницы свой адрес — не тот, что у дашборда.
+    setup_public=no
+    if [ "$same" = yes ]; then
+      fail setup-origin "адрес страницы настройки совпал с адресом дашборда — по внешнему адресу сервис её не отдаёт (через туннель SSH она открывается: ./ops/setup-link.sh --local). Нужен отдельный адрес — ./ops/set-setup-url.sh (проще всего то же имя на другом порту), затем ./ops/up.sh. На общем адресе ассистент мог бы действовать на странице от имени владельца"
+    elif [ "$MODE" != hermes ]; then
+      if [ -z "$setup_url" ] && [ -z "$svc_setup" ]; then
+        pass setup-origin "внешнего адреса у страницы настройки нет, как и положено без Hermes: она открывается с сервера и через туннель SSH (./ops/setup-link.sh)"
+      else
+        warn setup-origin "режим без Hermes, а у страницы настройки задан внешний адрес (${svc_setup:-$setup_url}) — наружу в этом режиме ничего не публикуется: ./ops/set-setup-url.sh --clear, затем ./ops/up.sh"
+      fi
+    elif [ -z "$setup_url" ] && [ -z "$svc_setup" ]; then
+      if [ -z "$dash_origin" ]; then
+        warn setup-origin "адрес страницы настройки не задан: сначала адрес дашборда — ./ops/set-public-url.sh (он запишет и адрес страницы). До тех пор страница открывается через туннель SSH: ./ops/setup-link.sh"
+      else
+        warn setup-origin "адрес страницы настройки не задан: она открывается только через туннель SSH (./ops/setup-link.sh). Чтобы открывать её по кнопке из мастера — ./ops/set-setup-url.sh"
+      fi
+    elif [ "$setup_url" != "$svc_setup" ]; then
+      warn setup-origin "адрес страницы настройки в .env (${setup_url:-не задан}) отличается от того, с которым запущен сервис переписки (${svc_setup:-без адреса}) — запустите ./ops/up.sh"
+    elif [ "$setup_fields" != yes ]; then
+      warn setup-origin "адрес задан ($svc_setup), но сервис переписки прежней сборки и не сверяет его с адресом дашборда — обновите экземпляр (UPGRADING.md) и запустите ./ops/up.sh"
+    else
+      setup_public=yes
+      pass setup-origin "у страницы настройки свой адрес: $svc_setup (дашборд — ${dash_origin:-не задан})"
+    fi
+
+    # 3. По своему адресу страницу отдаёт сервис переписки.
+    if [ "$setup_public" = yes ] && [ "$setup_marked" = yes ]; then
+      setup_probe "$svc_setup"
+      setup_port="$(url_port "$svc_setup")"
+      fix_proxy="нужен блок сайта для этого адреса в обратном прокси по образцу config/Caddyfile.example (правка прокси — стоп-точка); до тех пор страница открывается через туннель SSH: ./ops/setup-link.sh --local"
+      fix_port="проверьте, что порт $setup_port открыт в firewall сервера и хостинга (стоп-точка) и что в обратном прокси есть блок сайта на этом порту (config/Caddyfile.example); до тех пор страница открывается через туннель SSH: ./ops/setup-link.sh --local"
+      case "$probe_err" in
+        0)
+          case "${probe_code:-000}" in
+            200)
+              if [ "$probe_mark" = yes ]; then
+                pass setup-page-public "страница настройки переписки открывается по своему адресу"
+              else
+                warn setup-page-public "по адресу страницы настройки отвечает не сервис переписки (HTTP 200 без метки): блок сайта в прокси ведёт не на 127.0.0.1:8765 или перед адресом стоит внешняя защита со своей страницей — $fix_proxy"
+              fi ;;
+            404) warn setup-page-public "по адресу страницы настройки прокси отвечает «не найдено» (HTTP 404): в его блоке нет пути /shturman-setup/* — $fix_proxy" ;;
+            421) warn setup-page-public "сервис переписки не узнаёт этот адрес (HTTP 421): он запущен с другим адресом — ./ops/up.sh; если не помогло, прокси подменяет заголовок Host (он должен доходить как есть, вместе с портом)" ;;
+            502|503|504) warn setup-page-public "блок сайта для страницы настройки есть, но сервис переписки прокси не отвечает (HTTP $probe_code) — смотрите строку service и адрес 127.0.0.1:8765 в блоке прокси" ;;
+            52[0-9]|530) warn setup-page-public "внешняя защита перед адресом (Cloudflare или подобная) не достучалась до сервера (HTTP $probe_code): $fix_port" ;;
+            30[1-8]|401|403) warn setup-page-public "перед адресом страницы настройки стоит внешняя защита или перенаправление (HTTP $probe_code) — проверьте страницу из браузера; защита должна пропускать HTTPS на порт $setup_port" ;;
+            *) warn setup-page-public "страница настройки переписки по своему адресу не открывается (HTTP ${probe_code:-000}) — $fix_proxy" ;;
+          esac ;;
+        6) warn setup-page-public "имя из адреса страницы настройки не находится: записи DNS нет или она ещё не разошлась (запись делает владелец)" ;;
+        7) warn setup-page-public "по адресу страницы настройки соединение не принято: порт $setup_port закрыт или обратный прокси его не слушает — $fix_port" ;;
+        28) warn setup-page-public "адрес страницы настройки не ответил за 8 секунд: похоже, порт $setup_port закрыт — $fix_port" ;;
+        35|51|58|59|60|77|83|90|91) warn setup-page-public "по адресу страницы настройки нет подходящего сертификата (код curl $probe_err): у прокси нет блока сайта для этого адреса или сертификат ещё не получен — $fix_proxy" ;;
+        *) warn setup-page-public "адрес страницы настройки не проверен: запрос не удался (код curl $probe_err) — $fix_port" ;;
+      esac
+    elif [ "$setup_public" = yes ]; then
+      warn setup-page-public "не проверено: без метки сервиса его ответ по внешнему адресу не отличить от чужого"
+    fi
+
+    # 4. По адресу дашборда страница настройки не отдаётся.
+    if [ "$MODE" = hermes ] && [ -n "$dash_origin" ] && [ -n "${public_url:-}" ]; then
+      # Запрос идёт в корень адреса дашборда (схема, имя, порт): для браузера «общий адрес» — это
+      # они, а путь, если он записан в SHTURMAN_PUBLIC_URL, значения не имеет.
+      setup_probe "$dash_origin"
+      fix_dash="уберите /shturman-setup/* из блока дашборда в обратном прокси и поставьте на этот путь отказ (config/Caddyfile.example; правка прокси — стоп-точка)"
+      if [ "$probe_mark" = yes ]; then
+        fail setup-isolation "по адресу дашборда отдаётся страница настройки переписки (HTTP ${probe_code:-000}, метка сервиса) — так быть не должно: $fix_dash. На общем адресе ассистент может действовать на странице от имени владельца"
+      elif [ "$probe_err" != 0 ]; then
+        warn setup-isolation "не проверено: адрес дашборда не ответил (код curl $probe_err)"
+      elif [ "$setup_marked" != yes ] && [ "$setup_fields" != yes ]; then
+        warn setup-isolation "не проверено: сервис прежней сборки не ставит метку, и его ответ по адресу дашборда не отличить от чужого (HTTP ${probe_code:-000})"
+      elif [ "${probe_code:-000}" = "421" ]; then
+        warn setup-isolation "по адресу дашборда запрос к /shturman-setup/ всё ещё доходит до сервиса переписки (он отвечает отказом, HTTP 421): $fix_dash"
+      else
+        pass setup-isolation "по адресу дашборда страница настройки переписки не отдаётся (HTTP ${probe_code:-000})"
+      fi
+    fi
+
+    # 5. Что уже настроено — только то, что относится к первой настройке: ключи, аккаунт, архив.
+    setup_line="ключи приложения Telegram: $(word "$setup_keys" "заданы" "не заданы"), аккаунтов Telegram: ${setup_accounts:-0}, сообщений в архиве: $(num messages)"
+    setup_messages="$(num messages)"
+    if [ "${setup_accounts:-0}" -gt 0 ] || [ "${setup_messages:-0}" -gt 0 ] || [ "$setup_business" = "yes" ]; then
+      pass setup-state "$setup_line"
+    else
+      warn setup-state "$setup_line. Переписка ещё не настроена — это делает владелец на странице настройки переписки: ключи, вход в аккаунт, выбор чатов"
+    fi
   fi
 
   # Защита от внедрённых инструкций: включена ли, отвечает ли модель и сколько входящих сообщений
@@ -235,7 +429,9 @@ print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n
 
   # --- свой бот согласований и своя модель сервиса ---
   # Только признаки и коды неполадок из GET /api/executor/status: ни токена, ни ключа, ни имён.
-  # Без Hermes это единственные бот и модель; с Hermes строки появляются, только если они настроены.
+  # В первую настройку бот согласований не входит: он понадобится, когда владелец решит включать
+  # отправку. С Hermes строки approvals-* и model появляются, только если бот и модель настроены.
+  # Без Hermes это единственные бот и модель, поэтому об их отсутствии сказано одной спокойной строкой.
   bot_configured=unknown; bot_polling=unknown; bot_problem=""; bot_owner=unknown; bot_business=unknown
   llm_configured=unknown; llm_model=""; llm_last=unknown; llm_problem=""; llm_calls=0; llm_failures=0
   while IFS='=' read -r k v; do
@@ -273,7 +469,7 @@ EOF3
     if [ "$MODE" = standalone ]; then fail approvals-bot "сервис не отдал состояние бота согласований — docker logs --tail 50 $svc"; fi
   elif [ "$bot_configured" = no ]; then
     if [ "$MODE" = standalone ]; then
-      warn approvals-bot "бот согласований не настроен — карточки и кнопки владельцу доставить некому; токен вводит владелец: ./ops/init-env.sh, затем ./ops/up.sh"
+      warn approvals-bot "бот согласований не настроен: архив и поиск работают, а карточки с найденными обязательствами владельцу доставить некому. Когда он понадобится, токен вводит владелец — на странице настройки переписки, раздел «Дополнительно», либо в терминале: ./ops/init-env.sh, затем ./ops/up.sh"
     fi
   else
     if [ -n "$bot_problem" ]; then
@@ -281,15 +477,15 @@ EOF3
     elif [ "$bot_polling" = yes ]; then pass approvals-bot "бот согласований на связи с Telegram"
     else warn approvals-bot "бот согласований ещё не начал опрос Telegram — повторите проверку через минуту"; fi
     if [ "$bot_owner" = yes ]; then pass approvals-owner "владелец привязан к боту согласований"
-    else warn approvals-owner "владелец не привязан — карточки не отправляются, кнопки не действуют: ./ops/bot-bind.sh"; fi
+    else warn approvals-owner "владелец не привязан к боту согласований — карточки не отправляются, кнопки не действуют: привязка — на странице настройки переписки, раздел «Дополнительно», либо ./ops/bot-bind.sh"; fi
     if [ "$bot_business" = no ]; then
-      warn approvals-business "у бота выключен бизнес-режим — он нужен, только если подключать личные чаты (у @BotFather: Bot Settings → Business Mode)"
+      warn approvals-business "у бота выключен бизнес-режим — он нужен, только если подключать личные чаты (у @BotFather: Bot Settings → Secretary Mode; раньше пункт назывался Business Mode)"
     fi
   fi
 
   if [ "$llm_configured" = no ]; then
     if [ "$MODE" = standalone ]; then
-      warn model "своя модель не настроена — обязательства и страницы памяти не разбираются; ключ и имя модели вводит владелец: ./ops/init-env.sh, затем ./ops/up.sh"
+      warn model "своя модель не настроена: архив и поиск работают, а обязательства и страницы памяти не разбираются. Ключ и имя модели вводит владелец — на странице настройки переписки, раздел «Дополнительно», либо в терминале: ./ops/init-env.sh, затем ./ops/up.sh"
     fi
   elif [ "$llm_configured" = yes ]; then
     if [ "$llm_last" = no ] || { [ "$llm_last" = unknown ] && [ -n "$llm_problem" ]; }; then

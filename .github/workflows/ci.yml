@@ -63,6 +63,23 @@ jobs:
           test "$(emb)" = "--model-id /data/model --served-model-name intfloat/multilingual-e5-small --max-batch-tokens 2048 intfloat/multilingual-e5-small"
           export SHTURMAN_EMBEDDINGS_MODEL=deepvk/USER2-small SHTURMAN_EMBEDDINGS_MODEL_DIR=user2-small
           test "$(emb)" = "--model-id /data/user2-small --served-model-name deepvk/USER2-small --max-batch-tokens 2048 deepvk/USER2-small"
+          # Страница настройки переписки: сервис получает СВОЙ адрес страницы (SHTURMAN_SETUP_URL) и,
+          # отдельно, адрес дашборда — только для сверки. Адрес дашборда адресом страницы не становится
+          # никогда. Порт сервиса по-прежнему опубликован только на локальном адресе сервера.
+          svc() { docker compose config --format json | python3 -c 'import json, sys; s = json.load(sys.stdin)["services"]["shturman"]; e = s["environment"]; print(e["SHTURMAN_SETUP_ORIGIN"] or "-", e["SHTURMAN_DASHBOARD_ORIGIN"] or "-", " ".join(p["host_ip"] + ":" + str(p["published"]) + ":" + str(p["target"]) for p in s["ports"]))'; }
+          test "$(svc)" = "- - 127.0.0.1:8765:8765"
+          export SHTURMAN_PUBLIC_URL=https://assistant.example.com
+          test "$(svc)" = "- https://assistant.example.com 127.0.0.1:8765:8765"
+          export SHTURMAN_SETUP_URL=https://assistant.example.com:8443
+          test "$(svc)" = "https://assistant.example.com:8443 https://assistant.example.com 127.0.0.1:8765:8765"
+          # Адрес API своей модели: пока строки в .env нет, контейнер переменную не получает вовсе.
+          # Иначе сервис считал бы адрес заданным на сервере, и страница настройки не давала бы его
+          # ввести. Со строкой — получает её значение.
+          llm() { docker compose config --format json | python3 -c 'import json, sys; e = json.load(sys.stdin)["services"]["shturman"]["environment"]; print(e.get("SHTURMAN_LLM_BASE_URL", "нет"))'; }
+          case "$(llm)" in None|нет) ;; *) echo "адрес модели не должен подставляться по умолчанию: $(llm)"; exit 1 ;; esac
+          export SHTURMAN_LLM_BASE_URL=https://openrouter.ai/api/v1
+          test "$(llm)" = "https://openrouter.ai/api/v1"
+          unset SHTURMAN_LLM_BASE_URL
         env:
           HERMES_UID: "1000"
           HERMES_GID: "1000"
@@ -92,6 +109,23 @@ jobs:
           grep -qx 'SHTURMAN_MODE=hermes' .env
           grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
           test "$(stat -c '%a' .env)" = "600"
+          # Неразборчивый адрес в .env ./ops/up.sh останавливает до любого обращения к Docker: сервис
+          # переписки с таким значением не запустился бы. Путь у адреса дашборда допустим, у адреса
+          # страницы настройки — нет; сам запуск стека здесь подменён отказом.
+          mkdir stub; printf '#!/bin/sh\necho "docker $*" >> "%s/docker-called"\nexit 1\n' "$tmp" > stub/docker; chmod +x stub/docker
+          for bad in 'SHTURMAN_PUBLIC_URL=assistant.example.com' 'SHTURMAN_PUBLIC_URL=https://user@assistant.example.com' \
+                     'SHTURMAN_SETUP_URL=https://assistant.example.com:8443/shturman-setup/' 'SHTURMAN_SETUP_URL=assistant.example.com:8443'; do
+            printf 'SHTURMAN_MODE=hermes\n%s\n' "$bad" > .env
+            code=0; PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1 || code=$?
+            [ "$code" -eq 1 ] || { echo "$bad: код $code вместо 1"; exit 1; }
+            grep -q "^${bad%%=*} в .env записан не как" out.txt || { echo "$bad: нет объяснения"; cat out.txt; exit 1; }
+            if [ -e docker-called ]; then echo "$bad: до Docker дело дойти не должно"; exit 1; fi
+          done
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com/dash/\nSHTURMAN_SETUP_URL=https://assistant.example.com:8443/\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "адрес с путём у дашборда и с косой чертой у страницы допустимы"; cat out.txt; exit 1; fi
+          test -e docker-called
+          rm -rf stub docker-called out.txt
           # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
           # профиль и не трогает ни чужой, ни профиль Hermes. Запуск стека здесь подменён.
           printf '#!/bin/sh\nexit 0\n' > ops/up.sh
@@ -115,6 +149,169 @@ jobs:
           ./ops/init-env.sh --auto > /dev/null
           grep -qx 'COMPOSE_PROFILES=hermes' .env
           test "$(stat -c '%a' .env)" = "600"
+      # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
+      # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
+      # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.
+      - name: ops — отпечаток плагина
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops plugins "$tmp"/; cd "$tmp"
+          printf '. ops/lib.sh\nplugin_print\n' > print.sh
+          a="$(bash print.sh)"; test "${#a}" = "64"
+          test "$(bash print.sh)" = "$a"
+          echo 'правка' > plugins/shturman/tests/new-file.txt; test "$(bash print.sh)" = "$a"
+          echo '# правка' >> plugins/shturman/cli.py; test "$(bash print.sh)" != "$a"
+          grep -q 'plugin_print' ops/up.sh && grep -q 'plugin-code' ops/doctor.sh
+      # Адрес страницы настройки переписки. Она обязана стоять на отдельном адресе (origin), не на
+      # адресе дашборда: на общем адресе ассистент в Hermes мог бы действовать на ней от имени
+      # вошедшего владельца. По умолчанию — то же имя, порт 8443.
+      - name: ops — адрес страницы настройки переписки
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops "$tmp"/; cd "$tmp"
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_API_TOKEN=ci-only-secret-value\n' > .env; chmod 600 .env
+          url() { grep -E "^$1=" .env | cut -d= -f2-; }
+          # Адрес дашборда записывается вместе с адресом страницы по умолчанию — с портом.
+          ./ops/set-public-url.sh https://assistant.example.com > out.txt
+          test "$(url SHTURMAN_PUBLIC_URL)" = "https://assistant.example.com"
+          test "$(url SHTURMAN_SETUP_URL)" = "https://assistant.example.com:8443"
+          grep -q 'https://assistant.example.com:8443' out.txt
+          if grep -q 'ci-only-secret-value' out.txt; then echo "скрипт напечатал чужую строку .env"; exit 1; fi
+          # Совпадающий адрес — отказ с кодом 2 и объяснением; .env не меняется. Регистр, обычный порт
+          # и косая черта на конце адрес другим не делают.
+          before="$(cat .env)"
+          for same in https://assistant.example.com https://ASSISTANT.example.com:443/ https://assistant.example.com:443; do
+            code=0; ./ops/set-setup-url.sh "$same" > out.txt 2>&1 || code=$?
+            [ "$code" -eq 2 ] || { echo "$same: код $code вместо 2"; exit 1; }
+            grep -q 'ОТКАЗ' out.txt && grep -q 'Ничего не записано' out.txt
+          done
+          test "$(cat .env)" = "$before"
+          # Не https, путь, имя пользователя, IP-адрес, неверный порт — тоже отказ.
+          for bad in http://assistant.example.com:8443 https://assistant.example.com:8443/shturman-setup/ \
+                     https://user@assistant.example.com:8443 https://10.0.0.1:8443 https://assistant.example.com:99999 assistant.example.com; do
+            if ./ops/set-setup-url.sh "$bad" > /dev/null 2>&1; then echo "$bad: адрес не должен приниматься"; exit 1; fi
+          done
+          test "$(cat .env)" = "$before"
+          # Другой порт и отдельное имя принимаются; адрес записывается в приведённом виде.
+          ./ops/set-setup-url.sh https://Assistant.example.com:9443/ > /dev/null
+          test "$(url SHTURMAN_SETUP_URL)" = "https://assistant.example.com:9443"
+          ./ops/set-setup-url.sh https://setup.example.com > /dev/null
+          test "$(url SHTURMAN_SETUP_URL)" = "https://setup.example.com"
+          # Заданный вручную адрес set-public-url.sh не трогает, а занять его дашбордом не даёт.
+          ./ops/set-public-url.sh https://new.example.com > /dev/null
+          test "$(url SHTURMAN_SETUP_URL)" = "https://setup.example.com"
+          if ./ops/set-public-url.sh https://setup.example.com > /dev/null 2>&1; then echo "адрес дашборда не должен совпасть с адресом страницы"; exit 1; fi
+          test "$(url SHTURMAN_PUBLIC_URL)" = "https://new.example.com"
+          # Убранный адрес остаётся убранным: строка пустая, по умолчанию её никто не возвращает.
+          ./ops/set-setup-url.sh --clear > /dev/null
+          grep -qx 'SHTURMAN_SETUP_URL=' .env
+          printf '. ops/lib.sh\nensure_setup_url "$1"\n' > ensure.sh
+          bash ensure.sh hermes
+          grep -qx 'SHTURMAN_SETUP_URL=' .env
+          # Экземпляр, развёрнутый до появления этой строки: ./ops/up.sh дописывает адрес по умолчанию
+          # (здесь — та же функция, которой он пользуется), ничего другого в .env не меняя.
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\nSHTURMAN_API_TOKEN=ci-only-secret-value\n' > .env
+          bash ensure.sh hermes > out.txt
+          test "$(url SHTURMAN_SETUP_URL)" = "https://assistant.example.com:8443"
+          test "$(grep -c . .env)" = "4" && grep -qx 'SHTURMAN_API_TOKEN=ci-only-secret-value' .env
+          if grep -q 'ci-only-secret-value' out.txt; then echo "функция напечатала чужую строку .env"; exit 1; fi
+          bash ensure.sh hermes; test "$(grep -c '^SHTURMAN_SETUP_URL=' .env)" = "1"
+          grep -q 'ensure_setup_url "\$MODE"' ops/up.sh
+          # Адрес дашборда без https или уже на порту 8443: адреса по умолчанию нет, строка не появляется.
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=http://assistant.example.com\n' > .env
+          bash ensure.sh hermes; if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "для http адреса по умолчанию нет"; exit 1; fi
+          # Без Hermes внешний адрес не задаётся вовсе, а ссылка входа — только на локальный адрес.
+          printf 'SHTURMAN_MODE=standalone\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\n' > .env
+          bash ensure.sh standalone; if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "без Hermes адрес не пишется"; exit 1; fi
+          code=0; ./ops/set-setup-url.sh https://assistant.example.com:8443 > /dev/null 2>&1 || code=$?
+          [ "$code" -eq 2 ] || { echo "без Hermes адрес страницы не задаётся: код $code вместо 2"; exit 1; }
+          if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "без Hermes адрес не пишется"; exit 1; fi
+          # Ссылка входа строится только из адреса страницы: адрес дашборда в неё не попадает.
+          if grep -Eq 'base=.*SHTURMAN_PUBLIC_URL' ops/setup-link.sh; then echo "ссылка входа не должна строиться из адреса дашборда"; exit 1; fi
+          grep -q 'env_get SHTURMAN_SETUP_URL' ops/setup-link.sh
+      # Образец настройки прокси: блок дашборда не отдаёт страницу настройки переписки и ничего
+      # не проксирует на порт сервиса; из порта сервиса наружу выходит один префикс, во втором блоке.
+      - name: прокси — страница настройки переписки только в своём блоке
+        run: |
+          f=config/Caddyfile.example
+          block() { awk -v head="$1" '$0 == head {f=1} f {print} f && /^}/ {exit}' "$f" | grep -Ev '^[[:space:]]*#'; }
+          dash="$(block 'assistant.example.com {')"; setup="$(block 'assistant.example.com:8443 {')"
+          [ -n "$dash" ] && [ -n "$setup" ] || { echo "в образце должно быть два блока сайта"; exit 1; }
+          # Блок дашборда: порта сервиса нет вовсе, а на /shturman-setup* стоит явный отказ.
+          if grep -q '8765' <<< "$dash"; then echo "блок дашборда не должен проксировать на порт сервиса"; exit 1; fi
+          test "$(grep -c 'shturman-setup' <<< "$dash")" = "1"
+          grep -Eq '^[[:space:]]*@no_setup_page path /shturman-setup\*$' <<< "$dash"
+          grep -A1 -E '^[[:space:]]*handle @no_setup_page \{$' <<< "$dash" | grep -Eq '^[[:space:]]*respond 404$'
+          test "$(grep -c 'reverse_proxy' <<< "$dash")" = "1" && grep -Eq '^[[:space:]]*reverse_proxy 127\.0\.0\.1:9119$' <<< "$dash"
+          # Блок страницы: один выход на порт сервиса, только под префиксом; дашборда нет; остальное — отказ.
+          test "$(grep -c 'reverse_proxy' <<< "$setup")" = "1" && grep -Eq '^[[:space:]]*reverse_proxy 127\.0\.0\.1:8765$' <<< "$setup"
+          if grep -q '9119' <<< "$setup"; then echo "в блоке страницы настройки не должно быть дашборда"; exit 1; fi
+          grep -B1 -E '^[[:space:]]*reverse_proxy 127\.0\.0\.1:8765$' <<< "$setup" | grep -Eq '^[[:space:]]*handle @setup_page \{$'
+          grep -q '@setup_page expression' <<< "$setup" && grep -q '\^/shturman-setup/' <<< "$setup"
+          grep -Eq '^[[:space:]]*respond 404$' <<< "$setup"
+          grep -q 'Strict-Transport-Security' <<< "$setup"
+          # Заголовок Host не подменяется, журнал запросов не включён — ни в одном блоке.
+          if grep -Ev '^[[:space:]]*#' "$f" | grep -Eq 'header_up[[:space:]]+Host|^[[:space:]]*log([[:space:]]|$)'; then echo "Host не подменяется, журнал не включается"; exit 1; fi
+          # Настройку проверяет сам Caddy той версии, с которой она проверена.
+          docker run --rm -v "$PWD/$f:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      # Справка и неизвестные ключи. На -h и --help каждый скрипт печатает своё назначение и выходит
+      # с кодом 0 до любых действий: в каталоге без .env и данных он ничего не создаёт и не зовёт
+      # ни Docker, ни curl (вместо них подставлены заглушки, которые записывают вызов). На
+      # неизвестный ключ — сообщение и код 2, тоже без действий. Так ./ops/activation-link.sh --help
+      # не выпустит настоящую ссылку входа.
+      - name: ops — справка и неизвестные ключи
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops "$tmp"/; mkdir "$tmp/stub" "$tmp/empty"
+          for tool in docker curl ssh; do
+            printf '#!/bin/sh\necho "%s $*" >> "%s/called"\nexit 1\n' "$tool" "$tmp" > "$tmp/stub/$tool"
+          done
+          chmod +x "$tmp"/stub/*
+          export PATH="$tmp/stub:$PATH"
+          cd "$tmp/empty"
+          listing() { find "$tmp" | sort; }
+          before="$(listing)"
+          run() { code=0; out="$(bash "$@" < /dev/null 2>&1)" || code=$?; }
+          for f in ../ops/*.sh; do
+            for key in --help -h; do
+              run "$f" "$key"
+              [ "$code" -eq 0 ] || { echo "$f $key: код $code вместо 0"; exit 1; }
+              [ -n "$out" ] || { echo "$f $key: справка пустая"; exit 1; }
+            done
+            run "$f" --no-such-key
+            [ "$code" -eq 2 ] || { echo "$f --no-such-key: код $code вместо 2"; exit 1; }
+            grep -q 'no-such-key' <<< "$out" || { echo "$f --no-such-key: в сообщении нет имени ключа"; exit 1; }
+          done
+          # Справка побеждает и после других параметров; лишний параметр — тоже ошибка, а не действие.
+          for args in "up.sh --pull --help" "guard.sh on --help" "embeddings.sh on --model e5-small --help" \
+                      "mode.sh set standalone --help" "setup-link.sh --local --help" "backup.sh --list --help"; do
+            # shellcheck disable=SC2086
+            run ../ops/$args
+            [ "$code" -eq 0 ] || { echo "$args: код $code вместо 0"; exit 1; }
+          done
+          for args in "activation-link.sh сейчас" "bot-bind.sh x" "setup-link.sh x" "guard.sh on x" \
+                      "backup.sh x" "doctor.sh x" "preflight.sh x" "logout-all.sh x" "up.sh x" \
+                      "set-setup-url.sh --clear https://assistant.example.com:8443" "set-setup-url.sh a b"; do
+            # shellcheck disable=SC2086
+            run ../ops/$args
+            [ "$code" -eq 2 ] || { echo "$args: код $code вместо 2"; exit 1; }
+          done
+          test "$(listing)" = "$before"
+          if [ -e "$tmp/called" ]; then echo "справка обратилась к внешней программе:"; cat "$tmp/called"; exit 1; fi
+          # Без Hermes и без запущенного сервиса ссылка настройки переписки не выдаётся; из .env
+          # читаются только режим и адреса дашборда и страницы настройки.
+          cd "$tmp"; printf 'SHTURMAN_MODE=standalone\n' > .env
+          if ./ops/setup-link.sh > link.out 2>&1; then echo "без сервиса ссылки быть не должно"; exit 1; fi
+          grep -q 'не запущен' link.out
       # Образ сервиса должен собираться и запускаться: без базы он обязан выйти с понятной ошибкой.
       - run: docker build -t shturman-service:ci service
       - run: docker run --rm shturman-service:ci --help
+      # Страница настройки и миграции — данные пакета (pyproject.toml, package-data): в образе они
+      # должны лежать рядом с кодом, иначе сервис запустится, а страница ответит ошибкой.
+      - name: образ — файлы страницы настройки и миграции на месте
+        run: |
+          docker run --rm --entrypoint python shturman-service:ci -c '
+          from importlib import resources
+          root = resources.files("shturman")
+          for name in ("index.html", "setup.js", "setup.css", "qr.js"):
+              assert (root / "setup_page" / "static" / name).read_bytes(), name
+          names = sorted(p.name for p in (root / "migrations").iterdir() if p.name.endswith(".sql"))
+          assert names and names[-1] >= "0016_setup_page.sql", names
+          print("страница:", "ok", "миграций:", len(names))'

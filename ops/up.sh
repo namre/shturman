@@ -2,13 +2,29 @@
 # Поднимает стек (или применяет изменения). Повторный запуск безопасен.
 #   ./ops/up.sh          — скачать образы при необходимости и запустить
 #   ./ops/up.sh --pull   — сначала обновить образы указанных версий
+#   ./ops/up.sh --help   — эта справка; ничего не запускается
 # Что запускается, зависит от режима установки (SHTURMAN_MODE в .env, ./ops/mode.sh):
 #   hermes      — Hermes, сервис переписки, база; плагин и архив подключаются к Hermes;
 #   standalone  — только сервис переписки и база. Шаги Hermes пропускаются, его образ
 #                 не скачивается, а оставшийся от прежнего режима контейнер убирается.
+# В режиме с Hermes, если адрес дашборда задан, а адреса страницы настройки переписки в .env ещё
+# нет, скрипт дописывает адрес по умолчанию: то же имя, порт 8443 (./ops/set-setup-url.sh --help).
+# Прокси и firewall скрипт не трогает.
+# Если адрес дашборда или адрес страницы настройки записан в .env не как адрес (например, без
+# https://), скрипт останавливается до перезапуска и называет строку: с таким значением сервис
+# переписки не запустился бы. Из .env читаются только несекретные строки: режим, профили, эти два
+# адреса и — только на «задана ли и пуста ли» — строка адреса API своей модели.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
+ops_help "$@"
+pull=no
+for arg in "$@"; do
+  case "$arg" in
+    --pull) pull=yes ;;
+    *) ops_unknown "$arg" ;;
+  esac
+done
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 
@@ -16,6 +32,42 @@ cd "$(dirname "$0")/.." || exit 1
 # дописываются сами. Уже заданные значения скрипт не трогает и не печатает.
 ./ops/init-env.sh --auto > /dev/null
 load_mode
+# Адрес страницы настройки переписки по умолчанию (то же имя, что у дашборда, порт 8443) —
+# экземпляру, у которого этой строки ещё нет. Ничего другого в .env при этом не меняется.
+ensure_setup_url "$MODE"
+
+# Оба адреса compose.yaml передаёт сервису переписки (SHTURMAN_DASHBOARD_ORIGIN и
+# SHTURMAN_SETUP_ORIGIN), и сервис разбирает их при запуске: с неразборчивым адресом он не
+# запускается вовсе, а контейнер уходит в цикл перезапусков. Поэтому очевидно неверную запись
+# останавливаем здесь, до перезапуска, пока прежний сервис ещё работает. У адреса дашборда путь
+# и косая черта на конце допустимы (сервис берёт из него только схему, имя и порт), у адреса
+# страницы настройки — нет. Проверяется только вид записи; неверный порт и подобное сервис назовёт
+# сам, в журнале контейнера. Обе строки не секретные; значения не печатаются.
+addr_bad() {
+  local v
+  v="$(env_get "$1")"
+  [ -n "$v" ] || return 1
+  if printf '%s' "$v" | grep -Eq "$2"; then return 1; fi
+  return 0
+}
+if addr_bad SHTURMAN_PUBLIC_URL '^https?://[^/?#@[:space:]]+([/?#].*)?$'; then
+  echo "SHTURMAN_PUBLIC_URL в .env записан не как адрес вида https://имя[:порт] — с ним сервис переписки не запустится." >&2
+  echo "Запишите адрес заново: ./ops/set-public-url.sh https://адрес — и повторите ./ops/up.sh. Ничего не перезапущено." >&2
+  exit 1
+fi
+if addr_bad SHTURMAN_SETUP_URL '^https?://[^/?#@[:space:]]+/?$'; then
+  echo "SHTURMAN_SETUP_URL в .env записан не как https://имя[:порт] без пути — с ним сервис переписки не запустится." >&2
+  echo "Запишите адрес заново: ./ops/set-setup-url.sh https://имя:порт (или --clear) — и повторите ./ops/up.sh. Ничего не перезапущено." >&2
+  exit 1
+fi
+
+# Адрес API своей модели контейнер получает, только когда строка SHTURMAN_LLM_BASE_URL есть в .env
+# (compose.yaml): адрес из окружения страница настройки менять не даёт. Строка без значения значит
+# «адрес по умолчанию», но сервис принял бы её за пустой адрес — на время запуска подставляем
+# адрес по умолчанию. Файл .env при этом не меняется.
+if env_has SHTURMAN_LLM_BASE_URL && [ -z "$(env_get SHTURMAN_LLM_BASE_URL)" ]; then
+  export SHTURMAN_LLM_BASE_URL="https://api.openai.com/v1"
+fi
 
 # Каталог данных принадлежит тому, кто запускает стек; Hermes и сервис переписки в контейнерах
 # работают под ним же. Точки подключения создаём сами: иначе Docker создаст их от имени root.
@@ -87,6 +139,17 @@ wait_service() {
   done
   return 1
 }
+# Проверка здоровья и, если она прошла, одна строка о том, что дальше. Код возврата — её.
+finish() {
+  local rc=0
+  ./ops/doctor.sh || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$MODE" = hermes ]; then
+    echo "Дальше — настройка переписки: владелец открывает её кнопкой в мастере, а входит по одноразовой ссылке; ссылку выдаёт ./ops/setup-link.sh — только по его просьбе."
+  elif [ "$rc" -eq 0 ]; then
+    echo "Дальше — настройка переписки: владелец открывает страницу через туннель SSH по одноразовой ссылке; ссылку и команду туннеля выдаёт ./ops/setup-link.sh — только по его просьбе."
+  fi
+  exit "$rc"
+}
 wait_dashboard() {
   for _ in $(seq 1 45); do
     if curl -fsS -o /dev/null -m 3 http://127.0.0.1:9119/api/status 2>/dev/null; then return 0; fi
@@ -95,7 +158,7 @@ wait_dashboard() {
   return 1
 }
 
-[ "${1:-}" = "--pull" ] && docker compose pull --quiet --ignore-buildable
+[ "$pull" = yes ] && docker compose pull --quiet --ignore-buildable
 
 docker compose config --quiet
 # Образ сервиса переписки собирается здесь же, из каталога service/.
@@ -107,6 +170,10 @@ if [ "$MODE" != hermes ] && docker inspect "$c" >/dev/null 2>&1; then
   # Если контейнер создавали не этим файлом Compose, первая команда его не увидит.
   if docker inspect "$c" >/dev/null 2>&1; then docker rm --force "$c" >/dev/null; fi
 fi
+# Когда контейнер Hermes запущен в последний раз (пусто — контейнера нет): по этому ниже видно,
+# перезапустил ли его сам Compose.
+hermes_started() { docker inspect -f '{{.State.StartedAt}}' "$c" 2>/dev/null || true; }
+started_before="$(hermes_started)"
 docker compose up -d --remove-orphans
 
 echo "Жду запуска сервиса переписки…"
@@ -120,7 +187,7 @@ if [ "$MODE" != hermes ]; then
   echo "пропущено: режим без Hermes — запись архива (MCP-сервер shturman) в настройки Hermes"
   echo "пропущено: режим без Hermes — ожидание дашборда Hermes"
   echo "Архив к своему Codex CLI или Claude Code владелец подключает по ./ops/connect.sh."
-  exec ./ops/doctor.sh
+  finish
 fi
 
 echo "Жду запуска контейнера…"
@@ -143,12 +210,26 @@ case "$(mcp_register)" in
   same) ;;
   *) echo "не удалось записать MCP-сервер shturman в настройки Hermes" >&2; exit 1 ;;
 esac
+# Hermes читает плагин при запуске и держит его в памяти. Если файлы плагина изменились с прошлого
+# запуска (обновление репозитория), а контейнер Hermes при этом не перезапускался, он продолжает
+# исполнять прежний код: прежний мастер и прежний перечень маршрутов прохода к сервису — в том
+# числе тех, что в новой версии закрыты. Поэтому при изменившемся плагине Hermes перезапускается.
+plugin_now="$(plugin_print)"
+plugin_was=""
+if [ -f "$PLUGIN_MARK" ]; then plugin_was="$(head -n 1 "$PLUGIN_MARK")"; fi
+if [ "$plugin_now" != "$plugin_was" ] && [ -n "$started_before" ] && [ "$(hermes_started)" = "$started_before" ]; then
+  echo "Файлы плагина shturman изменились с прошлого запуска — перезапускаю Hermes, чтобы он загрузил новый код плагина…"
+  restart=yes
+fi
 [ "$restart" = "yes" ] && docker compose restart hermes
 
 echo "Жду запуска Hermes…"
 if wait_dashboard; then
   echo "Дашборд Hermes отвечает на локальном адресе."
-  exec ./ops/doctor.sh
+  # Отпечаток кода плагина, с которым Hermes сейчас работает (секретов в нём нет).
+  mkdir -p local
+  printf '%s\n' "$plugin_now" > "$PLUGIN_MARK"
+  finish
 fi
 echo "Дашборд не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-hermes" >&2
 exit 1

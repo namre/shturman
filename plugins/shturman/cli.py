@@ -33,6 +33,8 @@ def status_lines(store: Store, auth: Auth) -> list[str]:
         f"wizard_completed={'yes' if wizard.get('completed_at') else 'no'}",
         f"activation_pending={'yes' if store.read('activation').get('digest') else 'no'}",
         f"bridge_own_bot={'unknown' if own_bot is None else 'yes' if own_bot else 'no'}",
+        # Бот-ассистент (бот Hermes) подключён владельцем в бизнес-режиме Telegram — схема до 0.0.6.
+        f"hermes_business={'yes' if store.read('business').get('connected') is True else 'no'}",
     ]
 
 

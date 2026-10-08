@@ -34,6 +34,13 @@ max_completion_tokens») и дословный текст ошибки в github
 Повторы внутри клиента — только при ответах 429 и 5xx и при ошибке соединения, с нарастающей
 паузой. Истёкшее время и обрыв связи клиент не повторяет: задание вернётся в очередь.
 
+Перенаправлениям клиент не следует никогда: ответ 3xx — отказ. Иначе ключ в заголовке ушёл бы
+по адресу, который назвал чужой сервер.
+
+Адрес, введённый на странице настройки (`restricted=True`), дополнительно проходит фильтр
+`netguard`: только https, только адрес в интернете, соединение — с адресом, проверенным в
+момент запроса. Адрес из окружения (`SHTURMAN_LLM_BASE_URL`) задаёт оператор, фильтра для него нет.
+
 Тексты запросов и ответов в журнал и в ошибки не попадают: только код ответа и вид ошибки.
 """
 
@@ -47,6 +54,8 @@ from typing import Any, Awaitable, Callable, Mapping
 from urllib.parse import urlsplit
 
 import httpx
+
+from .. import netguard
 
 logger = logging.getLogger("shturman.executor.llm")
 
@@ -159,6 +168,7 @@ class LlmClient:
         self, *, base_url: str, api_key: str, model: str, models: Mapping[str, str] | None = None,
         proxy_url: str = "", transport: httpx.AsyncBaseTransport | None = None, timeout: float = 90.0,
         slots: int = 2, tokens_param: str = "", sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        restricted: bool = False,
     ) -> None:
         self.model = model
         self.models = dict(models or {})
@@ -184,8 +194,12 @@ class LlmClient:
             except Exception:  # noqa: BLE001
                 self.broken = "bad_proxy_url"
                 return
+        if restricted:
+            # Адрес пришёл со страницы настройки: каждый запрос — только наружу (netguard.py).
+            transport = netguard.PinnedTransport(
+                transport, connect_by_name=netguard.proxy_resolves_names(proxy_url))
         self._client = httpx.AsyncClient(
-            transport=transport, base_url=base_url.rstrip("/"), trust_env=False,
+            transport=transport, base_url=base_url.rstrip("/"), trust_env=False, follow_redirects=False,
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=httpx.Timeout(timeout, connect=10.0, pool=timeout),
         )
@@ -230,6 +244,9 @@ class LlmClient:
             wait: float | None = None
             try:
                 response = await self._client.post("/chat/completions", json=body)
+            except netguard.Blocked as exc:
+                # Адрес со страницы ведёт не туда, куда можно: повторять бессмысленно.
+                raise LlmError(exc.code, final=True) from None
             except _CONNECT as exc:
                 code, wait = f"connect:{type(exc).__name__}", 0.0
             except httpx.TimeoutException:

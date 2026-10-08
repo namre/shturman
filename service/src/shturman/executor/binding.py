@@ -97,8 +97,12 @@ async def revoke_code(conn: asyncpg.Connection, code: str) -> bool:
     return done.endswith(" 1")
 
 
-async def redeem(conn: asyncpg.Connection, code: str, *, user_id: int, chat_id: int, bot_id: int) -> bool:
-    """Гасит код и привязывает владельца. Одна транзакция: код срабатывает ровно один раз."""
+async def redeem(conn: asyncpg.Connection, code: str, *, user_id: int, chat_id: int, bot_id: int,
+                 name: str | None = None) -> bool:
+    """Гасит код и привязывает владельца. Одна транзакция: код срабатывает ровно один раз.
+
+    name — как владелец подписан в Telegram: его показывает страница настройки сервиса
+    («владелец привязан: …»). Через внутренний API эта отметка не читается."""
     async with conn.transaction():
         used = await conn.fetchval(
             """UPDATE executor_bind_codes SET used_at = now()
@@ -107,8 +111,20 @@ async def redeem(conn: asyncpg.Connection, code: str, *, user_id: int, chat_id: 
         if used is None:
             return False
         await bridge.set_owner(conn, int(user_id), int(chat_id))
-        await put_state(conn, "owner", {"user_id": int(user_id), "bot_id": int(bot_id)})
+        mark: dict[str, Any] = {"user_id": int(user_id), "bot_id": int(bot_id)}
+        if name:
+            mark["name"] = name
+        await put_state(conn, "owner", mark)
     return True
+
+
+async def bound_owner_name(conn: asyncpg.Connection, bot_id: int | None) -> str | None:
+    """Имя владельца, привязанного через этого бота, если оно было записано при привязке."""
+    if await bound_owner(conn, bot_id) is None:
+        return None
+    mark = await get_state(conn, "owner")
+    name = mark.get("name") if mark else None
+    return name if isinstance(name, str) and name else None
 
 
 async def bound_owner(conn: asyncpg.Connection, bot_id: int | None) -> dict[str, int] | None:

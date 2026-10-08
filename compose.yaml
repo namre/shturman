@@ -91,6 +91,20 @@ services:
       SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
       SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
       SHTURMAN_NIGHTLY_AT: ${SHTURMAN_NIGHTLY_AT:-03:30}
+      # Страница настройки переписки (/shturman-setup/): сервис отдаёт её сам, за собственным входом,
+      # и только на ОТДЕЛЬНОМ адресе — не на том, где дашборд Hermes. Ассистент может добавлять свои
+      # страницы на адрес дашборда; на общем адресе он действовал бы на странице настройки от имени
+      # вошедшего владельца (docs/architecture.md, «Почему у страницы настройки свой адрес»).
+      #   SHTURMAN_SETUP_ORIGIN     — внешний адрес страницы (схема, имя, порт; без пути). По умолчанию —
+      #                               то же имя, что у дашборда, порт 8443: его записывают
+      #                               ./ops/set-public-url.sh и ./ops/up.sh, меняет ./ops/set-setup-url.sh.
+      #                               Пусто — страница открывается только с сервера или через туннель
+      #                               SSH (./ops/setup-link.sh);
+      #   SHTURMAN_DASHBOARD_ORIGIN — адрес дашборда: сервису он нужен, только чтобы сверить, что
+      #                               адреса разные. Совпали — сервис запускается, но страницу снаружи
+      #                               не отдаёт.
+      SHTURMAN_SETUP_ORIGIN: ${SHTURMAN_SETUP_URL:-}
+      SHTURMAN_DASHBOARD_ORIGIN: ${SHTURMAN_PUBLIC_URL:-}
       # Отправка сообщений выключена, пока владелец не включит её сам в .env (docs/service.md);
       # без своего бота согласований (SHTURMAN_BOT_TOKEN) значение on не действует.
       # Через API это значение не меняется.
@@ -112,7 +126,12 @@ services:
       # ./ops/init-env.sh. Контейнеру Hermes эти переменные не передаются никогда.
       SHTURMAN_BOT_TOKEN: ${SHTURMAN_BOT_TOKEN:-}
       SHTURMAN_LLM_API_KEY: ${SHTURMAN_LLM_API_KEY:-}
-      SHTURMAN_LLM_BASE_URL: ${SHTURMAN_LLM_BASE_URL:-https://api.openai.com/v1}
+      # Адрес API модели — без значения по умолчанию и без подстановки: контейнер получает эту
+      # переменную, только если строка есть в .env. Адрес, заданный окружением, сервис считает
+      # заданным на сервере: страница настройки показывает его и менять не даёт. Подставляй мы сюда
+      # адрес по умолчанию, поле адреса на странице было бы закрыто всегда. Строки нет — сервис сам
+      # берёт https://api.openai.com/v1, а владелец может ввести другой адрес на странице.
+      SHTURMAN_LLM_BASE_URL:
       SHTURMAN_LLM_MODEL: ${SHTURMAN_LLM_MODEL:-}
       SHTURMAN_LLM_MODEL_EXTRACT: ${SHTURMAN_LLM_MODEL_EXTRACT:-}
       SHTURMAN_LLM_MODEL_REPLY: ${SHTURMAN_LLM_MODEL_REPLY:-}
@@ -124,6 +143,9 @@ services:
     # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста,
     # а в режиме standalone — клиент владельца (Codex CLI, Claude Code) с этого же сервера
     # или через SSH-туннель (./ops/connect.sh). Наружу порт не публикуется ни в одном режиме.
+    # В режиме с Hermes обратный прокси на хосте отдаёт наружу один префикс этого порта —
+    # /shturman-setup/ — и только на отдельном адресе страницы настройки (другой порт или другое
+    # имя), не на адресе дашборда (config/Caddyfile.example); /api/* и /mcp наружу не выходят.
     ports:
       - "127.0.0.1:8765:8765"
     # backend — к базе, эмбеддингам и классификатору защиты; egress — выход к Telegram

@@ -202,7 +202,15 @@ async def delete_owner(request: Request) -> JSONResponse:
 @handler
 async def status(request: Request) -> JSONResponse:
     """Сводное состояние без содержимого переписки: только счётчики."""
-    async with state_of(request).ro_pool.acquire() as conn:
+    return JSONResponse(await overview(state_of(request)))
+
+
+async def overview(state: AppState) -> dict[str, Any]:
+    """То, что отдаёт `GET /api/status`: счётчики и признаки. Этим же пользуется страница
+    настройки сервиса в разделе «Что собрано»."""
+    from .setup_page import summary as setup_summary
+
+    async with state.ro_pool.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT (SELECT count(*) FROM accounts) AS accounts,
                       (SELECT count(*) FROM chats WHERE NOT excluded) AS chats,
@@ -213,8 +221,9 @@ async def status(request: Request) -> JSONResponse:
                       (SELECT count(*) FROM jobs WHERE status = 'failed') AS jobs_failed,
                       (SELECT value IS NOT NULL FROM settings WHERE key = 'owner') AS owner_known"""
         )
-        guard = await guard_service.overview(conn, state_of(request).config)
-        search = await embeddings.overview(conn, state_of(request))
+        guard = await guard_service.overview(conn, state.config)
+        search = await embeddings.overview(conn, state)
+        setup = await setup_summary.overview(conn, state)
     out = dict(row)
     # Защита от внедрённых инструкций: включена ли, чем проверяет, и счётчики (проверено, скрыто,
     # показано владельцем, не проверено). Только числа и состояние.
@@ -222,12 +231,14 @@ async def status(request: Request) -> JSONResponse:
     # Поиск по смыслу: включён ли, какой моделью, сколько сообщений с вектором этой модели
     # и сколько ещё осталось посчитать (после смены модели — пересчитать).
     out.update(search)
-    config = state_of(request).config
+    config = state.config
     out.update(sending=config.sending, own_bot=bridge.owns_bot(),
                own_llm=bridge.LLM_TEXT in bridge.builtin_kinds())
     out["last_message_seen_at"] = out["last_message_seen_at"].isoformat() if out["last_message_seen_at"] else None
     out["owner_known"] = bool(out["owner_known"])
-    return JSONResponse(out)
+    # Страница настройки сервиса (/shturman-setup/): что на ней уже сделано. Только признаки.
+    out["setup"] = setup
+    return out
 
 
 @handler

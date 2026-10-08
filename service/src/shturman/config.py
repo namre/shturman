@@ -1,4 +1,10 @@
-"""Настройки сервиса. Всё приходит из переменных окружения; значений по умолчанию для секретов нет."""
+"""Настройки сервиса. Приходят из переменных окружения; значений по умолчанию для секретов нет.
+
+Шесть значений владелец может ввести не в окружении, а на странице настройки (`setup_page/`):
+ключи приложения Telegram, токен бота согласований, ключ, адрес и имя своей модели. Они лежат
+в файле каталога данных и подставляются здесь, если окружение их не задало: окружение главнее.
+Главный выключатель отправки к ним не относится — он читается только из окружения.
+"""
 
 from __future__ import annotations
 
@@ -39,7 +45,7 @@ class Config:
     # Имена, под которыми к сервису обращаются (защита от подмены адреса в MCP).
     allowed_hosts: tuple[str, ...] = ("127.0.0.1:8765", "localhost:8765")
     tg_api_id: int = 0
-    tg_api_hash: str = ""
+    tg_api_hash: str = field(default="", repr=False)
     proxy_url: str = ""
     embeddings_url: str = ""
     embeddings_model: str = "intfloat/multilingual-e5-small"
@@ -68,6 +74,19 @@ class Config:
     # одни правила: это заметно слабее модели.
     guard_url: str = ""
     guard_model: str = "Horizon-Labs/prompt-injection-guard-small"
+    # Внешний адрес страницы настройки (схема, имя и порт, без пути), например
+    # https://assistant.example.com:8443. Пусто — страница отвечает только под локальными именами
+    # из allowed_hosts (туннель SSH). Адрес обязан отличаться от адреса дашборда Hermes хотя бы
+    # портом: см. `setup_reason`.
+    setup_origin: str = ""
+    # Адрес дашборда Hermes (схема, имя, порт). Нужен только для сравнения с адресом страницы.
+    dashboard_origin: str = ""
+    # Адрес API своей модели введён на странице настройки (а не задан окружением и не взят по
+    # умолчанию): запросы по нему идут только наружу и только по https (netguard.py).
+    llm_url_from_page: bool = False
+    # Какие из значений страницы настройки заданы окружением сервиса: страница их не меняет
+    # (имена — как в setup_page/secrets_store.py).
+    locked: frozenset[str] = frozenset()
 
     @property
     def own_bot(self) -> bool:
@@ -77,6 +96,25 @@ class Config:
     @property
     def own_llm(self) -> bool:
         return bool(self.llm_api_key and self.llm_model)
+
+    @property
+    def setup_reason(self) -> str | None:
+        """Почему страница настройки не отдаётся по внешнему адресу; None — отдаётся.
+
+        same_origin — адрес страницы совпал с адресом дашборда Hermes. Ассистент в Hermes может
+        исполнять свой JavaScript на адресе дашборда; на том же адресе этот скрипт читал бы
+        хранилище страницы и слал бы запросы от её имени. Поэтому страница по такому адресу не
+        обслуживается вовсе — только под локальными именами."""
+        if not self.setup_origin:
+            return "no_origin"
+        if self.dashboard_origin and self.setup_origin == self.dashboard_origin:
+            return "same_origin"
+        return None
+
+    @property
+    def setup_external(self) -> str:
+        """Внешний адрес, под которым страница настройки действительно отдаётся, либо пусто."""
+        return self.setup_origin if self.setup_reason is None else ""
 
     @property
     def sessions_dir(self) -> Path:
@@ -106,11 +144,15 @@ class Config:
                 raise ConfigError(f"{name}: слишком короткое значение, нужно не меньше 32 знаков")
         port = _int("SHTURMAN_PORT", 8765)
         hosts = tuple(h.strip() for h in _env("SHTURMAN_ALLOWED_HOSTS").split(",") if h.strip())
-        return cls(
+        data_dir = Path(_env("SHTURMAN_DATA_DIR", "/data"))
+        config = cls(
             dsn=dsn, api_token=api_token, mcp_token=mcp_token,
             host=_env("SHTURMAN_HOST", "127.0.0.1"), port=port,
-            data_dir=Path(_env("SHTURMAN_DATA_DIR", "/data")),
+            data_dir=data_dir,
             allowed_hosts=hosts or (f"127.0.0.1:{port}", f"localhost:{port}"),
+            setup_origin=_setup_origin(_env("SHTURMAN_SETUP_ORIGIN")),
+            dashboard_origin=normalize_origin(_env("SHTURMAN_DASHBOARD_ORIGIN"), "SHTURMAN_DASHBOARD_ORIGIN",
+                                              strict=False),
             tg_api_id=_int("TELEGRAM_API_ID", 0), tg_api_hash=_env("TELEGRAM_API_HASH"),
             proxy_url=_env("EGRESS_PROXY_URL"),
             embeddings_url=_env("SHTURMAN_EMBEDDINGS_URL"),
@@ -119,7 +161,9 @@ class Config:
             timezone=_env("SHTURMAN_TIMEZONE", "Europe/Moscow"),
             nightly_at=_env("SHTURMAN_NIGHTLY_AT", "03:30"),
             # Отправка возможна только со своим ботом согласований: без него нажатие «Отправить»
-            # проходит через Hermes и может быть подделано ассистентом.
+            # проходит через Hermes и может быть подделано ассистентом. Токен бота здесь —
+            # именно из окружения: токен, введённый на странице настройки, отправку не включает,
+            # иначе её можно было бы включить со страницы (docs/decisions.md).
             sending=(_env("SHTURMAN_SENDING", "off").lower() in ("on", "1", "true", "yes")
                      and bool(_env("SHTURMAN_BOT_TOKEN"))),
             bot_token=_env("SHTURMAN_BOT_TOKEN"),
@@ -131,3 +175,59 @@ class Config:
             guard_model=_env("SHTURMAN_GUARD_MODEL", "Horizon-Labs/prompt-injection-guard-small"),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )
+        return with_page_values(config, os.environ)
+
+
+def with_page_values(config: Config, env) -> Config:
+    """Подставляет значения, введённые на странице настройки, туда, где окружение молчит."""
+    import dataclasses
+
+    from .setup_page import secrets_store
+
+    locked = secrets_store.locked_by_env(env)
+    stored = secrets_store.SecretStore(config.data_dir).load()
+    managed = [name for name in secrets_store.NAMES if name not in locked and stored.get(name)]
+    return dataclasses.replace(secrets_store.overlay(config, stored, managed), locked=locked)
+
+
+def normalize_origin(raw: str, name: str, *, strict: bool = True) -> str:
+    """Адрес как его сравнивает браузер (origin): схема, имя узла и порт — и ничего больше.
+
+    Приводится к одному виду: регистр, порт по умолчанию (80 для http, 443 для https) не
+    пишется, точка в конце имени убирается, имя не латиницей записывается в punycode. Два
+    адреса, которые после этого совпали, для браузера — один origin.
+
+    strict — путь, запрос и фрагмент запрещены (так задаётся адрес страницы настройки). Без
+    него они отбрасываются: адрес дашборда нужен только для сравнения."""
+    if not raw:
+        return ""
+    from urllib.parse import urlsplit
+
+    example = "https://assistant.example.com:8443"
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        raise ConfigError(f"{name}: неверный адрес или порт; нужен адрес вида {example}") from None
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username is not None \
+            or parts.password is not None or "@" in parts.netloc:
+        raise ConfigError(f"{name}: нужен адрес вида {example}")
+    if strict and (parts.path not in ("", "/") or parts.query or parts.fragment):
+        raise ConfigError(f"{name}: только схема, имя и порт, без пути — например {example}")
+    host = parts.hostname.lower().rstrip(".")
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ConfigError(f"{name}: имя узла записано неверно") from None
+    if not host or port == 0:
+        raise ConfigError(f"{name}: нужен адрес вида {example}")
+    if ":" in host:
+        host = f"[{host}]"
+    default = {"http": 80, "https": 443}[parts.scheme]
+    return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
+def _setup_origin(raw: str) -> str:
+    """Внешний адрес страницы настройки: схема, имя узла и порт (если он не обычный)."""
+    return normalize_origin(raw, "SHTURMAN_SETUP_ORIGIN")
