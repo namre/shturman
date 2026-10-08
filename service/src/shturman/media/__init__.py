@@ -14,12 +14,14 @@ from __future__ import annotations
 from typing import Any
 
 MEDIA_TYPES = ("photo", "file")
-ENABLED_KEY = "media.enabled"          # settings: {"enabled": bool, "by": ..., "at": ...}
+# Решение владельца хранится в setup_state (пишет только страница настройки переписки;
+# внутренний API, доступный ассистенту, его не меняет): {"enabled": bool}.
+ENABLED_KEY = "media"
 
 
 async def enabled(conn: Any) -> bool:
     """Включён ли разбор вложений (решение владельца на странице настройки)."""
-    value = await conn.fetchval("SELECT value FROM settings WHERE key = $1", ENABLED_KEY)
+    value = await conn.fetchval("SELECT value FROM setup_state WHERE key = $1", ENABLED_KEY)
     if isinstance(value, str):
         import json
         try:

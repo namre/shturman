@@ -15,6 +15,7 @@
   GET    /shturman-setup/api/state                      состояние шагов и блока «Дополнительно»
   GET    /shturman-setup/api/overview                   счётчики архива и журнал действий
   PUT    /shturman-setup/api/scenario                   способ подключения: {scenario: own | staff}
+  PUT    /shturman-setup/api/media                      разбор фото и документов моделью: {enabled}
   POST   /shturman-setup/api/bot/token                  проверить и сохранить токен бота: {token, separate?}
   DELETE /shturman-setup/api/bot/token                  убрать токен, введённый на странице
   POST   /shturman-setup/api/bot/bind                   ссылка привязки владельца к боту
@@ -630,6 +631,37 @@ async def scenario_save(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "scenario": scenario})
 
 
+# --- разбор фото и документов ---------------------------------------------------------------------
+# Решение владельца: отдавать ли фото и документы из переписки модели. Хранится в setup_state —
+# внутренний API, доступный ассистенту, его не меняет (media/__init__.py).
+
+async def _media_state(state: AppState) -> dict[str, Any]:
+    from .. import media
+    async with state.ro_pool.acquire() as conn:
+        on = await media.enabled(conn)
+    return {"enabled": on, "days": state.config.media_days,
+            "max_mb": state.config.media_max_bytes // (1024 * 1024)}
+
+
+@endpoint
+async def media_save(request: Request) -> JSONResponse:
+    from .. import media
+    data = await _body(request)
+    on = _flag(data, "enabled")
+    if on is None:
+        raise BadRequest("Нужно поле enabled: true или false.")
+    async with state_of(request).pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO setup_state (key, value, updated_at) VALUES ($1, $2::jsonb, now())
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
+            media.ENABLED_KEY, '{"enabled": true}' if on else '{"enabled": false}')
+    analyzer = state_of(request).extras.get("media")
+    if analyzer is not None:
+        analyzer.wake.set()
+    await _log(request, "setup.media", detail="разбор фото и документов " + ("включён" if on else "выключен"))
+    return JSONResponse({"ok": True, "media": await _media_state(state_of(request))})
+
+
 @endpoint
 async def page_state(request: Request) -> JSONResponse:
     state, page = state_of(request), _page(request)
@@ -642,6 +674,7 @@ async def page_state(request: Request) -> JSONResponse:
         "tg": await _tg_state(state, page),
         "llm": _llm_state(state, page),
         "imports": _imports_state(state),
+        "media": await _media_state(state),
     })
 
 
@@ -656,7 +689,8 @@ async def page_overview(request: Request) -> JSONResponse:
             "jobs_failed", "guard_enabled", "guard_model_used", "guard_problem", "guard_checked",
             "guard_hidden", "guard_released", "guard_unchecked", "embeddings_enabled", "embeddings_model",
             "embeddings_embedded", "embeddings_left", "embeddings_problem", "sending",
-            "voice_enabled", "voice_problem", "voice_pending", "voice_done", "voice_failed", "voice_skipped")
+            "voice_enabled", "voice_problem", "voice_pending", "voice_done", "voice_failed", "voice_skipped",
+            "media_enabled", "media_pending", "media_asking", "media_done", "media_failed", "media_skipped")
     # audit_key — входы, смена ключей и аккаунтов: их не вытеснить из вида потоком мелких действий.
     return JSONResponse({"archive": {k: counts[k] for k in keep if k in counts}, "audit": log,
                          "audit_key": key_log})
@@ -1313,6 +1347,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/state", page_state, methods=["GET"]),
         Route(API + "/overview", page_overview, methods=["GET"]),
         Route(API + "/scenario", scenario_save, methods=["PUT"]),
+        Route(API + "/media", media_save, methods=["PUT"]),
         Route(API + "/bot/token", bot_token_save, methods=["POST"]),
         Route(API + "/bot/token", bot_token_delete, methods=["DELETE"]),
         Route(API + "/bot/bind", bot_bind, methods=["POST"]),

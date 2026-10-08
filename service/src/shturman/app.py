@@ -53,6 +53,7 @@ MODULES = (
     "shturman.embeddings",
     "shturman.tg.service",
     "shturman.voice.service",      # после аккаунтов Telegram: скачивает голосовые их сессиями
+    "shturman.media.service",      # так же скачивает фото и документы; ответы модели — через задания
     "shturman.processing.service",
     "shturman.processing.pages_service",
     "shturman.processing.mcp_tools",

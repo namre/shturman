@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ from ..app import AppState
 from . import binding
 from .bot import Bot
 from .botapi import BotApi, NeverLeft, OutcomeUnknown, Refused, keyboard
-from .llm import LlmClient, LlmError, matches_schema, parse_json, structured_messages
+from .llm import Attachment, LlmClient, LlmError, matches_schema, parse_json, structured_messages
 from .subscription import ChatGptClient
 
 logger = logging.getLogger("shturman.executor.worker")
@@ -55,6 +56,30 @@ MAX_BACKOFF = 60.0
 REPORT_DELAYS = (0, 1, 2, 4, 8, 15)      # секунд перед попытками записать итог
 
 Buttons = list[list[tuple[str, str]]]
+
+
+
+def _images(payload: Mapping[str, Any]) -> list[Attachment] | None:
+    """Картинки задания (bridge.request_structured, поле images) — вложения для модели."""
+    raw = payload.get("images")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) > bridge.MAX_IMAGES:
+        raise _Fail("поле images задано неверно", None)
+    out: list[Attachment] = []
+    for n, item in enumerate(raw):
+        data = item.get("data") if isinstance(item, dict) else None
+        mime = item.get("mime") if isinstance(item, dict) else None
+        if not isinstance(data, str) or mime not in ("image/jpeg", "image/png"):
+            raise _Fail("поле images задано неверно", None)
+        try:
+            blob = base64.b64decode(data, validate=True)
+        except ValueError:
+            raise _Fail("поле images задано неверно", None) from None
+        out.append(Attachment(kind="image", mime=mime, name=f"image-{n + 1}.jpg", data=blob))
+    if sum(len(a.data) for a in out) > bridge.MAX_IMAGE_BYTES:
+        raise _Fail("поле images задано неверно", None)
+    return out
 
 
 class _Fail(Exception):
@@ -272,13 +297,14 @@ class Worker:
 
     async def _ask(self, kind: str, payload: Mapping[str, Any], messages: list[dict[str, str]],
                    attempt: int, *, json_mode: bool, schema: dict[str, Any] | None = None,
-                   schema_name: str | None = None) -> tuple[str, str]:
+                   schema_name: str | None = None, attachments: list[Attachment] | None = None) -> tuple[str, str]:
         if self.llm is None:
             raise _Fail("у сервиса нет своего доступа к модели", 300)
+        extra = {"attachments": attachments} if attachments else {}
         try:
             return await asyncio.wait_for(
                 self.llm.chat(messages, task=payload.get("task"), max_tokens=self._max_tokens(kind, payload),
-                              json_mode=json_mode, schema=schema, schema_name=schema_name),
+                              json_mode=json_mode, schema=schema, schema_name=schema_name, **extra),
                 timeout=self.llm_timeout)
         except LlmError as exc:
             if exc.pause:
@@ -293,7 +319,7 @@ class Worker:
         name = payload.get("schema_name") if isinstance(payload.get("schema_name"), str) else None
         answer, model = await self._ask(
             bridge.LLM_STRUCTURED, payload, structured_messages(instructions, text, schema, name),
-            attempt, json_mode=True, schema=schema, schema_name=name)
+            attempt, json_mode=True, schema=schema, schema_name=name, attachments=_images(payload))
         parsed = parse_json(answer)
         # Расхождение со схемой и неразборчивый JSON — не сбой задания: сервис проверяет ответ сам.
         valid = parsed is not None and (schema is None or matches_schema(parsed, schema))

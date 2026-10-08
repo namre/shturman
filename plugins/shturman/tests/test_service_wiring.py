@@ -752,7 +752,7 @@ def test_schema_violation_through_the_real_hermes_llm_facade(monkeypatch):
     import types
 
     monkeypatch.setattr(plugin_llm, "_resolve_task_ownership",
-                        lambda plugin_id: (frozenset({"shturman_extract", "shturman_reply", "shturman_watch"}), frozenset()))
+                        lambda plugin_id: (frozenset({"shturman_extract", "shturman_reply", "shturman_watch", "shturman_media"}), frozenset()))
     seen = []
     answers = ['{"commitments": [{"message": "1", "what": "прислать смету", "лишнее": true}]}', "не JSON вовсе",
                '```json\n{"commitments": []}\n```']
@@ -899,5 +899,5 @@ def test_three_auxiliary_tasks_are_registered_with_hermes():
         def register_auxiliary_task(self, key, **kwargs):
             registered.append((key, kwargs["display_name"], kwargs["defaults"]))
 
-    assert shturman_tools.register_auxiliary_tasks(Ctx()) == ["shturman_extract", "shturman_reply", "shturman_watch"]
+    assert shturman_tools.register_auxiliary_tasks(Ctx()) == ["shturman_extract", "shturman_reply", "shturman_watch", "shturman_media"]
     assert all(name.startswith("Штурман") for _, name, _ in registered)

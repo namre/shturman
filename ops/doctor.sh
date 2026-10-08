@@ -600,6 +600,17 @@ EOF3
         warn voice "контейнер распознавания запущен ($asr), но расшифровка в сервисе выключена — запустите ./ops/asr.sh on или off"
       fi ;;
   esac
+
+  # Разбор фото и документов: включает владелец на странице настройки переписки. Только числа.
+  m_pending="$(num media_pending)"; m_asking="$(num media_asking)"; m_done="$(num media_done)"
+  m_failed="$(num media_failed)"; m_skipped="$(num media_skipped)"
+  case "$st" in
+    *'"media_enabled":true'*)
+      pass media "разбор фото и документов включён владельцем; готово: ${m_done:-0}, ждут: $(( ${m_pending:-0} + ${m_asking:-0} )), пропущено: ${m_skipped:-0}, не получилось: ${m_failed:-0}" ;;
+    "") ;;
+    *)
+      pass media "разбор фото и документов выключен — включает владелец на странице настройки переписки (docs/media.md)" ;;
+  esac
 elif [ "$MODE" = standalone ]; then
   fail service "сервис переписки не развёрнут — запустите ./ops/up.sh"
 else

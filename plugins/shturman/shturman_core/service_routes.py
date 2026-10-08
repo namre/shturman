@@ -79,6 +79,7 @@ UI: Routes = _compile([
     ("GET", r"/api/guard/status"),
     # расшифровка голосовых: только числа и состояние, текстов нет
     ("GET", r"/api/voice/status"),
+    ("GET", r"/api/media/status"),
     ("GET", r"/api/processing/status"),
     ("GET", r"/api/executor/status"),        # свой бот и своя модель сервиса: только признаки и счётчики
     # действия, которые ждут подтверждения владельца в боте: посмотреть и отменить (не подтвердить)

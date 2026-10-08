@@ -71,6 +71,7 @@ TASK_ENV = {
     "shturman_extract": "SHTURMAN_LLM_MODEL_EXTRACT",
     "shturman_reply": "SHTURMAN_LLM_MODEL_REPLY",
     "shturman_watch": "SHTURMAN_LLM_MODEL_WATCH",
+    "shturman_media": "SHTURMAN_LLM_MODEL_MEDIA",
 }
 TOKEN_PARAMS = ("max_tokens", "max_completion_tokens")
 JSON_ONLY = ("Respond with a single JSON object that matches the requested shape. "

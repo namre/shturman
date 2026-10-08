@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import logging
@@ -38,6 +39,8 @@ logger = logging.getLogger("shturman.bridge")
 
 LLM_STRUCTURED = "llm.structured"
 LLM_TEXT = "llm.text"
+MAX_IMAGES = 6                        # картинок в одном запросе к модели
+MAX_IMAGE_BYTES = 6 * 1024 * 1024     # их общий размер до base64
 NOTIFY_OWNER = "notify.owner"
 NOTIFY_EDIT = "notify.edit"
 BUSINESS_SEND = "business.send"
@@ -243,12 +246,20 @@ async def request_structured(
     conn: asyncpg.Connection, *, handler: str, instructions: str, input: str,
     json_schema: dict[str, Any], schema_name: str, task: str = "shturman_extract",
     max_tokens: int = 2000, context: dict[str, Any] | None = None, dedup_key: str | None = None,
+    images: list[bytes] | None = None,
 ) -> int | None:
-    """Просит модель вернуть JSON по схеме. Результат придёт в `on_result(handler)`."""
+    """Просит модель вернуть JSON по схеме. Результат придёт в `on_result(handler)`.
+
+    images — картинки JPEG к запросу (фото, страницы скана; media/). В задании они лежат
+    base64 в поле images; модуль-владелец стирает задание после ответа, как и текст."""
+    payload: dict[str, Any] = {"instructions": instructions, "input": input, "json_schema": json_schema,
+                               "schema_name": schema_name, "task": task, "max_tokens": max_tokens}
+    if images:
+        if len(images) > MAX_IMAGES or sum(len(i) for i in images) > MAX_IMAGE_BYTES:
+            raise ValueError("слишком много картинок для одного запроса")
+        payload["images"] = [{"mime": "image/jpeg", "data": base64.b64encode(i).decode("ascii")} for i in images]
     return await jobs.enqueue(
-        conn, LLM_STRUCTURED,
-        {"instructions": instructions, "input": input, "json_schema": json_schema,
-         "schema_name": schema_name, "task": task, "max_tokens": max_tokens},
+        conn, LLM_STRUCTURED, payload,
         handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_STRUCTURED),
     )
 

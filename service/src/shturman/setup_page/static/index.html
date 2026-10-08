@@ -717,6 +717,39 @@
       </details>
     </section>
 
+    <!-- ------------------------------- необязательный шаг: фото и документы -->
+    <section class="card step optional" id="s-media" aria-labelledby="h-media" hidden>
+      <p class="step-lock locked-note" hidden></p>
+      <details id="media-details">
+        <summary>
+          <span class="card-head">
+            <span class="num" aria-hidden="true"></span>
+            <span class="h2" id="h-media" role="heading" aria-level="2">Фото и документы</span>
+            <span class="pill" id="st-media"></span>
+            <span class="optional-tag">необязательно</span>
+          </span>
+        </summary>
+        <p>Сейчас ассистент видит только, что в чате было фото или файл. Включите разбор — и сервис будет коротко пересказывать, что в них: о чём договор или смета, суммы и сроки, что на фото или скриншоте. Пересказ становится частью переписки: по нему ищут, из него берутся договорённости.</p>
+        <div class="split">
+          <div class="col">
+            <ul class="small">
+              <li>Разбираются фото и картинки, PDF (в том числе сканы), Word (.docx), Excel (.xlsx) и текстовые файлы. Старые .doc и .xls, презентации, архивы и видео — нет.</li>
+              <li>Только за последние <span id="media-days">30</span> дней и не больше <span id="media-max">20</span> МБ на файл.</li>
+              <li>Текст документа сервис достаёт сам, на вашем сервере. Фото и сканы смотрит модель — та же, что разбирает переписку: модель ассистента или своя модель сервиса (в том числе по подписке ChatGPT). Значит, <b>файлы уходят её провайдеру</b>, как уже уходит текст сообщений.</li>
+              <li>Сами файлы сервис не хранит: разобрав, удаляет. В архиве остаётся только пересказ.</li>
+              <li>Каждый файл — отдельный запрос к модели. По подписке это расходует её лимит.</li>
+            </ul>
+            <p class="note warn" id="media-error" role="alert" hidden></p>
+            <p class="note" id="media-status" role="status" hidden></p>
+            <div class="row">
+              <button class="btn" id="media-on" type="button">Включить разбор фото и документов</button>
+              <button class="btn ghost" id="media-off" type="button" hidden>Выключить</button>
+            </div>
+          </div>
+        </div>
+      </details>
+    </section>
+
     <!-- ============================================================ дополнительно -->
     <details class="extras" id="extras">
       <summary>

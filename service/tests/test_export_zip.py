@@ -113,7 +113,7 @@ def media_cfg(config, **kw):
 
 
 async def enable_media(conn):
-    await conn.execute("INSERT INTO settings (key, value) VALUES ('media.enabled', '{\"enabled\": true}')")
+    await conn.execute("INSERT INTO setup_state (key, value) VALUES ('media', '{\"enabled\": true}')")
 
 
 async def stored(conn):

@@ -239,7 +239,11 @@ async def overview(state: AppState) -> dict[str, Any]:
         setup = await setup_summary.overview(conn, state)
         from .voice import service as voice_service
         voice = await voice_service.overview(conn, state)
+        from .media import service as media_service
+        media = await media_service.overview(conn, state)
     out = dict(row)
+    # Разбор фото и документов: включён ли владельцем и счётчики очереди.
+    out.update(media)
     # Расшифровка голосовых: включена ли, отвечает ли контейнер, счётчики очереди.
     out.update(voice)
     # Защита от внедрённых инструкций: включена ли, чем проверяет, и счётчики (проверено, скрыто,

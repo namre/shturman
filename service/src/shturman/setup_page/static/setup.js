@@ -335,6 +335,7 @@
     renderBot(S.bot);
     renderBusiness(S.bot);
     renderLlm(S.llm);
+    renderMedia(S.media || {});
     renderProgress();
   }
 
@@ -346,10 +347,10 @@
    * иначе подключённое нельзя было бы ни увидеть, ни отключить. */
   var PLAN = {
     none: ["s-bot", "s-mode"],
-    own: ["s-bot", "s-mode", "s-keys", "s-accounts", "s-chats", "s-import"],
-    staff: ["s-bot", "s-mode", "s-business", "s-keys", "s-assistant", "s-chats", "s-import"]
+    own: ["s-bot", "s-mode", "s-keys", "s-accounts", "s-chats", "s-import", "s-media"],
+    staff: ["s-bot", "s-mode", "s-business", "s-keys", "s-assistant", "s-chats", "s-import", "s-media"]
   };
-  var ALL_STEPS = ["s-bot", "s-mode", "s-business", "s-keys", "s-accounts", "s-assistant", "s-chats", "s-import"];
+  var ALL_STEPS = ["s-bot", "s-mode", "s-business", "s-keys", "s-accounts", "s-assistant", "s-chats", "s-import", "s-media"];
 
   function lockStep(id, reason, done) {
     var card = $(id), lock = card.querySelector(".step-lock");
@@ -371,7 +372,8 @@
       chats: accounts.filter(function (a) { return !sc || a.role === (sc === "staff" ? "assistant" : "owner"); })
         .reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0),
       imported: (S.imports.items || []).some(function (i) { return i.state === "done"; }),
-      importsAny: (S.imports.items || []).length > 0
+      importsAny: (S.imports.items || []).length > 0,
+      media: !!(S.media && S.media.enabled)
     };
   }
 
@@ -381,7 +383,8 @@
     var BOT = "Откроется после шага 1 — когда бот согласований будет сохранён и привязан к вам.";
     var done = {
       "s-bot": f.bot, "s-mode": !!f.sc, "s-business": f.business, "s-keys": f.keys,
-      "s-accounts": f.ownerOk, "s-assistant": f.helperOk, "s-chats": f.chats > 0, "s-import": f.imported
+      "s-accounts": f.ownerOk, "s-assistant": f.helperOk, "s-chats": f.chats > 0, "s-import": f.imported,
+      "s-media": f.media
     };
     // Какой шаг держит закрытым этот: для строки «после шага N».
     var blocker = {
@@ -401,7 +404,7 @@
     // Подключённое раньше или в другом способе остаётся видно, чтобы его можно было отключить.
     var leftover = {
       "s-accounts": !!f.owner, "s-assistant": !!f.helper, "s-business": f.business,
-      "s-chats": !!(f.owner || f.helper), "s-import": f.importsAny
+      "s-chats": !!(f.owner || f.helper), "s-import": f.importsAny, "s-media": f.media
     };
     var why = f.sc ? "Не входит в выбранный способ. Виден, потому что уже подключён; если не нужен — отключите."
                    : "Подключено раньше. Выберите способ подключения — тогда страница покажет нужные шаги.";
@@ -476,6 +479,31 @@
         act(this, "mode-error", "PUT", "scenario", { scenario: name }, function () {
           toast(name === "own" ? "Способ выбран. Дальше — шаги для входа в ваш аккаунт." : "Способ выбран. Дальше — бизнес-режим для личных чатов.");
         });
+      });
+    });
+  }
+
+  /* ----------------------------------------------- фото и документы */
+
+  function renderMedia(m) {
+    pill("media", m.enabled ? "Включён" : "Выключен", m.enabled ? "done" : "");
+    text("media-days", String(m.days || 30));
+    text("media-max", String(m.max_mb || 20));
+    show("media-on", !m.enabled);
+    show("media-off", !!m.enabled);
+    note("media-status", "info", m.enabled ? "Разбор включён. Сколько разобрано — в разделе «Дополнительно» → «Что собрано»." : "");
+  }
+
+  function wireMedia() {
+    $("media-on").addEventListener("click", function () {
+      if (!confirm("Включить разбор фото и документов?\n\nФото, сканы и текст документов из переписки будут уходить модели — её провайдеру, как уже уходит текст сообщений. Сами файлы на сервере не хранятся: разобрав, сервис их удаляет.")) return;
+      act(this, "media-error", "PUT", "media", { enabled: true }, function () {
+        toast("Разбор включён. Свежие фото и документы разберутся в ближайшие минуты.");
+      });
+    });
+    $("media-off").addEventListener("click", function () {
+      act(this, "media-error", "PUT", "media", { enabled: false }, function () {
+        toast("Разбор выключен. Уже разобранное остаётся в архиве.");
       });
     });
   }
@@ -1361,6 +1389,10 @@
           ? "Не расшифровываются: ассистент видит, что было голосовое, но не его содержание. Включает оператор на сервере: ./ops/asr.sh on"
           : a.voice_problem ? "Расшифровка включена, но распознавание сейчас не отвечает. Ждут: " + number(a.voice_pending)
           : "Расшифровываются. Готово: " + number(a.voice_done) + (a.voice_pending ? ", ждут: " + number(a.voice_pending) : "")),
+        fact("Фото и документы", !a.media_enabled
+          ? "Не разбираются: ассистент видит, что было фото или файл, но не что в нём. Включается в шаге «Фото и документы»."
+          : "Разбираются. Готово: " + number(a.media_done) + ((a.media_pending || a.media_asking) ? ", ждут: " + number((a.media_pending || 0) + (a.media_asking || 0)) : "") +
+            (a.media_skipped ? ", пропущено: " + number(a.media_skipped) : "") + (a.media_failed ? ", не получилось: " + number(a.media_failed) : "")),
         fact("Отправка сообщений", a.sending ? "Включена в настройках сервера." : "Выключена. Включается только в настройках сервера, не здесь.")
       ];
     });
@@ -1401,7 +1433,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireSession();
+  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.
