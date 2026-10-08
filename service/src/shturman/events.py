@@ -9,6 +9,11 @@
   message.live     {account_id, chat_id, message_id, source, outgoing, edited, via_bot}
                    message_id — идентификатор строки архива (messages.id);
                    source — "session" или "business"; via_bot — сообщение отправлено через бота
+  message.content  {account_id, chat_id, message_id, outgoing}
+                   у свежего сообщения позже появился текст: расшифровка голосового, разбор
+                   вложения. Публикуется, только если сообщение отправлено не раньше часа назад
+                   и видно ассистенту. Подписчики, которым важен текст (наблюдатель за группами),
+                   разбирают его как живое сообщение.
   messages.deleted {message_ids: [...]}
   messages.hidden  {message_ids: [...]}
                    защита от внедрённых инструкций скрыла сообщения от ассистента (guard/). Они
@@ -29,6 +34,7 @@ from typing import Any, Awaitable, Callable
 logger = logging.getLogger("shturman.events")
 
 MESSAGE_LIVE = "message.live"
+MESSAGE_CONTENT = "message.content"
 MESSAGES_DELETED = "messages.deleted"
 MESSAGES_HIDDEN = "messages.hidden"
 CHAT_EXCLUDED = "chat.excluded"

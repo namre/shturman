@@ -42,7 +42,7 @@ from starlette.routing import BaseRoute, Route
 from .. import bridge, confirm, store
 from ..api_core import BadRequest, body, handler, need_int, settle
 from ..app import AppState, state_of
-from ..events import CHAT_EXCLUDED, MESSAGE_LIVE
+from ..events import CHAT_EXCLUDED, MESSAGE_CONTENT, MESSAGE_LIVE
 from . import autoreply, drafts, policy, runtime, watcher
 from . import text as textlib
 
@@ -817,6 +817,9 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     state.events.subscribe(CHAT_EXCLUDED, chat_excluded)
     state.events.subscribe(MESSAGE_LIVE, to_autoreply)
     state.events.subscribe(MESSAGE_LIVE, to_watcher)
+    # текст, появившийся позже (голосовое, вложение), наблюдатель разбирает как живой; автоответ — нет:
+    # отвечать с опозданием на расшифровку владелец не просил
+    state.events.subscribe(MESSAGE_CONTENT, to_watcher)
     state.spawn(drafts.run_sender(mod), name="outbox-sender")
     state.spawn(sweeper(), name="outbox-sweeper")
     try:

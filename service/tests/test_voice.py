@@ -291,3 +291,27 @@ async def test_problem_clears_even_with_empty_queue(conn, rig):
     t.problem = "unreachable"
     assert await t.step() == 0
     assert t.problem is None
+
+
+async def test_fresh_transcript_is_announced_and_marked_for_the_next_run(conn):
+    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=4)
+    asr, tg, published = Asr(), Telegram(), []
+    client = AsrClient("http://asr", transport=asr.transport())
+    t = core.Transcriber(pool, client, core.Settings(days=30, max_seconds=600),
+                         session_fetch=lambda: tg.fetch, bot_fetch=lambda: None,
+                         publish=lambda topic, payload: published.append((topic, payload)))
+    try:
+        _, chat_id = await add_chat(conn)
+        fresh, = await add(conn, chat_id, rec(1, at=NOW - timedelta(minutes=5)))
+        old, = await add(conn, chat_id, rec(2, at=NOW - timedelta(hours=5)))
+        tg.files = {1: b"x", 2: b"y"}
+        assert await t.step() == 2
+    finally:
+        await client.close()
+        await pool.close()
+    account_id = await conn.fetchval("SELECT account_id FROM chats WHERE id = $1", chat_id)
+    assert [p for _, p in published] == [
+        {"account_id": account_id, "chat_id": chat_id, "message_id": fresh, "outgoing": False}]
+    assert published[0][0] == "message.content"
+    assert all(r["late_content"] for r in await conn.fetch("SELECT late_content FROM messages"))
+    assert old not in [p["message_id"] for _, p in published]   # старое — не живое

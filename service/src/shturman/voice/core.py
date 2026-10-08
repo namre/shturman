@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable
 
 import asyncpg
 
-from .. import guard
+from .. import events, guard
 from . import VOICE_TYPES
 from .asr import AsrClient, AsrRejected, AsrUnavailable
 
@@ -36,6 +36,7 @@ RETRY = timedelta(minutes=10)       # пауза после сбоя
 NO_SOURCE_WAIT = timedelta(hours=1)  # источника нет (сессия на паузе) — проверить позже
 NO_SOURCE_GIVE_UP = timedelta(days=1)
 ENQUEUE_BATCH = 500
+FRESH = timedelta(hours=1)          # расшифровку сообщения не старше этого разбирают как живое
 
 # Скачивание файла: (аккаунт, вид собеседника, его id, номер сообщения, предел байт) → (байты, секунды).
 SessionFetch = Callable[[int, str, int, int, int], Awaitable[tuple[bytes, int | None]]]
@@ -97,6 +98,7 @@ LIMIT $1
 _DONE = """
 UPDATE messages SET
     transcript = $2, transcript_state = 'done', transcript_error = NULL, transcript_at = now(),
+    late_content = true,
     media_duration = COALESCE(media_duration, $3),
     text = voice_text(text, $2, media_type, COALESCE(media_duration, $3)),
     agent_visible = CASE WHEN $4 AND is_outgoing IS NOT TRUE THEN false ELSE agent_visible END,
@@ -105,7 +107,7 @@ UPDATE messages SET
     guard_model = CASE WHEN guard_label IN ('suspect', 'confirmed') THEN guard_model END,
     guard_checked_at = CASE WHEN guard_label IN ('suspect', 'confirmed') THEN guard_checked_at END
 WHERE id = $1 AND transcript_state = 'pending' AND transcript IS NULL AND deleted_at IS NULL
-RETURNING id, is_outgoing
+RETURNING id, is_outgoing, chat_id, sent_at
 """
 
 
@@ -128,8 +130,10 @@ class Transcriber:
 
     def __init__(self, pool: asyncpg.Pool, asr: AsrClient, settings: Settings, *,
                  session_fetch: Callable[[], SessionFetch | None],
-                 bot_fetch: Callable[[], BotFetch | None]) -> None:
+                 bot_fetch: Callable[[], BotFetch | None],
+                 publish: Callable[[str, dict[str, Any]], None] | None = None) -> None:
         self.pool, self.asr, self.settings = pool, asr, settings
+        self.publish = publish
         self._session_fetch, self._bot_fetch = session_fetch, bot_fetch
         self.problem: str | None = None       # None — в порядке; unreachable — контейнер не отвечает
         self.wake = asyncio.Event()
@@ -217,7 +221,22 @@ class Transcriber:
             updated = await conn.fetchrow(_DONE, mid, text, duration, holding)
         if updated is not None and holding and updated["is_outgoing"] is not True:
             await guard.screen([mid])
+        if updated is not None:
+            await self._announce(mid)
         return "done"
+
+    async def _announce(self, mid: int) -> None:
+        """Свежее голосовое стало текстом — сказать модулям, которым важен текст живых сообщений."""
+        if self.publish is None:
+            return
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT m.chat_id, m.is_outgoing, c.account_id FROM messages m JOIN chats c ON c.id = m.chat_id
+                   WHERE m.id = $1 AND m.agent_visible AND m.deleted_at IS NULL
+                     AND m.sent_at > now() - make_interval(secs => $2)""", mid, FRESH.total_seconds())
+        if row is not None:
+            self.publish(events.MESSAGE_CONTENT, {"account_id": row["account_id"], "chat_id": row["chat_id"],
+                                                  "message_id": mid, "outgoing": bool(row["is_outgoing"])})
 
     async def _finish(self, mid: int, state: str, error: str) -> None:
         async with self.pool.acquire() as conn:

@@ -68,6 +68,7 @@ SKIP_CHAT_TYPES = frozenset({"private_channel", "public_channel", "bot_chat", "s
 class Options:
     limit: int = 200              # предел запросов на извлечение за прогон
     window: int = 20_000          # сколько годных новых сообщений берётся за прогон
+    late_window: int = 500        # сколько сообщений с поздно появившимся текстом берётся за прогон
     first_run_days: int = 30      # при первом прогоне история старше не разбирается
     context_messages: int = 4     # сколько предыдущих сообщений показывается для понимания
     context_hours: int = 12
@@ -399,6 +400,30 @@ async def plan_run(
                 new_watermark = signal[budget - 1].last_id
                 eligible = [m for m in eligible if m.id <= new_watermark]
 
+        # Сообщения до прежней отметки, текст которых появился позже (расшифровка голосового,
+        # разбор вложения): прошлый прогон видел их пустыми. Эпизод — сами эти сообщения,
+        # предыдущие подтягиваются контекстом, как у любого эпизода. Делят тот же предел запросов.
+        late, late_signal, late_seen = [], [], []
+        if budget - len(signal) > 0 and watermark > 0:
+            late_rows = await conn.fetch(
+                f"""SELECT {_MSG_COLUMNS}, c.type AS chat_type {_FROM}
+                    WHERE m.late_content AND m.id <= $1 AND m.sent_at >= $2 AND ({_VERDICT}) = 'eligible'
+                    ORDER BY m.id LIMIT $3""",
+                watermark, floor, options.late_window)
+            for row in late_rows:
+                chat_types[row["chat_id"]] = row["chat_type"]
+            late = await _mark_service_sent(conn, [_msg(row) for row in late_rows])
+            room = budget - len(signal)
+            for episode in extract.build_episodes(late):
+                if extract.has_promise_signal(episode):
+                    if len(late_signal) >= room:
+                        cap_reached = more = True
+                        continue      # не поместилось: пометка остаётся до следующего прогона
+                    late_signal.append(episode)
+                late_seen.extend(m.id for m in episode.messages)
+            seen = set(late_seen)
+            late = [m for m in late if m.id in seen]
+
         # итоги — только по сообщениям до отметки; остальное отложено до следующего прогона
         counts = {"new": 0, "eligible": 0, "skipped_old": 0, "skipped_excluded": 0, "skipped_chat_type": 0,
                   "skipped_bot": 0, "skipped_service": 0, "skipped_deleted": 0, "skipped_empty": 0,
@@ -411,8 +436,16 @@ async def plan_run(
         counts["assistant"] = sum(1 for m in eligible if m.by_service)
         counts["deferred"] = await conn.fetchval("SELECT count(*) FROM messages WHERE id > $1", new_watermark)
 
+        # Рассмотренное снимается с пометки «текст появился позже»: и поздние сообщения, и
+        # годные из окна (их текст уже был на месте). Скрытое защитой остаётся помеченным.
+        cleared = [m.id for m in eligible] + late_seen
+        if cleared:
+            await conn.execute(
+                "UPDATE messages SET late_content = false WHERE late_content AND id = ANY($1::bigint[])", cleared)
+        counts["late"] = len(late_seen)
+
         planned = already = 0
-        for episode in signal:
+        for episode in [*signal, *late_signal]:
             job_id = await _enqueue_extract(conn, run_id, episode, chat_types[episode.chat_id], tz, options)
             if job_id is None:
                 already += 1
@@ -421,7 +454,7 @@ async def plan_run(
 
         resolve_planned = 0
         by_chat: dict[int, list[Msg]] = {}
-        for message in eligible:
+        for message in [*eligible, *late]:
             by_chat.setdefault(message.chat_id, []).append(message)
         if by_chat:
             with_open = await conn.fetch(
@@ -444,7 +477,7 @@ async def plan_run(
             "retried": replanned["retried"], "retry_dropped": replanned["retry_dropped"],
             "retry_waiting": waiting["retry"], "given_up": waiting["given_up"],
             "already_planned": already, "episodes": len(episodes),
-            "episodes_without_signal": len(episodes) - len(signal),
+            "episodes_without_signal": len(episodes) - len(signal), "late_planned": len(late_signal),
             "messages": counts, "cap_reached": cap_reached, "more": more,
             "watermark": new_state["watermark"], "floor": new_state["floor"],
             "expired": expired, "purged": swept, "people": synced,
