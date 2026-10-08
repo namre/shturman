@@ -96,7 +96,7 @@ git clone <адрес репозитория> shturman && cd shturman
 
 ## Документы
 
-`docs/target-model.md` · `docs/ceo-demo-video.md` · `docs/external-sources.md` · `docs/remote-mcp.md` · `docs/runbooks/validate-pilot.md` · `docs/architecture.md` · `docs/deployment.md` · `docs/service.md` · `docs/setup.md` · `docs/standalone.md` · `docs/security-review.md` · `docs/guard.md` · `docs/search.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `docs/runbooks/deploy-standalone.md` · `UPGRADING.md` · `service/README.md` · `AGENTS.md`
+`docs/target-model.md` · `docs/ceo-demo-video.md` · `docs/promo-video.md` · `docs/external-sources.md` · `docs/remote-mcp.md` · `docs/runbooks/validate-pilot.md` · `docs/architecture.md` · `docs/deployment.md` · `docs/service.md` · `docs/setup.md` · `docs/standalone.md` · `docs/security-review.md` · `docs/guard.md` · `docs/search.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `docs/runbooks/deploy-standalone.md` · `UPGRADING.md` · `service/README.md` · `AGENTS.md`
 
 ## Лицензия
 
