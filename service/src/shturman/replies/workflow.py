@@ -92,6 +92,41 @@ async def register(conn: Any, state: Any, chat_id: int, message_id: int) -> dict
     return task_dict(row)
 
 
+async def _current_telegram_owner(conn: Any) -> int | None:
+    """The current private control-bot receipt; numeric claims do not establish it."""
+    from .. import authority
+    principal = authority.get_owner_principal()
+    owner = await bridge.get_owner(conn)
+    if not bridge.owns_bot() or not owner or not principal or principal.source != 'telegram' \
+            or principal.user_id != int(owner['user_id']) \
+            or principal.chat_id != int(owner['chat_id']) or principal.chat_id != principal.user_id:
+        return None
+    return principal.user_id
+
+
+async def record_owner_resume(conn: Any, task_id: int) -> None:
+    """Persist fresh owner attention inside the successful decision transaction."""
+    owner_id = await _current_telegram_owner(conn)
+    if owner_id is None:
+        raise PermissionError('verified private Telegram owner decision required')
+    await conn.execute(
+        "UPDATE reply_tasks SET owner_resume_at=clock_timestamp(),owner_resume_by=$2,"
+        "owner_resume_via='telegram' WHERE id=$1 AND expires_at>clock_timestamp() "
+        "AND status IN ('waiting_source','waiting_owner','draft_ready')", task_id, owner_id)
+
+
+async def _owner_resumed(conn: Any, task: Mapping[str, Any]) -> bool:
+    owner = await bridge.get_owner(conn)
+    if owner and task.get('owner_resume_at') is not None \
+            and task.get('owner_resume_via') == 'telegram' \
+            and task.get('owner_resume_by') == int(owner['user_id']):
+        return True
+    # Before recording the decision, only the authenticated owner may inspect the
+    # waiting task or its exact pending draft beyond the automatic trigger age.
+    return task['status'] in ('waiting_source','waiting_owner','draft_ready') \
+        and await _current_telegram_owner(conn) is not None
+
+
 async def valid(conn: Any, state: Any, task: Mapping[str, Any]) -> bool:
     from ..outbox import autoreply
     from ..sources import broker
@@ -112,7 +147,8 @@ async def valid(conn: Any, state: Any, task: Mapping[str, Any]) -> bool:
     from ..outbox import autoreply
     settings = await autoreply.load(conn)
     if await conn.fetchval('SELECT sent_at < now()-make_interval(secs=>$2) FROM messages WHERE id=$1',
-                           task['trigger_message_id'], float(settings['max_age_seconds'])):
+                           task['trigger_message_id'], float(settings['max_age_seconds'])) \
+            and not await _owner_resumed(conn, task):
         return False
     # A newer incoming/outgoing makes an old automatic task obsolete even after an owner answer.
     if await conn.fetchval(
@@ -150,25 +186,48 @@ async def presend(conn: Any, state: Any, row: Mapping[str, Any]) -> policy.Decis
     return policy.ALLOW
 
 
+async def reconcile_delivery(conn: Any, task_id: int) -> None:
+    """A late proof of this exact business delivery corrects its one existing outcome."""
+    async with conn.transaction():
+        delivered = await conn.fetchrow(
+            "UPDATE reply_tasks t SET status='completed',error_code=NULL,updated_at=now(),nonce=$2 "
+            "FROM outbox_drafts d WHERE t.id=$1 AND t.status='failed' AND t.error_code='outcome_unknown' "
+            "AND t.draft_id=d.id AND d.task_id=t.id AND d.status='sent' AND d.channel='business' "
+            "AND d.account_id=t.account_id AND d.chat_id=t.chat_id "
+            "AND d.topic_tg_id IS NOT DISTINCT FROM t.topic_tg_id "
+            "AND d.task_policy_revision=t.policy_revision AND d.sources=t.source_refs "
+            "AND d.parts_sent=d.parts_total AND cardinality(d.sent_tg_message_ids)>0 "
+            "RETURNING t.outcome_log_id,t.account_id,t.chat_id", task_id, secrets.token_urlsafe(18))
+        if delivered is not None and delivered['outcome_log_id'] is not None:
+            await conn.execute(
+                "UPDATE outbox_autoreply_log SET outcome='replied',reason=NULL WHERE id=$1 "
+                "AND account_id=$2 AND chat_id=$3 AND outcome='failed' AND reason='outcome_unknown'",
+                delivered['outcome_log_id'], delivered['account_id'], delivered['chat_id'])
+
+
 async def stop(conn: Any, task_id: int, status: str, code: str | None = None) -> None:
-    """Record one terminal outcome per task, including malformed/empty model results."""
+    """Record one terminal outcome per task; proven late delivery corrects that event."""
     if status not in FINAL:
         raise ValueError('terminal_status_required')
-    done = await conn.fetchrow(
-        "UPDATE reply_tasks SET status=$2,error_code=$3,updated_at=now(),nonce=$4 "
-        "WHERE id=$1 AND status <> ALL($5::text[]) RETURNING account_id,chat_id",
-        task_id, status, code, secrets.token_urlsafe(18), sorted(FINAL))
-    if done is None:
-        return
-    from types import SimpleNamespace
-    from ..outbox import autoreply
-    outcome = ('replied' if status == 'completed' else
-               'declined' if status == 'declined' else
-               'no_answer' if code == 'invalid_model_result' else
-               'failed' if status == 'failed' else 'dropped')
-    await autoreply.log_outcome(conn, SimpleNamespace(**dict(done)), outcome, code)
-    if outcome == 'no_answer':
-        await autoreply._warn_if_model_is_silent(conn)
+    async with conn.transaction():
+        done = await conn.fetchrow(
+            "UPDATE reply_tasks SET status=$2,error_code=$3,updated_at=now(),nonce=$4 "
+            "WHERE id=$1 AND status <> ALL($5::text[]) RETURNING account_id,chat_id",
+            task_id, status, code, secrets.token_urlsafe(18), sorted(FINAL))
+        if done is None:
+            if status == 'completed':
+                await reconcile_delivery(conn, task_id)
+            return
+        from types import SimpleNamespace
+        from ..outbox import autoreply
+        outcome = ('replied' if status == 'completed' else
+                   'declined' if status == 'declined' else
+                   'no_answer' if code == 'invalid_model_result' else
+                   'failed' if status == 'failed' else 'dropped')
+        log_id = await autoreply.log_outcome(conn, SimpleNamespace(**dict(done)), outcome, code)
+        await conn.execute('UPDATE reply_tasks SET outcome_log_id=$2 WHERE id=$1', task_id, log_id)
+        if outcome == 'no_answer':
+            await autoreply._warn_if_model_is_silent(conn)
 
 
 async def queue(conn: Any, task: dict[str, Any]) -> None:

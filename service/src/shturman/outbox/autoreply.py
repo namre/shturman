@@ -398,10 +398,10 @@ async def on_message(mod: runtime.Outbox, payload: dict[str, Any]) -> None:
 
 # --- ответ модели ---
 
-async def log_outcome(conn: asyncpg.Connection, tgt: Target, outcome: str, reason: str | None = None) -> None:
-    """Записывает исход запроса автоответа. Без текста: только что произошло."""
-    await conn.execute(
-        "INSERT INTO outbox_autoreply_log (account_id, chat_id, outcome, reason) VALUES ($1, $2, $3, $4)",
+async def log_outcome(conn: asyncpg.Connection, tgt: Target, outcome: str, reason: str | None = None) -> int:
+    """Записывает исход без текста; номер связывает событие с конкретной задачей."""
+    return await conn.fetchval(
+        "INSERT INTO outbox_autoreply_log (account_id, chat_id, outcome, reason) VALUES ($1, $2, $3, $4) RETURNING id",
         tgt.account_id, tgt.chat_id, outcome, reason)
 
 

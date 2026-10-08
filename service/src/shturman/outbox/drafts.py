@@ -627,6 +627,9 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
         await finish(conn, row, tgt, "failed", code=decision.code, message=decision.message,
                      tell_owner=False, skip_part=pressed)
         return await closed("Не отправлено: " + decision.message)
+    if row['task_id'] is not None:
+        from ..replies import workflow
+        await workflow.record_owner_resume(conn, int(row['task_id']))
     await refresh_cards(conn, approved, tgt, skip_part=pressed)
     mod.kick()
     return await closed("Принято, отправляю.")

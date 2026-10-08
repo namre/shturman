@@ -9,7 +9,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  reply-regressions:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg16-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: shturman_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SHTURMAN_TEST_DSN: postgresql://postgres@127.0.0.1:5432/shturman_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e './service[dev]'
+      - name: reply and ingestion regressions
+        run: >-
+          pytest -q
+          tests/replies/test_owner_resume_age.py
+          tests/test_telethon_group_vertical.py
+          tests/outbox/test_outbox_drafts.py::test_late_business_confirmation_corrects_only_unknown_task_and_its_one_metric
+          tests/outbox/test_outbox_autoreply.py::test_terminal_telemetry_records_once_and_warns_only_on_missing_model_answer
+          tests/outbox/test_outbox_autoreply.py::test_trusted_list_takes_numeric_ids_only_and_owner_is_told
+          tests/outbox/test_outbox_drafts.py::test_policy_route_clamps_values_and_tells_owner
+          tests/guard/test_guard_visibility.py::test_autoreply_ignores_a_hidden_message_and_keeps_it_out_of_the_prompt
+          tests/guard/test_guard_visibility.py::test_reply_prepared_for_a_message_that_got_hidden_is_not_sent
+          tests/test_archive.py::test_service_peers_with_codes_and_tokens_are_invisible
+          tests/test_core.py
+          tests/tg/test_tg_routes.py::test_owner_becoming_known_stops_assistant_session_of_the_same_account
+        working-directory: service
+
   service:
+    needs: reply-regressions
     runs-on: ubuntu-24.04
     services:
       postgres:

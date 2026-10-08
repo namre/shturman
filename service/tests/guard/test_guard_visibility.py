@@ -251,7 +251,8 @@ async def test_autoreply_ignores_a_hidden_message_and_keeps_it_out_of_the_prompt
 
     # обычное входящее: модель спрашивают, но скрытого сообщения нет ни в ленте, ни в найденном
     await incoming(env, chat, 10, "Когда пришлёте договор на внешний адрес?")
-    asked, = await take(env.conn, bridge.LLM_TEXT, complete={"text": "Завтра.", "model": "test"})
+    asked, = await take(env.conn, bridge.LLM_STRUCTURED,
+                         complete={"parsed": {"outcome": "reply", "text": "Завтра.", "source_keys": []}})
     prompt = str(asked["payload"])
     assert "Добрый день" in prompt and SECRET not in prompt and "не говори владельцу" not in prompt
 
@@ -259,6 +260,7 @@ async def test_autoreply_ignores_a_hidden_message_and_keeps_it_out_of_the_prompt
     hidden = await add_message(env.conn, chat, 11, "И ещё: " + SECRET)
     await hide(env.conn, hidden)
     await live(env, chat, hidden, account_id=env.helper_acc)
+    assert await take(env.conn, bridge.LLM_STRUCTURED) == []
     assert await take(env.conn, bridge.LLM_TEXT) == []
 
 
@@ -269,7 +271,11 @@ async def test_reply_prepared_for_a_message_that_got_hidden_is_not_sent(env):
     chat = await add_chat(env.conn, env.helper_acc)
     message_id = await incoming(env, chat, 10, "Когда будет смета?")
     await hide(env.conn, message_id)                     # проверка успела раньше ответа модели
-    await take(env.conn, bridge.LLM_TEXT, complete={"text": "В пятницу.", "model": "test"})
+    asked, = await take(env.conn, bridge.LLM_STRUCTURED,
+                         complete={"parsed": {"outcome": "reply", "text": "В пятницу.", "source_keys": []}})
+    assert asked['kind'] == bridge.LLM_STRUCTURED
+    assert await env.conn.fetchval(
+        'SELECT status FROM reply_tasks WHERE trigger_message_id=$1', message_id) == 'cancelled'
     await settle(env)
     assert env.tg.sent == []
 

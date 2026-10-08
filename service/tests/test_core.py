@@ -67,7 +67,7 @@ async def test_excluded_chat_takes_nothing_from_any_source(conn):
     assert excluded is True
 
 
-@pytest.mark.parametrize("tg_id,username", [(777000, None), (93372553, "BotFather"), (5, "@SpamBot")])
+@pytest.mark.parametrize("tg_id,username", [(777000, None), (93372553, "BotFather"), (178220800, "@SpamBot")])
 async def test_service_chats_with_codes_and_tokens_are_always_excluded(conn, tg_id, username):
     account_id = await store.ensure_account(conn, 1000, "Владелец")
     chat_id, excluded = await store.ensure_chat(
@@ -258,3 +258,16 @@ async def test_executor_round_trip_over_http(make_client, conn):
     assert (await client.post("/api/jobs/claim", json={"kinds": ["rm -rf"]})).status_code == 400
     status = (await client.get("/api/status")).json()
     assert status["owner_known"] is True and status["jobs_waiting"] == 0
+
+
+async def test_service_username_does_not_exclude_an_unrelated_numeric_peer(conn):
+    account_id = await store.ensure_account(conn, 1000, "Владелец")
+    chat_id, excluded = await store.ensure_chat(
+        conn, account_id, ChatRecord("user", 5, "personal_chat", "Обычный собеседник", username="@SpamBot"))
+    assert excluded is False
+    assert store.is_blocked_peer("user", 5, "@SpamBot") is False
+    assert await conn.fetchval("SELECT excluded FROM chats WHERE id=$1", chat_id) is False
+    result = await store.upsert_messages(
+        conn, [(chat_id, rec(1, "ordinary conversation", sender=5))],
+        source="session", owner_tg_id=1000)
+    assert result.new == 1

@@ -12,7 +12,7 @@ from shturman.tg.gateway import AccountUnavailable, FloodWait, SendForbidden
 
 from outbox_helpers import (  # noqa: F401 - env — фикстура
     IVAN, MARIA, OWNER, STRANGER, add_chat, add_message, business, button, draft_row, edits, env,
-    new_draft, owner_messages, owner_request, press, settle, take, texts,
+    new_draft, owner_messages, owner_request, live, completion, press, settle, take, texts,
 )
 
 
@@ -572,7 +572,14 @@ async def test_policy_route_clamps_values_and_tells_owner(env):
     assert view["policy"]["drafting_default"] == "allow" and view["limits"]["daily_cap"]["max"] == 1000
     changed = await owner_request(env, "PUT", "/api/outbox/policy", json={"daily_cap": 10**9, "chat_window_max": 0})
     assert changed.json()["policy"]["daily_cap"] == 1000 and changed.json()["policy"]["chat_window_max"] == 1
-    assert changed.status_code == 200 and await owner_messages(env.conn) == []
+    assert changed.status_code == 200
+    notes = await owner_messages(env.conn)
+    assert len(notes) == 1 and notes[0]["payload"]["silent"] is True
+    assert texts(notes) == (
+        f'Изменены правила отправки сообщений. chat_window_max: {view["policy"]["chat_window_max"]} → 1')
+    repeated = await owner_request(env, "PUT", "/api/outbox/policy",
+                                   json={"daily_cap": 10**9, "chat_window_max": 0})
+    assert repeated.status_code == 200 and await owner_messages(env.conn) == []
     assert (await owner_request(env, "PUT", "/api/outbox/policy", json={"rm": 1})).status_code == 400
     assert (await owner_request(env, "PUT", "/api/outbox/policy", json={"daily_cap": "много"})).status_code == 400
     assert (await owner_request(env, "PUT", "/api/outbox/policy", json={"drafting_default": "да"})).status_code == 400
@@ -582,3 +589,60 @@ async def test_policy_route_clamps_values_and_tells_owner(env):
                            "WHERE key = 'outbox.policy'")
     rules = await policy.stored(env.conn)
     assert rules["daily_cap"] == 400 and rules["min_pause_seconds"] == 0
+
+
+@pytest.mark.parametrize("failure_code", ["outcome_unknown", "business_rejected"])
+@pytest.mark.parametrize("proof_path", ["callback", "recovery"])
+async def test_late_business_confirmation_corrects_only_unknown_task_and_its_one_metric(env, failure_code, proof_path):
+    from shturman.replies import workflow, service as reply_service
+    from shturman.sources import broker
+    from shturman.sources.registry import SourceError
+    await business(env.conn, env.owner_acc)
+    chat = await add_chat(env.conn, env.owner_acc)
+    assert (await owner_request(env, "POST", "/api/outbox/trusted",
+                               json={"tg_user_id": IVAN})).status_code == 200
+    assert (await owner_request(env, "PUT", "/api/outbox/autoreply",
+                               json={"account_id": env.owner_acc, "enabled": True})).status_code == 200
+    incoming = await add_message(env.conn, chat, 44, "Когда будет смета?")
+    await live(env, chat, incoming, account_id=env.owner_acc, source="business")
+    assert len(await take(env.conn, bridge.LLM_STRUCTURED, complete=completion("В пятницу."))) == 1
+    await settle(env)
+    draft = await env.conn.fetchrow("SELECT * FROM outbox_drafts WHERE trigger_message_id=$1", incoming)
+    task_id = draft["task_id"]
+    job = (await take(env.conn, bridge.BUSINESS_SEND))[0]["id"]
+    if failure_code != "outcome_unknown":
+        # An unrelated final failure must never be reopened by the delivery reconciliation exception.
+        await workflow.stop(env.conn, task_id, "failed", failure_code)
+    await env.conn.execute("UPDATE outbox_drafts SET claimed_at=now()-interval '10 minutes' WHERE id=$1", draft["id"])
+    assert (await drafts.sweep(env.mod))["unknown"] == 1
+    task = await workflow.get(env.conn, task_id)
+    assert (task["status"], task["error_code"]) == ("failed", failure_code)
+    log_id = task["outcome_log_id"]
+    assert log_id is not None
+    assert tuple(await env.conn.fetchrow("SELECT outcome,reason FROM outbox_autoreply_log WHERE id=$1", log_id)) == (
+        "failed", failure_code)
+    before = await env.conn.fetchval("SELECT count(*) FROM outbox_autoreply_log")
+    if proof_path == "callback":
+        await bridge.deliver_result(env.conn, job, {"message_id": 777})
+    else:
+        # Recover an interrupted handler after its exact delivery proof was already persisted.
+        await env.conn.execute(
+            "UPDATE outbox_drafts SET status='sent',parts_sent=parts_total,"
+            "sent_tg_message_ids=ARRAY[777::bigint],error_code=NULL,error_text=NULL WHERE id=$1", draft["id"])
+        await reply_service.sweep(env.state)
+    row = await draft_row(env.conn, draft["id"])
+    assert row["status"] == "sent" and list(row["sent_tg_message_ids"]) == [777]
+    expected = ("completed", None) if failure_code == "outcome_unknown" else ("failed", failure_code)
+    task = await workflow.get(env.conn, task_id)
+    assert (task["status"], task["error_code"]) == expected
+    metric = ("replied", None) if failure_code == "outcome_unknown" else ("failed", failure_code)
+    assert tuple(await env.conn.fetchrow("SELECT outcome,reason FROM outbox_autoreply_log WHERE id=$1", log_id)) == metric
+    # Duplicate proofs and repeated recovery sweeps cannot insert a metric or schedule another send.
+    await bridge.deliver_result(env.conn, job, {"message_id": 777})
+    await reply_service.sweep(env.state)
+    await reply_service.sweep(env.state)
+    assert await env.conn.fetchval("SELECT count(*) FROM outbox_autoreply_log") == before == 1
+    assert await take(env.conn, bridge.BUSINESS_SEND) == [] and env.tg.calls == 0
+    assert (await workflow.get(env.conn, task_id))["outcome_log_id"] == log_id
+    with pytest.raises(SourceError, match="inactive_task"):
+        await broker._task(env.conn, task_id)

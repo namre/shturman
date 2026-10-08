@@ -126,6 +126,8 @@ async def blocked_chat(conn, s: Seed, tg_id, username, *, in_group=True):
                                            source="import", owner_tg_id=OWNER)
     assert rejected.new == 0
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE chat_id = $1", chat_id) == 0
+    # Emulate old persisted data only after proving that the current writer rejects it.
+    await conn.execute("UPDATE chats SET excluded = false WHERE id = $1", chat_id)
     ids = await legacy_put(conn, chat_id, record)
     if in_group:
         ids |= await legacy_put(conn, s.family,

@@ -375,10 +375,14 @@ async def test_owner_becoming_known_stops_assistant_session_of_the_same_account(
     session = world.last
 
     # тот же владелец привязан повторно — ничего не происходит
-    await client.put("/api/owner", json={"user_id": SELF_ID, "chat_id": SELF_ID})
+    repeated = await client.put("/api/owner", json={"user_id": SELF_ID, "chat_id": SELF_ID})
+    assert repeated.status_code == 200, repeated.text
     assert manager.can_send(account_id) is True
 
-    await client.put("/api/owner", json={"user_id": HELPER_ID, "chat_id": HELPER_ID})
+    # The currently bound owner makes this change through the independent owner path.
+    with authority.owner_context(SELF_ID, chat_id=SELF_ID, action="test.owner.rebind"):
+        changed = await client.put("/api/owner", json={"user_id": HELPER_ID, "chat_id": HELPER_ID})
+    assert changed.status_code == 200, changed.text
     assert manager.can_send(account_id) is False             # сразу, не дожидаясь отключения
     await wait_for(lambda: not session.connected)
     account = (await client.get("/api/tg/accounts")).json()["accounts"][0]

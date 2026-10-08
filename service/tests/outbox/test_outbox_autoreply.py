@@ -424,7 +424,12 @@ async def test_trusted_list_takes_numeric_ids_only_and_owner_is_told(env):
 
     removed = await owner_request(env, "DELETE", "/api/outbox/trusted", params={"tg_user_id": IVAN})
     assert removed.json()["removed"] is True and removed.json()["trusted"] == []
-    assert removed.status_code == 200 and await owner_messages(env.conn) == []
+    assert removed.status_code == 200
+    notes = await owner_messages(env.conn)
+    assert len(notes) == 1 and texts(notes) == f"Из списка доверенных убран идентификатор {IVAN}. Осталось: 0."
+    repeated = await owner_request(env, "DELETE", "/api/outbox/trusted", params={"tg_user_id": IVAN})
+    assert repeated.status_code == 200 and repeated.json()["removed"] is False
+    assert await owner_messages(env.conn) == []
     assert (await owner_request(env, "DELETE", "/api/outbox/trusted", params={"tg_user_id": "ivan"})).status_code == 400
     assert (await owner_request(env, "PUT", "/api/outbox/autoreply", json={"enabled": True})).status_code == 400
     assert (await owner_request(env, "PUT", "/api/outbox/autoreply", json={"account_id": 99, "enabled": True})).status_code == 404
@@ -536,8 +541,11 @@ async def test_terminal_telemetry_records_once_and_warns_only_on_missing_model_a
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
     from shturman.replies import workflow
-    conn = SimpleNamespace(fetchrow=AsyncMock(side_effect=[{"account_id": 2, "chat_id": 3}, None]))
-    log, warn = AsyncMock(), AsyncMock()
+    from contextlib import nullcontext
+    rows = [{"account_id": 2, "chat_id": 3}, None] + ([None] if status == "completed" else [])
+    conn = SimpleNamespace(fetchrow=AsyncMock(side_effect=rows), execute=AsyncMock(),
+                           transaction=lambda: nullcontext())
+    log, warn = AsyncMock(return_value=42), AsyncMock()
     monkeypatch.setattr(autoreply, "log_outcome", log)
     monkeypatch.setattr(autoreply, "_warn_if_model_is_silent", warn)
     await workflow.stop(conn, 7, status, code)

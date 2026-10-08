@@ -88,7 +88,7 @@ async def _task(conn, task):
     if row is None or (isinstance(task, dict) and task.get("chat_id", row["chat_id"]) != row["chat_id"]):
         raise SourceError("invalid_task")
     if row["expires_at"] <= datetime.now(timezone.utc) or row["status"] in {
-            "cancelled", "expired", "failed", "sent", "rejected", "declined", "done"}:
+            "cancelled", "expired", "failed", "sent", "rejected", "declined", "done", "completed"}:
         raise SourceError("inactive_task")
     return dict(row)
 

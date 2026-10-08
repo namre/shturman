@@ -13,8 +13,9 @@ async def sweep(state: Any) -> None:
         # Recover completion missed by an interrupted sender before considering task expiry.
         finished = await conn.fetch(
             "SELECT t.id,d.status,d.error_code FROM reply_tasks t JOIN outbox_drafts d ON d.id=t.draft_id "
-            "WHERE t.status='draft_ready' AND d.status IN "
-            "('sent','rejected','superseded','expired','failed','outcome_unknown')")
+            "WHERE (t.status='draft_ready' AND d.status IN "
+            "('sent','rejected','superseded','expired','failed','outcome_unknown')) "
+            "OR (t.status='failed' AND t.error_code='outcome_unknown' AND d.status='sent')")
         for row in finished:
             status = ('completed' if row['status'] == 'sent' else 'declined' if row['status'] == 'rejected' else
                       'expired' if row['status'] == 'expired' else

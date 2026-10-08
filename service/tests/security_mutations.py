@@ -274,6 +274,8 @@ def main() -> int:
     }
     report_path = output / "security-mutations.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print("Provenance: " + json.dumps({key: report["provenance"][key] for key in
+          ("git_head", "dirty", "dirty_files", "tree_sha256")}, ensure_ascii=False), flush=True)
     print(json.dumps(report["summary"], ensure_ascii=False), flush=True)
     print(f"Report: {report_path}", flush=True)
     if not baseline_ok or any(item["status"] in ("error", "timeout", "blocked") for item in report["mutations"]):
