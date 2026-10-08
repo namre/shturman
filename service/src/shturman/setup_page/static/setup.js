@@ -555,7 +555,7 @@
     }
     if (id !== null) {
       buttons.push(el("button", { class: "btn ghost danger small-btn", type: "button", text: "Выйти из аккаунта", onclick: function () {
-        if (!confirm("Выйти из аккаунта?\n\nСессия на сервере завершится. Уже сохранённые сообщения останутся в архиве.")) return;
+        if (!confirm("Выйти из аккаунта?\n\nСессия на сервере завершится. Уже сохранённые сообщения останутся в архиве.\n\nЕсли подключили не тот аккаунт — после выхода удалите его из архива в блоке «Аккаунты в архиве без подключения».")) return;
         act(this, null, "POST", "tg/accounts/" + id + "/logout", {}, function () { toast("Сессия аккаунта завершена."); });
       } }));
     }
@@ -587,6 +587,22 @@
       });
     });
     show("tg-login", !!ui.login);
+    var detached = tg.detached || [];
+    show("detached-box", detached.length > 0);
+    renderIfChanged("detached-list", [detached], function () { return detached.map(detachedNode); });
+  }
+
+  function detachedNode(account) {
+    var id = account.account_id, name = account.label || "Аккаунт";
+    return el("div", { class: "row" }, [
+      el("span", { class: "account-name", text: name }),
+      el("span", { class: "small", text: "записан как " + account.role_name + " · сообщений: " + account.messages }),
+      el("button", { class: "btn ghost danger small-btn", type: "button", text: "Удалить из архива", onclick: function () {
+        if (!confirm("Удалить «" + name + "» из архива?\n\nУдалятся его чаты и сообщения (" + account.messages +
+                     ") и всё, что сервис из них извлёк. Вернуть их нельзя. Если подключить этот аккаунт снова, переписка загрузится заново.")) return;
+        act(this, null, "DELETE", "tg/accounts/" + id, {}, function () { toast("Аккаунт удалён из архива. Теперь его можно подключить заново."); });
+      } })
+    ]);
   }
 
   /* Блок с QR один на оба аккаунта: он переезжает туда, где начали вход. */

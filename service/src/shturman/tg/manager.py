@@ -61,6 +61,9 @@ PAUSED, UNAUTHORIZED, LOCKED, FAILED, NO_SESSION = "paused", "unauthorized", "lo
 ACTIVE = (STARTING, RUNNING, DISCONNECTED, ERROR)
 
 ROLE_NAMES = {"owner": "основной аккаунт владельца", "assistant": "аккаунт-помощник"}
+# Подсказка к отказам по роли: запись о роли остаётся в архиве и после выхода из аккаунта.
+FORGET_HINT = ("Если раньше подключили не тот аккаунт — выйдите из него и удалите его из архива на "
+               "странице настройки переписки (блок «Аккаунты в архиве без подключения»), затем войдите заново.")
 
 
 KEEP: Any = object()   # «настройку не трогать»
@@ -457,7 +460,7 @@ class TgManager:
             if known is not None and known["role"] != role:
                 raise LoginRejected(
                     f"Этот аккаунт уже записан в архиве как {ROLE_NAMES[known['role']]} — "
-                    f"подключить его как {ROLE_NAMES[role]} нельзя.")
+                    f"подключить его как {ROLE_NAMES[role]} нельзя. {FORGET_HINT}")
             if role == "assistant":
                 owner = await bridge.get_owner(conn)
                 if owner is not None and int(owner["user_id"]) == tg_user_id:
@@ -469,8 +472,8 @@ class TgManager:
                     "SELECT 1 FROM accounts WHERE role = 'owner' AND tg_user_id <> $1 LIMIT 1", tg_user_id)
                 if other:
                     raise LoginRejected(
-                        "В архиве уже есть основной аккаунт с другим идентификатором. "
-                        "Отсканируйте код тем аккаунтом, чья переписка уже загружена.")
+                        "В архиве уже есть основной аккаунт — другой. Отсканируйте код тем аккаунтом, "
+                        f"чья переписка уже загружена. {FORGET_HINT}")
             bound = await conn.fetchval(
                 """SELECT a.tg_user_id FROM tg_sessions s JOIN accounts a ON a.id = s.account_id
                    WHERE s.slot = $1""", rt.slot)
@@ -667,6 +670,47 @@ class TgManager:
                             "auto_personal": False, "auto_groups": False, "backfill_months": None,
                             "logged_in_at": None})
         return out
+
+    async def detached_accounts(self, conn: asyncpg.Connection) -> list[dict[str, Any]]:
+        """Аккаунты, которые есть в архиве, но без сессии: из них вышли, или переписка пришла
+        только из выгрузки или бизнес-режима. Их роль в архиве остаётся и мешает подключить тот же
+        аккаунт в другой роли — поэтому страница показывает их и даёт удалить (`forget`)."""
+        rows = await conn.fetch(
+            """SELECT a.id, a.label, a.role,
+                      (SELECT count(*) FROM chats c WHERE c.account_id = a.id) AS chats,
+                      (SELECT count(*) FROM messages m JOIN chats c ON c.id = m.chat_id
+                        WHERE c.account_id = a.id) AS messages
+               FROM accounts a
+               WHERE NOT EXISTS (SELECT 1 FROM tg_sessions s WHERE s.account_id = a.id)
+               ORDER BY a.id""")
+        return [{"account_id": r["id"], "label": r["label"], "role": r["role"],
+                 "role_name": ROLE_NAMES.get(r["role"], r["role"]),
+                 "chats": int(r["chats"]), "messages": int(r["messages"])} for r in rows]
+
+    async def forget(self, conn: asyncpg.Connection, account_id: int) -> dict[str, Any]:
+        """Удаляет из архива аккаунт без сессии вместе с его чатами, сообщениями и всем, что из
+        них извлечено (каскадом). Нужен, когда в роль вошли не тем аккаунтом: запись о роли
+        иначе не даёт подключить ни этот аккаунт в другой роли, ни правильный — в этой.
+
+        Вызывается из функции применения действия, внутри её транзакции."""
+        row = await conn.fetchrow("SELECT id, tg_user_id, label, role FROM accounts WHERE id = $1 FOR UPDATE",
+                                  account_id)
+        if row is None:
+            raise TgError("Такого аккаунта в архиве нет.", 404)
+        if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM tg_sessions WHERE account_id = $1)", account_id) \
+                or self._by_account(account_id) is not None:
+            raise TgError("Этот аккаунт подключён. Сначала выйдите из него, затем удалите из архива.", 409)
+        if any(not flow.done for flow in self.flows.values()):
+            raise TgError("Идёт вход в аккаунт Telegram. Дождитесь его окончания или отмените вход.", 409)
+        if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM business_connections WHERE account_id = $1 AND enabled)",
+                               account_id):
+            raise TgError("К этому аккаунту подключён бизнес-режим. Сначала отключите бота в Telegram: "
+                          "«Настройки» → «Telegram для бизнеса» → «Чат-боты».", 409)
+        messages = int(await conn.fetchval(
+            "SELECT count(*) FROM messages m JOIN chats c ON c.id = m.chat_id WHERE c.account_id = $1", account_id))
+        await conn.execute("DELETE FROM accounts WHERE id = $1", account_id)
+        logger.info("аккаунт %s (%s) удалён из архива, сообщений: %s", account_id, row["role"], messages)
+        return {"role": row["role"], "label": row["label"], "messages": messages}
 
     async def logout(self, account_id: int) -> dict[str, Any]:
         """Завершает сессию в Telegram и удаляет её файл. Архив остаётся."""

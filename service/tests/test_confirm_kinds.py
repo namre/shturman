@@ -11,7 +11,7 @@ EXPECTED = {
     "outbox.policy", "outbox.account_drafting", "outbox.chat_drafting", "outbox.autoreply",
     "outbox.trusted_add", "watch.rule_create", "watch.rule_update", "watch.rule_delete",
     "archive.chat_exclude", "archive.chat_include", "archive.chat_purge", "archive.import_run",
-    "tg.login", "tg.resume", "tg.options", "tg.sync",
+    "tg.login", "tg.resume", "tg.options", "tg.sync", "tg.forget",
     "commitments.decide", "people.merge", "people.split", "people.alias",
     "pages.owner_block", "pages.accept",
 }

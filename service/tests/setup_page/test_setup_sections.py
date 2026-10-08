@@ -294,6 +294,54 @@ async def test_roles_are_guarded_the_same_way_as_in_the_terminal(stand, conn):
     assert (account["role"], account["can_send"], account["account_id"]) == ("owner", False, account_id)
 
 
+async def attempt(s, role, world_user, **extra):
+    """Вход, который должен не состояться: итог входа для страницы."""
+    started = await s.page.post("/tg/login", {"role": role, **extra})
+    assert started.status_code == 200, started.text
+    s.world.me = world_user
+    s.world.last.scan.set_result(world_user)
+    login_id = started.json()["login_id"]
+    await wait_for(lambda: s.manager.flows[login_id].done)
+    return (await s.page.get(f"/tg/login/{login_id}")).json()
+
+
+async def test_account_connected_in_the_wrong_role_can_be_removed_from_the_archive(stand, conn):
+    """Сценарий пилота: основным подключили второй номер, вышли — и попали в тупик: второй номер
+    не подключается помощником, настоящий основной — основным. Выход из тупика — удалить аккаунт
+    из архива со страницы."""
+    world = World(HELPER)
+    world.authorized = False
+    s = await stand(world=world)
+    await s.page.login(conn)
+    assert (await s.page.put("/tg/keys", KEYS)).status_code == 200
+    wrong = await connect(s, "owner", HELPER, confirm_owner=True)
+    assert (await s.page.get("/state")).json()["tg"]["detached"] == []
+    busy = await s.page.delete(f"/tg/accounts/{wrong}")
+    assert busy.status_code == 409 and "выйдите" in busy.json()["error"]       # подключённый не удаляется
+    assert (await s.page.post(f"/tg/accounts/{wrong}/logout")).status_code == 200
+
+    detached = (await s.page.get("/state")).json()["tg"]["detached"]
+    assert [(d["account_id"], d["role"], d["label"]) for d in detached] == [(wrong, "owner", "Помощник")]
+    for role, who, extra in (("assistant", HELPER, {}), ("owner", ME, {"confirm_owner": True})):
+        failed = await attempt(s, role, who, **extra)
+        assert failed["status"] == "failed" and "удалите его из архива" in failed["error"], failed
+
+    # внутренний API такого действия не знает: удалить можно только со страницы
+    assert (await s.api.delete(f"/api/tg/accounts/{wrong}")).status_code in (404, 405)
+    gone = await s.page.delete(f"/tg/accounts/{wrong}")
+    assert gone.status_code == 200 and gone.json()["ok"] is True
+    assert await conn.fetchval("SELECT count(*) FROM accounts WHERE id = $1", wrong) == 0
+    assert (await s.page.get("/state")).json()["tg"]["detached"] == []
+    assert (await s.page.delete(f"/tg/accounts/{wrong}")).status_code == 404
+    assert ("tg.forget", "ok", "основной аккаунт владельца; сообщений: 0") in await audit_rows(conn)
+
+    # теперь всё на своих местах
+    owner = await connect(s, "owner", ME, confirm_owner=True)
+    helper = await connect(s, "assistant", HELPER)
+    roles = {a["account_id"]: a["role"] for a in (await s.page.get("/state")).json()["tg"]["accounts"]}
+    assert roles == {owner: "owner", helper: "assistant"}
+
+
 async def test_pause_resume_cancel_and_logout(stand, conn):
     world = World(HELPER)
     world.authorized = False

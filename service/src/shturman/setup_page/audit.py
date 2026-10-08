@@ -50,6 +50,7 @@ ACTIONS = {
     "tg.pause": "Аккаунт Telegram поставлен на паузу",
     "tg.resume": "Аккаунт Telegram снят с паузы",
     "tg.logout": "Выход из аккаунта Telegram",
+    "tg.forget": "Аккаунт Telegram удалён из архива",
     "tg.options": "Изменены настройки аккаунта Telegram",
     "tg.sync_on": "Включено чтение чатов",
     "tg.sync_off": "Выключено чтение чатов",
@@ -70,7 +71,7 @@ ACTIONS = {
 IMPORTANT = frozenset({
     "login.link", "login.code", "logout.all",
     "bot.token", "bot.token_removed", "bot.bind_link",
-    "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout",
+    "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed",
 })
 
