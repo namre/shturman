@@ -6,7 +6,7 @@ from shturman import bridge
 from shturman.processing import people, service
 
 from conftest import MCP_AUTH
-from proc_helpers import OWNER, account, chat, peer_id, say
+from proc_helpers import OWNER, account, chat, peer_id, press, say
 
 IVAN = 2001
 MODULES = ("shturman.api_core", "shturman.processing.service")
@@ -33,7 +33,7 @@ def items():
             item(2, "Договор отправлю через две недели", "отправить договор", "через две недели")]
 
 
-async def test_processing_and_commitment_routes(make_client, conn):
+async def test_processing_and_commitment_routes(make_client, conn, own_bot, approvals):
     client, _ = await make_client(*MODULES)
     _, ivan_chat, ids = await seed(conn)
 
@@ -66,10 +66,13 @@ async def test_processing_and_commitment_routes(make_client, conn):
     assert (await client.get("/api/commitments", params={"person_id": "x"})).status_code == 400
     assert (await client.get("/api/commitments", params={"person_id": 999})).status_code == 404
 
-    # нажатие кнопки приходит тем же путём, что и в жизни
+    # Numeric IDs in an HTTP callback cannot impersonate the private control-bot receipt.
     pressed = await client.post("/api/callbacks/telegram", json={"data": f"sh:cm:a:{smeta}", "from_user_id": OWNER})
-    assert pressed.json()["answer"] == "Принято."
-    assert (await client.post(f"/api/commitments/{dogovor}/accept")).json()["commitment"]["status"] == "open"
+    assert pressed.status_code == 403 and pressed.json()["code"] == "own_bot"
+    assert (await press(conn, f"sh:cm:a:{smeta}"))["answer"] == "Принято."
+    action = approvals.waiting(await client.post(f"/api/commitments/{dogovor}/accept"))
+    assert (await approvals.press(action))["answer"] == "Сделано."
+    assert (await client.get(f"/api/commitments/{dogovor}")).json()["status"] == "open"
 
     one = (await client.get(f"/api/commitments/{smeta}")).json()
     assert one["source_quote"] == "Пришлю смету по фасадам через 3 дня" and one["source"]["message_id"] == ids[0]
@@ -85,7 +88,9 @@ async def test_processing_and_commitment_routes(make_client, conn):
     assert len(by_person["commitments"]) == 2
 
     moved = await client.post(f"/api/commitments/{dogovor}/reschedule", json={"due": "через месяц"})
-    assert moved.status_code == 200 and moved.json()["commitment"]["due_expression"] == "через месяц"
+    action = approvals.waiting(moved)
+    assert (await approvals.press(action))["answer"] == "Сделано."
+    assert (await client.get(f"/api/commitments/{dogovor}")).json()["due_expression"] == "через месяц"
     vague = await client.post(f"/api/commitments/{dogovor}/reschedule", json={"due": "на днях"})
     assert vague.status_code == 422 and vague.json()["code"] == "vague"
     assert (await client.post(f"/api/commitments/{dogovor}/reschedule", json={})).status_code == 400
@@ -100,9 +105,10 @@ async def test_processing_and_commitment_routes(make_client, conn):
     assert [c["id"] for c in closed] == [smeta]
 
 
-async def test_people_routes(make_client, conn):
+async def test_people_routes(make_client, conn, own_bot, approvals):
     client, _ = await make_client(*MODULES)
     account_id = await account(conn)
+    await bridge.set_owner(conn, OWNER, OWNER)
     await chat(conn, account_id, IVAN, "Иван Петров")
     await chat(conn, account_id, 2020, "Ivan Petrov")
     first = await people.ensure_person_for_peer(conn, await peer_id(conn, IVAN))
@@ -119,7 +125,9 @@ async def test_people_routes(make_client, conn):
     assert (await client.get("/api/people/999")).status_code == 404
 
     added = await client.post(f"/api/people/{first}/aliases", json={"alias": "Иван Иванович"})
-    assert added.status_code == 200 and added.json()["person"]["confirmed"] is True
+    action = approvals.waiting(added)
+    assert (await approvals.press(action))["answer"] == "Сделано."
+    assert (await client.get(f"/api/people/{first}")).json()["confirmed"] is True
     assert (await client.post(f"/api/people/{first}/aliases", json={"alias": "  "})).status_code == 400
     assert (await client.post("/api/people/999/aliases", json={"alias": "Кто-то"})).status_code == 404
     found = (await client.get("/api/people", params={"query": "Иванычу"})).json()["people"]
@@ -130,16 +138,24 @@ async def test_people_routes(make_client, conn):
     proposals = (await client.get("/api/people/proposals")).json()["proposals"]
     assert [(p["person"]["id"], p["other"]["id"]) for p in proposals] == [(second, first)]
     merged = await client.post("/api/people/merge", json={"proposal_id": proposals[0]["id"]})
-    assert merged.status_code == 200 and merged.json()["person"]["id"] == first
-    assert len(merged.json()["person"]["peers"]) == 2
+    action = approvals.waiting(merged)
+    assert (await approvals.press(action))["answer"] == "Сделано."
+    merged_person = (await client.get(f"/api/people/{first}")).json()
+    assert merged_person["id"] == first and len(merged_person["peers"]) == 2
     assert (await client.get(f"/api/people/{second}")).json()["id"] == first      # старый идентификатор жив
     assert (await client.get("/api/people/proposals")).json()["proposals"] == []
     assert (await client.post("/api/people/merge", json={"source_id": first, "target_id": first})).status_code == 409
     assert (await client.post("/api/people/merge", json={"source_id": "a", "target_id": 1})).status_code == 400
 
     split = await client.post(f"/api/people/{first}/split", json={"peer_id": await peer_id(conn, 2020)})
-    assert split.status_code == 200 and split.json()["split_from"] == first
-    assert (await client.post(f"/api/people/{first}/split", json={"peer_id": await peer_id(conn, IVAN)})).status_code == 409
+    action = approvals.waiting(split)
+    assert (await approvals.press(action))["answer"] == "Сделано."
+    assert len((await client.get(f"/api/people/{first}")).json()["peers"]) == 1
+    impossible = approvals.waiting(await client.post(
+        f"/api/people/{first}/split", json={"peer_id": await peer_id(conn, IVAN)}))
+    assert (await approvals.press(impossible))["answer"] == "Не получилось."
+    assert await approvals.status(impossible) == "failed"
+    assert len((await client.get(f"/api/people/{first}")).json()["peers"]) == 1
 
     # отклонение предложения
     await chat(conn, account_id, 2030, "Иван Петров")

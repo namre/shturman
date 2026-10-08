@@ -1,6 +1,7 @@
 """Черновики и согласование: от создания до отправки по обоим каналам и все отказы."""
 
 import asyncio
+from types import SimpleNamespace
 
 import asyncpg
 import pytest
@@ -11,7 +12,7 @@ from shturman.tg.gateway import AccountUnavailable, FloodWait, SendForbidden
 
 from outbox_helpers import (  # noqa: F401 - env — фикстура
     IVAN, MARIA, OWNER, STRANGER, add_chat, add_message, business, button, draft_row, edits, env,
-    new_draft, owner_messages, press, settle, take, texts,
+    new_draft, owner_messages, owner_request, press, settle, take, texts,
 )
 
 
@@ -76,7 +77,12 @@ async def test_double_tap_sends_once(env):
     draft_id, cards = await approved(env, chat)
     data = button(cards, "Отправить")
     env.tg.delay = 0.05
-    answers = await asyncio.gather(*[press(env, data) for _ in range(4)])
+    async def concurrent_press():
+        # Each concurrent callback uses an independent PostgreSQL transaction/connection.
+        async with env.state.pool.acquire() as callback_conn:
+            return await press(SimpleNamespace(conn=callback_conn), data)
+
+    answers = await asyncio.gather(*[concurrent_press() for _ in range(4)])
     await settle(env)
     await press(env, data)
     await settle(env)
@@ -369,13 +375,13 @@ async def test_excluded_blocked_and_forbidden_chats_cannot_be_addressed(env):
     assert (await new_draft(env, 424242)).status_code == 404
 
     ivan = await add_chat(env.conn, env.helper_acc)
-    assert (await env.client.put(f"/api/outbox/chats/{ivan}", json={"drafting": "deny"})).json()["can_draft"] is False
+    assert (await owner_request(env, "PUT", f"/api/outbox/chats/{ivan}", json={"drafting": "deny"})).json()["can_draft"] is False
     assert (await new_draft(env, ivan)).json()["reason"] == "drafting_forbidden"
-    await env.client.put(f"/api/outbox/chats/{ivan}", json={"drafting": "default"})
+    await owner_request(env, "PUT", f"/api/outbox/chats/{ivan}", json={"drafting": "default"})
     # запрет по умолчанию для аккаунта и разрешение для одного чата
-    await env.client.put("/api/outbox/policy", json={"account_id": env.helper_acc, "drafting_default": "deny"})
+    await owner_request(env, "PUT", "/api/outbox/policy", json={"account_id": env.helper_acc, "drafting_default": "deny"})
     assert (await new_draft(env, ivan)).json()["reason"] == "drafting_forbidden"
-    await env.client.put(f"/api/outbox/chats/{ivan}", json={"drafting": "allow"})
+    await owner_request(env, "PUT", f"/api/outbox/chats/{ivan}", json={"drafting": "allow"})
     draft_id, cards = await approved(env, ivan)
 
     # чат исключили уже после создания черновика: нажатие ничего не отправит
@@ -452,7 +458,7 @@ async def test_session_channel_needs_running_assistant_session(env):
 
 async def test_limits_and_duplicates(env):
     chat = await add_chat(env.conn, env.helper_acc)
-    await env.client.put("/api/outbox/policy", json={"chat_window_max": 2, "duplicate_window_seconds": 300})
+    await owner_request(env, "PUT", "/api/outbox/policy", json={"chat_window_max": 2, "duplicate_window_seconds": 300})
     for text in ("Раз", "Два"):
         _, cards = await approved(env, chat, text)
         await press(env, button(cards, "Отправить"))
@@ -466,26 +472,26 @@ async def test_limits_and_duplicates(env):
     assert "уже отправлено 2 сообщений" in out["answer"] and out["remove_buttons"] is False
     # в другой чат того же аккаунта — можно, пока не выбран дневной предел
     maria = await add_chat(env.conn, env.helper_acc, MARIA, name="Мария")
-    await env.client.put("/api/outbox/policy", json={"daily_cap": 2})
+    await owner_request(env, "PUT", "/api/outbox/policy", json={"daily_cap": 2})
     _, maria_cards = await approved(env, maria, "Привет")
     assert "дневной предел" in (await press(env, button(maria_cards, "Отправить")))["answer"]
     await settle(env)
     assert [m["text"] for m in env.tg.sent] == ["Раз", "Два"]
     # окно прошло, предел подняли — тот же черновик уходит
     await env.conn.execute("UPDATE outbox_drafts SET claimed_at = claimed_at - interval '2 minutes'")
-    await env.client.put("/api/outbox/policy", json={"daily_cap": 50})
+    await owner_request(env, "PUT", "/api/outbox/policy", json={"daily_cap": 50})
     await press(env, button(cards, "Отправить"))
     await settle(env)
     assert [m["text"] for m in env.tg.sent] == ["Раз", "Два", "Три"]
     assert (await draft_row(env.conn, third))["status"] == "sent"
     # поток карточек владельцу тоже ограничен
-    await env.client.put("/api/outbox/policy", json={"drafts_per_hour": 1})
+    await owner_request(env, "PUT", "/api/outbox/policy", json={"drafts_per_hour": 1})
     flood = await new_draft(env, maria, "Ещё одно")
     assert flood.status_code == 429 and flood.json()["reason"] == "limit_drafts"
 
 
 async def test_pause_between_sends_of_one_account(env):
-    await env.client.put("/api/outbox/policy", json={"min_pause_seconds": 0.4})
+    await owner_request(env, "PUT", "/api/outbox/policy", json={"min_pause_seconds": 0.4})
     ivan = await add_chat(env.conn, env.helper_acc)
     maria = await add_chat(env.conn, env.helper_acc, MARIA, name="Мария")
     for chat in (ivan, maria):
@@ -564,13 +570,13 @@ async def test_no_owner_no_drafts_and_listing_filters(env):
 async def test_policy_route_clamps_values_and_tells_owner(env):
     view = (await env.client.get("/api/outbox/policy")).json()
     assert view["policy"]["drafting_default"] == "allow" and view["limits"]["daily_cap"]["max"] == 1000
-    changed = await env.client.put("/api/outbox/policy", json={"daily_cap": 10**9, "chat_window_max": 0})
+    changed = await owner_request(env, "PUT", "/api/outbox/policy", json={"daily_cap": 10**9, "chat_window_max": 0})
     assert changed.json()["policy"]["daily_cap"] == 1000 and changed.json()["policy"]["chat_window_max"] == 1
-    assert "daily_cap" in texts(await owner_messages(env.conn))
-    assert (await env.client.put("/api/outbox/policy", json={"rm": 1})).status_code == 400
-    assert (await env.client.put("/api/outbox/policy", json={"daily_cap": "много"})).status_code == 400
-    assert (await env.client.put("/api/outbox/policy", json={"drafting_default": "да"})).status_code == 400
-    assert (await env.client.put("/api/outbox/chats/999", json={"drafting": "deny"})).status_code == 404
+    assert changed.status_code == 200 and await owner_messages(env.conn) == []
+    assert (await owner_request(env, "PUT", "/api/outbox/policy", json={"rm": 1})).status_code == 400
+    assert (await owner_request(env, "PUT", "/api/outbox/policy", json={"daily_cap": "много"})).status_code == 400
+    assert (await owner_request(env, "PUT", "/api/outbox/policy", json={"drafting_default": "да"})).status_code == 400
+    assert (await owner_request(env, "PUT", "/api/outbox/chats/999", json={"drafting": "deny"})).status_code == 404
     # испорченное значение в базе не ломает правила: берётся умолчание
     await env.conn.execute("UPDATE settings SET value = '{\"daily_cap\": \"x\", \"min_pause_seconds\": -5}' "
                            "WHERE key = 'outbox.policy'")

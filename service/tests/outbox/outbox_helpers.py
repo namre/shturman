@@ -162,6 +162,18 @@ async def press(env, data: str, user: int = OWNER) -> dict:
     return await bridge.dispatch_callback(env.conn, data, user)
 
 
+async def owner_request(env, method, url, **kwargs):
+    """Explicit owner setup for positive domain tests, scoped to one request."""
+    with authority.owner_context(OWNER, chat_id=OWNER, action="test.owner.setup"):
+        return await env.client.request(method, url, **kwargs)
+
+
+def completion(reply):
+    if isinstance(reply, str) and "БЕЗ_ОТВЕТА" in reply.upper():
+        return {"parsed": {"outcome": "decline"}, "model": "test"}
+    return {"parsed": {"outcome": "reply", "text": reply}, "model": "test"}
+
+
 async def new_draft(env, chat_id, text="Добрый день! Смету пришлю в пятницу.", **extra):
     response = await env.client.post("/api/outbox/drafts", json={"chat_id": chat_id, "text": text, **extra})
     return response

@@ -133,7 +133,8 @@ async def grant_for_task(conn, task, request, *, owner_id: int, mode="read", exp
     now = datetime.now(timezone.utc)
     deadline = now + timedelta(days=30) if persistent else current["expires_at"]
     if expires_at is not None:
-        requested = datetime.fromisoformat(_date(expires_at))
+        requested = datetime.fromisoformat(_date(
+            expires_at.isoformat() if isinstance(expires_at, datetime) else expires_at))
         deadline = min(deadline, requested)
     if deadline <= now:
         raise SourceError("invalid_grant_expiry")

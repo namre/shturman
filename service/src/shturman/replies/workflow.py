@@ -19,7 +19,8 @@ from . import model
 HANDLER = 'replies.outcome'
 CALLBACK_MODULE = 'rp'
 MAX_GENERATIONS = 5
-TERMINAL = frozenset({'draft_ready', 'declined', 'cancelled', 'expired', 'failed'})
+FINAL = frozenset({'completed', 'declined', 'cancelled', 'expired', 'failed'})
+TERMINAL = FINAL | {'draft_ready'}
 
 
 def loads(value: Any) -> Any:
@@ -150,9 +151,24 @@ async def presend(conn: Any, state: Any, row: Mapping[str, Any]) -> policy.Decis
 
 
 async def stop(conn: Any, task_id: int, status: str, code: str | None = None) -> None:
-    await conn.execute(
-        'UPDATE reply_tasks SET status=$2,error_code=$3,updated_at=now(),nonce=$4 WHERE id=$1',
-        task_id, status, code, secrets.token_urlsafe(18))
+    """Record one terminal outcome per task, including malformed/empty model results."""
+    if status not in FINAL:
+        raise ValueError('terminal_status_required')
+    done = await conn.fetchrow(
+        "UPDATE reply_tasks SET status=$2,error_code=$3,updated_at=now(),nonce=$4 "
+        "WHERE id=$1 AND status <> ALL($5::text[]) RETURNING account_id,chat_id",
+        task_id, status, code, secrets.token_urlsafe(18), sorted(FINAL))
+    if done is None:
+        return
+    from types import SimpleNamespace
+    from ..outbox import autoreply
+    outcome = ('replied' if status == 'completed' else
+               'declined' if status == 'declined' else
+               'no_answer' if code == 'invalid_model_result' else
+               'failed' if status == 'failed' else 'dropped')
+    await autoreply.log_outcome(conn, SimpleNamespace(**dict(done)), outcome, code)
+    if outcome == 'no_answer':
+        await autoreply._warn_if_model_is_silent(conn)
 
 
 async def queue(conn: Any, task: dict[str, Any]) -> None:
@@ -211,14 +227,42 @@ async def notify_waiting(conn: Any, task: dict[str, Any], kind: str, detail: str
     nonce = secrets.token_urlsafe(12)
     await conn.execute('UPDATE reply_tasks SET nonce=$2,decision_expires_at=LEAST(expires_at,now()+interval \'10 minutes\') '
                        'WHERE id=$1', task['id'], nonce)
-    summary = f'Ответ № {task["id"]}, чат № {task["chat_id"]}.\n'
+    target_name = await conn.fetchval(
+        'SELECT COALESCE(c.title,p.name) FROM chats c JOIN peers p ON p.id=c.peer_id WHERE c.id=$1',
+        task['chat_id'])
+    recipient = clean_line(target_name, 120) or f'чат № {task["chat_id"]}'
+    topic = f'тема № {task["topic_tg_id"]}' if task.get('topic_tg_id') else 'без темы'
+    summary = f'Ответ № {task["id"]}. Получатель: {recipient} (чат № {task["chat_id"]}), {topic}.\n'
     if kind == 'source':
         request = task['source_request']
-        summary += (f'Нужен источник: {request["kind"]} / {request["source_id"]}.\n'
-                    f'Границы: {json.dumps({k:v for k,v in request.items() if k != "reason"}, ensure_ascii=False)}\n'
-                    'Это разрешает только чтение для этой задачи. Новое раскрытие будет отдельным черновиком.\n')
-        buttons = [[bridge.button('Разрешить чтение', CALLBACK_MODULE, f'y:{task["id"]}:{nonce}'),
-                    bridge.button('Отказать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')]]
+        source_id = request['source_id']
+        if request['kind'] == 'external':
+            connector = (getattr(state_current(), 'extras', {}).get('source_registry') or {}).get(source_id)
+            source_name = clean_line(connector.name, 100) if connector else f'подключённый источник «{source_id}»'
+        elif request['kind'] == 'chat':
+            name = await conn.fetchval(
+                'SELECT COALESCE(c.title,p.name) FROM chats c JOIN peers p ON p.id=c.peer_id WHERE c.id=$1',
+                int(source_id)) if source_id else None
+            source_name = f'переписка: {clean_line(name, 120) or f"чат № {source_id}"}' if source_id else 'общий архив доступной переписки'
+        else:
+            name = await conn.fetchval('SELECT display_name FROM people WHERE id=$1',
+                                       int(source_id.split(':')[1])) if source_id else None
+            source_name = f'память о человеке: {clean_line(name, 120) or source_id}' if source_id else 'общая память о людях'
+        # Quote the complete query, including escaped line breaks; never shorten its scope.
+        query = json.dumps(request['query'], ensure_ascii=False) if request['query'] else 'без фильтра по словам'
+        period = (f'с {request["since"] or "начала архива"} (включительно) '
+                  f'до {request["until"] or "конца архива"} (не включая эту дату)')
+        if request['kind'] == 'memory':
+            period = 'страница памяти, без фильтра по датам'
+        summary += (f'Для подготовки ответа нужно прочитать: {source_name}.\n'
+                    f'Запрос: {query}.\nПериод: {period}.\n'
+                    f'Не более {request["limit"]} фрагментов, всего до {request["max_chars"]} знаков.\n'
+                    'Разрешение касается только чтения. Раскрытие собеседнику согласуется отдельно.\n'
+                    '«На 30 дней» повторяет только этот поиск: тот же источник, запрос, период, '
+                    'пределы, получатель и тема. Отзыв — /sourcerevoke ID; список — /sources.\n')
+        buttons = [[bridge.button('Прочитать один раз', CALLBACK_MODULE, f'y:{task["id"]}:{nonce}')]]
+        buttons.append([bridge.button('Этот поиск — на 30 дней', CALLBACK_MODULE, f'r:{task["id"]}:{nonce}')])
+        buttons.append([bridge.button('Отказать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')])
     else:
         summary += f'Нужно уточнение. Ответьте командой /replytask {task["id"]} answer <ответ>.\n'
         buttons = [[bridge.button('Не отвечать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')]]
@@ -325,12 +369,12 @@ async def on_result(conn: Any, job: dict[str, Any], result: dict[str, Any]) -> N
 async def on_failure(conn: Any, job: dict[str, Any], error: str) -> None:
     task_id = (job.get('context') or {}).get('task_id')
     if task_id is not None:
-        task = await get(conn, task_id)
+        task = await get(conn, task_id, lock=True)
         mod = runtime.current()
         if task is not None and mod is not None:
             mod.stop_typing(task['account_id'], task['chat_id'])
-        await conn.execute("UPDATE reply_tasks SET status='failed',error_code='model_unavailable',updated_at=now() "
-                           "WHERE id=$1 AND job_id=$2 AND status='generating'", task_id, job['id'])
+        if task is not None and task['status'] == 'generating' and task['job_id'] == job['id']:
+            await stop(conn, task_id, 'failed', 'model_unavailable')
 
 
 async def owner_granted(conn: Any, state: Any, task_id: int) -> bool:

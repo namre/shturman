@@ -63,6 +63,34 @@ async def register(conn: asyncpg.Connection, bot_tg_id: int, *, reason: str = "s
                       summary_state = 'failed' WHERE id = ANY($1::bigint[])""", page_ids)
         await conn.execute("DELETE FROM page_blocks WHERE page_id = ANY($1::bigint[])", page_ids)
         await conn.execute("DELETE FROM page_entries WHERE page_id = ANY($1::bigint[])", page_ids)
+        # Reply prompts and draft cards hold copies rather than foreign keys to every
+        # source message. Scrub all generations before deleting their source rows.
+        task_ids = [r["id"] for r in await conn.fetch(
+            """SELECT t.id FROM reply_tasks t
+               WHERE t.chat_id = ANY($1::bigint[]) OR t.trigger_message_id = ANY($2::bigint[])
+                  OR EXISTS (SELECT 1 FROM jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(t.source_refs) = 'array'
+                             THEN t.source_refs ELSE '[]'::jsonb END) ref
+                     WHERE (ref->>'kind' = 'chat' AND ref->>'message_id' = ANY($3::text[]))
+                        OR (ref->>'kind' = 'memory' AND ref->>'source_id' IN
+                            (SELECT entity_id FROM pages WHERE id = ANY($4::bigint[]))))
+               ORDER BY t.id FOR UPDATE OF t""", chats, ids, text_ids, page_ids)]
+        await conn.execute(
+            """UPDATE jobs j SET status = 'failed', payload = '{}', result = NULL, context = '{}',
+                      error = 'protected_control_peer', finished_at = now(), locked_until = NULL
+               WHERE j.context->>'task_id' = ANY($1::text[])
+                  OR j.id IN (SELECT job_id FROM reply_tasks WHERE id = ANY($2::bigint[]))
+                  OR j.context->>'draft_id' IN
+                     (SELECT id::text FROM outbox_drafts WHERE task_id = ANY($2::bigint[]))
+                  OR EXISTS (SELECT 1 FROM reply_tasks t WHERE t.id = ANY($2::bigint[])
+                             AND j.dedup_key LIKE 'reply-wait:' || t.id::text || ':%')""",
+            [str(i) for i in task_ids], task_ids)
+        await conn.execute("DELETE FROM outbox_drafts WHERE task_id = ANY($1::bigint[])", task_ids)
+        await conn.execute(
+            """UPDATE reply_tasks SET status = 'cancelled', error_code = 'protected_control_peer',
+                      input_messages = '[]', source_refs = '[]', source_request = NULL,
+                      owner_question = NULL, owner_answer = NULL, decision_expires_at = NULL,
+                      updated_at = now() WHERE id = ANY($1::bigint[])""", task_ids)
         # Закрытое задание тоже может содержать старый ответ модели; очищаем его до удаления
         # ссылок из commitments/watch_hits. Поздний ответ исполнителя больше не применяется.
         await conn.execute(

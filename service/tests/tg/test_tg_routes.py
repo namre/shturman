@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from telethon import errors
 
-from shturman import bridge, store
+from shturman import authority, bridge, store
 from shturman.tg.client import session_path
 from shturman.tg.manager import TgManager
 
@@ -28,8 +28,14 @@ async def service(make_client, config, world, *, owner=SELF_ID, sending=True):
     return client, state, manager
 
 
+async def setup_request(client, method, path, **kwargs):
+    """Simulate the setup handler's authenticated session for one chosen request."""
+    with authority.setup_context("test-tg-owner-session", action=path):
+        return await client.request(method, path, **kwargs)
+
+
 async def login(client, world, role="assistant", **extra):
-    started = (await client.post("/api/tg/login", json={"role": role, **extra})).json()
+    started = (await setup_request(client, "POST", "/api/tg/login", json={"role": role, **extra})).json()
     world.last.scan.set_result(world.me)
     for _ in range(200):
         status = (await client.get(f"/api/tg/login/{started['login_id']}")).json()
@@ -59,14 +65,14 @@ async def test_qr_login_over_http_then_account_is_listed(make_client, config):
     world.authorized = False
     client, state, manager = await service(make_client, config, world)
     assert (await client.get("/api/tg/accounts")).json() == {"accounts": []}
-    assert (await client.post("/api/tg/login", json={"role": "admin"})).status_code == 400
+    assert (await setup_request(client, "POST", "/api/tg/login", json={"role": "admin"})).status_code == 400
 
-    started = (await client.post("/api/tg/login", json={"role": "assistant"})).json()
+    started = (await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})).json()
     assert started["status"] == "pending" and started["qr_svg"].startswith("<svg")
     assert started["link"].startswith("tg://login?token=") and started["expires_at"]
     assert world.last.policy.login is True and world.last.role == "assistant"
     # повторное открытие экрана входа отменяет прежний код
-    again = (await client.post("/api/tg/login", json={"role": "assistant"})).json()
+    again = (await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})).json()
     assert again["login_id"] != started["login_id"]
     assert (await client.get(f"/api/tg/login/{started['login_id']}")).json()["status"] == "cancelled"
 
@@ -88,7 +94,7 @@ async def test_qr_login_over_http_then_account_is_listed(make_client, config):
     assert account["backfill_months"] == 12
     assert session_path(manager.config, "assistant").exists()
     # второй вход в занятую роль — отказ
-    busy = await client.post("/api/tg/login", json={"role": "assistant"})
+    busy = await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})
     assert busy.status_code == 409 and "выйдите" in busy.json()["error"]
     assert (await client.get("/api/tg/login/nope")).status_code == 404
 
@@ -99,7 +105,7 @@ async def test_two_factor_login_over_http_never_echoes_password(make_client, con
     world = World(HELPER)
     world.authorized, world.password = False, PASSWORD
     client, state, manager = await service(make_client, config, world)
-    started = (await client.post("/api/tg/login", json={"role": "assistant"})).json()
+    started = (await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})).json()
     url = f"/api/tg/login/{started['login_id']}"
     early = await client.post(f"{url}/password", json={"password": PASSWORD})
     assert early.status_code == 409                       # пароль ещё не требуется
@@ -127,25 +133,25 @@ async def test_cancel_and_failed_start_clean_up_session_file(make_client, config
     world.authorized = False
     client, state, manager = await service(make_client, config, world)
     path = session_path(manager.config, "assistant")
-    started = (await client.post("/api/tg/login", json={"role": "assistant"})).json()
+    started = (await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})).json()
     assert path.exists()
     cancelled = (await client.post(f"/api/tg/login/{started['login_id']}/cancel")).json()
     assert cancelled["status"] == "cancelled" and not path.exists() and not world.last.connected
     assert (await client.get("/api/tg/accounts")).json() == {"accounts": []}
     world.connect_error = ConnectionError("нет сети")
-    failed = await client.post("/api/tg/login", json={"role": "assistant"})
+    failed = await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})
     assert failed.status_code == 502 and not path.exists()
     world.connect_error = errors.FloodWaitError(None, 600)
-    assert (await client.post("/api/tg/login", json={"role": "assistant"})).status_code == 429
+    assert (await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})).status_code == 429
     world.connect_error = None
-    assert (await client.post("/api/tg/login", json={"role": "assistant"})).status_code == 200   # блокировки отпущены
+    assert (await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})).status_code == 200   # блокировки отпущены
 
 
 async def test_owner_login_needs_explicit_confirmation_and_stays_read_only(make_client, config):
     world = World(ME)
     world.authorized = False
     client, state, manager = await service(make_client, config, world)
-    refused = await client.post("/api/tg/login", json={"role": "owner"})
+    refused = await setup_request(client, "POST", "/api/tg/login", json={"role": "owner"})
     assert refused.status_code == 400 and "confirm_owner" in refused.json()["error"]
     assert world.clients == []
     _, status = await login(client, world, "owner", confirm_owner=True)
@@ -206,14 +212,14 @@ async def test_dialogs_selection_sync_and_status(make_client, config):
     empty = (await client.get(f"{base}/sync")).json()
     assert empty["counts"]["enabled"] == 0 and empty["chats"] == []
 
-    assert (await client.post(f"{base}/sync", json={"enabled": True})).status_code == 400
-    assert (await client.post(f"{base}/sync", json={"chats": [{"peer_class": "user", "tg_id": IVAN}]})).status_code == 400
-    assert (await client.post(f"{base}/sync", json={"enabled": True, "chats": [{"peer_class": "x", "tg_id": 1}]})).status_code == 400
-    one = (await client.post(f"{base}/sync", json={
+    assert (await setup_request(client, "POST", f"{base}/sync", json={"enabled": True})).status_code == 400
+    assert (await setup_request(client, "POST", f"{base}/sync", json={"chats": [{"peer_class": "user", "tg_id": IVAN}]})).status_code == 400
+    assert (await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "chats": [{"peer_class": "x", "tg_id": 1}]})).status_code == 400
+    one = (await setup_request(client, "POST", f"{base}/sync", json={
         "enabled": True, "chats": [{"peer_class": "user", "tg_id": IVAN}, {"peer_class": "user", "tg_id": 424242}]})).json()
     assert one["chats"][0] == {"peer_class": "user", "tg_id": IVAN, "enabled": True}
     assert one["chats"][1]["enabled"] is False and "не найден" in one["chats"][1]["error"]
-    bulk = (await client.post(f"{base}/sync", json={"enabled": True, "types": ["private_group", "public_channel"]})).json()
+    bulk = (await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "types": ["private_group", "public_channel"]})).json()
     assert sorted(c["tg_id"] for c in bulk["chats"] if c["enabled"]) == [GROUP, 4001]
 
     rt = manager.runtimes["owner"]
@@ -230,14 +236,14 @@ async def test_dialogs_selection_sync_and_status(make_client, config):
     listed = (await client.get(f"{base}/dialogs")).json()["items"]
     assert [i["tg_id"] for i in listed if i["enabled"]] == [IVAN, GROUP, 4001]
 
-    off = (await client.post(f"{base}/sync", json={"enabled": False, "types": ["public_channel"]})).json()
+    off = (await setup_request(client, "POST", f"{base}/sync", json={"enabled": False, "types": ["public_channel"]})).json()
     assert off["chats"] == [{"peer_class": "channel", "tg_id": 4001, "enabled": False}]
     assert (await client.get(f"{base}/sync")).json()["counts"]["enabled"] == 2
     assert (await client.get("/api/status")).json()["messages"] == 155     # сохранённое остаётся
 
-    options = await client.put(f"{base}/options", json={"auto_personal": True})
+    options = await setup_request(client, "PUT", f"{base}/options", json={"auto_personal": True})
     assert options.status_code == 200
-    assert (await client.put(f"{base}/options", json={"auto_groups": "да"})).status_code == 400
+    assert (await setup_request(client, "PUT", f"{base}/options", json={"auto_groups": "да"})).status_code == 400
     account = (await client.get("/api/tg/accounts")).json()["accounts"][0]
     assert (account["auto_personal"], account["auto_groups"]) == (True, False)
     assert (await client.get("/api/tg/accounts/999/sync")).status_code == 404
@@ -260,12 +266,12 @@ async def test_pause_resume_and_logout(make_client, config):
     account = (await client.get("/api/tg/accounts")).json()["accounts"][0]
     assert (account["status"], account["paused"], account["can_send"]) == ("paused", True, False)
     assert (await client.get(f"{base}/dialogs")).status_code == 409
-    assert (await client.post("/api/tg/login", json={"role": "assistant"})).status_code == 409
+    assert (await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})).status_code == 409
     await manager.start()                                    # перезапуск сервиса паузу не снимает
     assert "assistant" not in manager.runtimes
 
     world.authorized = True                                  # сессия на диске действительна
-    assert (await client.post(f"{base}/resume")).json() == {"ok": True}
+    assert (await setup_request(client, "POST", f"{base}/resume")).json() == {"ok": True}
     await wait_for(lambda: manager.runtimes["assistant"].status == "running")
     assert world.last is not first_client and manager.can_send(account_id) is True
 
@@ -323,7 +329,7 @@ async def test_service_shutdown_disconnects_sessions(make_client, config):
     await login(client, world, "assistant")
     await wait_for(lambda: manager.runtimes["assistant"].status == "running")
     running = world.last
-    pending = (await client.post("/api/tg/login", json={"role": "owner", "confirm_owner": True})).json()
+    pending = (await setup_request(client, "POST", "/api/tg/login", json={"role": "owner", "confirm_owner": True})).json()
     flow = manager.flows[pending["login_id"]]
     await manager.stop()
     assert not running.connected and flow.status == "cancelled"
@@ -338,7 +344,7 @@ async def test_assistant_login_is_refused_until_owner_is_known(make_client, conf
     world = World(ME)
     world.authorized = False
     client, state, manager = await service(make_client, config, world, owner=None)
-    refused = await client.post("/api/tg/login", json={"role": "assistant"})
+    refused = await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})
     assert refused.status_code == 409
     # Отказ называет оба пути: основной — подключить свой аккаунт на странице настройки (шаг 2),
     # запасной — привязка к боту. Мастера Hermes он не упоминает: сервис не знает, установлен ли Hermes.
@@ -348,7 +354,7 @@ async def test_assistant_login_is_refused_until_owner_is_known(make_client, conf
     assert world.clients == [] and manager.flows == {}       # ни клиента, ни кода
     assert not session_path(manager.config, "assistant").exists()
     # вход основного аккаунта (только чтение) от этого не зависит
-    assert (await client.post("/api/tg/login", json={"role": "owner", "confirm_owner": True})).status_code == 200
+    assert (await setup_request(client, "POST", "/api/tg/login", json={"role": "owner", "confirm_owner": True})).status_code == 200
     await manager.cancel_login(next(iter(manager.flows)))
     # владелец известен по архиву (экспорт загружен) — этого достаточно
     await store.ensure_account(conn, SELF_ID, "Владелец", "owner")
@@ -383,7 +389,7 @@ async def test_owner_becoming_known_stops_assistant_session_of_the_same_account(
 
     # снять паузу нельзя: запуск с диска сверяет аккаунт с владельцем и отвергает сессию
     world.authorized = True
-    assert (await client.post(f"/api/tg/accounts/{account_id}/resume")).status_code == 200
+    assert (await setup_request(client, "POST", f"/api/tg/accounts/{account_id}/resume")).status_code == 200
     rt = manager.runtimes["assistant"]
     await wait_for(lambda: rt.task.done())
     assert rt.status == "failed" and "основной аккаунт" in rt.error.lower()
@@ -449,7 +455,7 @@ async def test_backfill_depth_per_chat_and_account_default(make_client, config):
 
     channel = [{"peer_class": "channel", "tg_id": 4001}]
     # 1) глубина не названа — по настройке аккаунта: 12 месяцев
-    await client.post(f"{base}/sync", json={"enabled": True, "chats": channel})
+    await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "chats": channel})
     chats = await settled()
     assert 360 <= chats[4001]["messages"] <= 370 and chats[4001]["backfill_done"] is True
     oldest = chats[4001]["backfill_before"]
@@ -459,13 +465,13 @@ async def test_backfill_depth_per_chat_and_account_default(make_client, config):
 
     # 2) явная дата ближе прежней — уже загруженное остаётся, новых запросов нет
     recent = (now - timedelta(days=30)).date().isoformat()
-    await client.post(f"{base}/sync", json={"enabled": True, "chats": channel, "since": recent})
+    await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "chats": channel, "since": recent})
     chats = await settled()
     assert chats[4001]["backfill_since"].startswith(recent) and chats[4001]["backfill_before"] == oldest
     assert len([r for r in world.last.requests if type(r).__name__ == "GetHistoryRequest"]) == 4
 
     # 3) null — вся история: загрузка продолжается ровно с курсора
-    await client.post(f"{base}/sync", json={"enabled": True, "chats": channel, "since": None})
+    await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "chats": channel, "since": None})
     chats = await settled()
     assert chats[4001]["backfill_since"] is None and chats[4001]["messages"] == 500
     assert chats[4001]["backfill_before"] == 1 and chats[4001]["backfill_done"] is True
@@ -473,23 +479,33 @@ async def test_backfill_depth_per_chat_and_account_default(make_client, config):
     assert deeper[0].offset_id == oldest and len(deeper) == 2
 
     # 4) чат целиком старше границы: ничего не взято, но чат включён и новые сообщения идут
-    await client.post(f"{base}/sync", json={"enabled": True, "chats": [{"peer_class": "user", "tg_id": IVAN}]})
+    await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "chats": [{"peer_class": "user", "tg_id": IVAN}]})
     chats = await settled()
     assert (chats[IVAN]["messages"], chats[IVAN]["backfill_done"], chats[IVAN]["enabled"]) == (0, True, True)
 
     # 5) настройка аккаунта: «вся история» для чатов, включаемых после этого
-    assert (await client.put(f"{base}/options", json={"backfill_months": 0})).status_code == 400
-    assert (await client.put(f"{base}/options", json={"backfill_months": "год"})).status_code == 400
-    assert (await client.put(f"{base}/options", json={"backfill_months": None})).status_code == 200
+    assert (await setup_request(client, "PUT", f"{base}/options", json={"backfill_months": 0})).status_code == 400
+    assert (await setup_request(client, "PUT", f"{base}/options", json={"backfill_months": "год"})).status_code == 400
+    assert (await setup_request(client, "PUT", f"{base}/options", json={"backfill_months": None})).status_code == 200
     assert (await client.get("/api/tg/accounts")).json()["accounts"][0]["backfill_months"] is None
-    await client.post(f"{base}/sync", json={"enabled": True, "types": ["private_group"]})
+    await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "types": ["private_group"]})
     chats = await settled()
     assert chats[GROUP]["backfill_since"] is None and chats[GROUP]["messages"] == 5
     assert chats[IVAN]["messages"] == 0                       # уже включённых настройка не касается
-    assert (await client.put(f"{base}/options", json={"backfill_months": 6})).status_code == 200
-    assert (await client.put(f"{base}/options", json={"auto_groups": False})).status_code == 200
+    assert (await setup_request(client, "PUT", f"{base}/options", json={"backfill_months": 6})).status_code == 200
+    assert (await setup_request(client, "PUT", f"{base}/options", json={"auto_groups": False})).status_code == 200
     assert (await client.get("/api/tg/accounts")).json()["accounts"][0]["backfill_months"] == 6
 
     for bad in ("вчера", 5, "2090-01-01", "1999-01-01"):
-        response = await client.post(f"{base}/sync", json={"enabled": True, "chats": channel, "since": bad})
+        response = await setup_request(client, "POST", f"{base}/sync", json={"enabled": True, "chats": channel, "since": bad})
         assert response.status_code == 400
+
+
+async def test_agent_token_cannot_start_owner_login_without_independent_authority(make_client, config):
+    world = World(ME)
+    world.authorized = False
+    client, state, manager = await service(make_client, config, world)
+    refused = await client.post("/api/tg/login", json={"role": "owner", "confirm_owner": True})
+    assert (refused.status_code, refused.json()["code"]) == (409, "owner_unknown")
+    assert world.clients == [] and manager.flows == {}
+    assert not session_path(manager.config, "owner").exists()

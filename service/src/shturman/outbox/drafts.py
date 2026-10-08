@@ -525,6 +525,11 @@ async def finish(
         row["id"], status, code, message)
     if done is None:
         return False
+    if done.get("task_id") is not None:
+        from ..replies import workflow
+        task_status = ("completed" if status == "sent" else "declined" if status == "rejected" else
+                       "expired" if status == "expired" else "cancelled" if status == "superseded" else "failed")
+        await workflow.stop(conn, done["task_id"], task_status, code)
     mod = runtime.current()
     if mod is not None:
         mod.stop_typing(done["account_id"], done["chat_id"])

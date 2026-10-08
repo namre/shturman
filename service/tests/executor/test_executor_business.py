@@ -241,7 +241,8 @@ async def test_with_sending_switched_off_the_press_sends_nothing(service, conn):
     state.config = dataclasses.replace(state.config, sending=False)      # владелец выключил отправку
     tg.press(buttons_of(cards[0])["Отправить"], message_id=tg.last_message_id())
     await until(lambda: tg.calls("answerCallbackQuery"))
-    await until(lambda: conn.fetchval(
-        "SELECT status NOT IN ('pending', 'approved', 'sending') FROM outbox_drafts WHERE id = $1",
-        made.json()["draft_id"]))
+    row = await conn.fetchrow("SELECT status, approved_at FROM outbox_drafts WHERE id = $1",
+                              made.json()["draft_id"])
+    assert tuple(row) == ("pending", None)
+    assert "Пока нельзя:" in tg.calls("answerCallbackQuery")[-1]["text"]
     assert tg.sent(business=True) == []

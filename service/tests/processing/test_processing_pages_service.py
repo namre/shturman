@@ -3,12 +3,12 @@
 import asyncio
 import json
 
-from shturman import bridge, events, store
+from shturman import authority, bridge, events, store
 from shturman.processing import commitments, pages, pages_build, pages_service, people
 
 from conftest import MCP_AUTH
 from pages_helpers import IVAN, MARIA, blocks_of, ivan_owes_estimate, log, page_row, seed, statement
-from proc_helpers import OWNER, chat, peer_id, say
+from proc_helpers import OWNER, chat, peer_id, press, say
 
 MODULES = ("shturman.api_core", "shturman.mcp_server", "shturman.processing.service",
            "shturman.processing.pages_service")
@@ -69,7 +69,7 @@ def fast(monkeypatch, poll=3600.0):
     monkeypatch.setattr(pages_service, "WAKE_DELAY", 0.05)
 
 
-async def test_page_routes(make_client, conn, config, monkeypatch):
+async def test_page_routes(make_client, conn, config, monkeypatch, own_bot, approvals):
     fast(monkeypatch)
     client, state = await make_client(*MODULES)
     w = await seed(conn)
@@ -107,7 +107,8 @@ async def test_page_routes(make_client, conn, config, monkeypatch):
 
     # блок владельца — единственное, что можно записать через API
     saved = await client.put(f"/api/pages/{w.ivan}/owner-block", json={"text": "Не писать после 19:00."})
-    assert saved.status_code == 200 and saved.json()["changed"] and saved.json()["commit"]
+    action = approvals.waiting(saved)
+    assert (await approvals.press(action))["answer"] == "Сделано."
     assert blocks_of((config.pages_dir / page["path"]).read_text(encoding="utf-8")).owner == "Не писать после 19:00.\n\n"
     assert log(config)[0] == ("Владелец", "Правка владельца: 1 страница (из кабинета)")
     assert (await client.get(f"/api/pages/{w.ivan}")).json()["blocks"]["owner"] == "Не писать после 19:00."
@@ -136,19 +137,23 @@ async def test_page_routes(make_client, conn, config, monkeypatch):
     broken = (await client.get(f"/api/pages/{w.ivan}")).json()
     assert broken["blocks"] is None and "нет меток блоков: timeline" == broken["problem"] and broken["markdown"]
     frozen = await client.put(f"/api/pages/{w.ivan}/owner-block", json={"text": "ещё"})
-    assert frozen.status_code == 409 and "не обновляется" in frozen.json()["error"]
+    action = approvals.waiting(frozen)
+    assert (await approvals.press(action))["answer"] == "Не получилось."
+    assert await approvals.status(action) == "failed"
+    assert "не обновляется" in await conn.fetchval("SELECT error FROM pending_actions WHERE id = $1", action)
     assert state.config.pages_dir == config.pages_dir
 
 
-async def test_proposal_routes(make_client, conn, config, monkeypatch):
+async def test_proposal_routes(make_client, conn, config, monkeypatch, own_bot, approvals):
     fast(monkeypatch)
     client, _ = await make_client(*MODULES)
     w = await seed(conn, confirm=False)
     await ivan_owes_estimate(conn, w)
-    await commitments.accept(conn, await conn.fetchval(
-        """INSERT INTO commitments (chat_id, source_message_id, debtor_peer_id, creditor_peer_id, direction, what,
-                                    source_quote) VALUES ($1, $2, $3, $4, 'owed_to_owner', 'подписать акт', 'ц')
-           RETURNING id""", w.maria_chat, w.maria_msgs[0], w.maria_peer, w.owner_peer))
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.accept(conn, await conn.fetchval(
+            """INSERT INTO commitments (chat_id, source_message_id, debtor_peer_id, creditor_peer_id, direction, what,
+                                        source_quote) VALUES ($1, $2, $3, $4, 'owed_to_owner', 'подписать акт', 'ц')
+               RETURNING id""", w.maria_chat, w.maria_msgs[0], w.maria_peer, w.owner_peer))
     plan = (await client.post("/api/pages/build")).json()
     assert (plan["status"], plan["proposals_shown"]) == ("done", 2)
     pending = (await client.get("/api/pages/proposals")).json()["proposals"]
@@ -156,11 +161,12 @@ async def test_proposal_routes(make_client, conn, config, monkeypatch):
         (w.ivan, "Иван Петров", 1), (w.maria, "Мария Сидорова", 1)]
     assert (await client.get("/api/pages/proposals", params={"status": "все"})).status_code == 400
 
-    # нажатие кнопки приходит тем же путём, что и в жизни
+    # HTTP identifiers do not establish private control-bot authority.
     pressed = await client.post("/api/callbacks/telegram", json={"data": f"sh:pg:a:{w.ivan}", "from_user_id": OWNER})
-    assert pressed.json()["answer"] == "Страница будет заведена."
+    assert pressed.status_code == 403 and pressed.json()["code"] == "own_bot"
+    assert (await press(conn, f"sh:pg:a:{w.ivan}"))["answer"] == "Страница будет заведена."
     stranger = await client.post("/api/callbacks/telegram", json={"data": f"sh:pg:a:{w.maria}", "from_user_id": 4242})
-    assert stranger.json()["answer"] == "Кнопка недоступна."
+    assert stranger.status_code == 403 and stranger.json()["code"] == "own_bot"
     # страницу согласованного человека создаёт фоновая работа — без новой сборки
     row = await until(lambda: conn.fetchrow("SELECT * FROM pages WHERE person_id = $1 AND file_hash IS NOT NULL", w.ivan))
     assert (config.pages_dir / row["path"]).exists()
@@ -171,9 +177,12 @@ async def test_proposal_routes(make_client, conn, config, monkeypatch):
     assert (await client.get("/api/pages/proposals")).json()["proposals"] == []
     assert (await client.post(f"/api/pages/proposals/{w.ivan}", json={"accept": False})).status_code == 409
     assert (await client.post(f"/api/pages/proposals/{w.maria}", json={"accept": "да"})).status_code == 400
-    assert (await client.post("/api/pages/proposals/999999", json={"accept": True})).status_code == 404
+    missing = approvals.waiting(await client.post("/api/pages/proposals/999999", json={"accept": True}))
+    assert (await approvals.press(missing))["answer"] == "Не получилось."
+    assert await approvals.status(missing) == "failed"
     yes = await client.post(f"/api/pages/proposals/{w.maria}", json={"accept": True})
-    assert yes.json()["status"] == "accepted" and yes.json()["page_id"]
+    action = approvals.waiting(yes)
+    assert (await approvals.press(action))["answer"] == "Сделано."
     await until(lambda: conn.fetchval("SELECT count(*) = 2 FROM pages WHERE file_hash IS NOT NULL"))
     async def committed():     # запись в историю идёт следом за записью файла и отметкой в базе
         return len(log(config)) >= 2
@@ -181,7 +190,7 @@ async def test_proposal_routes(make_client, conn, config, monkeypatch):
     assert [subject for _, subject in log(config)] == ["Обновление страниц: создано 1, обновлено 0"] * 2
 
 
-async def test_agent_tools_read_pages(make_client, conn, config, monkeypatch):
+async def test_agent_tools_read_pages(make_client, conn, config, monkeypatch, own_bot, approvals):
     fast(monkeypatch)
     client, _ = await make_client(*MODULES)
     w = await seed(conn)
@@ -191,7 +200,9 @@ async def test_agent_tools_read_pages(make_client, conn, config, monkeypatch):
     await built(client, conn, lambda job: [statement(spoof, [w.ivan_msgs[0]])]
                 if "Иван" in job["payload"]["input"] else [statement("Бухгалтер", [w.maria_msgs[0]])])
     await until(lambda: conn.fetchval("SELECT count(*) = 2 FROM pages WHERE file_hash IS NOT NULL"))
-    await client.put(f"/api/pages/{w.ivan}/owner-block", json={"text": "Не писать ему после 19:00.​\x07"})
+    action = approvals.waiting(await client.put(
+        f"/api/pages/{w.ivan}/owner-block", json={"text": "Не писать ему после 19:00.​\x07"}))
+    assert (await approvals.press(action))["answer"] == "Сделано."
 
     tools = (await rpc(client, "tools/list")).json()["result"]["tools"]
     mine = {t["name"]: t for t in tools if t["name"] in ("get_person_page", "search_pages")}

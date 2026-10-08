@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..sanitize import clean_line
+from ..outbox.text import clean_outgoing
 
 OUTCOMES = frozenset({'reply', 'need_source', 'ask_owner', 'decline'})
 SCHEMA = {
@@ -20,7 +21,8 @@ SCHEMA = {
             'properties': {
                 'kind': {'type': 'string', 'enum': ['chat', 'memory', 'external']},
                 'source_id': {'type': 'string'}, 'query': {'type': 'string'},
-                'since': {'type': 'string'}, 'until': {'type': 'string'},
+                'since': {'type': ['string', 'null'], 'format': 'date-time'},
+                'until': {'type': ['string', 'null'], 'format': 'date-time'},
                 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 10},
                 'max_chars': {'type': 'integer', 'minimum': 1, 'maximum': 12000},
                 'reason': {'type': 'string'},
@@ -59,6 +61,7 @@ def parse(raw: Any, refs: list[dict[str, Any]], *, max_chars: int = 4000) -> Out
     question = raw.get('question', '')
     if not isinstance(text, str) or not isinstance(question, str):
         raise ValueError('bad_text')
+    text = clean_outgoing(text)
     if len(text) > max_chars or len(question) > 1000:
         raise ValueError('text_too_long')
     if kind == 'reply' and not text.strip():

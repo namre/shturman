@@ -1,8 +1,9 @@
 """Общие заготовки тестов обработки: аккаунт, чаты, сообщения, подставной ответ модели."""
 
+import json
 from datetime import datetime, timedelta, timezone
 
-from shturman import bridge, jobs, store
+from shturman import authority, bridge, jobs, store
 from shturman.records import ChatRecord, MessageRecord
 
 OWNER = 1000
@@ -64,7 +65,26 @@ async def answer(conn, job, parsed, *, model="test-model"):
 
 
 async def press(conn, data):
-    return await bridge.dispatch_callback(conn, data, OWNER)
+    """Simulate a verified private control-bot receipt for this single owner press."""
+    # Older test scenarios name the item; the owner presses the versioned button
+    # actually shown in a notification, retaining its original content fingerprint.
+    if data.startswith(("sh:cm:a:", "sh:cm:ca:")) and data.count(":") == 3:
+        shown = await conn.fetch("SELECT payload FROM jobs WHERE kind = $1 ORDER BY id DESC", bridge.NOTIFY_OWNER)
+        for notification in shown:
+            payload = notification["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            matches = [b["data"] for line in payload.get("buttons") or [] for b in line
+                       if b["data"].startswith(data + ":")]
+            if matches:
+                data = matches[0]
+                break
+        else:
+            raise AssertionError(f"No displayed commitment button for {data}")
+    owner = await bridge.get_owner(conn)
+    assert owner is not None and owner["user_id"] == OWNER
+    with authority.owner_context(OWNER, chat_id=owner["chat_id"], action="test.telegram.callback"):
+        return await bridge.dispatch_callback(conn, data, OWNER)
 
 
 def buttons_of(job):

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from shturman import archive, store
+from shturman import archive, control_peers, store
 from shturman.records import ChatRecord, MessageRecord
 
 OWNER = 1000
@@ -103,16 +103,34 @@ async def seed(conn) -> Seed:
     return Seed(account, ivan, sidorov, family, news, bot, secret, ids)
 
 
+async def legacy_put(conn, chat_id, record):
+    """Seed pre-boundary rows directly: the current writer must reject this content."""
+    peer_id = await store.ensure_peer(conn, record.sender_class, record.sender_tg_id,
+                                      name=record.sender_name)
+    message_id = await conn.fetchval(
+        """INSERT INTO messages (chat_id, tg_message_id, sent_at, kind, sender_peer_id,
+                                 sender_name, is_outgoing, text, sources)
+           VALUES ($1, $2, $3, $4, $5, $6, false, $7, ARRAY['import']) RETURNING id""",
+        chat_id, record.tg_message_id, record.sent_at, record.kind, peer_id, record.sender_name, record.text)
+    return {(chat_id, record.tg_message_id): message_id}
+
+
 async def blocked_chat(conn, s: Seed, tg_id, username, *, in_group=True):
     """Служебный собеседник, который попал в архив в обход записи: чат не помечен исключённым."""
     chat_id, excluded = await store.ensure_chat(
         conn, s.account, ChatRecord("user", tg_id, "personal_chat", "Telegram", username=username))
     assert excluded is True
     await conn.execute("UPDATE chats SET excluded = false WHERE id = $1", chat_id)
-    ids = await put(conn, chat_id, [rec(1, SECRET_CODE, sender=tg_id, name="Telegram", at=T0 + timedelta(hours=3))])
+    record = rec(1, SECRET_CODE, sender=tg_id, name="Telegram", at=T0 + timedelta(hours=3))
+    rejected = await store.upsert_messages(conn, [(chat_id, record)],
+                                           source="import", owner_tg_id=OWNER)
+    assert rejected.new == 0
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE chat_id = $1", chat_id) == 0
+    ids = await legacy_put(conn, chat_id, record)
     if in_group:
-        ids |= await put(conn, s.family, [
-            rec(500, SECRET_CODE + " в группе", sender=tg_id, name="Telegram", at=T0 + timedelta(hours=4))])
+        ids |= await legacy_put(conn, s.family,
+                                rec(500, SECRET_CODE + " в группе", sender=tg_id, name="Telegram",
+                                    at=T0 + timedelta(hours=4)))
     return chat_id, ids
 
 
@@ -386,10 +404,12 @@ async def test_fully_deleted_chat_leaves_no_time_or_count(conn):
 
 @pytest.mark.parametrize("tg_id,username", [
     (777000, None), (93372553, "BotFather"), (178220800, None),
-    (5, "BotFather"), (6, "@SpamBot"), (7, "telegram"),
+    (7000000001, "renamed_control_bot"),
 ])
 async def test_service_peers_with_codes_and_tokens_are_invisible(conn, tg_id, username):
     s = await seed(conn)
+    if tg_id not in store.BLOCKED_USER_IDS:
+        await control_peers.register(conn, tg_id)
     chat_id, ids = await blocked_chat(conn, s, tg_id, username)
     # предусловие: признака «исключён» нет, сообщения в базе есть — скрывает только правило чтения
     assert await conn.fetchval("SELECT NOT excluded FROM chats WHERE id = $1", chat_id)
@@ -416,13 +436,22 @@ async def test_service_peers_with_codes_and_tokens_are_invisible(conn, tg_id, us
 
 
 def test_every_blocked_peer_from_store_is_in_the_read_filter():
-    """Список служебных собеседников один — в store.py; запросы чтения собраны из него."""
+    """Read filters use exact service IDs and the independently registered bot IDs."""
     for tg_id in store.BLOCKED_USER_IDS:
         assert str(tg_id) in archive._BLOCKED_IDS
-    for name in store.BLOCKED_USERNAMES:
-        assert f"'{name}'" in archive._BLOCKED_NAMES
-    assert archive._BLOCKED_IDS in archive._MESSAGES and archive._BLOCKED_NAMES in archive._MESSAGES
-    assert archive._BLOCKED_IDS in archive._VISIBLE_CHATS and archive._BLOCKED_IDS in archive._PEOPLE
+    for query in (archive._MESSAGES, archive._VISIBLE_CHATS, archive._PEOPLE):
+        assert archive._BLOCKED_IDS in query and "control_peers" in query
+
+
+@pytest.mark.parametrize("tg_id,username", [(5, "BotFather"), (6, "@SpamBot"), (7, "telegram")])
+async def test_service_names_do_not_block_an_unrelated_numeric_peer(conn, tg_id, username):
+    s = await seed(conn)
+    chat_id, excluded = await store.ensure_chat(
+        conn, s.account, ChatRecord("user", tg_id, "personal_chat", "Ordinary peer", username=username))
+    assert excluded is False
+    ids = await put(conn, chat_id, [rec(1, "ordinary conversation", sender=tg_id, name="Ordinary peer")])
+    assert chat_id in {c["id"] for c in await archive.list_chats(conn)}
+    assert set(await archive.visible_messages(conn, list(ids.values()))) == set(ids.values())
 
 
 async def test_reply_to_a_service_peer_message_is_not_linked(conn):

@@ -84,6 +84,12 @@ async def test_trusted_person_gets_one_reply_with_typing(env, monkeypatch):
         (env.helper_acc, IVAN, "Смета будет в пятницу.")]
     row = await env.conn.fetchrow("SELECT * FROM outbox_drafts")
     assert (row["origin"], row["status"], row["trigger_message_id"]) == ("autoreply", "sent", message_id)
+    assert await env.conn.fetchval("SELECT status FROM reply_tasks") == "completed"
+    # Both sender completion and repeated recovery sweeps record this task only once.
+    from shturman.replies import service as reply_service
+    await reply_service.sweep(env.state)
+    await reply_service.sweep(env.state)
+    assert await env.conn.fetchval("SELECT count(*) FROM outbox_autoreply_log WHERE outcome='replied'") == 1
     # владелец видит автоответ в общем списке отправленного
     listed = (await env.client.get("/api/outbox/drafts", params={"origin": "autoreply"})).json()["drafts"]
     assert [d["text"] for d in listed] == ["Смета будет в пятницу."]
@@ -406,21 +412,19 @@ async def test_trusted_list_takes_numeric_ids_only_and_owner_is_told(env):
 
     added = await owner_request(env, "POST", "/api/outbox/trusted", json={"tg_user_id": IVAN, "note": "прораб"})
     assert added.json()["added"] is True and added.json()["trusted"][0]["name"] == "Иван Петров"
-    note = texts(await owner_messages(env.conn))
-    assert f"добавлен идентификатор {IVAN}" in note and "Иван Петров" in note
+    assert added.status_code == 200 and await owner_messages(env.conn) == []
     again = await owner_request(env, "POST", "/api/outbox/trusted", json={"tg_user_id": IVAN})
     assert again.json()["added"] is False and await owner_messages(env.conn) == []
 
     enabled = await owner_request(env, "PUT", "/api/outbox/autoreply", json={"account_id": env.helper_acc, "enabled": True})
     assert [a["enabled"] for a in enabled.json()["accounts"]] == [False, True]
-    note = texts(await owner_messages(env.conn))
-    assert "ВКЛЮЧЁН" in note and "«Помощник»" in note and "Доверенных в списке: 1" in note
+    assert enabled.status_code == 200 and await owner_messages(env.conn) == []
     await owner_request(env, "PUT", "/api/outbox/autoreply", json={"account_id": env.helper_acc, "enabled": True})
     assert await owner_messages(env.conn) == []                # ничего не изменилось — не шумим
 
     removed = await owner_request(env, "DELETE", "/api/outbox/trusted", params={"tg_user_id": IVAN})
     assert removed.json()["removed"] is True and removed.json()["trusted"] == []
-    assert f"убран идентификатор {IVAN}" in texts(await owner_messages(env.conn))
+    assert removed.status_code == 200 and await owner_messages(env.conn) == []
     assert (await owner_request(env, "DELETE", "/api/outbox/trusted", params={"tg_user_id": "ivan"})).status_code == 400
     assert (await owner_request(env, "PUT", "/api/outbox/autoreply", json={"enabled": True})).status_code == 400
     assert (await owner_request(env, "PUT", "/api/outbox/autoreply", json={"account_id": 99, "enabled": True})).status_code == 404
@@ -489,3 +493,54 @@ async def test_bounded_source_read_resumes_same_task_then_exact_draft_approval(e
     await settle(env)
     assert [(m['tg_id'],m['text']) for m in env.tg.sent] == [(IVAN,'Сумма сметы — 100 рублей.')]
     assert await env.conn.fetchval('SELECT count(*) FROM reply_tasks') == 1
+
+
+@pytest.mark.parametrize("text", ["  \u200b ", "\ufeff\u202e\x07", "\r\n\t"])
+def test_control_only_model_reply_is_rejected_before_draft_creation(text):
+    from shturman.replies import model
+    with pytest.raises(ValueError, match="empty_reply"):
+        model.parse({"outcome": "reply", "text": text}, [])
+
+
+@pytest.mark.parametrize("naive", [False, True])
+async def test_task_source_expiry_accepts_aware_datetime_and_rejects_naive(monkeypatch, naive):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from shturman.sources import broker
+    from shturman.sources.registry import SourceError
+    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    conn = SimpleNamespace(fetchrow=AsyncMock(return_value={"id": 4, "expires_at": expires}))
+    task = {"id": 7, "chat_id": 3, "topic_tg_id": None, "expires_at": expires}
+    monkeypatch.setattr(broker, "_owner", AsyncMock())
+    monkeypatch.setattr(broker, "_task", AsyncMock(return_value=task))
+    deadline = expires.replace(tzinfo=None) if naive else expires
+    request = {"kind": "memory", "query": "смета", "limit": 2, "reason": "Проверить сумму"}
+    if naive:
+        with pytest.raises(SourceError, match="invalid_source_window"):
+            await broker.grant_for_task(conn, task, request, owner_id=OWNER, expires_at=deadline)
+        conn.fetchrow.assert_not_awaited()
+    else:
+        granted = await broker.grant_for_task(conn, task, request, owner_id=OWNER, expires_at=deadline)
+        assert granted["expires_at"] == expires.isoformat()
+        assert conn.fetchrow.call_args.args[-1] == expires
+
+
+@pytest.mark.parametrize("status,code,outcome", [
+    ("completed", None, "replied"), ("declined", None, "declined"),
+    ("failed", "invalid_model_result", "no_answer"), ("failed", "model_unavailable", "failed"),
+    ("cancelled", "context_changed", "dropped"), ("expired", "expired", "dropped"),
+])
+async def test_terminal_telemetry_records_once_and_warns_only_on_missing_model_answer(
+        monkeypatch, status, code, outcome):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from shturman.replies import workflow
+    conn = SimpleNamespace(fetchrow=AsyncMock(side_effect=[{"account_id": 2, "chat_id": 3}, None]))
+    log, warn = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(autoreply, "log_outcome", log)
+    monkeypatch.setattr(autoreply, "_warn_if_model_is_silent", warn)
+    await workflow.stop(conn, 7, status, code)
+    await workflow.stop(conn, 7, status, code)
+    assert log.await_count == 1 and log.call_args.args[2:] == (outcome, code)
+    assert warn.await_count == (1 if outcome == "no_answer" else 0)

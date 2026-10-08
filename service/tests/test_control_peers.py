@@ -1,5 +1,7 @@
 """Только синтетические данные: служебный bot ID нельзя вернуть в архив другим входом."""
 from datetime import datetime, timezone
+from dataclasses import replace
+import json
 
 import pytest
 
@@ -82,3 +84,66 @@ def test_unverified_transport_cannot_create_telegram_addressing_proof():
     assert store._row(1, record, OWNER, False, "import")[-5:] == (None,) * 5
     assert store._row(1, record, OWNER, False, "business")[-5:] == (None,) * 5
     assert store._row(1, record, OWNER, False, "session")[-5:] == ("[]", 44, False, False, False)
+
+
+@pytest.mark.parametrize("source_kind", ["chat", "memory", "trigger"])
+async def test_registration_scrubs_all_reply_generations_and_source_derived_drafts(conn, source_kind):
+    a, protected_chat, protected_message = await scene(conn)
+    c, _ = await store.ensure_chat(conn, a, ChatRecord("user", BOT + 10, "personal_chat", "Получатель"))
+    record = replace(message("Обычный вопрос"), sender_tg_id=BOT + 10, sender_name="Получатель")
+    ordinary = (await store.upsert_messages(conn, [(c, record)], source="session", owner_tg_id=OWNER)).new_ids[0]
+    source_ref = {"kind": "chat", "source_id": str(protected_chat), "message_id": protected_message}
+    if source_kind == "memory":
+        person = await conn.fetchval("INSERT INTO people(display_name) VALUES('Человек') RETURNING id")
+        entity = f"person:{person}"
+        page = await conn.fetchval(
+            """INSERT INTO pages(entity_type,entity_id,person_id,path,title)
+               VALUES('person',$1,$2,'people/reply-source.md','Человек') RETURNING id""", entity, person)
+        entry = await conn.fetchval(
+            """INSERT INTO page_entries(page_id,block,key,text,n_sources)
+               VALUES($1,'summary','0','Код 12345678',1) RETURNING id""", page)
+        await conn.execute("INSERT INTO page_entry_sources VALUES($1,$2)", entry, protected_message)
+        source_ref = {"kind": "memory", "source_id": entity, "block": "summary"}
+    trigger = protected_message if source_kind == "trigger" else ordinary
+    if source_kind == "trigger":
+        c = protected_chat
+    target_tg_id = BOT if source_kind == "trigger" else BOT + 10
+    peer = await conn.fetchval("SELECT peer_id FROM chats WHERE id=$1", c)
+    task = await conn.fetchval(
+        """INSERT INTO reply_tasks(account_id,chat_id,target_peer_id,target_tg_id,trigger_message_id,
+               trigger_hash,policy_revision,nonce,input_messages,source_refs,status)
+           VALUES($1,$2,$3,$4,$5,'hash','policy','nonce',$6::jsonb,$7::jsonb,'generating') RETURNING id""",
+        a, c, peer, target_tg_id, trigger,
+        json.dumps([{"role": "user", "content": "Код 12345678"}]), json.dumps([source_ref]))
+    draft = await conn.fetchval(
+        """INSERT INTO outbox_drafts(account_id,chat_id,channel,text,text_hash,origin,nonce,status,
+               expires_at,task_id,task_policy_revision,sources)
+           VALUES($1,$2,'session','Код 12345678','hash','agent','nonce','pending',
+                  now()+interval '1 hour',$3,'policy',$4::jsonb) RETURNING id""",
+        a, c, task, json.dumps([source_ref]))
+    affected_jobs = []
+    for generation in (1, 2):
+        affected_jobs.append(await jobs.enqueue(conn, kind="llm.text", payload={"text": "Код 12345678"},
+            context={"task_id": task, "generation": generation}))
+    await conn.execute("UPDATE reply_tasks SET job_id=$2 WHERE id=$1", task, affected_jobs[-1])
+    affected_jobs.append(await jobs.enqueue(conn, kind="llm.text", payload={"text": "Код 12345678"},
+                                           context={"draft_id": draft}))
+    affected_jobs.append(await jobs.enqueue(conn, kind="llm.text", payload={"text": "Код 12345678"},
+                                           dedup_key=f"reply-wait:{task}:2"))
+    ordinary_job = await jobs.enqueue(conn, kind="llm.text", payload={"text": "Обычный вопрос"})
+
+    await control_peers.register(conn, BOT)
+
+    assert not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM outbox_drafts WHERE id=$1)", draft)
+    for job in affected_jobs:
+        row = await conn.fetchrow("SELECT status,payload,result,context FROM jobs WHERE id=$1", job)
+        assert row["status"] == "failed"
+        assert row["payload"] == row["context"] == "{}" and row["result"] is None
+    row = await conn.fetchrow("SELECT * FROM reply_tasks WHERE id=$1", task)
+    if source_kind == "trigger":
+        assert row is None
+    else:
+        assert row["status"] == "cancelled"
+        assert row["input_messages"] == row["source_refs"] == "[]"
+        assert row["source_request"] is row["owner_question"] is row["owner_answer"] is None
+    assert await conn.fetchval("SELECT status FROM jobs WHERE id=$1", ordinary_job) == "queued"

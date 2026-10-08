@@ -18,7 +18,7 @@ async def authorized(conn: Any, user_id: int) -> bool:
 @bridge.on_callback(workflow.CALLBACK_MODULE)
 async def on_button(conn: Any, rest: str, user_id: int) -> dict[str, Any]:
     parts = rest.split(':')
-    if len(parts) != 3 or parts[0] not in ('y', 'n') or not parts[1].isascii() \
+    if len(parts) != 3 or parts[0] not in ('y', 'r', 'n') or not parts[1].isascii() \
             or not parts[1].isdigit() or len(parts[1]) > 18 or not await authorized(conn, user_id):
         return REFUSED
     task = await workflow.get(conn, int(parts[1]), lock=True)
@@ -38,12 +38,16 @@ async def on_button(conn: Any, rest: str, user_id: int) -> dict[str, Any]:
     if task['status'] != 'waiting_source' or not task['source_request']:
         return REFUSED
     from ..sources import broker
+    persistent = parts[0] == 'r'
+    grant_options = {'persistent': True} if persistent else {'expires_at': task['expires_at']}
     await broker.grant_for_task(conn, task, task['source_request'], owner_id=user_id,
-                                expires_at=task['expires_at'], mode='read')
+                                mode='read', **grant_options)
     await conn.execute('UPDATE reply_tasks SET owner_decided_by=$2,owner_decided_at=now() WHERE id=$1',
                        task['id'], user_id)
     await workflow.owner_granted(conn, state, task['id'])
-    return {**REFUSED, 'answer': 'Чтение разрешено для этой задачи.', 'remove_buttons': True}
+    answer = 'Этот поиск разрешён на 30 дней для того же получателя и темы.' if persistent \
+        else 'Чтение разрешено для этой задачи.'
+    return {**REFUSED, 'answer': answer, 'remove_buttons': True}
 
 async def handle_command(conn: Any, state: Any, text: str, user_id: int) -> dict[str, Any]:
     if not await authorized(conn, user_id):

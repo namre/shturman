@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import shturman.ingest_api as ingest_api
+from shturman import authority
 from shturman.importer import ImportStats
 
 from conftest import IVAN, OWNER, full_export, msg
@@ -32,6 +33,12 @@ async def upload(client, obj) -> str:
     r = await client.post("/api/imports", content=pieces(payload(obj)))
     assert r.status_code == 201, r.text
     return r.json()["import_id"]
+
+
+async def run_import(client, path, **kwargs):
+    """The independently authenticated setup owner starts this one import request."""
+    with authority.setup_context("test-import-owner-session", action=path):
+        return await client.post(path, **kwargs)
 
 
 async def wait_state(client, import_id, *states, timeout=10.0):
@@ -151,7 +158,7 @@ async def test_slow_scan_answers_202_and_is_picked_up_later(make_client, sample_
     import_id = await upload(client, sample_export)
     r = await client.get(f"/api/imports/{import_id}/scan", params={"wait": "0.05"})
     assert r.status_code == 202 and r.json()["state"] == "scanning"
-    busy = await client.post(f"/api/imports/{import_id}/run", json={})
+    busy = await run_import(client, f"/api/imports/{import_id}/run", json={})
     assert (busy.status_code, busy.json()["code"]) == (409, "scanning")
     release.set()
     r = await client.get(f"/api/imports/{import_id}/scan")
@@ -169,7 +176,7 @@ async def test_run_imports_in_background_and_removes_the_file(make_client, conn,
 
     state.events.subscribe("message.live", on_live)
     import_id = await upload(client, sample_export)
-    r = await client.post(f"/api/imports/{import_id}/run", json={"exclude": ["chat:3001"]})
+    r = await run_import(client, f"/api/imports/{import_id}/run", json={"exclude": ["chat:3001"]})
     assert r.status_code == 202 and r.json()["state"] == "running"
     done = await wait_state(client, import_id, "done", "failed")
     assert done["state"] == "done" and done["error"] is None
@@ -193,7 +200,7 @@ async def test_run_imports_in_background_and_removes_the_file(make_client, conn,
 
     # тот же экспорт ещё раз: дублей нет, запрет на чат помнится
     again = await upload(client, sample_export)
-    await client.post(f"/api/imports/{again}/run")
+    await run_import(client, f"/api/imports/{again}/run")
     stats = (await wait_state(client, again, "done", "failed"))["stats"]
     assert (stats["messages_new"], stats["messages_known"], stats["chats_excluded"]) == (0, 7, 1)
     scan_after = await upload(client, sample_export)
@@ -207,12 +214,12 @@ async def test_single_chat_export_needs_owner_and_can_be_retried(make_client, co
               "messages": [msg(1, T, OWNER, "Евгений", "Привет")]}
     import_id = await upload(client, single)
     assert (await client.get(f"/api/imports/{import_id}/scan")).json()["owner"] is None
-    await client.post(f"/api/imports/{import_id}/run", json={})
+    await run_import(client, f"/api/imports/{import_id}/run", json={})
     failed = await wait_state(client, import_id, "done", "failed")
     assert failed["state"] == "failed" and "владельц" in failed["error"] and failed["file_kept"] is True
     assert await conn.fetchval("SELECT count(*) FROM messages") == 0
 
-    r = await client.post(f"/api/imports/{import_id}/run", json={"owner_id": OWNER})
+    r = await run_import(client, f"/api/imports/{import_id}/run", json={"owner_id": OWNER})
     assert r.status_code == 202
     done = await wait_state(client, import_id, "done", "failed")
     assert done["state"] == "done" and done["stats"]["messages_new"] == 1 and files(config) == []
@@ -222,7 +229,7 @@ async def test_single_chat_export_needs_owner_and_can_be_retried(make_client, co
 async def test_owner_mismatch_fails_with_clear_text(make_client, conn, sample_export):
     client, _ = await make_client(*MODULES)
     import_id = await upload(client, sample_export)
-    await client.post(f"/api/imports/{import_id}/run", json={"owner_id": 42})
+    await run_import(client, f"/api/imports/{import_id}/run", json={"owner_id": 42})
     failed = await wait_state(client, import_id, "done", "failed")
     assert failed["state"] == "failed" and "не совпадает" in failed["error"]
     assert await conn.fetchval("SELECT count(*) FROM messages") == 0
@@ -246,12 +253,12 @@ async def test_not_an_export_fails_and_file_is_removed(make_client, conn, config
             again = await client.get(f"/api/imports/{import_id}/scan")
             assert again.status_code == 422
         else:
-            await client.post(f"/api/imports/{import_id}/run", json={})
+            await run_import(client, f"/api/imports/{import_id}/run", json={})
         failed = await wait_state(client, import_id, "failed", "done")
         assert failed["state"] == "failed" and failed["file_kept"] is False
         assert any("а" <= ch <= "я" for ch in failed["error"])
         assert files(config) == []
-        r = await client.post(f"/api/imports/{import_id}/run", json={})
+        r = await run_import(client, f"/api/imports/{import_id}/run", json={})
         assert (r.status_code, r.json()["code"]) == (409, "no_file")
     assert await conn.fetchval("SELECT count(*) FROM messages") == 0
 
@@ -272,7 +279,7 @@ async def test_one_import_at_a_time_with_live_progress(make_client, conn, config
 
     monkeypatch.setattr(ingest_api, "import_export", held)
     first, second = await upload(client, sample_export), await upload(client, sample_export)
-    assert (await client.post(f"/api/imports/{first}/run", json={})).status_code == 202
+    assert (await run_import(client, f"/api/imports/{first}/run", json={})).status_code == 202
     running = await wait_state(client, first, "running")
     for _ in range(100):
         if running["progress"].get("messages_read"):
@@ -284,7 +291,7 @@ async def test_one_import_at_a_time_with_live_progress(make_client, conn, config
             running["progress"]["messages_new"]) == (2, 40, 30)
 
     for target in (first, second):
-        r = await client.post(f"/api/imports/{target}/run", json={})
+        r = await run_import(client, f"/api/imports/{target}/run", json={})
         assert (r.status_code, r.json()["code"]) == (409, "import_running") and russian(r)
     r = await client.get(f"/api/imports/{first}/scan")
     assert (r.status_code, r.json()["code"]) == (409, "import_running")
@@ -295,7 +302,7 @@ async def test_one_import_at_a_time_with_live_progress(make_client, conn, config
     release.set()
     done = await wait_state(client, first, "done", "failed")
     assert done["state"] == "done" and done["stats"]["messages_new"] == 31
-    assert (await client.post(f"/api/imports/{second}/run", json={})).status_code == 202
+    assert (await run_import(client, f"/api/imports/{second}/run", json={})).status_code == 202
 
 
 async def test_delete_stops_a_running_import_and_removes_the_file(make_client, config, sample_export, monkeypatch):
@@ -308,7 +315,7 @@ async def test_delete_stops_a_running_import_and_removes_the_file(make_client, c
 
     monkeypatch.setattr(ingest_api, "import_export", stuck)
     import_id = await upload(client, sample_export)
-    await client.post(f"/api/imports/{import_id}/run", json={})
+    await run_import(client, f"/api/imports/{import_id}/run", json={})
     await asyncio.wait_for(started.wait(), 5)
     r = await client.delete(f"/api/imports/{import_id}")
     assert r.json() == {"deleted": True, "was_running": True}
@@ -325,7 +332,7 @@ async def test_internal_failure_is_reported_without_details(make_client, config,
 
     monkeypatch.setattr(ingest_api, "import_export", broken)
     import_id = await upload(client, sample_export)
-    await client.post(f"/api/imports/{import_id}/run", json={})
+    await run_import(client, f"/api/imports/{import_id}/run", json={})
     failed = await wait_state(client, import_id, "failed", "done")
     assert failed["state"] == "failed" and "12345" not in failed["error"] and failed["file_kept"] is True
     assert "12345" not in caplog.text and "RuntimeError" in caplog.text
@@ -341,9 +348,9 @@ async def test_unknown_ids_and_bad_run_bodies(make_client, sample_export):
     for body in ({"exclude": "user:1"}, {"exclude": ["user:abc"]}, {"exclude": ["bot:1"]}, {"exclude": [5]},
                  {"exclude": ["user:" + "9" * 30]}, {"owner_id": "1000"}, {"owner_id": -1}, {"owner_id": True},
                  {"owner_id": 2 ** 70}):
-        r = await client.post(f"/api/imports/{import_id}/run", json=body)
+        r = await run_import(client, f"/api/imports/{import_id}/run", json=body)
         assert r.status_code == 400 and russian(r), body
-    r = await client.post(f"/api/imports/{import_id}/run", content=b"[1]")
+    r = await run_import(client, f"/api/imports/{import_id}/run", content=b"[1]")
     assert r.status_code == 400 and russian(r)
     assert (await client.get(f"/api/imports/{import_id}")).json()["state"] == "uploaded"
 
@@ -376,3 +383,12 @@ def test_finished_records_make_room_for_new_ones(tmp_path):
         registry.items[item.id] = item
     registry.trim()
     assert len(registry.items) == ingest_api.MAX_RECORDS - 1 and f"{0:032x}" not in registry.items
+
+
+async def test_agent_token_cannot_start_an_import_without_owner_authority(make_client, conn, sample_export):
+    client, _ = await make_client(*MODULES)
+    import_id = await upload(client, sample_export)
+    refused = await client.post(f"/api/imports/{import_id}/run", json={})
+    assert (refused.status_code, refused.json()["code"]) == (409, "owner_unknown")
+    assert (await client.get(f"/api/imports/{import_id}")).json()["state"] == "uploaded"
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 0

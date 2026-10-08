@@ -31,7 +31,6 @@ async def test_presend_rechecks_immutable_bindings(monkeypatch, changed):
     if changed=='requires_approval': task['requires_approval']=True
     monkeypatch.setattr(workflow,'get',AsyncMock(return_value=task))
     monkeypatch.setattr(workflow,'valid',AsyncMock(return_value=changed!='revoked'))
-    # This test isolates immutable bindings; disclosure revocation has its own test below.
     from shturman.sources import broker
     monkeypatch.setattr(broker,'disclosure_allowed',AsyncMock(return_value=True))
     assert not (await workflow.presend(None,None,row)).ok
@@ -74,3 +73,17 @@ async def test_revoked_disclosure_grant_blocks_auto_even_if_read_is_valid(monkey
     monkeypatch.setattr(workflow,'valid',AsyncMock(return_value=True))
     monkeypatch.setattr(broker,'disclosure_allowed',AsyncMock(return_value=False))
     assert not (await workflow.presend(None,None,row)).ok
+
+@pytest.mark.asyncio
+async def test_allowed_automatic_presend_keeps_preapproved_path(monkeypatch):
+    from shturman.sources import broker
+    task={'id':1,'status':'draft_ready','prepare_only':False,'chat_id':3,'account_id':2,
+          'policy_revision':'r','source_refs':[{'message_id':9}],'requires_approval':False}
+    row={'task_id':1,'chat_id':3,'account_id':2,'task_policy_revision':'r',
+         'sources':task['source_refs'],'origin':'autoreply'}
+    monkeypatch.setattr(workflow,'get',AsyncMock(return_value=task))
+    monkeypatch.setattr(workflow,'valid',AsyncMock(return_value=True))
+    disclosure=AsyncMock(return_value=True)
+    monkeypatch.setattr(broker,'disclosure_allowed',disclosure)
+    assert (await workflow.presend(None,None,row)).ok
+    disclosure.assert_awaited_once_with(None,task,task['source_refs'])

@@ -17,7 +17,7 @@ for sub in ("processing", "outbox"):       # заготовки соседних
     if str(ROOT / sub) not in sys.path:
         sys.path.insert(0, str(ROOT / sub))
 
-from shturman import archive, bridge, retrieval  # noqa: E402
+from shturman import authority, archive, bridge, retrieval  # noqa: E402
 from shturman import search as fts  # noqa: E402
 from shturman.processing import commitments, pages_build  # noqa: E402
 
@@ -26,7 +26,7 @@ from outbox_helpers import (  # noqa: E402, F401 — env это фикстура
 )
 from pages_helpers import NOW, build_with, ivan_owes_estimate, path_of, statement  # noqa: E402
 from pages_helpers import seed as pages_seed  # noqa: E402
-from proc_helpers import answer, claim, say  # noqa: E402
+from proc_helpers import OWNER, answer, claim, say  # noqa: E402
 from test_archive import seed  # noqa: E402
 from test_embeddings import add as add_plain  # noqa: E402
 from test_embeddings import add_chat as plain_chat  # noqa: E402
@@ -187,7 +187,8 @@ async def test_commitment_derived_from_a_hidden_message_disappears_and_comes_bac
     ids = await say(conn, ivan_chat, [SMETA, DOGOVOR])
     await extract_once(conn, [SMETA_ITEM])
     commitment_id = await conn.fetchval("SELECT id FROM commitments")
-    assert (await commitments.accept(conn, commitment_id))["ok"]
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        assert (await commitments.accept(conn, commitment_id))["ok"]
     today = date(2026, 10, 6)
     assert [c["id"] for c in await commitments.list_commitments(conn, view="open", today=today)] == [commitment_id]
 

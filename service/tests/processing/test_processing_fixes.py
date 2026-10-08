@@ -3,7 +3,7 @@
 
 from datetime import date, time, timedelta, timezone, datetime
 
-from shturman import bridge, outbox, store
+from shturman import authority, bridge, outbox, store
 from shturman.processing import commitments, people, pipeline
 
 from conftest import MCP_AUTH
@@ -62,7 +62,8 @@ async def two_chats(conn):
                        now=T0 + timedelta(hours=3))
     ivan_c, maria_c = [r["id"] for r in await conn.fetch("SELECT id FROM commitments ORDER BY id")]
     for commitment_id in (ivan_c, maria_c):
-        await commitments.accept(conn, commitment_id)
+        with authority.owner_context(OWNER, chat_id=OWNER):
+            await commitments.accept(conn, commitment_id)
     maria_person = await people.person_for_peer(conn, await peer_id(conn, MARIA))
     await people.add_alias(conn, maria_person, "Маша Секретарь")
     await claim(conn, bridge.NOTIFY_OWNER)
@@ -336,7 +337,8 @@ async def test_next_week_view_and_untrusted_fields(make_client, conn):
         item(3, "Отчёт пришлю через две недели", "прислать отчёт", "через две недели"),
     ])
     for row in await conn.fetch("SELECT id FROM commitments"):
-        await commitments.accept(conn, row["id"])
+        with authority.owner_context(OWNER, chat_id=OWNER):
+            await commitments.accept(conn, row["id"])
     listed = commitments.list_commitments
     assert [c["what"] for c in await listed(conn, view="week", today=TODAY)] == ["прислать смету"]
     assert [c["what"] for c in await listed(conn, view="next_week", today=TODAY)] == ["прислать акт"]

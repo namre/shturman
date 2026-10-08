@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from starlette.requests import Request
@@ -38,9 +39,28 @@ class Gateway:
                                                     for field in ("dashboard_origin", "setup_origin"))):
             raise ValueError("remote_mcp_origin requires a separate HTTPS origin")
 
+    @staticmethod
+    def _host_key(host):
+        """Equivalent HTTPS authorities must enter the same OAuth boundary."""
+        if not isinstance(host, str) or any(c.isspace() for c in host):
+            return None
+        try:
+            parsed = urlsplit("//" + host)
+            if not parsed.hostname or parsed.username is not None or parsed.password is not None \
+                    or parsed.path or parsed.query or parsed.fragment:
+                return None
+            hostname = parsed.hostname.lower().rstrip(".")
+            try:
+                hostname = str(ipaddress.ip_address(hostname))
+            except ValueError:
+                pass
+            return hostname, 443 if parsed.port is None else parsed.port
+        except ValueError:
+            return None
+
     def handles(self, path, host):
         # На этом отдельном адресе перехватываем ВСЁ; /api не должен попасть во внутренний Gate.
-        return bool(self.origin) and host.lower() == self.host
+        return bool(self.origin) and self._host_key(host) == self._host_key(self.host)
 
     @property
     def state(self):
@@ -75,7 +95,8 @@ class Gateway:
                     raise core.OAuthError("invalid_token", 401)
                 # Сам SDK получает только уже проверенный токен и ожидаемый origin.
                 forwarded = dict(scope)
-                forwarded["headers"] = [(k,v) for k,v in headers if k.lower() not in (b"authorization", b"origin")]
+                forwarded["headers"] = [(k,v) for k,v in headers if k.lower() not in (b"authorization", b"origin", b"host")]
+                forwarded["headers"].append((b"host", self.host.encode("ascii")))
                 forwarded["headers"].append((b"authorization", f"Bearer {self.config.mcp_token}".encode()))
                 async def cors_send(message):
                     if message["type"] == "http.response.start":
