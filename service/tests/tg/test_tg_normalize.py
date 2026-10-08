@@ -27,7 +27,7 @@ def export_fields(record):
     """Словарь экспорта прежний; метаданные адресации проверяются отдельно."""
     fields = dataclasses.asdict(record)
     for key in ("telegram_entities", "topic_tg_id", "is_forwarded", "telegram_via_bot", "telegram_sender_bot",
-                "media_ref", "media_duration"):   # для скачивания голосового — у каждого источника своё
+                "media_ref", "media_duration", "media_name", "media_mime", "media_size"):   # для скачивания голосового — у каждого источника своё
         fields.pop(key)
     return fields
 

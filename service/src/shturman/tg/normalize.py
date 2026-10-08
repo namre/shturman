@@ -353,6 +353,24 @@ def media_duration(media: Any) -> int | None:
     return None
 
 
+
+def media_file_info(media: Any) -> dict[str, Any]:
+    """Имя, тип и размер файла документа — для разбора вложений (media/). У фото — тип."""
+    if isinstance(media, types.MessageMediaPhoto):
+        return {"media_mime": "image/jpeg"}
+    if not isinstance(media, types.MessageMediaDocument) or media.document is None:
+        return {}
+    document = media.document
+    name = next((a.file_name for a in getattr(document, "attributes", None) or ()
+                 if isinstance(a, types.DocumentAttributeFilename) and a.file_name), None)
+    mime, size = getattr(document, "mime_type", None), getattr(document, "size", None)
+    return {
+        "media_name": name[:255] if isinstance(name, str) else None,
+        "media_mime": mime[:100] if isinstance(mime, str) and mime else None,
+        "media_size": int(size) if isinstance(size, int) and 0 <= size < 10**13 else None,
+    }
+
+
 def service_action(action: Any) -> str | None:
     if action is None or isinstance(action, types.MessageActionEmpty):
         return None
@@ -458,6 +476,7 @@ def message_record(message: Any, entities: Entities, *, self_id: int) -> Message
         telegram_via_bot=getattr(message, "via_bot_id", None) is not None,
         telegram_sender_bot=bool(sender_entity.bot) if isinstance(sender_entity, types.User) else None,
         media_duration=None if service else media_duration(message.media),
+        **({} if service else media_file_info(message.media)),
     )
 
 

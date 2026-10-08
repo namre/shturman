@@ -327,12 +327,12 @@ async def test_export_then_business_is_one_row_without_false_edit(linked, sample
     assert len(after) == 6 and await conn.fetchval("SELECT count(*) FROM messages") == 8
     assert await conn.fetchval("SELECT count(*) FROM message_versions") == 0
     assert [r["sources"] for r in after] == [["import", "business"]] * 3 + [["import"]] + [["import", "business"]] * 2
-    # Бизнес-копия ничего не меняет, кроме источников и file_id голосового: по нему сервис
-    # потом скачает файл для расшифровки (voice/).
+    # Бизнес-копия ничего не меняет, кроме источников и file_id голосового и фото: по нему сервис
+    # потом скачает файл для расшифровки (voice/) и разбора (media/).
     for old, new in zip(before, after):
-        assert {k: v for k, v in old.items() if k not in ("sources", "media_ref")} == \
-               {k: v for k, v in new.items() if k not in ("sources", "media_ref")}
-    assert [r["media_ref"] for r in after] == [None, None, None, None, "v", None]
+        assert {k: v for k, v in old.items() if k not in ("sources", "media_ref", "media_mime", "media_size", "media_name")} == \
+               {k: v for k, v in new.items() if k not in ("sources", "media_ref", "media_mime", "media_size", "media_name")}
+    assert [r["media_ref"] for r in after] == [None, None, None, None, "v", "p"]
     assert svc.live == []            # прошлое из экспорта событием не становится
     assert await conn.fetchval("SELECT count(*) FROM accounts") == 1
 

@@ -41,6 +41,9 @@ class MessageRecord:
     # чтобы потом скачать файл и расшифровать (voice/).
     media_duration: int | None = None
     media_ref: str | None = None
+    media_name: str | None = None      # имя файла документа
+    media_mime: str | None = None
+    media_size: int | None = None      # байт
 
 
 @dataclass

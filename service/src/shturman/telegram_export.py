@@ -175,7 +175,27 @@ def parse_message(raw: dict[str, Any]) -> ExportMessage | None:
         media_duration=(raw["duration_seconds"] if media_type in ("voice_message", "video_message")
                         and isinstance(raw.get("duration_seconds"), int) and not isinstance(raw.get("duration_seconds"), bool)
                         and 0 <= raw["duration_seconds"] < 10**7 else None),
+        **_file_info(raw, media_type, media_path),
     )
+
+
+def _file_info(raw: dict[str, Any], media_type: Any, media_path: str | None) -> dict[str, Any]:
+    """Имя, тип и размер файла — для разбора вложений (media/). Имя документа экспорт пишет
+    в file_name (в новых версиях), иначе берётся из пути файла в папке выгрузки."""
+    if media_type not in ("photo", "file"):
+        return {}
+    name = raw.get("file_name") if isinstance(raw.get("file_name"), str) else None
+    if name is None and media_type == "file" and media_path:
+        name = media_path.replace("\\", "/").rsplit("/", 1)[-1] or None
+    mime = raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None
+    size = raw.get("file_size") if isinstance(raw.get("file_size"), int) and not isinstance(raw.get("file_size"), bool) else None
+    if size is None and media_type == "photo":
+        size = raw.get("photo_file_size") if isinstance(raw.get("photo_file_size"), int) else None
+    return {
+        "media_name": name[:255] if name else None,
+        "media_mime": (mime[:100] if mime else ("image/jpeg" if media_type == "photo" else None)),
+        "media_size": size if size is not None and 0 <= size < 10**13 else None,
+    }
 
 
 def iter_export(fp: BinaryIO) -> Iterator[tuple[str, Any, Any]]:

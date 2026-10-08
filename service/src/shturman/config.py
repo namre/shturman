@@ -91,6 +91,10 @@ class Config:
     # Предел длительности (секунд) и размера файла: длиннее — не скачивается и не распознаётся.
     asr_max_seconds: int = 600
     asr_max_bytes: int = 20 * 1024 * 1024
+    # Разбор фото и документов (media/, docs/media.md). Включает и выключает владелец на странице
+    # настройки переписки (settings 'media.enabled'): файлы уходят модели. Здесь — только пределы.
+    media_days: int = 30
+    media_max_bytes: int = 20 * 1024 * 1024
     # Внешний адрес страницы настройки (схема, имя и порт, без пути), например
     # https://assistant.example.com:8443. Пусто — страница отвечает только под локальными именами
     # из allowed_hosts (туннель SSH). Адрес обязан отличаться от адреса дашборда Hermes хотя бы
@@ -158,6 +162,11 @@ class Config:
         return self.data_dir / "uploads"
 
     @property
+    def media_files_dir(self) -> Path:
+        """Файлы вложений из загруженной выгрузки: лежат до разбора (media/files.py)."""
+        return self.data_dir / "media-files"
+
+    @property
     def pages_dir(self) -> Path:
         return self.data_dir / "pages"
 
@@ -214,6 +223,7 @@ class Config:
             asr_url=_env("SHTURMAN_ASR_URL").rstrip("/"),
             asr_days=min(3650, max(0, _int("SHTURMAN_ASR_DAYS", 30))),
             asr_max_seconds=min(3600, max(10, _int("SHTURMAN_ASR_MAX_SECONDS", 600))),
+            media_days=min(3650, max(0, _int("SHTURMAN_MEDIA_DAYS", 30))),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )
         return with_page_values(config, os.environ)
