@@ -122,22 +122,19 @@ def _correspondence_step() -> str:
     return _CODE[_CODE.index("function CorrespondenceStep"):_CODE.index("function correspondenceSummary")]
 
 
-def test_correspondence_step_is_short_and_does_not_explain_two_bots():
-    """Первая настройка — без бота согласований и без бизнес-режима: в шаге о них одна мелкая строка
-    внизу, блока «Два бота» нет."""
+def test_correspondence_step_is_short_and_names_the_approvals_bot_and_two_ways():
+    """Шаг «Переписка» короткий: подробности — на странице сервиса. Он называет то, что там будет:
+    бот согласований (первый шаг страницы) и два способа подключения. Блока «Два бота» нет."""
     step = _correspondence_step()
     for gone in ("Два бота", "shturman-bots", "не перепутайте", "Бот-ассистент", "К нему подключается",
-                 "по коду от бота", "токен второго бота", "Почему отдельная страница"):
+                 "по коду от бота", "токен второго бота", "Почему отдельная страница", "Шагов там три"):
         assert gone not in _CODE, gone
     assert "чтобы ваш вход в Telegram не проходил через ассистента" in step
-    assert "Шагов там три: ключи приложения Telegram, вход в аккаунт по QR-коду, выбор чатов." in step
-    # бот согласований упомянут один раз, мелкой строкой, как то, что понадобится позже
-    assert step.count("согласований") == 1 and _CODE.count("бот согласований") == 1
+    assert "бота согласований" in step and "ассистент видит всё как вы" in step and "отдельный" in step
     fine = step[step.index("shturman-fine"):]
-    assert "Разрешить ассистенту отправлять сообщения можно позже" in fine and "«Дополнительно»" in fine
-    # бизнес-режим — только в спокойном предупреждении для экземпляра прежней схемы
-    assert step.count("бизнес-режим") == 1 and "st.business.connected ?" in step
-    assert "Ничего не сломано" in step
+    assert "Разрешить ассистенту отправлять сообщения можно позже" in fine and "«Дополнительно»" not in fine
+    # бот-ассистент в бизнес-режиме — только спокойное предупреждение для экземпляра прежней схемы
+    assert "st.business.connected ?" in step and "Ничего не сломано" in step
 
 
 def test_correspondence_step_shows_three_facts_of_the_simple_path():

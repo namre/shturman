@@ -55,8 +55,8 @@ async def test_module_is_idle_and_says_so_without_app_keys(make_client):
                          ("POST", "/api/tg/accounts/1/logout"), ("GET", "/api/tg/accounts/1/sync")):
         response = await client.request(method, path, json={"role": "assistant"} if method == "POST" else None)
         assert response.status_code == 503
-        # Основной путь — страница настройки переписки, шаг 1; переменные окружения — запасной.
-        assert "TELEGRAM_API_ID" in response.json()["error"] and "шаг 1" in response.json()["error"]
+        # Основной путь — страница настройки переписки; переменные окружения — запасной.
+        assert "TELEGRAM_API_ID" in response.json()["error"] and "Ключи приложения Telegram" in response.json()["error"]
     assert (await client.get("/api/tg/accounts", headers={"Authorization": "Bearer nope"})).status_code == 401
 
 
@@ -346,10 +346,10 @@ async def test_assistant_login_is_refused_until_owner_is_known(make_client, conf
     client, state, manager = await service(make_client, config, world, owner=None)
     refused = await setup_request(client, "POST", "/api/tg/login", json={"role": "assistant"})
     assert refused.status_code == 409
-    # Отказ называет оба пути: основной — подключить свой аккаунт на странице настройки (шаг 2),
-    # запасной — привязка к боту. Мастера Hermes он не упоминает: сервис не знает, установлен ли Hermes.
+    # Отказ называет оба пути: основной — привязка к боту согласований (первый шаг страницы),
+    # другой — подключить свой аккаунт. Мастера Hermes он не упоминает: сервис не знает, установлен ли Hermes.
     text = refused.json()["error"]
-    assert "подключите основной аккаунт" in text and "шаг 2" in text and "привяжите" in text
+    assert "привяжите себя как владельца" in text and "первый шаг" in text and "подключите основной аккаунт" in text
     assert "мастер" not in text.lower() and "Hermes" not in text
     assert world.clients == [] and manager.flows == {}       # ни клиента, ни кода
     assert not session_path(manager.config, "assistant").exists()
