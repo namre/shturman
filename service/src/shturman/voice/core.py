@@ -234,10 +234,26 @@ class Transcriber:
 
     # --- обход ---
 
+    async def _reachable(self) -> bool:
+        """Контейнер распознавания отвечает? Пока он не отвечал, перед каждым обходом спрашиваем
+        его заново: после запуска сервиса он может ещё загружать модель. Пока не ответил, файлы
+        из Telegram не скачиваются — запросы впустую не тратятся."""
+        if self.problem is None:
+            return True
+        try:
+            await self.asr.health()
+        except AsrUnavailable:
+            return False
+        self.problem = None
+        logger.info("контейнер распознавания речи отвечает")
+        return True
+
     async def step(self, batch: int = 5) -> int:
         """Ставит новое в очередь и обрабатывает до `batch` сообщений. Возвращает, сколько взято."""
         async with self.pool.acquire() as conn:
             await enqueue(conn, self.settings)
+            if not await self._reachable():
+                return 0
             rows = await conn.fetch(_NEXT, batch)
         for row in rows:
             await self.process(row)
