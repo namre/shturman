@@ -5,7 +5,7 @@ CI with an isolated test database may add --include-db. Only src/, tests/ and
 pyproject.toml are copied; no instance files, real Telegram or providers are used.
 Every mutation changes one exact anchor in a fresh temporary snapshot. This is
 not an estimate of whole-project coverage. Exit 0 requires all selected mutants
-killed by call-phase AssertionErrors, with clean baseline/setup/collection.
+killed by call-phase security assertions, with clean baseline/setup/collection.
 """
 from __future__ import annotations
 
@@ -148,7 +148,11 @@ def classify(returncode: int, phases: dict) -> str:
     if phases.get("collection_errors") or not phases.get("collected"):
         return "error"
     failures = [r for r in records if r["outcome"] == "failed"]
-    if any(r["phase"] != "call" or r["exception"] != "AssertionError" for r in failures):
+    def security_assertion(record: dict) -> bool:
+        return record["phase"] == "call" and (
+            record["exception"] == "AssertionError" or
+            (record["exception"] == "Failed" and "DID NOT RAISE" in (record.get("detail") or "")))
+    if any(not security_assertion(r) for r in failures):
         return "error"
     passed = [r for r in records if r["phase"] == "call" and r["outcome"] == "passed"]
     if failures and returncode == 1:
@@ -157,7 +161,7 @@ def classify(returncode: int, phases: dict) -> str:
         return "error"
     if not passed:
         return "untested"
-    if any(r["phase"] == "call" and r["outcome"] == "skipped" for r in records):
+    if any(r["outcome"] == "skipped" for r in records):
         return "untested"
     return "pass"
 
