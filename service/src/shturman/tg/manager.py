@@ -180,7 +180,7 @@ class TgManager:
         if not self.configured:
             raise TgError(
                 "Работа с аккаунтами Telegram не настроена: не заданы ключи приложения. Владелец вводит их "
-                "на странице настройки переписки, шаг 1; запасной путь — TELEGRAM_API_ID и "
+                "на странице настройки переписки, шаг «Ключи приложения Telegram»; запасной путь — TELEGRAM_API_ID и "
                 "TELEGRAM_API_HASH в настройках сервера.", 503)
 
     def _default_factory(self, role: str, path: Any, policy: RequestPolicy, on_reconnect: Any) -> Any:
@@ -308,7 +308,7 @@ class TgManager:
             await lock.release()
             raise
         rt.lock, rt.policy, rt.client = lock, policy, client
-        rt.pacer = sync.Pacer(self.pacing)
+        rt.pacer = sync.Pacer(self.pacing, jitter=True)
 
     async def _launch(self, slot: str) -> AccountRuntime:
         rt = AccountRuntime(slot=slot)
@@ -526,10 +526,10 @@ class TgManager:
                     "SELECT EXISTS (SELECT 1 FROM accounts WHERE role = 'owner')")
             if not owner_known:
                 raise TgError(
-                    "Сервис ещё не знает, какой аккаунт ваш основной. Сначала подключите основной аккаунт: "
-                    "на странице настройки переписки это шаг 2, в терминале — `./ops/tg-login.sh owner`. "
-                    "Другой способ — привяжите себя как владельца к боту: бота согласований привязывают "
-                    "на той же странице, в разделе «Дополнительно», или ссылкой из `./ops/bot-bind.sh`. "
+                    "Сервис ещё не знает, какой аккаунт ваш основной. Сначала привяжите себя как владельца "
+                    "к боту согласований: на странице настройки переписки это первый шаг, в терминале — "
+                    "ссылка из `./ops/bot-bind.sh`. Другой способ — подключите основной аккаунт: на той же "
+                    "странице или `./ops/tg-login.sh owner`. "
                     "Иначе сервис не сможет отличить основной аккаунт от помощника, а помощнику "
                     "разрешена отправка сообщений. После этого подключите помощника снова.", 409)
         current = self.runtimes.get(role)
@@ -564,7 +564,7 @@ class TgManager:
             raise TgError(f"Сессия занята другим процессом: {exc}.", 409) from None
         try:
             rt.lock, rt.policy = lock, RequestPolicy(role, login=True, sending=self.config.sending)
-            rt.pacer = sync.Pacer(self.pacing)
+            rt.pacer = sync.Pacer(self.pacing, jitter=True)
             rt.client = self.client_factory(role, path, rt.policy, rt.on_reconnect)
         except NotConfigured as exc:
             await lock.release()

@@ -202,7 +202,7 @@ main:focus { outline: none; }
 .progress { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 10px 22px; flex: 1 1 auto; }
 .progress li { display: flex; align-items: center; gap: 8px; font-size: 15px; }
 .p-mark {
-  flex: none; width: 26px; height: 26px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  flex: none; min-width: 26px; height: 26px; padding: 0 6px; border-radius: 13px; display: inline-flex; align-items: center; justify-content: center;
   font-size: 13px; font-weight: 700; background: var(--sunken); color: var(--muted); border: 1px solid var(--line);
 }
 .progress .done .p-mark { background: var(--ok-bg); color: var(--ok-ink); border-color: transparent; }
@@ -227,6 +227,7 @@ main:focus { outline: none; }
 .card.step .num { width: 44px; height: 44px; font-size: 22px; background: var(--accent); color: var(--on-accent); }
 .card.step h2, .h2 { font-size: 24px; font-weight: 600; line-height: 1.2; flex: 1 1 180px; min-width: 0; }
 .card.step.is-done .num { background: var(--ok-bg); color: var(--ok-ink); }
+.num:empty { display: none; }
 .card.step.locked { background: transparent; border-style: dashed; }
 .card.step.locked .num { background: var(--sunken); color: var(--muted); border: 1px solid var(--line); }
 .card.step.locked h2 { color: var(--muted); }
@@ -277,6 +278,46 @@ form { display: flex; flex-direction: column; gap: 14px; }
 .ways, .rules { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; }
 .ways { font-size: 17px; }
 .ways code { white-space: nowrap; }
+
+/* Способ подключения: две карточки на выбор. */
+.choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.choice { border: 2px solid var(--line); border-radius: var(--radius); padding: 20px; display: flex; flex-direction: column; gap: 12px; background: var(--sunken); }
+.choice h3 { font-size: 20px; font-weight: 600; line-height: 1.25; }
+.choice.is-chosen { border-color: var(--accent); background: var(--accent-soft); }
+.choice .row { margin-top: auto; }
+.traits { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.traits dt { font-weight: 600; font-size: 14px; color: var(--muted); margin-top: 8px; }
+.traits dt:first-child { margin-top: 0; }
+.traits dd { margin: 0; }
+
+/* Короткий словарь под заголовком страницы. */
+.glossary { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 20px; font-size: 15px; }
+.glossary div { display: flex; flex-direction: column; }
+.glossary dt { font-weight: 600; }
+.glossary dd { margin: 0; color: var(--muted); }
+
+/* Подсказка «откройте на компьютере» нужна только на узком экране. */
+.phone-only { display: none; }
+@media (max-width: 720px) { .phone-only { display: block; } }
+
+/* «Что это даст» — одна строка под описанием шага. */
+.gives { border-left: 4px solid var(--amber); padding: 2px 0 2px 12px; }
+
+/* Вопросы и ответы под шагом: свёрнуты, чтобы не мешать тем, у кого вопросов нет. */
+details.faq { border-top: 1px solid var(--line); padding-top: 6px; }
+details.faq > summary { font-weight: 600; }
+.faq dl { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.faq dt { font-weight: 600; margin-top: 10px; }
+.faq dt:first-child { margin-top: 0; }
+.faq dd { margin: 0; color: var(--ink); }
+.intro details.faq { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 18px 14px; }
+
+/* Тексты под выбранный способ. Пока способ не выбран, показывается вариант «как вы». */
+body.sc-staff .only-own, body:not(.sc-staff) .only-staff { display: none !important; }
+
+/* Закрытый шаг: видна только шапка и строка о том, когда он откроется. */
+.card.step.locked > :not(.card-head):not(.step-lock) { display: none !important; }
+.card.step:not(.locked) > .step-lock { display: none; }
 
 /* ---------------------------------------------- схемы «куда нажать и что ввести» */
 

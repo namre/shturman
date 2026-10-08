@@ -90,28 +90,323 @@
 
   <main id="main" tabindex="-1">
     <div class="intro">
-      <h1>Настройка Telegram и архива</h1>
-      <p class="lead">Три шага по порядку. Следующий шаг откроется, когда будет готов предыдущий.</p>
+      <h1>Подключение ассистента к Telegram</h1>
+      <p class="lead">Здесь вы решаете, что из вашей переписки в Telegram увидит ассистент, — и подключаете это. Займёт 15–20 минут. Понадобятся телефон с Telegram и компьютер: QR-коды на этой странице сканируют телефоном.</p>
+      <dl class="glossary">
+        <div><dt>Ассистент</dt><dd>ИИ, который помнит вашу переписку и помогает с ней.</dd></div>
+        <div><dt>Сервис</dt><dd>программа на вашем сервере: собирает переписку в архив и показывает эту страницу.</dd></div>
+        <div><dt>Бот согласований</dt><dd>отдельный бот в Telegram только для ваших «Да» и «Нет».</dd></div>
+      </dl>
       <div class="done-line" id="done-line" role="status" aria-label="Что уже сделано">
         <ol class="progress" id="progress"></ol>
         <p class="collected">Собрано сообщений: <b id="collected">0</b></p>
       </div>
       <p class="note warn" id="net-error" role="alert" hidden>Нет связи с сервером. Страница попробует ещё раз сама.</p>
+      <details class="faq" id="faq-main">
+        <summary>Частые вопросы: безопасность, где хранится переписка, как всё отключить</summary>
+        <dl>
+          <dt>Почему это отдельная страница, а не разговор с ассистентом?</dt>
+          <dd>Здесь вводятся ключи и вход в ваш Telegram. Страница работает отдельно от ассистента: он её не видит и ничего на ней нажать не может. Поэтому и вход сюда — по одноразовой ссылке, а не через ассистента.</dd>
+          <dt>Где хранится моя переписка и кто её видит?</dt>
+          <dd>На вашем сервере. Наружу уходят только фрагменты, нужные для работы: провайдеру языковой модели, с которой работает ассистент (например, OpenRouter или OpenAI), и вам в Telegram — в вопросах бота согласований и в сводках ассистента. Если вы подключите к архиву другую программу (например, Claude Code или Codex), фрагменты получит и её провайдер.</dd>
+          <dt>Может ли ассистент написать кому-то от моего имени?</dt>
+          <dd id="faq-sending">Сейчас нет: отправка сообщений выключена в настройках сервера и с этой страницы не включается. Ассистент читает, запоминает и готовит черновики. Включить отправку — отдельное решение, которое принимаете вы.</dd>
+          <dt>Можно ли всё отключить?</dt>
+          <dd>Да, в любой момент. Здесь — кнопками «Пауза» и «Выйти из аккаунта». В Telegram — «Настройки» → «Устройства» (сервис там называется «Shturman») или «Telegram для бизнеса» → «Чат-боты». Сохранённое можно стереть по чатам.</dd>
+          <dt>Как понять, что никто, кроме меня, здесь ничего не менял?</dt>
+          <dd>Каждое действие на этой странице записывается в журнал — он внизу, в разделе «Дополнительно». Если увидите там то, чего не делали, нажмите «Выйти на всех устройствах».</dd>
+        </dl>
+      </details>
     </div>
 
-    <!-- ------------------------------------------- шаг 1. ключи приложения Telegram -->
-    <section class="card step" id="s-keys" aria-labelledby="h-keys">
+    <!-- ------------------------------------------------------------ бот согласований -->
+    <section class="card step" id="s-bot" aria-labelledby="h-bot">
       <div class="card-head">
-        <span class="num" aria-hidden="true">1</span>
+        <span class="num" aria-hidden="true"></span>
+        <h2 id="h-bot">Бот согласований — ваш пульт</h2>
+        <span class="pill" id="st-bot"></span>
+      </div>
+      <p class="step-lock locked-note" hidden></p>
+      <p>Отдельный бот, который присылает вам вопросы с кнопками «Да» и «Нет». Например: «В переписке с Иваном найдена договорённость: прислать смету до пятницы. Записать?»</p>
+      <p class="gives"><b>Что это даст.</b> С вашей перепиской ассистент ничего важного не сделает сам: не запишет договорённость и не начнёт читать новый чат без вашего «Да» в этом боте. Отправлять сообщения — когда вы её включите — он будет только после «Да» или по правилам, которые вы заранее разрешите.</p>
+
+      <div class="split">
+        <div class="col">
+          <p class="note info" id="bot-server" hidden>Токен бота задан в настройках сервера. Изменить его можно только там.</p>
+          <p class="note" id="bot-status" role="status" hidden></p>
+
+          <form id="bot-form" autocomplete="off" novalidate hidden>
+            <div class="field">
+              <label for="bot-token">Токен нового бота</label>
+              <input id="bot-token" name="token" type="password" autocomplete="off" spellcheck="false"
+                     autocapitalize="off" aria-describedby="bot-token-hint bot-error">
+              <p class="hint" id="bot-token-hint">Это пароль бота: длинная строка с двоеточием из ответа @BotFather — как его получить, показано справа. Нужен <b>новый</b> бот: бот, которым уже пользуется другая программа (в том числе бот ассистента), сюда не подходит.</p>
+            </div>
+            <p class="note warn" id="bot-error" role="alert" hidden></p>
+            <div class="row">
+              <button class="btn" id="bot-check" type="submit">Проверить токен</button>
+              <button class="btn ghost" id="bot-form-cancel" type="button" hidden>Отмена</button>
+            </div>
+          </form>
+
+          <div id="bot-confirm" class="box" hidden>
+            <p>Telegram ответил: это бот <b id="bot-confirm-name"></b>.</p>
+            <p>Это должен быть отдельный бот, которым не пользуется никакая другая программа. Два сервиса одним ботом пользоваться не могут.</p>
+            <div class="row">
+              <button class="btn" id="bot-save" type="button">Да, это отдельный бот — сохранить</button>
+              <button class="btn ghost" id="bot-confirm-cancel" type="button">Ввести другой токен</button>
+            </div>
+            <p class="small" id="bot-save-wait" hidden>Проверяю, что ботом не пользуется другая программа. Это занимает несколько секунд…</p>
+          </div>
+
+          <div class="row" id="bot-actions" hidden>
+            <button class="btn ghost small-btn" id="bot-change" type="button">Сменить токен</button>
+            <button class="btn ghost danger small-btn" id="bot-remove" type="button">Убрать токен</button>
+          </div>
+
+          <div id="bind" hidden>
+            <h3>Привязка владельца</h3>
+            <p id="bind-none">Теперь бот должен узнать, что его владелец — вы: вопросы он будет присылать только вам, и кнопки будут действовать только от вас. Это одно нажатие.</p>
+            <p class="note ok" id="bind-done" hidden></p>
+            <div id="bind-link-box" class="box" hidden>
+              <p><b>Откройте ссылку в Telegram и нажмите «Запустить».</b> Она действует <span id="bind-minutes">15</span> минут и срабатывает один раз.</p>
+              <div class="qr-row">
+                <div class="qr" id="bind-qr" aria-hidden="true"></div>
+                <div class="col">
+                  <a class="btn" id="bind-open" href="#" target="_blank" rel="noopener noreferrer">Открыть бота в Telegram</a>
+                  <p class="small">Или наведите камеру телефона на код. Кто откроет ссылку и нажмёт «Запустить», тот и станет владельцем — никому её не пересылайте.</p>
+                  <p class="small waiting" id="bind-wait" role="status">Жду, пока вы нажмёте «Запустить»…</p>
+                </div>
+              </div>
+            </div>
+            <p class="note warn" id="bind-error" role="alert" hidden></p>
+            <div class="row">
+              <button class="btn" id="bind-go" type="button">Показать ссылку привязки</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="aside">
+          <figure class="shot" id="shot-newbot">
+            <div class="shot-bar">Telegram · @BotFather</div>
+            <div class="shot-body">
+              <div class="msg out marked"><span class="mark" aria-hidden="true">1</span>/newbot</div>
+              <div class="msg in">Alright, a new bot. How are we going to call it?</div>
+              <div class="msg out marked"><span class="mark" aria-hidden="true">2</span>Согласования</div>
+              <div class="msg in">Good. Now let's choose a username… It must end in `bot`.</div>
+              <div class="msg out marked"><span class="mark" aria-hidden="true">3</span>ivan_soglasovaniya_bot</div>
+              <div class="msg in">Done! … Use this token to access the HTTP API:<br><span class="hl"><span class="mark" aria-hidden="true">4</span>1234567890:AAH…xyz</span></div>
+            </div>
+            <figcaption>
+              <ol>
+                <li>Найдите в Telegram @BotFather (с синей галочкой) и отправьте ему /newbot.</li>
+                <li>Придумайте название — так бот будет подписан в списке чатов.</li>
+                <li>Придумайте адрес латиницей; он должен заканчиваться на bot.</li>
+                <li>Скопируйте токен из ответа — длинную строку с двоеточием — и вставьте слева.</li>
+              </ol>
+              <div class="shot-foot">Схема. Подписи на вашем экране могут немного отличаться.</div>
+            </figcaption>
+          </figure>
+          <figure class="shot" id="shot-start" hidden>
+            <div class="shot-bar">Telegram · ваш бот согласований</div>
+            <div class="shot-body">
+              <div class="msg in">Здесь будут карточки с кнопками.</div>
+              <div class="key marked startbar"><span class="mark" aria-hidden="true">2</span>ЗАПУСТИТЬ</div>
+            </div>
+            <figcaption>
+              <ol>
+                <li>Нажмите «Открыть бота в Telegram» — откроется чат с ботом.</li>
+                <li>Внизу чата нажмите «Запустить» (в английской версии — Start).</li>
+                <li>Бот ответит «Готово: вы привязаны как владелец». Эта страница увидит привязку сама.</li>
+              </ol>
+              <div class="shot-foot">Схема. Подписи на вашем экране могут немного отличаться.</div>
+            </figcaption>
+          </figure>
+        </div>
+      </div>
+
+      <details class="faq">
+        <summary>Вопросы про бота согласований</summary>
+        <dl>
+          <dt>Зачем ещё один бот?</dt>
+          <dd>Если у ассистента есть свой бот для разговоров, этот — другой. В том боте вы общаетесь с ассистентом, а этот принимает только ваши решения и работает мимо ассистента: нажатие кнопки приходит прямо на ваш сервер. Так ассистент не может разрешить что-то сам себе — даже если кто-то попробует обмануть его хитро составленным сообщением.</dd>
+          <dt>Что такое токен?</dt>
+          <dd>Пароль бота, который Telegram выдаёт при его создании. Он хранится только на вашем сервере; обратно эта страница его не показывает. Никому его не пересылайте.</dd>
+          <dt>Почему бот должен быть новым?</dt>
+          <dd>Одним ботом не могут пользоваться две программы: они перехватывали бы сообщения друг у друга. Поэтому не подойдёт ни бот ассистента, ни любой другой, который у вас уже есть.</dd>
+          <dt>Это бесплатно?</dt>
+          <dd>Да. Создание ботов в Telegram бесплатное.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- ------------------------------------------------------------ способ подключения -->
+    <section class="card step" id="s-mode" aria-labelledby="h-mode">
+      <div class="card-head">
+        <span class="num" aria-hidden="true"></span>
+        <h2 id="h-mode">Как ассистент будет видеть вашу переписку</h2>
+        <span class="pill" id="st-mode"></span>
+      </div>
+      <p>Есть два способа. Они по-разному устроены и несут разный риск — выберите тот, что вам ближе. Способ можно сменить позже: собранное не теряется, а подключённое продолжает работать — ненужное вы отключаете сами.</p>
+      <div class="choices" id="mode-choices">
+        <div class="choice" id="choice-own">
+          <h3>Ассистент видит всё как вы</h3>
+          <p class="small">Сервис входит в ваш аккаунт Telegram как ещё одно устройство.</p>
+          <dl class="traits">
+            <dt>Что увидит</dt>
+            <dd>Личные чаты, группы и каналы, которые вы отметите, — вместе с историей за выбранный срок.</dd>
+            <dt>Как будет отвечать</dt>
+            <dd>Сейчас — только черновики. Если включите отправку: в личных чатах — через бота от вашего имени (для этого понадобятся Telegram Premium и бизнес-режим, ответить можно в течение суток после входящего); в группах — черновик, который вы отправляете сами.</dd>
+            <dt>Чем рискуете</dt>
+            <dd>На сервере хранится вход в ваш основной аккаунт. Если Telegram сочтёт его подозрительным, ограничения коснутся вашего номера. Сервис только читает и делает это неторопливо, но Telegram своих правил не публикует, поэтому гарантий нет.</dd>
+            <dt>Что понадобится</dt>
+            <dd>Телефон с Telegram, около 10 минут. Бесплатно.</dd>
+          </dl>
+          <div class="row"><button class="btn" id="mode-own" type="button">Выбрать этот способ</button></div>
+        </div>
+        <div class="choice" id="choice-staff">
+          <h3>Ассистент — отдельный сотрудник</h3>
+          <p class="small">Бот подключается к вашим личным чатам официальным способом Telegram, а в группах у ассистента свой аккаунт.</p>
+          <dl class="traits">
+            <dt>Что увидит</dt>
+            <dd>Новые сообщения в личных чатах, которые вы откроете боту в настройках Telegram, — с момента подключения; прошлое можно добавить выгрузкой. В группах — только там, куда вы добавите аккаунт ассистента.</dd>
+            <dt>Как будет отвечать</dt>
+            <dd>Сейчас — только черновики. Когда вы включите отправку: в личных чатах — бот от вашего имени; в группах — ассистент от своего имени, и все видят, что пишет он.</dd>
+            <dt>Чем рискуете</dt>
+            <dd>Вход в ваш основной аккаунт на сервере не хранится. Риск ограничений — только у номера ассистента.</dd>
+            <dt>Что понадобится</dt>
+            <dd>Подписка Telegram Premium — бизнес-режим входит в неё. Для групп — вторая SIM-карта для аккаунта ассистента. Каналы в этом способе не видны.</dd>
+          </dl>
+          <div class="row"><button class="btn" id="mode-staff" type="button">Выбрать этот способ</button></div>
+        </div>
+      </div>
+      <p class="note info" id="mode-hint" hidden></p>
+      <p class="note warn" id="mode-error" role="alert" hidden></p>
+      <details class="faq">
+        <summary>Вопросы про выбор способа</summary>
+        <dl>
+          <dt>Какой выбрать?</dt>
+          <dd>Если важна полная картина и прошлая переписка — первый. Если не хотите хранить на сервере вход в свой основной аккаунт или ассистент должен открыто участвовать в группах — второй: для него сразу нужен Premium, прошлое личных чатов добавляется только выгрузкой, каналов он не видит, а участники групп видят аккаунт ассистента. Не уверены — начните с первого на нескольких рабочих чатах: это быстрее и бесплатно.</dd>
+          <dt>Что значит «вход в аккаунт хранится на сервере»?</dt>
+          <dd>Как если бы вы вошли в Telegram на ещё одном компьютере, и этот компьютер — ваш сервер. Тот, кто получит доступ к серверу, получит и доступ к переписке. Поэтому сервер должен быть только вашим.</dd>
+          <dt>Можно оба способа сразу?</dt>
+          <dd>Технически можно, но настраивать и понимать это сложнее. Начните с одного: сменить способ можно в любой момент, архив сохранится. Если переходите на «сотрудника», чтобы не хранить вход в свой аккаунт, после смены нажмите «Выйти из аккаунта» в шаге входа — сам по себе он не отключится.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- ------------------------------------------- бизнес-режим Telegram (способ «сотрудник») -->
+    <section class="card step" id="s-business" aria-labelledby="h-business" hidden>
+      <div class="card-head">
+        <span class="num" aria-hidden="true"></span>
+        <h2 id="h-business">Личные чаты: бизнес-режим Telegram</h2>
+        <span class="pill" id="st-business"></span>
+      </div>
+      <p class="step-lock locked-note" hidden></p>
+      <p class="note warn other-note" hidden></p>
+      <p>Telegram официально позволяет подключить бота к вашим личным чатам — функция называется «Telegram для бизнеса». Бот видит новые сообщения в чатах, которые вы ему откроете, и передаёт их в ваш архив. Подключается тот самый бот согласований из первого шага.</p>
+      <p class="gives"><b>Что это даст.</b> Ассистент знает, о чём вам пишут в личных чатах, — без входа в ваш аккаунт.</p>
+      <p class="note info" id="business-nobot">Сначала привяжите себя как владельца к боту согласований — первый шаг.</p>
+
+      <div id="business-body" hidden>
+        <p class="note" id="business-status" role="status"></p>
+        <p class="note warn" id="business-reply" hidden>Боту выдано право отвечать на сообщения. Отправка в сервисе выключена, поэтому это право лучше снять: Telegram → настройки бизнес-режима → ваш бот.</p>
+        <div class="steps">
+          <div class="step-part">
+            <h3>Сначала включите режим у @BotFather</h3>
+            <div class="split">
+              <div class="col">
+                <p>Это разрешение самому боту — без него подключить его к аккаунту нельзя.</p>
+                <p class="note" id="business-capable" role="status"></p>
+                <p class="note warn" id="business-error" role="alert" hidden></p>
+                <div class="row"><button class="btn ghost" id="business-refresh" type="button">Проверить, включён ли режим</button></div>
+              </div>
+              <div class="aside">
+                <figure class="shot">
+                  <div class="shot-bar">Telegram · @BotFather</div>
+                  <div class="shot-body">
+                    <div class="msg out">/mybots</div>
+                    <div class="key marked"><span class="mark" aria-hidden="true">1</span><span class="bot-name">@ваш_бот</span></div>
+                    <div class="key marked"><span class="mark" aria-hidden="true">2</span>Bot Settings</div>
+                    <div class="key marked"><span class="mark" aria-hidden="true">3</span>Secretary Mode</div>
+                    <div class="key marked"><span class="mark" aria-hidden="true">4</span>Turn on</div>
+                  </div>
+                  <figcaption>
+                    <ol>
+                      <li>Отправьте @BotFather команду /mybots и выберите бота согласований.</li>
+                      <li>Нажмите Bot Settings.</li>
+                      <li>Нажмите Secretary Mode. В прежних версиях пункт назывался Business Mode — название может отличаться.</li>
+                      <li>Нажмите Turn on.</li>
+                    </ol>
+                    <div class="shot-foot">Схема. Название режима сверено с документацией Telegram 7 октября 2026 года; остальные подписи могут отличаться.</div>
+                  </figcaption>
+                </figure>
+              </div>
+            </div>
+          </div>
+          <div class="step-part">
+            <h3>Затем подключите бота в настройках Telegram</h3>
+            <div class="split">
+              <div class="col">
+                <p>Для начала откройте боту <b>один чат</b>: убедитесь, что его сообщения появляются в архиве (счётчик вверху страницы растёт), и только потом добавляйте остальные.</p>
+                <p><b>Право отвечать боту пока не давайте</b> — отправка выключена.</p>
+                <p class="small">Подключение сервис принимает только от вашего аккаунта — того, что привязан к боту как владелец.</p>
+              </div>
+              <div class="aside">
+                <figure class="shot">
+                  <div class="shot-bar">Telegram · Настройки</div>
+                  <div class="shot-body">
+                    <div class="row-item marked"><span class="mark" aria-hidden="true">1</span><span>Telegram для бизнеса</span><span class="arrow" aria-hidden="true">›</span></div>
+                    <div class="row-item marked"><span class="mark" aria-hidden="true">2</span><span>Чат-боты</span><span class="arrow" aria-hidden="true">›</span></div>
+                    <div class="fake-input"><span class="hl"><span class="mark" aria-hidden="true">3</span><span class="bot-name">@ваш_бот</span></span></div>
+                    <div class="row-item marked"><span class="mark" aria-hidden="true">4</span><span>Доступные чаты</span><span class="arrow" aria-hidden="true">›</span></div>
+                    <div class="tick"><span class="box-off" aria-hidden="true"></span> Отвечать на сообщения</div>
+                  </div>
+                  <figcaption>
+                    <ol>
+                      <li>В Telegram откройте «Настройки» → «Telegram для бизнеса» (Telegram Business).</li>
+                      <li>Выберите «Чат-боты». Пункт может называться иначе — например «Автоматизация чатов» (Chat Automation).</li>
+                      <li>Впишите адрес бота согласований и добавьте его.</li>
+                      <li>Выберите, в каких чатах бот может работать, — для начала один.</li>
+                    </ol>
+                    <div class="shot-foot">Схема. Названия пунктов на живом Telegram не сверялись и могут отличаться.</div>
+                  </figcaption>
+                </figure>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <details class="faq">
+        <summary>Вопросы про бизнес-режим</summary>
+        <dl>
+          <dt>Обязательно ли Premium?</dt>
+          <dd>Да: «Telegram для бизнеса» — часть подписки Telegram Premium. Без неё подключить бота к личным чатам нельзя.</dd>
+          <dt>Какие чаты увидит бот?</dt>
+          <dd>Только те, что вы отметите в настройках Telegram: можно «все, кроме…» или только выбранные. Список меняется там же в любой момент; убрать бота — там же.</dd>
+          <dt>Почему только новые сообщения?</dt>
+          <dd>Так устроен бизнес-режим: бот получает сообщения с момента подключения. Прошлую переписку можно добавить выгрузкой из Telegram Desktop — последний шаг.</dd>
+          <dt>А группы?</dt>
+          <dd>Бизнес-режим работает только с личными чатами. В группах у ассистента свой аккаунт — следующие шаги.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- ------------------------------------------------- ключи приложения Telegram -->
+    <section class="card step" id="s-keys" aria-labelledby="h-keys" hidden>
+      <div class="card-head">
+        <span class="num" aria-hidden="true"></span>
         <h2 id="h-keys">Ключи приложения Telegram</h2>
         <span class="pill" id="st-keys"></span>
+        <span class="optional-tag only-staff">для групп, по желанию</span>
       </div>
-      <p>Чтобы сервис мог читать ваши чаты, Telegram просит «ключи приложения» — два значения, которые вы один раз получаете на сайте Telegram. Это бесплатно и занимает пару минут.</p>
+      <p class="step-lock locked-note" hidden></p>
+      <p><span class="only-own">Чтобы программа могла войти в ваш аккаунт, Telegram просит «ключи приложения» — два значения, которые вы один раз получаете на сайте Telegram.</span><span class="only-staff">Нужны, чтобы подключить аккаунт ассистента для групп: Telegram просит «ключи приложения» — два значения, которые один раз получают на сайте Telegram. Если ассистент в группах не нужен, этот и два следующих шага можно пропустить.</span> Это бесплатно и занимает пару минут.</p>
 
       <div class="split">
         <div class="col">
           <p class="note info" id="keys-server" hidden>Ключи заданы в настройках сервера. Изменить их можно только там.</p>
-          <p class="note ok" id="keys-ok" hidden>Ключи сохранены. Переходите к шагу 2.</p>
+          <p class="note ok" id="keys-ok" hidden>Ключи сохранены. Переходите к следующему шагу.</p>
           <form id="keys-form" autocomplete="off" novalidate hidden>
             <div class="grid2">
               <div class="field">
@@ -159,20 +454,34 @@
           </figure>
         </div>
       </div>
+      <details class="faq">
+        <summary>Вопросы про ключи</summary>
+        <dl>
+          <dt>Это не опасно? Что дают эти ключи?</dt>
+          <dd>Сами по себе ключи доступа к переписке не дают: это «паспорт программы», а не пароль от аккаунта. Доступ появляется, только когда вы сами войдёте по QR-коду на следующем шаге.</dd>
+          <dt>Сайт пишет «ERROR» при создании приложения</dt>
+          <dd>Так бывает часто. Попробуйте позже, в другом браузере или без VPN; поля заполняйте латиницей.</dd>
+          <dt>На какой номер получать?</dt>
+          <dd>На любой ваш аккаунт Telegram — ключи подходят для входа в любой аккаунт. Получить их нужно один раз.</dd>
+        </dl>
+      </details>
     </section>
 
-    <!-- ------------------------------------------------- шаг 2. вход в аккаунт -->
-    <section class="card step" id="s-accounts" aria-labelledby="h-accounts">
+    <!-- --------------------------------------------- вход в основной аккаунт (способ «как вы») -->
+    <section class="card step" id="s-accounts" aria-labelledby="h-accounts" hidden>
       <div class="card-head">
-        <span class="num" aria-hidden="true">2</span>
-        <h2 id="h-accounts">Вход в аккаунт Telegram</h2>
+        <span class="num" aria-hidden="true"></span>
+        <h2 id="h-accounts">Вход в ваш аккаунт Telegram</h2>
         <span class="pill" id="st-accounts"></span>
       </div>
-      <p class="locked-note" id="accounts-nokeys" hidden>Откроется, когда будут сохранены ключи приложения — шаг 1.</p>
+      <p class="step-lock locked-note" hidden></p>
+      <p class="note warn other-note" hidden></p>
+      <p class="locked-note" id="accounts-nokeys" hidden>Откроется, когда будут сохранены ключи приложения.</p>
 
       <div id="accounts-body" hidden>
-        <p>Сервис войдёт в ваш Telegram как ещё одно устройство — так же, как Telegram на компьютере. Он только читает: ничего не отправляет, не отмечает прочитанным и не меняет настройки. Сам вход ничего не читает — чаты вы выберете на шаге 3.</p>
-        <p><b>Входите своим личным аккаунтом</b> — тем, чью переписку должен знать ассистент. Второй номер («ассистент такого-то») подключается отдельно, в разделе «Дополнительно» → «Аккаунт-помощник».</p>
+        <p>Сервис войдёт в ваш Telegram как ещё одно устройство — так же, как Telegram на компьютере. В списке устройств он будет называться «Shturman» — или так, как вы назвали приложение на my.telegram.org. <b>Входите своим личным аккаунтом</b> — тем, чью переписку должен знать ассистент.</p>
+        <p class="gives"><b>Что это даст.</b> Сам вход ничего не читает: какие чаты читать, вы выберете на следующем шаге.</p>
+        <p class="note info phone-only">Откройте эту страницу на компьютере: QR-код показывается на экране, а сканируют его телефоном.</p>
         <div class="role-state" id="role-owner-state"></div>
         <div id="login-slot-owner">
           <div id="tg-login" class="box" hidden>
@@ -182,10 +491,10 @@
                 <div id="tg-login-qr-box">
                   <p><b>Отсканируйте код телефоном</b> — тем аккаунтом, который подключаете.</p>
                   <div class="qr big" id="tg-login-qr" role="img" aria-label="QR-код для входа в аккаунт Telegram"></div>
-                  <p class="small waiting" id="tg-login-wait" role="status">Жду, пока вы отсканируете код. Он обновляется сам каждые полминуты.</p>
+                  <p class="small waiting" id="tg-login-wait" role="status">Жду, пока вы отсканируете код. Он обновляется сам каждые полминуты; на весь вход — 5 минут, потом его можно начать заново.</p>
                 </div>
                 <form id="tg-password-form" autocomplete="off" novalidate hidden>
-                  <p><b>На аккаунте включён облачный пароль.</b> Введите его: он уйдёт в Telegram и нигде не сохранится.</p>
+                  <p><b>На аккаунте включён облачный пароль</b> (в Telegram: «Настройки» → «Конфиденциальность» → «Двухэтапная аутентификация»). Введите его: он уйдёт в Telegram и нигде не сохранится.</p>
                   <div class="field">
                     <label for="tg-password">Облачный пароль Telegram</label>
                     <input id="tg-password" name="password" type="password" autocomplete="off" aria-describedby="tg-password-hint tg-login-error">
@@ -213,32 +522,69 @@
                       <li>Нажмите «Подключить устройство».</li>
                       <li>Наведите камеру на код слева и подтвердите вход.</li>
                     </ol>
-                    <div class="shot-foot">Схема. Подписи на вашем экране могут немного отличаться. Завершить сессию можно там же, в списке устройств.</div>
+                    <div class="shot-foot">Схема. Подписи на вашем экране могут немного отличаться. Завершить сеанс можно там же, в списке устройств.</div>
                   </figcaption>
                 </figure>
               </div>
             </div>
           </div>
         </div>
-        <div class="box" id="detached-box" hidden>
-          <h3>Аккаунты в архиве без подключения</h3>
-          <p class="small">У этих аккаунтов нет подключения — из них вышли, или их переписка пришла из выгрузки, — но переписка и роль остались в архиве. Если аккаунт подключили не в той роли (например, второй номер — как основной), удалите его здесь и подключите заново, как нужно.</p>
-          <div id="detached-list"></div>
-        </div>
       </div>
+      <details class="faq">
+        <summary>Вопросы про вход в аккаунт</summary>
+        <dl>
+          <dt>Что сервис сможет делать в моём аккаунте?</dt>
+          <dd>Только читать. Он не отправляет сообщений, не отмечает прочитанным, не меняет настройки и не вступает в группы. Это ограничено в самой программе: запросы на отправку она до Telegram не пропускает.</dd>
+          <dt>Не заблокирует ли Telegram мой аккаунт?</dt>
+          <dd>Сервис только читает и не торопится: историю он загружает по одному запросу, со случайными паузами в несколько секунд, а если Telegram просит подождать — ждёт столько, сколько тот сказал. Но Telegram своих правил не публикует, поэтому гарантий нет. Чтобы снизить риск, начните с нескольких чатов и глубины 3–6 месяцев. Если Telegram спросит в приложении, вы ли вошли с нового устройства, — подтвердите.</dd>
+          <dt>Как отключить?</dt>
+          <dd>Кнопкой «Выйти из аккаунта» здесь или в Telegram: «Настройки» → «Устройства» → «Shturman» → «Завершить сеанс». Сохранённая переписка останется в архиве, пока вы её не сотрёте.</dd>
+        </dl>
+      </details>
     </section>
 
-    <!-- ---------------------------------------------------------- шаг 3. чаты -->
-    <section class="card step" id="s-chats" aria-labelledby="h-chats">
+    <!-- --------------------------------------------- аккаунт ассистента для групп (способ «сотрудник») -->
+    <section class="card step" id="s-assistant" aria-labelledby="h-assistant" hidden>
       <div class="card-head">
-        <span class="num" aria-hidden="true">3</span>
-        <h2 id="h-chats">Выбор чатов</h2>
+        <span class="num" aria-hidden="true"></span>
+        <h2 id="h-assistant">Группы: аккаунт ассистента</h2>
+        <span class="pill" id="st-assistant"></span>
+        <span class="optional-tag">по желанию</span>
+      </div>
+      <p class="step-lock locked-note" hidden></p>
+      <p class="note warn other-note" hidden></p>
+      <p>Отдельный аккаунт Telegram на другом номере — например, «Ассистент Евгения». Вы добавляете его в те группы, где ассистент должен быть, и он читает их под своим именем.</p>
+      <p class="gives"><b>Что понадобится.</b> Вторая SIM-карта. Второй телефон не нужен: аккаунт ассистента можно добавить в Telegram на вашем телефоне («Настройки» → «Добавить аккаунт»), переключиться на него и отсканировать QR-код. Сам аккаунт создаётся в Telegram обычным способом.</p>
+      <p class="note info phone-only">Откройте эту страницу на компьютере: QR-код показывается на экране, а сканируют его телефоном.</p>
+      <p class="note info" id="assistant-nokeys" hidden>Сначала сохраните ключи приложения Telegram — предыдущий шаг.</p>
+      <div class="role-state" id="role-assistant-state"></div>
+      <div id="login-slot-assistant"></div>
+      <details class="faq">
+        <summary>Вопросы про аккаунт ассистента</summary>
+        <dl>
+          <dt>Будет ли он писать в группы?</dt>
+          <dd>Сейчас нет: отправка выключена. Когда вы её включите, он будет писать от своего имени — все участники видят, что это ассистент.</dd>
+          <dt>Что он увидит?</dt>
+          <dd>Только группы и чаты, где состоит сам, и личные сообщения, написанные ему. Ваши личные чаты он не видит.</dd>
+          <dt>Можно подключить сюда мой основной аккаунт?</dt>
+          <dd>Нет: аккаунту ассистента разрешено будет отправлять сообщения, поэтому сервис не даст подключить сюда ваш собственный аккаунт.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- ------------------------------------------------------------------------ чаты -->
+    <section class="card step" id="s-chats" aria-labelledby="h-chats" hidden>
+      <div class="card-head">
+        <span class="num" aria-hidden="true"></span>
+        <h2 id="h-chats"><span class="only-own">Какие чаты читать</span><span class="only-staff">Какие группы читать</span></h2>
         <span class="pill" id="st-chats"></span>
       </div>
-      <p class="locked-note" id="chats-none">Откроется, когда вы войдёте в аккаунт — шаг 2.</p>
+      <p class="step-lock locked-note" hidden></p>
+      <p class="locked-note" id="chats-none">Откроется, когда будет подключён аккаунт.</p>
 
       <div id="chats-body" hidden>
-        <p>Отметьте «читать» у чатов, которые сервис должен запоминать. Он загрузит их недавнюю историю и дальше будет сохранять новые сообщения. Чат без отметки не читается вовсе.</p>
+        <p>Отметьте «читать» у <span class="only-own">чатов</span><span class="only-staff">групп</span>, которые ассистент должен знать. Сервис загрузит их историю за выбранный срок и дальше будет сохранять новые сообщения. Без отметки чат не читается вовсе.</p>
+        <p class="gives"><b>Совет.</b> Начните с рабочих чатов. Чем меньше лишнего, тем точнее ассистент и тем меньше запросов к Telegram.</p>
         <div class="tabs" id="chats-accounts" role="tablist" aria-label="Аккаунт" hidden></div>
         <p class="note warn" id="chats-offline" role="status" hidden></p>
 
@@ -289,20 +635,41 @@
           </div>
         </details>
       </div>
+      <details class="faq">
+        <summary>Вопросы про выбор чатов</summary>
+        <dl>
+          <dt>Сколько времени займёт загрузка?</dt>
+          <dd>Примерно тысяча с лишним сообщений в минуту: сервис нарочно не торопится. Небольшая переписка загрузится за минуты, архив в сотни тысяч сообщений — за несколько часов. Ассистент пользуется загруженным сразу, не дожидаясь конца.</dd>
+          <dt>Что значит «Не сохранять»?</dt>
+          <dd>Чат исключается из архива совсем: его сообщения не сохранятся ни из аккаунта, ни из выгрузки. Пригодится для личного — например, семейного чата. Уже сохранённое из него можно сразу стереть.</dd>
+          <dt>Узнают ли собеседники, что чат читается?</dt>
+          <dd>Сервис ничего не пишет в чаты и не отмечает сообщения прочитанными.</dd>
+        </dl>
+      </details>
     </section>
 
-    <!-- ------------------------------- шаг 4 (необязательный). выгрузка из Telegram Desktop -->
-    <section class="card step optional" id="s-import" aria-labelledby="h-import">
+    <!-- -------------------------------- аккаунты в архиве без подключения (оба способа) -->
+    <section class="card" id="detached-box" aria-labelledby="h-detached" hidden>
+      <div class="card-head">
+        <h3 id="h-detached">Аккаунты в архиве без подключения</h3>
+      </div>
+      <p class="small">У этих аккаунтов нет подключения — из них вышли, или их переписка пришла из выгрузки, — но переписка и роль остались в архиве. Если аккаунт подключили не в той роли (например, второй номер — как основной), удалите его здесь и подключите заново, как нужно.</p>
+      <div id="detached-list"></div>
+    </section>
+
+    <!-- ------------------------------- необязательный шаг: выгрузка из Telegram Desktop -->
+    <section class="card step optional" id="s-import" aria-labelledby="h-import" hidden>
+      <p class="step-lock locked-note" hidden></p>
       <details id="import-details">
         <summary>
           <span class="card-head">
-            <span class="num" aria-hidden="true">4</span>
-            <span class="h2" id="h-import" role="heading" aria-level="2">Выгрузка из Telegram Desktop</span>
+            <span class="num" aria-hidden="true"></span>
+            <span class="h2" id="h-import" role="heading" aria-level="2">Прошлая переписка из Telegram Desktop</span>
             <span class="pill" id="st-import"></span>
             <span class="optional-tag">необязательно</span>
           </span>
         </summary>
-        <p>Прошлая переписка — одним файлом. Telegram на компьютере умеет выгрузить историю ваших чатов; сервис положит её в архив, и по ней заработает поиск. Этот шаг можно сделать в любое время или пропустить.</p>
+        <p><span class="only-own">Если нужна переписка глубже, чем загружает вход в аккаунт, — выгрузите её из Telegram на компьютере и загрузите сюда одним файлом.</span><span class="only-staff">Бизнес-режим видит только новые сообщения. Прошлую переписку личных чатов можно выгрузить из Telegram на компьютере и загрузить сюда одним файлом.</span> Шаг можно сделать в любое время или пропустить.</p>
 
         <div class="split">
           <div class="col">
@@ -337,7 +704,7 @@
                 <ol>
                   <li>В Telegram на компьютере откройте «Настройки» → «Продвинутые настройки».</li>
                   <li>Внизу выберите «Экспорт данных из Telegram».</li>
-                  <li>Отметьте, что выгружать: личные чаты, при желании группы и каналы. Фотографии, видео и файлы можно не отмечать: вложения сервис не хранит.</li>
+                  <li>Отметьте, что выгружать: личные чаты, при желании группы и каналы. Фотографии, видео и файлы не отмечайте: вложения сервис не хранит, а выгрузка без них в разы меньше.</li>
                   <li>Формат — «Машиночитаемый JSON».</li>
                   <li>Нажмите «Экспортировать». Когда выгрузка закончится, в её папке будет файл result.json — его и загрузите слева.</li>
                 </ol>
@@ -353,207 +720,11 @@
     <details class="extras" id="extras">
       <summary>
         <span class="extras-title">Дополнительно</span>
-        <span class="extras-lead">Понадобится позже — когда решите разрешить ассистенту отправлять сообщения.</span>
+        <span class="extras-lead">Своя модель сервиса, что собрано в архиве, журнал действий.</span>
       </summary>
 
       <div class="extras-body">
         <p class="note info" id="sending-note">Отправка сообщений выключена: сервис только читает и запоминает. С этой страницы включить её нельзя.</p>
-
-        <!-- ------------------------------------------------ бот согласований -->
-        <section class="card" id="s-bot" aria-labelledby="h-bot">
-          <div class="card-head">
-            <h3 id="h-bot">Бот согласований</h3>
-            <span class="pill" id="st-bot"></span>
-          </div>
-          <p>Отдельный бот, через которого сервис присылает вам карточки с кнопками: найденные договорённости, вопросы «можно ли». Его токен хранится только на вашем сервере, а ваши нажатия приходят сервису напрямую от Telegram.</p>
-
-          <div class="split">
-            <div class="col">
-              <p class="note info" id="bot-server" hidden>Токен бота задан в настройках сервера. Изменить его можно только там.</p>
-              <p class="note" id="bot-status" role="status" hidden></p>
-
-              <form id="bot-form" autocomplete="off" novalidate hidden>
-                <div class="field">
-                  <label for="bot-token">Токен бота</label>
-                  <input id="bot-token" name="token" type="password" autocomplete="off" spellcheck="false"
-                         autocapitalize="off" aria-describedby="bot-token-hint bot-error">
-                  <p class="hint" id="bot-token-hint">Длинная строка с двоеточием из сообщения @BotFather. Нужен <b>новый</b> бот: токен бота, которым уже пользуется другая программа, сюда не подходит.</p>
-                </div>
-                <p class="note warn" id="bot-error" role="alert" hidden></p>
-                <div class="row">
-                  <button class="btn" id="bot-check" type="submit">Проверить токен</button>
-                  <button class="btn ghost" id="bot-form-cancel" type="button" hidden>Отмена</button>
-                </div>
-              </form>
-
-              <div id="bot-confirm" class="box" hidden>
-                <p>Telegram ответил: это бот <b id="bot-confirm-name"></b>.</p>
-                <p>Это должен быть отдельный бот, которым не пользуется никакая другая программа. Два сервиса одним ботом пользоваться не могут.</p>
-                <div class="row">
-                  <button class="btn" id="bot-save" type="button">Да, это отдельный бот — сохранить</button>
-                  <button class="btn ghost" id="bot-confirm-cancel" type="button">Ввести другой токен</button>
-                </div>
-                <p class="small" id="bot-save-wait" hidden>Проверяю, что ботом не пользуется другая программа. Это занимает несколько секунд…</p>
-              </div>
-
-              <div class="row" id="bot-actions" hidden>
-                <button class="btn ghost small-btn" id="bot-change" type="button">Сменить токен</button>
-                <button class="btn ghost danger small-btn" id="bot-remove" type="button">Убрать токен</button>
-              </div>
-
-              <div id="bind" hidden>
-                <h4>Привязка владельца</h4>
-                <p id="bind-none">Бот должен знать, кто его владелец: карточки он пришлёт только вам, и кнопки будут действовать только от вас.</p>
-                <p class="note ok" id="bind-done" hidden></p>
-                <div id="bind-link-box" class="box" hidden>
-                  <p><b>Откройте ссылку в Telegram и нажмите «Запустить».</b> Она действует <span id="bind-minutes">15</span> минут и срабатывает один раз.</p>
-                  <div class="qr-row">
-                    <div class="qr" id="bind-qr" aria-hidden="true"></div>
-                    <div class="col">
-                      <a class="btn" id="bind-open" href="#" target="_blank" rel="noopener noreferrer">Открыть бота в Telegram</a>
-                      <p class="small">Или наведите камеру телефона на код. Кто откроет ссылку и нажмёт «Запустить», тот и станет владельцем — никому её не пересылайте.</p>
-                      <p class="small waiting" id="bind-wait" role="status">Жду, пока вы нажмёте «Запустить»…</p>
-                    </div>
-                  </div>
-                </div>
-                <p class="note warn" id="bind-error" role="alert" hidden></p>
-                <div class="row">
-                  <button class="btn" id="bind-go" type="button">Показать ссылку привязки</button>
-                </div>
-              </div>
-            </div>
-
-            <div class="aside">
-              <figure class="shot" id="shot-newbot">
-                <div class="shot-bar">Telegram · @BotFather</div>
-                <div class="shot-body">
-                  <div class="msg out marked"><span class="mark" aria-hidden="true">1</span>/newbot</div>
-                  <div class="msg in">Alright, a new bot. How are we going to call it?</div>
-                  <div class="msg out marked"><span class="mark" aria-hidden="true">2</span>Согласования</div>
-                  <div class="msg in">Good. Now let's choose a username… It must end in `bot`.</div>
-                  <div class="msg out marked"><span class="mark" aria-hidden="true">3</span>ivan_soglasovaniya_bot</div>
-                  <div class="msg in">Done! … Use this token to access the HTTP API:<br><span class="hl"><span class="mark" aria-hidden="true">4</span>1234567890:AAH…xyz</span></div>
-                </div>
-                <figcaption>
-                  <ol>
-                    <li>Найдите в Telegram @BotFather (с синей галочкой) и отправьте ему /newbot.</li>
-                    <li>Придумайте название — так бот будет подписан в списке чатов.</li>
-                    <li>Придумайте адрес латиницей; он должен заканчиваться на bot.</li>
-                    <li>Скопируйте токен из ответа — длинную строку с двоеточием — и вставьте слева.</li>
-                  </ol>
-                  <div class="shot-foot">Схема. Подписи на вашем экране могут немного отличаться.</div>
-                </figcaption>
-              </figure>
-              <figure class="shot" id="shot-start" hidden>
-                <div class="shot-bar">Telegram · ваш бот согласований</div>
-                <div class="shot-body">
-                  <div class="msg in">Здесь будут карточки с кнопками.</div>
-                  <div class="key marked startbar"><span class="mark" aria-hidden="true">2</span>ЗАПУСТИТЬ</div>
-                </div>
-                <figcaption>
-                  <ol>
-                    <li>Нажмите «Открыть бота в Telegram» — откроется чат с ботом.</li>
-                    <li>Внизу чата нажмите «Запустить» (в английской версии — Start).</li>
-                    <li>Бот ответит «Готово: вы привязаны как владелец». Эта страница увидит привязку сама.</li>
-                  </ol>
-                  <div class="shot-foot">Схема. Подписи на вашем экране могут немного отличаться.</div>
-                </figcaption>
-              </figure>
-            </div>
-          </div>
-        </section>
-
-        <!-- ------------------------------------------- бизнес-режим Telegram (только при боте) -->
-        <section class="card" id="s-business" aria-labelledby="h-business" hidden>
-          <div class="card-head">
-            <h3 id="h-business">Бизнес-режим Telegram</h3>
-            <span class="pill" id="st-business"></span>
-          </div>
-          <p>Официальный способ дать боту доступ к вашим личным чатам: новые сообщения выбранных чатов сразу попадают в архив, без сессии аккаунта на сервере. Подключается к боту согласований.</p>
-          <p class="note info" id="business-nobot">Сначала привяжите себя как владельца к боту согласований — блок выше.</p>
-
-          <div id="business-body" hidden>
-            <p class="note" id="business-status" role="status"></p>
-            <p class="note warn" id="business-reply" hidden>Боту выдано право отвечать на сообщения. Отправка в сервисе выключена, поэтому это право лучше снять: Telegram → настройки бизнес-режима → ваш бот.</p>
-            <div class="steps">
-              <div class="step-part">
-                <h4>Сначала включите режим у @BotFather</h4>
-                <div class="split">
-                  <div class="col">
-                    <p>Это разрешение самому боту — без него подключить его к аккаунту нельзя.</p>
-                    <p class="note" id="business-capable" role="status"></p>
-                    <p class="note warn" id="business-error" role="alert" hidden></p>
-                    <div class="row"><button class="btn ghost" id="business-refresh" type="button">Проверить, включён ли режим</button></div>
-                  </div>
-                  <div class="aside">
-                    <figure class="shot">
-                      <div class="shot-bar">Telegram · @BotFather</div>
-                      <div class="shot-body">
-                        <div class="msg out">/mybots</div>
-                        <div class="key marked"><span class="mark" aria-hidden="true">1</span><span class="bot-name">@ваш_бот</span></div>
-                        <div class="key marked"><span class="mark" aria-hidden="true">2</span>Bot Settings</div>
-                        <div class="key marked"><span class="mark" aria-hidden="true">3</span>Secretary Mode</div>
-                        <div class="key marked"><span class="mark" aria-hidden="true">4</span>Turn on</div>
-                      </div>
-                      <figcaption>
-                        <ol>
-                          <li>Отправьте @BotFather команду /mybots и выберите бота согласований.</li>
-                          <li>Нажмите Bot Settings.</li>
-                          <li>Нажмите Secretary Mode. В прежних версиях пункт назывался Business Mode — название может отличаться.</li>
-                          <li>Нажмите Turn on.</li>
-                        </ol>
-                        <div class="shot-foot">Схема. Название режима сверено с документацией Telegram 7 октября 2026 года; остальные подписи могут отличаться.</div>
-                      </figcaption>
-                    </figure>
-                  </div>
-                </div>
-              </div>
-              <div class="step-part">
-                <h4>Затем подключите бота в настройках Telegram</h4>
-                <div class="split">
-                  <div class="col">
-                    <p>Для начала выберите <b>один тестовый чат</b>: убедитесь, что его сообщения появляются в архиве, и только потом добавляйте остальные.</p>
-                    <p><b>Право отвечать боту не давайте</b> — отправка в сервисе выключена.</p>
-                    <p class="small">Подключение сервис принимает только от вашего аккаунта — того, что привязан как владелец. Раздел бизнес-функций в Telegram может требовать подписки Telegram Premium.</p>
-                  </div>
-                  <div class="aside">
-                    <figure class="shot">
-                      <div class="shot-bar">Telegram · Настройки</div>
-                      <div class="shot-body">
-                        <div class="row-item marked"><span class="mark" aria-hidden="true">1</span><span>Telegram для бизнеса</span><span class="arrow" aria-hidden="true">›</span></div>
-                        <div class="row-item marked"><span class="mark" aria-hidden="true">2</span><span>Чат-боты</span><span class="arrow" aria-hidden="true">›</span></div>
-                        <div class="fake-input"><span class="hl"><span class="mark" aria-hidden="true">3</span><span class="bot-name">@ваш_бот</span></span></div>
-                        <div class="row-item marked"><span class="mark" aria-hidden="true">4</span><span>Доступные чаты</span><span class="arrow" aria-hidden="true">›</span></div>
-                        <div class="tick"><span class="box-off" aria-hidden="true"></span> Отвечать на сообщения</div>
-                      </div>
-                      <figcaption>
-                        <ol>
-                          <li>В Telegram откройте «Настройки» → «Telegram для бизнеса» (Telegram Business).</li>
-                          <li>Выберите «Чат-боты». Пункт может называться иначе — например «Автоматизация чатов» (Chat Automation).</li>
-                          <li>Впишите адрес бота согласований и добавьте его.</li>
-                          <li>Выберите, в каких чатах бот может работать, — для начала один.</li>
-                        </ol>
-                        <div class="shot-foot">Схема. Названия пунктов на живом Telegram не сверялись и могут отличаться.</div>
-                      </figcaption>
-                    </figure>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <!-- ------------------------------------------------- аккаунт-помощник -->
-        <section class="card" id="s-assistant" aria-labelledby="h-assistant">
-          <div class="card-head">
-            <h3 id="h-assistant">Аккаунт-помощник</h3>
-            <span class="pill" id="st-assistant"></span>
-          </div>
-          <p>Отдельный аккаунт Telegram на другом номере — «ассистент такого-то». Нужен, если помощник должен состоять в группах под своим именем. Отправка от его имени сейчас выключена.</p>
-          <p class="note info" id="assistant-nokeys" hidden>Сначала сохраните ключи приложения Telegram — шаг 1.</p>
-          <div class="role-state" id="role-assistant-state"></div>
-          <div id="login-slot-assistant"></div>
-        </section>
 
         <!-- --------------------------------------------- своя модель сервиса -->
         <section class="card" id="s-llm" aria-labelledby="h-llm">
@@ -561,7 +732,7 @@
             <h3 id="h-llm">Своя модель сервиса</h3>
             <span class="pill" id="st-llm"></span>
           </div>
-          <p>Раз в сутки сервис просит модель разобрать новые сообщения: найти договорённости и обновить страницы о людях. Здесь можно дать сервису собственный ключ — тогда он обращается к модели сам.</p>
+          <p>Раз в сутки сервис разбирает новые сообщения: находит договорённости и обновляет заметки о людях. Для этого нужна языковая модель. Если сервис работает вместе с ассистентом Hermes, разбор делает ассистент своей моделью, и отдельный ключ не обязателен. Здесь можно дать сервису собственный ключ — тогда он обращается к модели сам.</p>
           <p class="note info" id="llm-server" hidden>Ключ модели задан в настройках сервера. Изменить его можно только там.</p>
           <p class="note" id="llm-status" role="status" hidden></p>
           <form id="llm-form" autocomplete="off" novalidate hidden>

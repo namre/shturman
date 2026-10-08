@@ -326,6 +326,7 @@
   function render() {
     if (!S) return;
     text("foot-version", "Штурман " + S.version);
+    renderMode(S.scenario || {});
     renderKeys(S.tg);
     renderAccounts(S.tg);
     renderChats(S.tg);
@@ -336,40 +337,145 @@
     renderProgress();
   }
 
-  /* Строка «что уже сделано» и замки на шагах: следующий шаг открыт, когда готов предыдущий. */
-  function lockStep(id, locked, done) {
-    var card = $(id);
-    card.classList.toggle("locked", !!locked);
+  /* Шаги зависят от выбранного способа подключения:
+   *   own   — «ассистент видит всё как вы»: вход в основной аккаунт, выбор чатов;
+   *   staff — «ассистент — отдельный сотрудник»: бизнес-режим для личных чатов и
+   *           аккаунт ассистента для групп.
+   * Шаг другого способа, где уже что-то подключено, остаётся виден без номера и с пояснением:
+   * иначе подключённое нельзя было бы ни увидеть, ни отключить. */
+  var PLAN = {
+    none: ["s-bot", "s-mode"],
+    own: ["s-bot", "s-mode", "s-keys", "s-accounts", "s-chats", "s-import"],
+    staff: ["s-bot", "s-mode", "s-business", "s-keys", "s-assistant", "s-chats", "s-import"]
+  };
+  var ALL_STEPS = ["s-bot", "s-mode", "s-business", "s-keys", "s-accounts", "s-assistant", "s-chats", "s-import"];
+
+  function lockStep(id, reason, done) {
+    var card = $(id), lock = card.querySelector(".step-lock");
+    card.classList.toggle("locked", !!reason);
     card.classList.toggle("is-done", !!done);
+    if (lock) { lock.textContent = reason || ""; lock.hidden = !reason; }
+  }
+
+  function facts() {
+    var tg = S.tg, b = S.bot, sc = (S.scenario || {}).chosen || null;
+    var owner = accountOf(tg, "owner"), helper = accountOf(tg, "assistant");
+    var accounts = (tg.accounts || []).filter(function (a) { return a.account_id !== null; });
+    return {
+      sc: sc, bot: !!(b.configured && b.owner_bound), keys: tg.keys.configured,
+      owner: owner, helper: helper,
+      ownerOk: !!(owner && owner.status === "running"), helperOk: !!(helper && helper.status === "running"),
+      business: b.business_connections > 0,
+      // Чаты считаются у аккаунта выбранного способа: свой — для «как вы», ассистента — для «сотрудника».
+      chats: accounts.filter(function (a) { return !sc || a.role === (sc === "staff" ? "assistant" : "owner"); })
+        .reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0),
+      imported: (S.imports.items || []).some(function (i) { return i.state === "done"; }),
+      importsAny: (S.imports.items || []).length > 0
+    };
   }
 
   function renderProgress() {
-    var tg = S.tg, keys = tg.keys.configured;
-    var accounts = (tg.accounts || []).filter(function (a) { return a.account_id !== null; });
-    var chats = accounts.reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
-    var imported = (S.imports.items || []).some(function (i) { return i.state === "done"; });
-    var steps = [
-      ["Ключи приложения", keys, keys ? "готово" : "сделайте сейчас"],
-      ["Вход в аккаунт", accounts.length > 0, accounts.length ? "готово" : keys ? "сделайте сейчас" : "после шага 1"],
-      ["Выбор чатов", chats > 0, chats ? "выбрано: " + chats : accounts.length ? "сделайте сейчас" : "после шага 2"]
-    ];
-    lockStep("s-keys", false, keys);
-    lockStep("s-accounts", !keys, accounts.length > 0);
-    lockStep("s-chats", !accounts.length, chats > 0);
-    renderIfChanged("progress", [steps, imported], function () {
-      var nodes = steps.map(function (s, i) {
+    var f = facts(), plan = PLAN[f.sc] || PLAN.none;
+    var num = function (id) { return plan.indexOf(id) + 1; };
+    var BOT = "Откроется после шага 1 — когда бот согласований будет сохранён и привязан к вам.";
+    var done = {
+      "s-bot": f.bot, "s-mode": !!f.sc, "s-business": f.business, "s-keys": f.keys,
+      "s-accounts": f.ownerOk, "s-assistant": f.helperOk, "s-chats": f.chats > 0, "s-import": f.imported
+    };
+    // Какой шаг держит закрытым этот: для строки «после шага N».
+    var blocker = {
+      "s-business": 1, "s-keys": 1,
+      "s-accounts": !f.bot ? 1 : num("s-keys"), "s-assistant": !f.bot ? 1 : num("s-keys"),
+      "s-chats": !f.bot ? 1 : num(f.sc === "staff" ? "s-assistant" : "s-accounts")
+    };
+    var lock = {
+      "s-business": !f.bot ? BOT : "",
+      "s-keys": !f.bot ? BOT : "",
+      "s-accounts": !f.bot ? BOT : !f.keys ? "Откроется, когда будут сохранены ключи приложения — шаг " + num("s-keys") + "." : "",
+      "s-assistant": !f.bot ? BOT : !f.keys ? "Откроется, когда будут сохранены ключи приложения — шаг " + num("s-keys") + "." : "",
+      "s-chats": !f.bot ? BOT : f.sc === "staff"
+        ? (!f.helper ? "Откроется, когда будет подключён аккаунт ассистента — шаг " + num("s-assistant") + "." : "")
+        : (!f.owner ? "Откроется после входа в аккаунт — шаг " + num("s-accounts") + "." : "")
+    };
+    // Подключённое раньше или в другом способе остаётся видно, чтобы его можно было отключить.
+    var leftover = {
+      "s-accounts": !!f.owner, "s-assistant": !!f.helper, "s-business": f.business,
+      "s-chats": !!(f.owner || f.helper), "s-import": f.importsAny
+    };
+    var why = f.sc ? "Не входит в выбранный способ. Виден, потому что уже подключён; если не нужен — отключите."
+                   : "Подключено раньше. Выберите способ подключения — тогда страница покажет нужные шаги.";
+    ALL_STEPS.forEach(function (id) {
+      var card = $(id), planned = plan.indexOf(id) >= 0, extra = !planned && !!leftover[id];
+      card.hidden = !planned && !extra;
+      var numNode = card.querySelector(".num");
+      if (numNode) numNode.textContent = planned ? String(num(id)) : "";
+      var other = card.querySelector(".other-note");
+      if (other) { other.textContent = extra ? why : ""; other.hidden = !extra; }
+      lockStep(id, planned ? lock[id] || "" : "", done[id]);
+    });
+
+    var items;
+    if (f.sc === "own") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-keys", "Ключи приложения"], ["s-accounts", "Вход в аккаунт"], ["s-chats", "Выбор чатов"]];
+    else if (f.sc === "staff") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-business", "Бизнес-режим"], ["s-chats", "Группы", true, num("s-keys") + "–" + num("s-chats")]];
+    else items = [["s-bot", "Бот согласований"], ["s-mode", "Способ подключения"]];
+    var current = null;
+    var steps = items.map(function (it) {
+      var id = it[0], ok = done[id], optional = !!it[2], state;
+      if (ok) state = id === "s-chats" ? "выбрано: " + f.chats : id === "s-mode" ? (f.sc === "own" ? "как вы" : "сотрудник") : "готово";
+      else if (optional) state = "по желанию";
+      else if (!current && !lock[id]) { current = id; state = "сделайте сейчас"; }
+      else if (!lock[id]) state = "можно сейчас";
+      else state = "после шага " + blocker[id];
+      return [it[1], ok, state, it[3] || num(id)];
+    });
+    renderIfChanged("progress", [steps, f.imported], function () {
+      var nodes = steps.map(function (s) {
         var now = !s[1] && s[2] === "сделайте сейчас";
         return el("li", { class: s[1] ? "done" : now ? "now" : "wait" }, [
-          el("span", { class: "p-mark", "aria-hidden": "true", text: s[1] ? "✓" : String(i + 1) }),
+          el("span", { class: "p-mark", "aria-hidden": "true", text: s[1] ? "✓" : String(s[3]) }),
           el("span", { class: "p-name", text: s[0] }),
           el("span", { class: "p-state", text: s[2] })
         ]);
       });
-      if (imported) nodes.push(el("li", { class: "done" }, [
+      if (f.imported) nodes.push(el("li", { class: "done" }, [
         el("span", { class: "p-mark", "aria-hidden": "true", text: "✓" }),
         el("span", { class: "p-name", text: "Выгрузка" }), el("span", { class: "p-state", text: "импортирована" })
       ]));
       return nodes;
+    });
+  }
+
+  /* ------------------------------------------------ способ подключения */
+
+  var MODE_NAMES = { own: "Как вы", staff: "Сотрудник" };
+
+  function renderMode(sc) {
+    var chosen = sc.chosen || null;
+    document.body.classList.toggle("sc-own", chosen === "own");
+    document.body.classList.toggle("sc-staff", chosen === "staff");
+    pill("mode", chosen ? "Выбрано: " + MODE_NAMES[chosen].toLowerCase() : "Не выбран", chosen ? "done" : "");
+    // На экземпляре, где что-то уже подключено, подсказываем способ — но выбирает владелец.
+    note("mode-hint", "info", !chosen && sc.suggested ? "Судя по тому, что уже подключено, это способ «" +
+      (sc.suggested === "own" ? "Ассистент видит всё как вы" : "Ассистент — отдельный сотрудник") +
+      "». Выберите его, чтобы страница показала оставшиеся шаги, — или другой." : "");
+    ["own", "staff"].forEach(function (name) {
+      var on = chosen === name, button = $("mode-" + name);
+      $("choice-" + name).classList.toggle("is-chosen", on);
+      button.disabled = on;
+      button.textContent = on ? "Выбран" : chosen ? "Сменить на этот способ" : "Выбрать этот способ";
+      button.className = on || !chosen ? "btn" : "btn ghost";
+    });
+  }
+
+  function wireMode() {
+    ["own", "staff"].forEach(function (name) {
+      $("mode-" + name).addEventListener("click", function () {
+        var chosen = S && S.scenario && S.scenario.chosen;
+        if (chosen && chosen !== name && !confirm("Сменить способ подключения?\n\nНичего не удаляется и не отключается: собранное остаётся в архиве, подключённое — подключённым. Изменится набор шагов на странице. То, что не нужно в новом способе, вы отключите сами.")) return;
+        act(this, "mode-error", "PUT", "scenario", { scenario: name }, function () {
+          toast(name === "own" ? "Способ выбран. Дальше — шаги для входа в ваш аккаунт." : "Способ выбран. Дальше — бизнес-режим для личных чатов.");
+        });
+      });
     });
   }
 
@@ -390,7 +496,6 @@
     show("bot-actions", b.configured && b.source === "page" && !ui.botEditing);
     show("shot-newbot", !b.configured || ui.botEditing);
 
-    show("s-business", b.configured);
     var canBind = b.configured && !!b.username && !ui.botEditing;
     show("bind", canBind);
     if (!canBind) { ui.bind = null; return; }
@@ -490,7 +595,7 @@
       var body = { api_id: id.value.trim(), api_hash: hash.value.trim() };
       hash.value = "";
       act($("keys-save"), "keys-error", "PUT", "tg/keys", body, function () {
-        id.value = ""; ui.keysEditing = false; toast("Ключи сохранены. Теперь шаг 2 — вход в аккаунт.");
+        id.value = ""; ui.keysEditing = false; toast("Ключи сохранены. Переходите к следующему шагу.");
       });
     });
     $("keys-change").addEventListener("click", function () { ui.keysEditing = true; render(); $("keys-id").focus(); });
@@ -518,16 +623,16 @@
     var nodes = [], consent = null;
     if (role === "owner") {
       consent = el("input", { type: "checkbox", id: "consent-owner" });
-      nodes.push(el("label", { class: "check" }, [consent, el("span", { text: "Понимаю: на сервере появится сессия моего основного аккаунта. Если Telegram сочтёт её подозрительной, ограничения коснутся основного номера. Завершить сессию можно в Telegram: «Настройки» → «Устройства»." })]));
+      nodes.push(el("label", { class: "check" }, [consent, el("span", { text: "Понимаю: на сервере будет храниться вход в мой основной аккаунт. Если Telegram сочтёт его подозрительным, ограничения коснутся моего номера. Отключить его можно в Telegram: «Настройки» → «Устройства»." })]));
     }
     if (role === "assistant" && !tg.owner_known) {
-      nodes.push(el("p", { class: "note info", text: "Сначала подключите свой основной аккаунт — шаг 2. Пока сервис не знает, какой аккаунт ваш, он не сможет отличить его от помощника." }));
+      nodes.push(el("p", { class: "note info", text: "Сначала привяжите себя к боту согласований — шаг 1. Пока сервис не знает, какой аккаунт ваш, он не сможет отличить его от аккаунта ассистента." }));
       return nodes;
     }
     nodes.push(el("div", { class: "row" }, [el("button", {
-      class: "btn", type: "button", text: again ? "Войти заново" : role === "owner" ? "Показать QR-код для входа" : "Подключить помощника",
+      class: "btn", type: "button", text: again ? "Войти заново" : role === "owner" ? "Показать QR-код для входа" : "Подключить аккаунт ассистента",
       onclick: function () {
-        if (consent && !consent.checked) { toast("Отметьте, что понимаете: на сервере появится сессия основного аккаунта.", true); consent.focus(); return; }
+        if (consent && !consent.checked) { toast("Отметьте, что понимаете: на сервере будет храниться вход в ваш основной аккаунт.", true); consent.focus(); return; }
         startLogin(role, this);
       }
     })]));
@@ -609,7 +714,6 @@
   function placeLogin(role) {
     var slot = $("login-slot-" + role), box = $("tg-login");
     if (slot && box.parentNode !== slot) slot.appendChild(box);
-    if (role === "assistant") $("extras").open = true;
   }
 
   function startLogin(role, button) {
@@ -627,7 +731,7 @@
   }
 
   function showLogin(flow) {
-    text("tg-login-title", flow.role === "owner" ? "Вход в основной аккаунт" : "Вход в аккаунт-помощник");
+    text("tg-login-title", flow.role === "owner" ? "Вход в ваш аккаунт" : "Вход в аккаунт ассистента");
     var pending = flow.status === "pending", password = flow.status === "password_required";
     show("tg-login-qr-box", pending);
     show("tg-password-form", password);
@@ -646,7 +750,7 @@
     }
     if (flow.status === "completed") {
       closeLogin();
-      toast("Аккаунт подключён. Теперь шаг 3 — выберите чаты.");
+      toast("Аккаунт подключён. Теперь выберите, какие чаты читать.");
       fast(20);
       refresh(); refreshOverview();
     } else if (!pending && !password) {
@@ -713,13 +817,17 @@
 
   function renderChats(tg) {
     var accounts = runningAccounts(tg), all = (tg.accounts || []).filter(function (a) { return a.account_id !== null; });
-    var total = all.reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
+    var total = all.filter(function (a) { return !(S.scenario || {}).chosen || a.role === ((S.scenario || {}).chosen === "staff" ? "assistant" : "owner"); })
+      .reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
     pill("chats", all.length ? (total ? "Выбрано: " + total : "Выберите чаты") : "", total ? "done" : all.length ? "todo" : "");
     show("chats-none", !all.length);
     show("chats-body", !!all.length);
     if (!all.length) { ui.chatAccount = null; return; }
+    var sc = (S.scenario || {}).chosen, mine = sc ? (sc === "staff" ? "assistant" : "owner") : null;
+    if (ui.chatScenario !== sc) { ui.chatScenario = sc; ui.chatAccount = null; }   // сменили способ — своя вкладка
     if (!all.some(function (a) { return a.account_id === ui.chatAccount; })) {
-      ui.chatAccount = (accounts[0] || all[0]).account_id;
+      var preferred = all.filter(function (a) { return a.role === mine; })[0];
+      ui.chatAccount = (preferred || accounts[0] || all[0]).account_id;
       ui.chatsKey = "";
     }
     var current = all.filter(function (a) { return a.account_id === ui.chatAccount; })[0];
@@ -728,13 +836,13 @@
       return all.map(function (a) {
         return el("button", {
           class: "tab", type: "button", role: "tab", "aria-selected": a.account_id === ui.chatAccount ? "true" : "false",
-          text: (a.role === "owner" ? "Основной: " : "Помощник: ") + (a.label || ""),
+          text: (a.role === "owner" ? "Ваш: " : "Ассистента: ") + (a.label || ""),
           onclick: function () { ui.chatAccount = a.account_id; ui.chatsKey = ""; render(); }
         });
       });
     });
     var online = current.status === "running";
-    note("chats-offline", "warn", online ? "" : "Этот аккаунт сейчас не подключён, поэтому список чатов недоступен. Его состояние — на шаге 2.");
+    note("chats-offline", "warn", online ? "" : "Этот аккаунт сейчас не подключён, поэтому список чатов недоступен. Его состояние — в шаге со входом в аккаунт.");
     ["chats-options", "chats-counter", "chats-list"].forEach(function (id) { show(id, online); });
     document.querySelector("#chats-body .toolbar").hidden = !online;
     show("chats-refresh", online);
@@ -1100,6 +1208,9 @@
   function renderSummary(data) {
     var a = data.archive || {};
     $("sending-note").hidden = !!a.sending;
+    text("faq-sending", a.sending
+      ? "Отправка сообщений включена в настройках сервера. Ассистент отправляет только после вашего «Да» в боте согласований или по правилам, которые вы разрешили; с этой страницы отправку не включить и не выключить."
+      : "Сейчас нет: отправка сообщений выключена в настройках сервера и с этой страницы не включается. Ассистент читает, запоминает и готовит черновики. Включить отправку — отдельное решение, которое принимаете вы.");
     text("collected", number(a.messages));
     renderIfChanged("tiles", a, function () {
       return [
@@ -1160,7 +1271,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireSession();
+  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.

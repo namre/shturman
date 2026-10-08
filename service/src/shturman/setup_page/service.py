@@ -14,6 +14,7 @@
   POST   /shturman-setup/api/logout-all                 завершить все сессии
   GET    /shturman-setup/api/state                      состояние шагов и блока «Дополнительно»
   GET    /shturman-setup/api/overview                   счётчики архива и журнал действий
+  PUT    /shturman-setup/api/scenario                   способ подключения: {scenario: own | staff}
   POST   /shturman-setup/api/bot/token                  проверить и сохранить токен бота: {token, separate?}
   DELETE /shturman-setup/api/bot/token                  убрать токен, введённый на странице
   POST   /shturman-setup/api/bot/bind                   ссылка привязки владельца к боту
@@ -534,11 +535,52 @@ def _imports_state(state: AppState) -> dict[str, Any]:
     return {"available": True, "items": [u.view() for u in items], "max_bytes": registry.max_bytes}
 
 
+# --- способ подключения ----------------------------------------------------------------------------
+# own   — «ассистент видит всё как вы»: сессия основного аккаунта на чтение;
+# staff — «ассистент — отдельный сотрудник»: бизнес-режим для личных чатов, аккаунт ассистента
+#         (роль assistant) для групп.
+# Выбор влияет только на то, какие шаги показывает страница: подключённое в другом способе
+# не отключается и остаётся видно. Хранится в setup_state — внутренний API его не читает.
+
+SCENARIOS = {"own": "ассистент видит всё как вы", "staff": "ассистент — отдельный сотрудник"}
+SCENARIO_KEY = "scenario"
+
+
+async def _scenario_state(state: AppState) -> dict[str, Any]:
+    async with state.ro_pool.acquire() as conn:
+        chosen = await conn.fetchval("SELECT value->>'scenario' FROM setup_state WHERE key = $1", SCENARIO_KEY)
+        owner_session = await conn.fetchval(
+            """SELECT EXISTS (SELECT 1 FROM tg_sessions s JOIN accounts a ON a.id = s.account_id
+                              WHERE a.role = 'owner')""")
+        staffish = await conn.fetchval(
+            """SELECT EXISTS (SELECT 1 FROM business_connections WHERE enabled)
+                   OR EXISTS (SELECT 1 FROM tg_sessions s JOIN accounts a ON a.id = s.account_id
+                              WHERE a.role = 'assistant')""")
+    suggested = "own" if owner_session else "staff" if staffish else None
+    return {"chosen": chosen if chosen in SCENARIOS else None, "suggested": suggested}
+
+
+@endpoint
+async def scenario_save(request: Request) -> JSONResponse:
+    data = await _body(request)
+    scenario = data.get("scenario")
+    if scenario not in SCENARIOS:
+        raise BadRequest("Выберите один из двух способов подключения.")
+    async with state_of(request).pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO setup_state (key, value, updated_at) VALUES ($1, $2::jsonb, now())
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
+            SCENARIO_KEY, f'{{"scenario": "{scenario}"}}')
+    await _log(request, "setup.scenario", detail=SCENARIOS[scenario])
+    return JSONResponse({"ok": True, "scenario": scenario})
+
+
 @endpoint
 async def page_state(request: Request) -> JSONResponse:
     state, page = state_of(request), _page(request)
     return JSONResponse({
         "version": __version__,
+        "scenario": await _scenario_state(state),
         "origin_set": bool(state.config.setup_external),
         "sending": bool(state.config.sending),
         "bot": await _bot_state(state, page),
@@ -554,7 +596,7 @@ async def page_overview(request: Request) -> JSONResponse:
     counts = await api_core.overview(state)
     async with state.ro_pool.acquire() as conn:
         log = await audit.recent(conn, 30)
-        key_log = await audit.recent_important(conn, 10)
+        key_log = await audit.recent_important(conn, 20)
     keep = ("messages", "chats", "chats_excluded", "accounts", "last_message_seen_at", "jobs_waiting",
             "jobs_failed", "guard_enabled", "guard_model_used", "guard_problem", "guard_checked",
             "guard_hidden", "guard_released", "guard_unchecked", "embeddings_enabled", "embeddings_model",
@@ -665,7 +707,7 @@ def _tg(request: Request) -> TgManager:
     if not isinstance(manager, TgManager):
         raise BadRequest("Модуль аккаунтов Telegram не запущен.", 503)
     if not manager.configured:
-        raise BadRequest("Сначала введите ключи приложения Telegram — шаг 1.", 409, "no_keys")
+        raise BadRequest("Сначала введите ключи приложения Telegram — шаг «Ключи приложения Telegram».", 409, "no_keys")
     return manager
 
 
@@ -696,8 +738,8 @@ async def tg_login_start(request: Request) -> JSONResponse:
         raise BadRequest("Выберите, какой аккаунт подключаете.")
     if role == "assistant" and not await _owner_known(state_of(request)):
         raise BadRequest(
-            "Сначала подключите свой основной аккаунт — шаг 2. Пока сервис не знает, какой аккаунт ваш, "
-            "он не сможет отличить его от помощника, а помощнику разрешена отправка сообщений.",
+            "Сначала привяжите себя к боту согласований — первый шаг на этой странице. Пока сервис не знает, "
+            "какой аккаунт ваш, он не сможет отличить его от аккаунта ассистента, а тому разрешена отправка сообщений.",
             409, "owner_unknown")
     flow = await manager.start_login(role, confirm_owner=_flag(data, "confirm_owner") is True)
     await _log(request, "tg.login", detail=f"роль: {ROLE_NAMES[role]}")
@@ -1016,6 +1058,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/logout-all", logout_all, methods=["POST"]),
         Route(API + "/state", page_state, methods=["GET"]),
         Route(API + "/overview", page_overview, methods=["GET"]),
+        Route(API + "/scenario", scenario_save, methods=["PUT"]),
         Route(API + "/bot/token", bot_token_save, methods=["POST"]),
         Route(API + "/bot/token", bot_token_delete, methods=["DELETE"]),
         Route(API + "/bot/bind", bot_bind, methods=["POST"]),

@@ -39,6 +39,7 @@ ACTIONS = {
     "login.code_locked": "Вход по коду закрыт после неверных попыток",
     "logout": "Выход",
     "logout.all": "Выход на всех устройствах",
+    "setup.scenario": "Выбран способ подключения",
     "bot.token": "Токен бота согласований сохранён",
     "bot.token_removed": "Токен бота согласований убран",
     "bot.bind_link": "Выдана ссылка привязки владельца к боту",
@@ -69,7 +70,7 @@ ACTIONS = {
 # отдельно от обычных и показываются на странице отдельным списком. Неудачные попытки входа сюда
 # не входят намеренно: их может слать посторонний, и они не должны вытеснять остальное.
 IMPORTANT = frozenset({
-    "login.link", "login.code", "logout.all",
+    "login.link", "login.code", "logout.all", "setup.scenario",
     "bot.token", "bot.token_removed", "bot.bind_link",
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed",

@@ -274,7 +274,7 @@ async def test_roles_are_guarded_the_same_way_as_in_the_terminal(stand, conn):
     await s.page.put("/tg/keys", KEYS)
     # помощник — только когда сервис знает владельца
     early = await s.page.post("/tg/login", {"role": "assistant"})
-    assert early.status_code == 409 and early.json()["code"] == "owner_unknown" and "шаг 2" in early.json()["error"]
+    assert early.status_code == 409 and early.json()["code"] == "owner_unknown" and "первый шаг" in early.json()["error"]
     assert (await s.page.post("/tg/login", {"role": "admin"})).status_code == 400
     # основной аккаунт — только с явным согласием
     assert (await s.page.post("/tg/login", {"role": "owner"})).status_code == 400
@@ -720,3 +720,31 @@ async def test_changing_actions_need_a_session(stand, conn):
     for path in ("/state", "/overview", "/tg/login/x", "/tg/accounts/1/dialogs", "/imports", "/imports/x", "/imports/x/scan"):
         assert (await guest.get(path)).status_code == 401, path
     assert await conn.fetchval("SELECT count(*) FROM setup_audit") == 0
+
+
+async def test_scenario_is_chosen_on_the_page_and_suggested_from_what_is_connected(stand, conn):
+    """Способ подключения выбирает владелец на странице; пока не выбран, страница подсказывает его
+    по тому, что уже подключено. Выбор только меняет шаги: ничего не отключает."""
+    world = World(ME)
+    world.authorized = False
+    s = await stand(world=world)
+    await s.page.login(conn)
+    assert (await s.page.get("/state")).json()["scenario"] == {"chosen": None, "suggested": None}
+    assert (await s.page.put("/scenario", {"scenario": "both"})).status_code == 400
+    assert (await s.page.put("/scenario", {})).status_code == 400
+    assert (await s.page.put("/scenario", {"scenario": "staff"})).json() == {"ok": True, "scenario": "staff"}
+    assert (await s.page.get("/state")).json()["scenario"]["chosen"] == "staff"
+
+    await save_bot(s)
+    await bind_owner(s)
+    assert (await s.page.put("/tg/keys", KEYS)).status_code == 200
+    await connect(s, "owner", ME, confirm_owner=True)
+    scenario = (await s.page.get("/state")).json()["scenario"]
+    assert scenario == {"chosen": "staff", "suggested": "own"}      # выбор не подменяется подсказкой
+    assert (await s.page.put("/scenario", {"scenario": "own"})).status_code == 200
+    assert (await s.page.get("/state")).json()["tg"]["accounts"][0]["status"] == "running"   # ничего не отключилось
+    rows = await audit_rows(conn)
+    assert ("setup.scenario", "ok", "ассистент — отдельный сотрудник") in rows
+    assert ("setup.scenario", "ok", "ассистент видит всё как вы") in rows
+    # внутренний API способа подключения не знает
+    assert (await s.api.put("/api/scenario", json={"scenario": "own"})).status_code in (404, 405)

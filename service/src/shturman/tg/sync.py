@@ -17,6 +17,10 @@
 
 Ограничения Telegram: запрос истории — примерно 10 за 30 секунд, поэтому между запросами
 пауза; при FLOOD_WAIT сервис ждёт названное время (и секунду сверху) и не повторяет раньше.
+У настоящих сессий пауза случайная (`Pacer(jitter=True)`): от одного до 1,8 базового интервала,
+а примерно раз в сто запросов — перерыв 15–60 секунд (при базовом интервале 3 с). Ровный шаг
+выдаёт программу; насколько случайный шаг влияет на решения Telegram, не известно — он их не
+публикует. Нижняя граница паузы не меньше базового интервала: предел частоты не нарушается.
 Все ожидания прерываются остановкой сервиса.
 
 Порядок запросов и вид курсоров — по образцу:
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -55,6 +60,9 @@ RECONCILE_WINDOW = 7 * 86400  # «недавно активный» чат и г
 RECONCILE_LIMIT = 300         # сообщений на чат за одну сверку
 IDLE_WAIT = 60.0
 ERROR_WAIT = 60.0
+JITTER = (1.0, 1.8)           # пауза — столько базовых интервалов, случайно в этих пределах
+BREAK_CHANCE = 0.01           # вероятность длинного перерыва перед запросом
+BREAK_RANGE = (5.0, 20.0)     # длинный перерыв — столько базовых интервалов (15–60 с при 3 с)
 
 
 def _errors(*names: str) -> tuple[type[BaseException], ...]:
@@ -100,13 +108,28 @@ class Pacer:
         self, interval: float = 3.0, *,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float, asyncio.Event], Awaitable[bool]] = interruptible_sleep,
+        jitter: bool = False,
+        rng: random.Random | None = None,
     ) -> None:
         self.interval = interval
+        self.jitter = jitter
+        # Системный источник случайности, а не время или счётчик: последовательность пауз не
+        # выводится из того, что видно снаружи.
+        self._rng = rng or random.SystemRandom()
         self._clock, self._sleep = clock, sleep
         self._next_at = 0.0
         self._flood_at = 0.0
         self._lock = asyncio.Lock()
         self.flood_until: datetime | None = None  # для экрана состояния
+
+    def gap(self) -> float:
+        """Пауза до следующего запроса. Без `jitter` — ровно базовый интервал."""
+        if not self.jitter or self.interval <= 0:
+            return self.interval
+        gap = self.interval * self._rng.uniform(*JITTER)
+        if self._rng.random() < BREAK_CHANCE:
+            gap += self.interval * self._rng.uniform(*BREAK_RANGE)
+        return gap
 
     def flood(self, seconds: int) -> None:
         """Telegram велел ждать: раньше названного времени запросов не будет."""
@@ -129,7 +152,7 @@ class Pacer:
                     break
                 if await self._sleep(delay, stop):
                     raise Stopped()
-            self._next_at = self._clock() + self.interval
+            self._next_at = self._clock() + self.gap()
             if self.flood_until is not None and self._flood_at <= self._clock():
                 self.flood_until = None
 

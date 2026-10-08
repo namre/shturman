@@ -454,3 +454,20 @@ async def test_run_loop_catches_up_fills_gaps_and_backfills(rig):
     rig.stop.set()
     wake.set()
     await asyncio.wait_for(task, 2)
+
+
+def test_jittered_pause_is_random_never_shorter_than_the_interval_and_sometimes_long():
+    import random
+
+    pacer = Pacer(3.0, jitter=True, rng=random.Random(7))
+    gaps = [pacer.gap() for _ in range(5000)]
+    assert min(gaps) >= 3.0                                  # предел частоты не нарушается
+    assert len({round(g, 3) for g in gaps}) > 1500           # шаг не ровный
+    short = [g for g in gaps if g <= 3.0 * 1.8]
+    long = [g for g in gaps if g >= 15.0]
+    assert 0.97 < len(short) / len(gaps) < 1.0               # почти всегда — обычная пауза
+    assert 0.003 < len(long) / len(gaps) < 0.02              # изредка — перерыв
+    assert max(gaps) <= 3.0 * (1.8 + 20.0)
+    assert Pacer(3.0).gap() == 3.0                           # без jitter — ровно интервал
+    assert Pacer(0.0, jitter=True).gap() == 0.0              # стенды и тесты: без пауз
+    assert isinstance(Pacer(3.0, jitter=True)._rng, random.SystemRandom)

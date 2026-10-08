@@ -1,4 +1,5 @@
-// Браузерная проверка страницы настройки: ссылка → вход → три шага → выгрузка → «Дополнительно» →
+// Браузерная проверка страницы настройки: ссылка → вход → бот согласований → способ «как вы» → ключи,
+// вход, чаты → выгрузка → смена способа на «сотрудник»: бизнес-режим, аккаунт ассистента → «Дополнительно» →
 // попытки «дашборда» с соседнего порта → выход → вход по коду.
 // Запуск и стенд — README.md в этом каталоге. Печатает строки PASS/FAIL, код возврата 1 при FAIL.
 
@@ -199,131 +200,18 @@ await page.reload();
 await page.waitForSelector("#screen-app:not([hidden])");
 check("перезагрузка страницы сохраняет вход", (await storedKey()) === KEY);
 
-// --- шаг 1. ключи приложения -------------------------------------------------------------------
+// --- первый экран: бот согласований и выбор способа ------------------------------------------
 await page.waitForSelector("#progress li");
-check("сверху — строка «что уже сделано» и счётчик собранного",
-      (await page.locator("#progress li").count()) === 3 && (await page.textContent(".collected")).includes("Собрано сообщений"));
-check("шаги 2 и 3 закрыты, пока не готов шаг 1",
-      (await page.isVisible("#accounts-nokeys")) && (await page.isVisible("#chats-none")) && !(await page.isVisible("#accounts-body")));
-check("«Дополнительно» свёрнуто, бот согласований на первом экране не виден",
-      !(await page.isVisible("#s-bot")) && (await page.textContent("#extras > summary")).includes("Понадобится позже"));
-await shot(page, "20-step1-keys-desktop-light");
-await variants("20-step1-keys");
-await page.fill("#keys-id", "12ab");
-await page.fill("#keys-hash", "0123456789abcdef0123456789abcdef");
-await page.click("#keys-save");
-await page.waitForSelector("#keys-error:not([hidden])");
-check("ключи: неверный api_id объяснён", (await page.textContent("#keys-error")).includes("api_id"));
-await page.fill("#keys-id", "1234567");
-await page.fill("#keys-hash", "0123456789abcdef0123456789abcdef");
-await page.click("#keys-save");
-await page.waitForSelector("#keys-ok:not([hidden])");
-check("ключи: сохранены, поля очищены", (await page.inputValue("#keys-hash")) === "");
-await page.waitForSelector("#accounts-body:not([hidden])");
-check("шаг 2 открылся, шаг 3 ещё закрыт", (await page.isVisible("#role-owner-state")) && (await page.isVisible("#chats-none")));
-
-// --- шаг 2. вход в аккаунт ---------------------------------------------------------------------
-await page.click("#role-owner-state button");
-check("вход: без отметки согласия QR не показывается", !(await page.isVisible("#tg-login")));
-await page.check("#consent-owner");
-await page.click("#role-owner-state button");
-await page.waitForSelector("#tg-login-qr svg");
-await page.evaluate(() => { document.getElementById("toast").hidden = true; });
-await page.locator("#tg-login-qr").screenshot({ path: path.join(OUT, "qr-login.png") });
-if (DECODER) check("вход: QR со страницы распознаётся как ссылка входа Telegram", decodeQr(path.join(OUT, "qr-login.png")).startsWith("tg://login?token="));
-await shot(page, "21-step2-login-desktop-light");
-await variants("21-step2-login", (p) => p.waitForSelector("#tg-login-qr svg"));
-await control("POST", "/scan?role=owner");
-await page.waitForFunction(() => document.querySelector("#role-owner-state").textContent.includes("Подключён"), null, { timeout: 20000 });
-check("вход: основной аккаунт подключён", (await page.textContent("#st-accounts")) === "Готово");
-
-// --- шаг 3. чаты -------------------------------------------------------------------------------
-await page.waitForSelector("#chats-list li");
-check("чаты: сначала показаны первые 15", (await page.locator("#chats-list li").count()) === 15);
-check("чаты: счётчик показывает, сколько выбрано и показано", (await page.textContent("#chats-counter")).includes("Показано 15 из"));
-check("чаты: один аккаунт — вкладок нет", !(await page.isVisible("#chats-accounts")));
-await page.click("#chats-more");
-await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 45);
-check("чаты: «Показать ещё» догружает следующую порцию", (await page.textContent("#chats-more")).includes("осталось"));
-await page.fill("#chats-q", "Иван Петров");
-await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length > 0 && document.querySelectorAll("#chats-list li").length < 30);
-check("чаты: поиск по названию", (await page.textContent("#chats-list")).includes("Иван Петров"));
-await page.locator("#chats-list li .chat-read input").first().check();
-await page.waitForFunction(() => document.querySelector("#chats-counter").textContent.includes("Выбрано для чтения: 1 чат"));
-check("чаты: включение чтения одного чата меняет счётчик", true);
-await page.waitForFunction(() => document.querySelector("#progress").textContent.includes("выбрано: 1"), null, { timeout: 20000 });
-check("строка «что уже сделано»: все три шага готовы", (await page.locator("#progress li.done").count()) === 3);
-await page.fill("#chats-q", "");
-await page.selectOption("#chats-kind", "channel");
-await page.waitForFunction(() => document.querySelector("#chats-bulk") && !document.querySelector("#chats-bulk").hidden);
-check("чаты: отбор по виду и кнопка «читать все»", (await page.textContent("#chats-bulk")).includes("каналы"));
-check("чаты: служебный чат Telegram нельзя ни читать, ни вернуть", (await page.locator("#chats-list li", { hasText: "служебный чат" }).count()) === 0);
-await page.locator("#chats-list li button").first().click();              // «Не сохранять» + два подтверждения
-await page.waitForFunction(() => document.querySelector("#chats-list").textContent.includes("не сохраняется"));
-check("чаты: исключённый чат помечен, читать его нельзя", await page.locator("#chats-list li.is-excluded .chat-read input").first().isDisabled());
-await page.selectOption("#chats-kind", "");
-await page.click("#chats-options > summary");
-await page.selectOption("#opt-depth", "6");
-await page.waitForFunction(() => !document.querySelector("#toast").hidden && document.querySelector("#toast").textContent.includes("Настройка сохранена"));
-check("чаты: глубина истории сохраняется", true);
-{
-  // уведомление не перекрывает кнопки и не ловит нажатия
-  const clash = await page.evaluate(() => {
-    const t = document.getElementById("toast").getBoundingClientRect();
-    const hit = (r) => r.width && r.height && !(r.right < t.left || r.left > t.right || r.bottom < t.top || r.top > t.bottom);
-    const buttons = [...document.querySelectorAll("main .btn, main input, main select")].filter((b) => b.offsetParent !== null);
-    return { over: buttons.filter((b) => hit(b.getBoundingClientRect())).length,
-             events: getComputedStyle(document.getElementById("toast")).pointerEvents };
-  });
-  check("уведомление не ловит нажатия и не лежит поверх кнопок", clash.events === "none", "кнопок под уведомлением: " + clash.over);
-}
-await page.click("#chats-options > summary");
-await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 15);
-await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("s-chats").scrollIntoView(); });
-await shot(page, "22-step3-chats-desktop-light");
-await page.locator("#s-chats").screenshot({ path: path.join(OUT, "22b-step3-chats-section-desktop-light.png") });
-await variants("22-step3-chats", (p) => p.waitForSelector("#chats-list li"));
-
-// --- шаг 4. выгрузка ---------------------------------------------------------------------------
-const exportFile = path.join(OUT, "result.json");
-const msg = (id, ts, from, fromId, text) => ({ id, type: "message", date: "2026-09-12T10:00:00", date_unixtime: String(ts), from, from_id: "user" + fromId, text, text_entities: [{ type: "plain", text }] });
-writeFileSync(exportFile, JSON.stringify({
-  about: "Here is the data you requested.",
-  personal_information: { user_id: 1000, first_name: "Евгений", last_name: "Тестов" },
-  contacts: { about: "", list: [] },
-  chats: { about: "", list: [
-    { name: "Иван Петров", type: "personal_chat", id: 2001, messages: [msg(1, 1789200000, "Иван Петров", 2001, "Добрый день! Пришлю смету по фасадам к пятнице."), msg(2, 1789200060, "Евгений Тестов", 1000, "Хорошо, жду.")] },
-    { name: "Семья", type: "private_group", id: 3001, messages: [msg(10, 1789200010, "Мария", 2002, "Купи хлеба и молока")] },
-    { name: "Telegram", type: "personal_chat", id: 777000, messages: [msg(20, 1789200020, "Telegram", 777000, "Login code: 12345")] } ] },
-  left_chats: { about: "", list: [] } }));
-check("выгрузка: шаг необязательный и свёрнут", !(await page.isVisible("#import-form")) && (await page.textContent("#import-details > summary")).includes("необязательно"));
-await page.click("#import-details > summary");
-await page.setInputFiles("#import-file", exportFile);
-const uploadRequest = page.waitForRequest((r) => r.url().endsWith("/api/imports") && r.method() === "POST");
-await page.click("#import-upload");
-check("выгрузка: файл уходит с ключом сессии в заголовке, без cookie",
-      (await uploadRequest).headers()["x-shturman-session"] === KEY && !(await uploadRequest).headers()["cookie"]);
-await page.waitForSelector(".import-chats li", { timeout: 30000 });
-check("выгрузка: файл загружен и разобран, показаны чаты", (await page.locator(".import-chats li").count()) === 3);
-check("выгрузка: служебный чат Telegram принять нельзя", await page.locator(".import-chats li", { hasText: "служебный чат" }).locator("input").isDisabled());
-await page.locator(".import-chats li", { hasText: "Семья" }).locator("input").uncheck();
-await page.waitForFunction(() => document.querySelector(".import-item .counter").textContent.includes("К импорту: 1 чат"));
-check("выгрузка: снятый чат не идёт в импорт, счётчик пересчитан", true);
-await shot(page, "23-step4-import-desktop-light");
-await page.locator(".import-item button", { hasText: "Импортировать" }).click();
-await page.waitForFunction(() => document.querySelector("#import-items").textContent.includes("Импорт завершён"), null, { timeout: 30000 });
-// Эти два сообщения сервис мог уже получить из аккаунта на шаге 3 — тогда они «уже были в архиве».
-const importText = await page.textContent("#import-items");
-const importNums = /Новых сообщений: (\d+), уже были в архиве: (\d+)/.exec(importText);
-check("выгрузка: импорт прошёл сразу, без карточки в боте", !!importNums && Number(importNums[1]) + Number(importNums[2]) === 2, importText.slice(0, 200));
-await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
-await page.waitForFunction(() => document.querySelector("#collected").textContent.trim() !== "0", null, { timeout: 20000 });
-check("счётчик «собрано сообщений» не нулевой", true);
-
-// --- «Дополнительно» ---------------------------------------------------------------------------
-await page.click("#extras > summary");
-await page.waitForSelector("#s-bot");
-check("«Дополнительно»: бизнес-режим скрыт, пока нет бота согласований", !(await page.isVisible("#s-business")));
+check("сверху — строка «что уже сделано» (бот и способ) и счётчик собранного",
+      (await page.locator("#progress li").count()) === 2 && (await page.textContent(".collected")).includes("Собрано сообщений"));
+check("первый шаг — бот согласований, второй — выбор способа; остальные шаги до выбора скрыты",
+      (await page.textContent("#s-bot .num")) === "1" && (await page.textContent("#s-mode .num")) === "2" &&
+      !(await page.isVisible("#s-keys")) && !(await page.isVisible("#s-accounts")) && !(await page.isVisible("#s-business")));
+check("у шагов есть «что это даст» и свёрнутые вопросы",
+      (await page.locator("#s-bot .gives").count()) === 1 && !(await page.isVisible("#s-bot details.faq dl")));
+check("«Дополнительно» свёрнуто", !(await page.isVisible("#s-llm")));
+await shot(page, "20-start-desktop-light");
+await variants("20-start");
 
 // бот согласований
 await page.fill("#bot-token", "не токен");
@@ -359,17 +247,153 @@ await control("POST", "/start?code=" + bindLink.split("start=")[1]);
 await page.waitForFunction(() => document.querySelector("#bind-done").textContent.includes("Владелец привязан"), null, { timeout: 20000 });
 check("привязка: страница сама увидела владельца и показала имя", (await page.textContent("#bind-done")).includes("Евгений Тестов"));
 check("привязка: ссылка убрана с экрана", !(await page.isVisible("#bind-link-box")));
+check("бот: шаг 1 отмечен готовым", (await page.locator("#progress li.done").count()) === 1);
 
-// бизнес-режим
-await page.waitForSelector("#business-body:not([hidden])");
-check("бизнес-режим: появился вместе с ботом; в схемах подставлено имя бота", (await page.locator("#s-business .bot-name").first().textContent()) === "@shturman_soglasovaniya_bot");
+// способ подключения: «как вы»
+await page.click("#mode-own");
+await page.waitForSelector("#s-keys:not([hidden])");
+check("способ «как вы»: появились ключи, вход и чаты под номерами 3–5; бизнес-режима и помощника нет",
+      (await page.textContent("#s-keys .num")) === "3" && (await page.textContent("#s-accounts .num")) === "4" &&
+      (await page.textContent("#s-chats .num")) === "5" && !(await page.isVisible("#s-business")) && !(await page.isVisible("#s-assistant")));
+check("способ «как вы»: выбранная карточка отмечена", (await page.getAttribute("#choice-own", "class")).includes("is-chosen") && await page.isDisabled("#mode-own"));
+check("строка «что уже сделано»: пять шагов", (await page.locator("#progress li").count()) === 5);
+check("вход и чаты закрыты, пока нет ключей; сказано, когда откроются",
+      (await page.textContent("#s-accounts .step-lock")).includes("ключи") && !(await page.isVisible("#accounts-body")));
+await shot(page, "21-mode-own-desktop-light");
+await variants("21-mode-own");
+
+// ключи приложения
+await page.fill("#keys-id", "12ab");
+await page.fill("#keys-hash", "0123456789abcdef0123456789abcdef");
+await page.click("#keys-save");
+await page.waitForSelector("#keys-error:not([hidden])");
+check("ключи: неверный api_id объяснён", (await page.textContent("#keys-error")).includes("api_id"));
+await page.fill("#keys-id", "1234567");
+await page.fill("#keys-hash", "0123456789abcdef0123456789abcdef");
+await page.click("#keys-save");
+await page.waitForSelector("#keys-ok:not([hidden])");
+check("ключи: сохранены, поля очищены", (await page.inputValue("#keys-hash")) === "");
+await page.waitForSelector("#accounts-body:not([hidden])");
+check("вход открылся, выбор чатов ещё закрыт", (await page.isVisible("#role-owner-state")) && (await page.isVisible("#s-chats .step-lock")));
+
+// вход в аккаунт
+await page.click("#role-owner-state button");
+check("вход: без отметки согласия QR не показывается", !(await page.isVisible("#tg-login")));
+await page.check("#consent-owner");
+await page.click("#role-owner-state button");
+await page.waitForSelector("#tg-login-qr svg");
+await page.evaluate(() => { document.getElementById("toast").hidden = true; });
+await page.locator("#tg-login-qr").screenshot({ path: path.join(OUT, "qr-login.png") });
+if (DECODER) check("вход: QR со страницы распознаётся как ссылка входа Telegram", decodeQr(path.join(OUT, "qr-login.png")).startsWith("tg://login?token="));
+await shot(page, "22-login-desktop-light");
+await variants("22-login", (p) => p.waitForSelector("#tg-login-qr svg"));
+await control("POST", "/scan?role=owner");
+await page.waitForFunction(() => document.querySelector("#role-owner-state").textContent.includes("Подключён"), null, { timeout: 20000 });
+check("вход: основной аккаунт подключён", (await page.textContent("#st-accounts")) === "Готово");
+
+// чаты
+await page.waitForSelector("#chats-list li");
+check("чаты: сначала показаны первые 15", (await page.locator("#chats-list li").count()) === 15);
+check("чаты: счётчик показывает, сколько выбрано и показано", (await page.textContent("#chats-counter")).includes("Показано 15 из"));
+check("чаты: один аккаунт — вкладок нет", !(await page.isVisible("#chats-accounts")));
+await page.click("#chats-more");
+await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 45);
+check("чаты: «Показать ещё» догружает следующую порцию", (await page.textContent("#chats-more")).includes("осталось"));
+await page.fill("#chats-q", "Иван Петров");
+await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length > 0 && document.querySelectorAll("#chats-list li").length < 30);
+check("чаты: поиск по названию", (await page.textContent("#chats-list")).includes("Иван Петров"));
+await page.locator("#chats-list li .chat-read input").first().check();
+await page.waitForFunction(() => document.querySelector("#chats-counter").textContent.includes("Выбрано для чтения: 1 чат"));
+check("чаты: включение чтения одного чата меняет счётчик", true);
+await page.waitForFunction(() => document.querySelector("#progress").textContent.includes("выбрано: 1"), null, { timeout: 20000 });
+check("строка «что уже сделано»: все пять шагов готовы", (await page.locator("#progress li.done").count()) === 5);
+await page.fill("#chats-q", "");
+await page.selectOption("#chats-kind", "channel");
+await page.waitForFunction(() => document.querySelector("#chats-bulk") && !document.querySelector("#chats-bulk").hidden);
+check("чаты: отбор по виду и кнопка «читать все»", (await page.textContent("#chats-bulk")).includes("каналы"));
+check("чаты: служебный чат Telegram нельзя ни читать, ни вернуть", (await page.locator("#chats-list li", { hasText: "служебный чат" }).count()) === 0);
+await page.locator("#chats-list li button").first().click();              // «Не сохранять» + два подтверждения
+await page.waitForFunction(() => document.querySelector("#chats-list").textContent.includes("не сохраняется"));
+check("чаты: исключённый чат помечен, читать его нельзя", await page.locator("#chats-list li.is-excluded .chat-read input").first().isDisabled());
+await page.selectOption("#chats-kind", "");
+await page.click("#chats-options > summary");
+await page.selectOption("#opt-depth", "6");
+await page.waitForFunction(() => !document.querySelector("#toast").hidden && document.querySelector("#toast").textContent.includes("Настройка сохранена"));
+check("чаты: глубина истории сохраняется", true);
+{
+  // уведомление не перекрывает кнопки и не ловит нажатия
+  const clash = await page.evaluate(() => {
+    const t = document.getElementById("toast").getBoundingClientRect();
+    const hit = (r) => r.width && r.height && !(r.right < t.left || r.left > t.right || r.bottom < t.top || r.top > t.bottom);
+    const buttons = [...document.querySelectorAll("main .btn, main input, main select")].filter((b) => b.offsetParent !== null);
+    return { over: buttons.filter((b) => hit(b.getBoundingClientRect())).length,
+             events: getComputedStyle(document.getElementById("toast")).pointerEvents };
+  });
+  check("уведомление не ловит нажатия и не лежит поверх кнопок", clash.events === "none", "кнопок под уведомлением: " + clash.over);
+}
+await page.click("#chats-options > summary");
+await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 15);
+await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("s-chats").scrollIntoView(); });
+await shot(page, "23-chats-desktop-light");
+await page.locator("#s-chats").screenshot({ path: path.join(OUT, "23b-chats-section-desktop-light.png") });
+await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
+
+// --- выгрузка ----------------------------------------------------------------------------------
+const exportFile = path.join(OUT, "result.json");
+const msg = (id, ts, from, fromId, text) => ({ id, type: "message", date: "2026-09-12T10:00:00", date_unixtime: String(ts), from, from_id: "user" + fromId, text, text_entities: [{ type: "plain", text }] });
+writeFileSync(exportFile, JSON.stringify({
+  about: "Here is the data you requested.",
+  personal_information: { user_id: 1000, first_name: "Евгений", last_name: "Тестов" },
+  contacts: { about: "", list: [] },
+  chats: { about: "", list: [
+    { name: "Иван Петров", type: "personal_chat", id: 2001, messages: [msg(1, 1789200000, "Иван Петров", 2001, "Добрый день! Пришлю смету по фасадам к пятнице."), msg(2, 1789200060, "Евгений Тестов", 1000, "Хорошо, жду.")] },
+    { name: "Семья", type: "private_group", id: 3001, messages: [msg(10, 1789200010, "Мария", 2002, "Купи хлеба и молока")] },
+    { name: "Telegram", type: "personal_chat", id: 777000, messages: [msg(20, 1789200020, "Telegram", 777000, "Login code: 12345")] } ] },
+  left_chats: { about: "", list: [] } }));
+check("выгрузка: шаг необязательный и свёрнут", !(await page.isVisible("#import-form")) && (await page.textContent("#import-details > summary")).includes("необязательно"));
+await page.click("#import-details > summary");
+await page.setInputFiles("#import-file", exportFile);
+const uploadRequest = page.waitForRequest((r) => r.url().endsWith("/api/imports") && r.method() === "POST");
+await page.click("#import-upload");
+check("выгрузка: файл уходит с ключом сессии в заголовке, без cookie",
+      (await uploadRequest).headers()["x-shturman-session"] === KEY && !(await uploadRequest).headers()["cookie"]);
+await page.waitForSelector(".import-chats li", { timeout: 30000 });
+check("выгрузка: файл загружен и разобран, показаны чаты", (await page.locator(".import-chats li").count()) === 3);
+check("выгрузка: служебный чат Telegram принять нельзя", await page.locator(".import-chats li", { hasText: "служебный чат" }).locator("input").isDisabled());
+await page.locator(".import-chats li", { hasText: "Семья" }).locator("input").uncheck();
+await page.waitForFunction(() => document.querySelector(".import-item .counter").textContent.includes("К импорту: 1 чат"));
+check("выгрузка: снятый чат не идёт в импорт, счётчик пересчитан", true);
+await shot(page, "24-import-desktop-light");
+await page.locator(".import-item button", { hasText: "Импортировать" }).click();
+await page.waitForFunction(() => document.querySelector("#import-items").textContent.includes("Импорт завершён"), null, { timeout: 30000 });
+// Эти два сообщения сервис мог уже получить из аккаунта — тогда они «уже были в архиве».
+const importText = await page.textContent("#import-items");
+const importNums = /Новых сообщений: (\d+), уже были в архиве: (\d+)/.exec(importText);
+check("выгрузка: импорт прошёл сразу, без карточки в боте", !!importNums && Number(importNums[1]) + Number(importNums[2]) === 2, importText.slice(0, 200));
+await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+await page.waitForFunction(() => document.querySelector("#collected").textContent.trim() !== "0", null, { timeout: 20000 });
+check("счётчик «собрано сообщений» не нулевой", true);
+
+// --- смена способа: «отдельный сотрудник» ------------------------------------------------------
+await page.click("#mode-staff");                                    // подтверждение принимается само
+await page.waitForSelector("#s-business:not([hidden])");
+check("способ «сотрудник»: бизнес-режим — шаг 3, ключи — 4, аккаунт ассистента — 5, группы — 6",
+      (await page.textContent("#s-business .num")) === "3" && (await page.textContent("#s-keys .num")) === "4" &&
+      (await page.textContent("#s-assistant .num")) === "5" && (await page.textContent("#s-chats .num")) === "6");
+check("способ «сотрудник»: вход в основной аккаунт виден без номера и с пояснением — он уже подключён",
+      (await page.isVisible("#s-accounts")) && (await page.textContent("#s-accounts .num")) === "" &&
+      (await page.textContent("#s-accounts .other-note")).includes("Не входит в выбранный способ"));
+check("способ «сотрудник»: тексты шагов — свой вариант", (await page.innerText("#h-chats")).trim() === "Какие группы читать" &&
+      (await page.isVisible("#s-keys .optional-tag")));
+check("смена способа ничего не отключила", (await page.textContent("#st-accounts")) === "Готово");
+check("бизнес-режим: в схемах подставлено имя бота", (await page.locator("#s-business .bot-name").first().textContent()) === "@shturman_soglasovaniya_bot");
 await control("POST", "/business?connect=1");
 await page.click("#business-refresh");
 await page.waitForFunction(() => document.querySelector("#business-capable").textContent.includes("режим включён"));
 await page.waitForFunction(() => document.querySelector("#st-business").textContent === "Подключён", null, { timeout: 20000 });
 check("бизнес-режим: подключение от владельца замечено", (await page.textContent("#st-business")).includes("Подключён"));
 
-// аккаунт-помощник: QR и облачный пароль — в этом же блоке
+// аккаунт ассистента: QR и облачный пароль — в этом же блоке
 await page.click("#role-assistant-state button");
 await page.waitForSelector("#login-slot-assistant #tg-login-qr svg");
 await control("POST", "/scan?role=assistant");
@@ -385,6 +409,13 @@ await page.waitForFunction(() => document.querySelector("#role-assistant-state")
 check("помощник: подключён", (await page.textContent("#role-assistant-state")).includes("Помощник"));
 await page.waitForFunction(() => document.querySelectorAll("#chats-accounts .tab").length === 2);
 check("чаты: два аккаунта — две вкладки", true);
+await page.evaluate(() => { document.getElementById("toast").hidden = true; window.scrollTo(0, 0); });
+await shot(page, "25-mode-staff-desktop-light");
+await variants("25-mode-staff");
+
+// --- «Дополнительно» ---------------------------------------------------------------------------
+await page.click("#extras > summary");
+await page.waitForSelector("#s-llm");
 
 // своя модель
 await page.fill("#llm-key", LLM_KEY);
@@ -429,14 +460,14 @@ check("журнал: входы, ключи и аккаунты — отдель
 check("журнал: общий список действий", (await page.textContent("#audit")).length > 50);
 check("отправка со страницы не включилась", (await page.textContent("#facts")).includes("Выключена"));
 await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("extras").scrollIntoView(); });
-await shot(page, "24-extras-open-desktop-light");
-await variants("24-extras-open", async (p) => {
+await shot(page, "26-extras-open-desktop-light");
+await variants("26-extras-open", async (p) => {
   await p.click("#extras > summary");
   await p.waitForFunction(() => document.querySelector("#audit").children.length > 1);
   await p.evaluate(() => document.getElementById("extras").scrollIntoView());
 });
 await page.evaluate(() => window.scrollTo(0, 0));
-await shot(page, "25-app-done-desktop-light");
+await shot(page, "27-app-done-desktop-light");
 
 // --- «дашборд» на соседнем порту: тот же браузер владельца, вход на страницу выполнен -------------
 {
