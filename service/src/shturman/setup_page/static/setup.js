@@ -382,6 +382,12 @@
       "s-bot": f.bot, "s-mode": !!f.sc, "s-business": f.business, "s-keys": f.keys,
       "s-accounts": f.ownerOk, "s-assistant": f.helperOk, "s-chats": f.chats > 0, "s-import": f.imported
     };
+    // Какой шаг держит закрытым этот: для строки «после шага N».
+    var blocker = {
+      "s-business": 1, "s-keys": 1,
+      "s-accounts": !f.bot ? 1 : num("s-keys"), "s-assistant": !f.bot ? 1 : num("s-keys"),
+      "s-chats": !f.bot ? 1 : num(f.sc === "staff" ? "s-assistant" : "s-accounts")
+    };
     var lock = {
       "s-business": !f.bot ? BOT : "",
       "s-keys": !f.bot ? BOT : "",
@@ -410,7 +416,7 @@
 
     var items;
     if (f.sc === "own") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-keys", "Ключи приложения"], ["s-accounts", "Вход в аккаунт"], ["s-chats", "Выбор чатов"]];
-    else if (f.sc === "staff") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-business", "Бизнес-режим"], ["s-chats", "Группы", true]];
+    else if (f.sc === "staff") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-business", "Бизнес-режим"], ["s-chats", "Группы", true, num("s-keys") + "–" + num("s-chats")]];
     else items = [["s-bot", "Бот согласований"], ["s-mode", "Способ подключения"]];
     var current = null;
     var steps = items.map(function (it) {
@@ -418,8 +424,9 @@
       if (ok) state = id === "s-chats" ? "выбрано: " + f.chats : id === "s-mode" ? (f.sc === "own" ? "как вы" : "сотрудник") : "готово";
       else if (optional) state = "по желанию";
       else if (!current && !lock[id]) { current = id; state = "сделайте сейчас"; }
-      else state = "после шага " + (plan.indexOf(id));
-      return [it[1], ok, state, num(id)];
+      else if (!lock[id]) state = "можно сейчас";
+      else state = "после шага " + blocker[id];
+      return [it[1], ok, state, it[3] || num(id)];
     });
     renderIfChanged("progress", [steps, f.imported], function () {
       var nodes = steps.map(function (s) {
@@ -447,6 +454,10 @@
     document.body.classList.toggle("sc-own", chosen === "own");
     document.body.classList.toggle("sc-staff", chosen === "staff");
     pill("mode", chosen ? "Выбрано: " + MODE_NAMES[chosen].toLowerCase() : "Не выбран", chosen ? "done" : "");
+    // На экземпляре, где что-то уже подключено, подсказываем способ — но выбирает владелец.
+    note("mode-hint", "info", !chosen && sc.suggested ? "Судя по тому, что уже подключено, это способ «" +
+      (sc.suggested === "own" ? "Ассистент видит всё как вы" : "Ассистент — отдельный сотрудник") +
+      "». Выберите его, чтобы страница показала оставшиеся шаги, — или другой." : "");
     ["own", "staff"].forEach(function (name) {
       var on = chosen === name, button = $("mode-" + name);
       $("choice-" + name).classList.toggle("is-chosen", on);
@@ -612,7 +623,7 @@
     var nodes = [], consent = null;
     if (role === "owner") {
       consent = el("input", { type: "checkbox", id: "consent-owner" });
-      nodes.push(el("label", { class: "check" }, [consent, el("span", { text: "Понимаю: на сервере появится сессия моего основного аккаунта. Если Telegram сочтёт её подозрительной, ограничения коснутся основного номера. Завершить сессию можно в Telegram: «Настройки» → «Устройства»." })]));
+      nodes.push(el("label", { class: "check" }, [consent, el("span", { text: "Понимаю: на сервере будет храниться вход в мой основной аккаунт. Если Telegram сочтёт его подозрительным, ограничения коснутся моего номера. Отключить его можно в Telegram: «Настройки» → «Устройства»." })]));
     }
     if (role === "assistant" && !tg.owner_known) {
       nodes.push(el("p", { class: "note info", text: "Сначала привяжите себя к боту согласований — шаг 1. Пока сервис не знает, какой аккаунт ваш, он не сможет отличить его от аккаунта ассистента." }));
@@ -621,7 +632,7 @@
     nodes.push(el("div", { class: "row" }, [el("button", {
       class: "btn", type: "button", text: again ? "Войти заново" : role === "owner" ? "Показать QR-код для входа" : "Подключить аккаунт ассистента",
       onclick: function () {
-        if (consent && !consent.checked) { toast("Отметьте, что понимаете: на сервере появится сессия основного аккаунта.", true); consent.focus(); return; }
+        if (consent && !consent.checked) { toast("Отметьте, что понимаете: на сервере будет храниться вход в ваш основной аккаунт.", true); consent.focus(); return; }
         startLogin(role, this);
       }
     })]));
@@ -806,13 +817,17 @@
 
   function renderChats(tg) {
     var accounts = runningAccounts(tg), all = (tg.accounts || []).filter(function (a) { return a.account_id !== null; });
-    var total = all.reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
+    var total = all.filter(function (a) { return !(S.scenario || {}).chosen || a.role === ((S.scenario || {}).chosen === "staff" ? "assistant" : "owner"); })
+      .reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
     pill("chats", all.length ? (total ? "Выбрано: " + total : "Выберите чаты") : "", total ? "done" : all.length ? "todo" : "");
     show("chats-none", !all.length);
     show("chats-body", !!all.length);
     if (!all.length) { ui.chatAccount = null; return; }
+    var sc = (S.scenario || {}).chosen, mine = sc ? (sc === "staff" ? "assistant" : "owner") : null;
+    if (ui.chatScenario !== sc) { ui.chatScenario = sc; ui.chatAccount = null; }   // сменили способ — своя вкладка
     if (!all.some(function (a) { return a.account_id === ui.chatAccount; })) {
-      ui.chatAccount = (accounts[0] || all[0]).account_id;
+      var preferred = all.filter(function (a) { return a.role === mine; })[0];
+      ui.chatAccount = (preferred || accounts[0] || all[0]).account_id;
       ui.chatsKey = "";
     }
     var current = all.filter(function (a) { return a.account_id === ui.chatAccount; })[0];
@@ -1193,6 +1208,9 @@
   function renderSummary(data) {
     var a = data.archive || {};
     $("sending-note").hidden = !!a.sending;
+    text("faq-sending", a.sending
+      ? "Отправка сообщений включена в настройках сервера. Ассистент отправляет только после вашего «Да» в боте согласований или по правилам, которые вы разрешили; с этой страницы отправку не включить и не выключить."
+      : "Сейчас нет: отправка сообщений выключена в настройках сервера и с этой страницы не включается. Ассистент читает, запоминает и готовит черновики. Включить отправку — отдельное решение, которое принимаете вы.");
     text("collected", number(a.messages));
     renderIfChanged("tiles", a, function () {
       return [

@@ -173,7 +173,7 @@ def test_only_flags_numbers_and_the_checked_address_leave_the_summary():
     assert set(out) == {"state", "url", "setup", "archive"}
     assert summary({"setup": dict(NOTHING, accounts=True)})["setup"]["accounts"] == 0      # True — не число
     assert summary({"setup": dict(NOTHING, accounts=10 ** 15)})["setup"]["accounts"] == 0
-    # бот согласований и своя модель к первой настройке не относятся: в сводке их нет вовсе
+    # бот согласований и своя модель — дело самой страницы настройки: в сводке мастера их нет вовсе
     assert "own_bot" not in out["setup"] and "owner_bound" not in out["setup"] and "own_model" not in out["setup"]
 
 
