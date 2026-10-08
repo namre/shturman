@@ -23,10 +23,17 @@ else
   fail os "нужен Linux, обнаружено: $(uname -s)"
 fi
 
+# Пороги — по таблице docs/voice.md, «Какой сервер нужен». Сервер «на 4 ГБ» показывает
+# немного меньше 4096 МБ, поэтому нижняя граница — 3500.
 mem_mb="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
-if [ "$mem_mb" -ge 7500 ]; then pass memory "${mem_mb} МБ"
-elif [ "$mem_mb" -ge 3500 ]; then warn memory "${mem_mb} МБ — хватит на базовый набор и распознавание голосовых; тяжёлые локальные модели эмбеддингов не поместятся"
+if [ "$mem_mb" -ge 7500 ]; then pass memory "${mem_mb} МБ — помещаются все дополнения сразу: расшифровка голосовых, поиск по смыслу, защита"
+elif [ "$mem_mb" -ge 3500 ]; then warn memory "${mem_mb} МБ — ассистент, архив и одно тяжёлое дополнение: расшифровка голосовых или поиск по смыслу с защитой; всё сразу — от 8 ГБ (docs/voice.md)"
 else fail memory "${mem_mb} МБ — нужно не меньше 4 ГБ"; fi
+
+case "$(uname -m)" in
+  x86_64|amd64) pass cpu "$(uname -m), ядер: $(nproc 2>/dev/null || echo '?')" ;;
+  *) warn cpu "$(uname -m) — расшифровка голосовых на этом сервере не включится: её образ собирается только для x86-64" ;;
+esac
 
 disk_gb="$(df -Pk . 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}')"
 disk_gb="${disk_gb:-0}"
@@ -76,25 +83,39 @@ else
 fi
 
 # --- исходящая сеть ---
+# Что откуда скачивается — docs/deployment.md, «Что откуда скачивается».
 # Любой HTTP-ответ означает, что узел достижим. 000 — нет соединения.
+#   probe <метка> <адрес> <need> <proxy> <что не заработает без него>
+#   need=yes — без узла установка невозможна (FAIL); иначе WARN.
+#   proxy=yes — узел нужен сервису в работе: проверяется через EGRESS_PROXY_URL, если он задан.
+#   Узлы для установки и сборки образов проверяются напрямую: исходящий прокси сервиса на них не действует.
 probe() {
-  local label="$1" url="$2" required="$3" code
+  local label="$1" url="$2" required="$3" via="$4" what="$5" code
   if ! command -v curl >/dev/null 2>&1; then warn "net:$label" "curl отсутствует"; return; fi
-  code="$(curl -sS -o /dev/null -m 12 -w '%{http_code}' ${EGRESS_PROXY_URL:+--proxy "$EGRESS_PROXY_URL"} "$url" 2>/dev/null)"
+  if [ "$via" = yes ]; then
+    code="$(curl -sS -o /dev/null -m 12 -w '%{http_code}' ${EGRESS_PROXY_URL:+--proxy "$EGRESS_PROXY_URL"} "$url" 2>/dev/null)"
+  else
+    code="$(curl -sS -o /dev/null -m 12 -w '%{http_code}' "$url" 2>/dev/null)"
+  fi
   code="${code:-000}"
   if [ "$code" = "000" ]; then
-    if [ "$required" = "yes" ]; then fail "net:$label" "нет соединения с $url"
-    else warn "net:$label" "нет соединения с $url — понадобится исходящий прокси (EGRESS_PROXY_URL)"; fi
+    if [ "$required" = "yes" ]; then fail "net:$label" "нет соединения с $url — $what"
+    else warn "net:$label" "нет соединения с $url — $what"; fi
   elif [ "$label" = "openai" ] && [ "$code" = "403" ]; then
     warn "net:$label" "ответ 403 — вероятно, регион сервера не поддерживается провайдером"
   else
     pass "net:$label" "HTTP $code"
   fi
 }
-probe github   https://github.com               yes
-probe registry https://registry-1.docker.io/v2/ yes
-probe telegram https://api.telegram.org         no
-probe openai   https://api.openai.com/v1/models no
+probe github      https://github.com                    yes no  "без него не скачать и не обновить репозиторий"
+probe registry    https://registry-1.docker.io/v2/      yes no  "без Docker Hub не скачать образы Hermes, базы и основу образов"
+probe debian      https://deb.debian.org/debian/        yes no  "без него не собрать образ сервиса (системные пакеты внутри образа)"
+probe pypi        https://pypi.org/simple/              yes no  "без него не собрать образ сервиса (библиотеки Python)"
+probe telegram    https://api.telegram.org              no  yes "сервису нужен Telegram; понадобится исходящий прокси (EGRESS_PROXY_URL)"
+probe openai      https://api.openai.com/v1/models      no  yes "нужен, если модель ассистента — OpenAI; иначе понадобится исходящий прокси (EGRESS_PROXY_URL) или другой провайдер"
+probe huggingface https://huggingface.co                no  no  "не скачать модели поиска по смыслу, защиты и расшифровки голосовых — эти дополнения не включатся"
+probe ghcr        https://ghcr.io/v2/                   no  no  "не скачать образ сервера моделей — не включатся поиск по смыслу и защита"
+probe pytorch     https://download.pytorch.org/whl/cpu/ no  no  "не собрать контейнер расшифровки голосовых"
 
 # --- репозиторий ---
 if [ -f .env ]; then
