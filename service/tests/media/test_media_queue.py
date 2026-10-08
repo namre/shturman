@@ -296,3 +296,34 @@ async def test_hanging_parser_is_killed(monkeypatch):
         assert "время" in str(exc)
     else:
         raise AssertionError("зависший разбор должен закончиться BadFile")
+
+
+def test_images_are_cut_to_what_one_job_may_carry():
+    big = b"x" * 1_000_000
+    assert len(core._fit([big, big, big, big])) == 2               # 2,5 МБ на задание
+    assert core._fit([b"x" * 3_000_000]) == []
+
+
+async def test_page_images_over_the_job_limit_do_not_loop(conn, rig, monkeypatch):
+    analyzer, tg, _, _ = rig
+    _, chat_id = await add_chat(conn)
+    await add(conn, chat_id, rec(13, media="file", name="скан.pdf"))
+    await enable(conn)
+    tg.files = {13: b"%PDF"}
+
+    async def huge(data, name, mime):
+        return core.extract.Extracted(kind="pdf", text="", pages=4, images=[b"x" * 3_000_000])
+    monkeypatch.setattr(core, "run_extract", huge)
+    await analyzer.step()
+    assert ((await row(conn, 13))["media_state"], (await row(conn, 13))["media_error"]) == ("skipped", "too_big")
+
+
+async def test_messages_hidden_by_the_guard_are_not_sent_to_the_model(conn, rig):
+    analyzer, tg, _, _ = rig
+    _, chat_id = await add_chat(conn)
+    await add(conn, chat_id, rec(14, "подозрительная подпись"))
+    await conn.execute("UPDATE messages SET agent_visible = false, guard_label = 'suspect' WHERE tg_message_id = 14")
+    await enable(conn)
+    tg.files = {14: jpeg()}
+    assert await analyzer.step() == 0
+    assert (await row(conn, 14))["media_state"] is None and tg.calls == []

@@ -101,7 +101,7 @@ class NotSent(Exception):
 
 
 MAX_IMAGES = 6
-MAX_IMAGE_BYTES = 6 * 1024 * 1024
+MAX_IMAGE_BYTES = 2_500_000         # как bridge.MAX_IMAGE_BYTES в сервисе
 
 
 def _images(payload: Mapping[str, Any]) -> list[bytes]:

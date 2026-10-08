@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -201,7 +202,7 @@ def _who(peer_id: int | None, direction: str, labels: dict[tuple, str]) -> str:
 
 async def _enqueue_extract(
     conn: asyncpg.Connection, run_id: int, episode: Episode, chat_type: str, tz: str,
-    options: Options, attempt: int = 0,
+    options: Options, attempt: int = 0, late: bool = False,
 ) -> int | None:
     """Ставит запрос на извлечение по эпизоду. None — такой запрос уже ставился."""
     episode.context = await _context_for(conn, episode.messages[0], options)
@@ -211,6 +212,10 @@ async def _enqueue_extract(
     known = [{"who": _who(r["debtor_peer_id"], r["direction"], labels), "what": r["what"],
               "due_expression": r["due_expression"]} for r in known_rows]
     key = f"cm-x{extract.PROMPT_VERSION}:{episode.chat_id}:{episode.first_id}-{episode.last_id}"
+    if late:
+        # Тот же эпизод уже разбирали без расшифровки или пересказа вложения: ключ — по новому тексту.
+        digest = hashlib.md5("\n".join(m.text for m in episode.messages).encode()).hexdigest()[:16]
+        key = f"{key}:late:{digest}"
     job_id = await bridge.request_structured(
         conn, handler=HANDLER_EXTRACT, instructions=extract.EXTRACT_INSTRUCTIONS,
         input=extract.build_extract_input(episode, labels, ZoneInfo(tz), chat_kind=_chat_kind(chat_type), known=known),
@@ -438,15 +443,31 @@ async def plan_run(
 
         # Рассмотренное снимается с пометки «текст появился позже»: и поздние сообщения, и
         # годные из окна (их текст уже был на месте). Скрытое защитой остаётся помеченным.
-        cleared = [m.id for m in eligible] + late_seen
+        # Снимается, только если текст тот же, что прочитан: расшифровка, записанная за время
+        # прогона, оставит пометку следующему.
+        seen_ids = set(late_seen)
+        cleared = [*eligible, *(m for m in late if m.id in seen_ids)]
         if cleared:
             await conn.execute(
-                "UPDATE messages SET late_content = false WHERE late_content AND id = ANY($1::bigint[])", cleared)
+                """UPDATE messages m SET late_content = false
+                   FROM unnest($1::bigint[], $2::text[]) AS v (id, digest)
+                   WHERE m.id = v.id AND m.late_content AND md5(m.text) = v.digest""",
+                [m.id for m in cleared], [hashlib.md5(m.text.encode()).hexdigest() for m in cleared])
+        # Пометка у того, что разбираться не будет никогда (исключённый чат, канал, бот, старое,
+        # служебное, удалённое), тоже снимается — кроме скрытого защитой: его могут открыть.
+        if watermark > 0:
+            await conn.execute(
+                f"""UPDATE messages SET late_content = false WHERE id IN (
+                        SELECT m.id {_FROM}
+                        WHERE m.late_content AND m.id <= $1 AND ({_VERDICT}) NOT IN ('eligible', 'skipped_hidden'))""",
+                watermark, floor)
         counts["late"] = len(late_seen)
 
         planned = already = 0
+        late_ids = {id(e) for e in late_signal}
         for episode in [*signal, *late_signal]:
-            job_id = await _enqueue_extract(conn, run_id, episode, chat_types[episode.chat_id], tz, options)
+            job_id = await _enqueue_extract(conn, run_id, episode, chat_types[episode.chat_id], tz, options,
+                                            late=id(episode) in late_ids)
             if job_id is None:
                 already += 1
             else:

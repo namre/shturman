@@ -339,3 +339,17 @@ async def test_status_text_for_limit(stand, conn, openai):
     sub = (await s.page.get("/state")).json()["llm"]["subscription"]
     assert sub["status"] == "limit" and "Лимит подписки исчерпан" in sub["status_text"]
     assert (await s.api.get("/api/executor/status")).json()["llm"]["subscription"] == "limit"
+
+
+async def test_failed_relogin_keeps_the_working_subscription(stand, conn, openai):
+    """Подписка работает; владелец входит ещё раз, и пробный вопрос получает отказ — прежний вход
+    остаётся: токены на месте, своя модель по-прежнему подписка."""
+    s = await opened(stand, conn)
+    assert (await connect(s, openai)).status_code == 200
+    store = siwc.CredentialStore(s.config.data_dir)
+    refresh = store.load()["refresh_token"]
+    openai.responses_script = [api_error(403, "subscription_sharing_user_not_eligible")]
+    got = await connect(s, openai)
+    assert got.status_code == 422 and got.json()["code"] == "probe_failed"
+    assert store.status() == "active" and store.load()["refresh_token"] == refresh
+    assert s.state.config.chatgpt is True and refresh not in openai.revoked

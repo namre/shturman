@@ -30,7 +30,6 @@ import json
 import logging
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -97,6 +96,8 @@ WITH todo AS (
     WHERE m.media_state IS NULL AND m.media_type IN ({", ".join(f"'{t}'" for t in MEDIA_TYPES)})
       AND m.kind = 'message' AND m.deleted_at IS NULL AND NOT c.excluded
       AND m.sent_at >= now() - make_interval(days => $1)
+      -- скрытое защитой модели не отдаётся; станет видимым — попадёт в очередь
+      AND (m.agent_visible OR m.is_outgoing IS TRUE)
     ORDER BY m.id DESC LIMIT $3
 ), verdict AS (
     SELECT m.id,
@@ -120,7 +121,7 @@ SELECT m.id, m.tg_message_id, m.media_type, m.media_ref, m.media_name, m.media_m
        m.media_file, m.media_attempts, m.first_seen_at, c.account_id, p.class AS peer_class, p.tg_id AS peer_tg_id
 FROM messages m JOIN chats c ON c.id = m.chat_id JOIN peers p ON p.id = c.peer_id
 WHERE m.media_state = 'pending' AND (m.media_at IS NULL OR m.media_at <= now())
-  AND m.deleted_at IS NULL AND NOT c.excluded
+  AND m.deleted_at IS NULL AND NOT c.excluded AND (m.agent_visible OR m.is_outgoing IS TRUE)
 ORDER BY m.sent_at DESC
 LIMIT $1
 """
@@ -152,8 +153,8 @@ async def run_extract(data: bytes, name: str | None, mime: str | None) -> extrac
     if os.environ.get("PYTHONPATH"):
         env["PYTHONPATH"] = os.environ["PYTHONPATH"]
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "shturman.media.worker", stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env, cwd=tempfile.gettempdir())
+        sys.executable, "-P", "-m", "shturman.media.worker", stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env, cwd="/")
     head = json.dumps({"name": name, "mime": mime}, ensure_ascii=False).encode() + b"\n"
     try:
         out, _ = await asyncio.wait_for(proc.communicate(head + data), timeout=EXTRACT_TIMEOUT)
@@ -175,6 +176,17 @@ async def run_extract(data: bytes, name: str | None, mime: str | None) -> extrac
     return extract.Extracted(kind=result["kind"], text=result.get("text") or "", pages=result.get("pages"),
                              images=[base64.b64decode(i) for i in result.get("images") or []],
                              truncated=bool(result.get("truncated")))
+
+
+def _fit(images: list[bytes]) -> list[bytes]:
+    """Первые картинки, которые помещаются в предел одного задания (bridge.MAX_IMAGE_BYTES)."""
+    out, total = [], 0
+    for image in images[:bridge.MAX_IMAGES]:
+        if total + len(image) > bridge.MAX_IMAGE_BYTES:
+            break
+        out.append(image)
+        total += len(image)
+    return out
 
 
 class NoSource(Exception):
@@ -325,7 +337,10 @@ class Analyzer:
             return await self._failed_attempt(mid, row["media_attempts"], type(exc).__name__)
 
         mark = label(found.kind, row["media_type"], row["media_name"], found.pages, found.truncated)
-        if not found.images and not found.text.strip():
+        images = _fit(found.images)
+        if found.images and not images:
+            return await self._finish(mid, "skipped", "too_big")     # даже одна картинка больше предела
+        if not images and not found.text.strip():
             return await self._finish(mid, "skipped", "empty")
         if found.kind == "image":
             instructions, text = PHOTO_INSTRUCTIONS, "Картинка приложена."
@@ -336,18 +351,25 @@ class Analyzer:
                     f"{'Текст документа (обрезан):' if cut else 'Текст документа:'}\n{body}"
                     if body.strip() else f"Имя файла: {row['media_name'] or 'не указано'}\nТекста нет — это скан, страницы приложены.")
             instructions = DOC_INSTRUCTIONS
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                job_id = await bridge.request_structured(
-                    conn, handler=HANDLER, instructions=instructions, input=text, json_schema=SCHEMA,
-                    schema_name="media_summary", task=TASK, max_tokens=MAX_TOKENS,
-                    context={"message_id": mid, "label": mark},
-                    dedup_key=f"media:{mid}:{row['media_attempts']}", images=found.images or None)
-                if job_id is None:
-                    return "later"     # такое задание уже стоит
-                await conn.execute(
-                    """UPDATE messages SET media_state = 'asking', media_job = $2, media_at = now()
-                       WHERE id = $1 AND media_state = 'pending'""", mid, job_id)
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    job_id = await bridge.request_structured(
+                        conn, handler=HANDLER, instructions=instructions, input=text, json_schema=SCHEMA,
+                        schema_name="media_summary", task=TASK, max_tokens=MAX_TOKENS,
+                        context={"message_id": mid, "label": mark},
+                        dedup_key=f"media:{mid}:{row['media_attempts']}", images=images or None)
+                    if job_id is None:
+                        await self._later(mid, RETRY, count=True)   # такое задание уже было — следующая попытка
+                        return "later"
+                    await conn.execute(
+                        """UPDATE messages SET media_state = 'asking', media_job = $2, media_at = now()
+                           WHERE id = $1 AND media_state = 'pending'""", mid, job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — не ставится задание: не крутить вложение без конца
+            logger.warning("вложение %s: задание модели не поставлено (%s)", mid, type(exc).__name__)
+            return await self._failed_attempt(mid, row["media_attempts"], type(exc).__name__)
         return "asking"
 
     async def _finish(self, mid: int, state: str, error: str) -> str:
@@ -378,6 +400,11 @@ class Analyzer:
         """Сообщить о готовом (наблюдателю — только о свежем и видимом) и убрать файлы выгрузки."""
         ready, self.finished = self.finished, []
         for mid in ready:
+            async with self.pool.acquire() as conn:
+                still = await conn.fetchval("SELECT media_state FROM messages WHERE id = $1", mid)
+            if still == "asking":
+                self.finished.append(mid)      # ответ ещё не зафиксирован — в следующий обход
+                continue
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """SELECT m.chat_id, m.is_outgoing, m.agent_visible, m.media_state,

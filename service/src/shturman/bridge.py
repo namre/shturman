@@ -40,7 +40,8 @@ logger = logging.getLogger("shturman.bridge")
 LLM_STRUCTURED = "llm.structured"
 LLM_TEXT = "llm.text"
 MAX_IMAGES = 6                        # картинок в одном запросе к модели
-MAX_IMAGE_BYTES = 6 * 1024 * 1024     # их общий размер до base64
+MAX_IMAGE_BYTES = 2_500_000           # их общий размер до base64: плагин забирает по два задания
+                                      # за раз, а ответ сервиса ему — не больше 8 МиБ
 NOTIFY_OWNER = "notify.owner"
 NOTIFY_EDIT = "notify.edit"
 BUSINESS_SEND = "business.send"

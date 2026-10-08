@@ -835,3 +835,29 @@ async def test_voice_transcribed_before_the_run_is_planned_once(conn):
     out = await plan(conn)
     assert (out["planned"], out["late_planned"]) == (1, 0)
     assert not await conn.fetchval("SELECT late_content FROM messages WHERE id = $1", ids[0])
+
+
+async def test_captioned_photo_planned_before_its_summary_is_planned_again(conn):
+    """Фото с подписью-обещанием уже разбирали одним эпизодом; пересказ вложения пришёл позже —
+    тот же эпизод с новым текстом ставится снова, а не считается «уже поставленным»."""
+    account_id, ivan_chat = await scene(conn)
+    ids = await say(conn, ivan_chat, [(IVAN, "Иван Петров", "Пришлю счёт завтра")])
+    first = await plan(conn)
+    job, = await claim(conn)
+    await answer(conn, job, {"commitments": []})
+    await conn.execute(
+        """UPDATE messages SET media_summary = '[фото] Счёт № 12 на 40 000 руб.', late_content = true,
+               text = media_text(text, '[фото] Счёт № 12 на 40 000 руб.') WHERE id = $1""", ids[0])
+    second = await plan(conn, now=NOW + timedelta(minutes=10))
+    assert (second["late_planned"], second["planned"], second["already_planned"]) == (1, 1, 0)
+    assert first["watermark"] == second["watermark"]
+
+
+async def test_late_flag_is_dropped_for_messages_that_will_never_be_planned(conn):
+    account_id, _ = await scene(conn)
+    channel = await chat(conn, account_id, 4001, "Новости", type_="public_channel", cls="channel")
+    ids = await say(conn, channel, [(4001, "Новости", "", {"sender_class": "channel"})])
+    await plan(conn)
+    await conn.execute("UPDATE messages SET text = '[фото] афиша', late_content = true WHERE id = $1", ids[0])
+    await plan(conn, now=NOW + timedelta(minutes=5))
+    assert not await conn.fetchval("SELECT late_content FROM messages WHERE id = $1", ids[0])

@@ -1222,6 +1222,14 @@ async def chatgpt_finish(request: Request) -> JSONResponse:
         await _log(request, "llm.chatgpt", audit.REFUSED, "ключ API введён во время входа")
         raise apply.Invalid(apply.SWITCH_NEEDED, "switch_needed")
     previous = store.load()
+    # Подписка уже работает, а повторный вход не удался — прежний вход остаётся как был:
+    # неудачная попытка не должна стирать рабочие токены.
+    keep_previous = store.active()
+
+    async def remember(record: dict[str, Any]) -> None:
+        if not keep_previous:
+            await keeper.save_signed_in(record)
+
     try:
         async with keeper.http() as http:
             tokens = await siwc.exchange(http, attempt, code, client_id)
@@ -1241,15 +1249,19 @@ async def chatgpt_finish(request: Request) -> JSONResponse:
             }
             if not siwc.plan_allowed(tokens):
                 await siwc.revoke(http, {"refresh_token": tokens["refresh_token"], "client_id": client_id})
-                await keeper.save_signed_in({**registration, "need_consent": True})
+                await remember({**registration, "need_consent": True})
                 raise siwc.SiwcError("no_plan")
-            models = await siwc.list_models(http, tokens["access_token"])
+            try:
+                models = await siwc.list_models(http, tokens["access_token"])
+            except siwc.SiwcError:
+                await siwc.revoke(http, {"refresh_token": tokens["refresh_token"], "client_id": client_id})
+                raise
     except siwc.SiwcError as exc:
         await _log(request, "llm.chatgpt", audit.REFUSED, f"вход не удался: {exc.code.split(':')[0]}")
         raise _siwc_invalid(exc) from None
     if not models:
         await _discard(keeper, tokens, client_id)
-        await keeper.save_signed_in(registration)
+        await remember(registration)
         await _log(request, "llm.chatgpt", audit.REFUSED, "нет моделей")
         raise apply.Invalid(apply.siwc_problem_text("no_models"), "no_models")
     slugs = [m["slug"] for m in models]
@@ -1258,7 +1270,7 @@ async def chatgpt_finish(request: Request) -> JSONResponse:
     outcome, problem = await apply.probe_subscription(state.config, tokens["access_token"], model)
     if outcome == "hard":
         await _discard(keeper, tokens, client_id)
-        await keeper.save_signed_in({**registration, "models": models, "model": model})
+        await remember({**registration, "models": models, "model": model})
         await _log(request, "llm.chatgpt", audit.REFUSED, f"пробный вопрос: {(problem or '').split(':')[0]}")
         raise apply.Invalid(apply.subscription_problem_text(problem) + " Своя модель не переключена.",
                             "probe_failed")
