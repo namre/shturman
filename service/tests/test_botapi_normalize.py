@@ -43,9 +43,11 @@ def ent(text: str, fragment: str, kind: str, **extra):
 
 
 def same(export_raw, bot_raw):
-    """Запись из экспорта и запись из Bot API совпадают во всём, кроме пути к файлу."""
+    """Запись из экспорта и запись из Bot API совпадают во всём, кроме пути к файлу и того, что
+    нужно для скачивания голосового (file_id и длительность есть только у Bot API)."""
     a, b = asdict(parse_message(export_raw)), asdict(normalize_message(bot_raw).record)
-    a.pop("media_path"), b.pop("media_path")
+    for key in ("media_path", "media_ref", "media_duration"):
+        a.pop(key), b.pop(key)
     assert a == b
     return normalize_message(bot_raw)
 
@@ -259,3 +261,14 @@ def test_strings_are_safe_for_the_database():
     n = normalize_message(bot(1, "нуль\x00 и \ud83d половинка", sender={"id": IVAN, "first_name": "Ив\x00ан"}))
     n.record.text.encode("utf-8")
     assert "\x00" not in n.record.text and n.record.sender_name == "Иван"
+
+
+def test_voice_and_video_note_keep_file_id_and_duration_for_transcription():
+    voice = normalize_message(bot(5, voice={"file_id": "AwACAg", "duration": 42})).record
+    assert (voice.media_type, voice.media_ref, voice.media_duration) == ("voice_message", "AwACAg", 42)
+    note = normalize_message(bot(6, video_note={"file_id": "DQACAg", "length": 240, "duration": 9})).record
+    assert (note.media_type, note.media_ref, note.media_duration) == ("video_message", "DQACAg", 9)
+    photo = normalize_message(bot(7, photo=[{"file_id": "p", "width": 1, "height": 1}])).record
+    assert (photo.media_ref, photo.media_duration) == (None, None)
+    odd = normalize_message(bot(8, voice={"file_id": "x" * 400, "duration": True})).record
+    assert (odd.media_ref, odd.media_duration) == (None, None)

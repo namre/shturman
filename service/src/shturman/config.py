@@ -74,6 +74,15 @@ class Config:
     # одни правила: это заметно слабее модели.
     guard_url: str = ""
     guard_model: str = "Horizon-Labs/prompt-injection-guard-small"
+    # Расшифровка голосовых и «кружков» (voice/, docs/voice.md). По умолчанию выключена; включает
+    # её ./ops/asr.sh on — он же скачивает модель и поднимает контейнер распознавания речи.
+    asr: bool = False
+    asr_url: str = ""
+    # Сколько дней назад от сегодняшнего голосовые ещё ставятся в очередь; более старые — нет.
+    asr_days: int = 30
+    # Предел длительности (секунд) и размера файла: длиннее — не скачивается и не распознаётся.
+    asr_max_seconds: int = 600
+    asr_max_bytes: int = 20 * 1024 * 1024
     # Внешний адрес страницы настройки (схема, имя и порт, без пути), например
     # https://assistant.example.com:8443. Пусто — страница отвечает только под локальными именами
     # из allowed_hosts (туннель SSH). Адрес обязан отличаться от адреса дашборда Hermes хотя бы
@@ -186,6 +195,10 @@ class Config:
             guard=_env("SHTURMAN_GUARD", "off").lower() in ("on", "1", "true", "yes"),
             guard_url=_env("SHTURMAN_GUARD_URL").rstrip("/"),
             guard_model=_env("SHTURMAN_GUARD_MODEL", "Horizon-Labs/prompt-injection-guard-small"),
+            asr=_env("SHTURMAN_ASR", "off").lower() in ("on", "1", "true", "yes"),
+            asr_url=_env("SHTURMAN_ASR_URL").rstrip("/"),
+            asr_days=min(3650, max(0, _int("SHTURMAN_ASR_DAYS", 30))),
+            asr_max_seconds=min(3600, max(10, _int("SHTURMAN_ASR_MAX_SECONDS", 600))),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )
         return with_page_values(config, os.environ)

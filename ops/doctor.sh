@@ -559,6 +559,31 @@ EOF3
         warn embeddings "контейнер эмбеддингов запущен ($emb), но поиск по смыслу в сервисе выключен — запустите ./ops/embeddings.sh on или off"
       fi ;;
   esac
+
+  # Расшифровка голосовых: включена ли, отвечает ли контейнер, сколько ждёт и сколько готово.
+  # Только числа и состояние: текстов расшифровок здесь нет.
+  asr="$(container_state shturman-asr off)"
+  v_pending="$(num voice_pending)"; v_done="$(num voice_done)"; v_failed="$(num voice_failed)"
+  case "$st" in
+    *'"voice_enabled":true'*)
+      if [ "$asr" != "running" ]; then
+        fail voice "контейнер распознавания речи в состоянии: $asr — голосовые ждут; docker logs --tail 50 shturman-asr, ./ops/asr.sh on"
+      else
+        case "$st" in
+          *'"voice_problem":"unreachable"'*)
+            fail voice "контейнер распознавания речи не отвечает — голосовые ждут (${v_pending:-0}); docker logs --tail 50 shturman-asr" ;;
+          *)
+            pass voice "расшифровка голосовых включена; готово: ${v_done:-0}, ждут: ${v_pending:-0}, не получилось: ${v_failed:-0}" ;;
+        esac
+      fi ;;
+    "") ;;
+    *)
+      if [ "$asr" = "off" ]; then
+        pass voice "расшифровка голосовых выключена — ассистент видит, что было голосовое, но не его содержание (./ops/asr.sh on, docs/voice.md)"
+      else
+        warn voice "контейнер распознавания запущен ($asr), но расшифровка в сервисе выключена — запустите ./ops/asr.sh on или off"
+      fi ;;
+  esac
 elif [ "$MODE" = standalone ]; then
   fail service "сервис переписки не развёрнут — запустите ./ops/up.sh"
 else

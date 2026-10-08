@@ -600,7 +600,8 @@ async def page_overview(request: Request) -> JSONResponse:
     keep = ("messages", "chats", "chats_excluded", "accounts", "last_message_seen_at", "jobs_waiting",
             "jobs_failed", "guard_enabled", "guard_model_used", "guard_problem", "guard_checked",
             "guard_hidden", "guard_released", "guard_unchecked", "embeddings_enabled", "embeddings_model",
-            "embeddings_embedded", "embeddings_left", "embeddings_problem", "sending")
+            "embeddings_embedded", "embeddings_left", "embeddings_problem", "sending",
+            "voice_enabled", "voice_problem", "voice_pending", "voice_done", "voice_failed", "voice_skipped")
     # audit_key — входы, смена ключей и аккаунтов: их не вытеснить из вида потоком мелких действий.
     return JSONResponse({"archive": {k: counts[k] for k in keep if k in counts}, "audit": log,
                          "audit_key": key_log})

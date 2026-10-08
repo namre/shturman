@@ -171,6 +171,10 @@ def parse_message(raw: dict[str, Any]) -> ExportMessage | None:
         media_type=media_type if isinstance(media_type, str) else None,
         media_path=media_path,
         service_action=raw.get("action") if kind == "service" else None,
+        # Длительность голосового и «кружка» экспорт пишет в duration_seconds.
+        media_duration=(raw["duration_seconds"] if media_type in ("voice_message", "video_message")
+                        and isinstance(raw.get("duration_seconds"), int) and not isinstance(raw.get("duration_seconds"), bool)
+                        and 0 <= raw["duration_seconds"] < 10**7 else None),
     )
 
 

@@ -142,6 +142,8 @@ def test_allowlist_is_exactly_this_and_default_is_deny():
         "channels.GetChannelsRequest", "messages.GetDialogsRequest", "messages.GetHistoryRequest",
         "messages.GetMessagesRequest", "channels.GetMessagesRequest", "functions.PingRequest",
         "auth.LogOutRequest",
+        # скачивание голосового для расшифровки (voice/): файл и перенос авторизации в его дата-центр
+        "upload.GetFileRequest", "auth.ExportAuthorizationRequest", "auth.ImportAuthorizationRequest",
     }
     login = {"auth.ExportLoginTokenRequest", "auth.ImportLoginTokenRequest",
              "account.GetPasswordRequest", "auth.CheckPasswordRequest"}

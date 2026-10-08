@@ -341,6 +341,18 @@ def media_type(media: Any) -> str | None:
     return "file"
 
 
+def media_duration(media: Any) -> int | None:
+    """Длительность голосового или «кружка» в секундах — для очереди расшифровки (voice/)."""
+    if not isinstance(media, types.MessageMediaDocument) or media.document is None:
+        return None
+    for attr in getattr(media.document, "attributes", None) or ():
+        if isinstance(attr, (types.DocumentAttributeAudio, types.DocumentAttributeVideo)):
+            value = getattr(attr, "duration", None)
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(round(value))
+    return None
+
+
 def service_action(action: Any) -> str | None:
     if action is None or isinstance(action, types.MessageActionEmpty):
         return None
@@ -445,6 +457,7 @@ def message_record(message: Any, entities: Entities, *, self_id: int) -> Message
         is_forwarded=message.fwd_from is not None,
         telegram_via_bot=getattr(message, "via_bot_id", None) is not None,
         telegram_sender_bot=bool(sender_entity.bot) if isinstance(sender_entity, types.User) else None,
+        media_duration=None if service else media_duration(message.media),
     )
 
 

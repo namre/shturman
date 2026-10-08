@@ -52,6 +52,7 @@ MODULES = (
     "shturman.mcp_server",
     "shturman.embeddings",
     "shturman.tg.service",
+    "shturman.voice.service",      # после аккаунтов Telegram: скачивает голосовые их сессиями
     "shturman.processing.service",
     "shturman.processing.pages_service",
     "shturman.processing.mcp_tools",

@@ -81,9 +81,9 @@ async def test_derived_page_and_queued_model_payload_are_inaccessible(conn):
 def test_unverified_transport_cannot_create_telegram_addressing_proof():
     record = message(telegram_entities=[], topic_tg_id=44, is_forwarded=False,
                      telegram_via_bot=False, telegram_sender_bot=False)
-    assert store._row(1, record, OWNER, False, "import")[-5:] == (None,) * 5
-    assert store._row(1, record, OWNER, False, "business")[-5:] == (None,) * 5
-    assert store._row(1, record, OWNER, False, "session")[-5:] == ("[]", 44, False, False, False)
+    assert store._row(1, record, OWNER, False, "import")[-7:-2] == (None,) * 5
+    assert store._row(1, record, OWNER, False, "business")[-7:-2] == (None,) * 5
+    assert store._row(1, record, OWNER, False, "session")[-7:-2] == ("[]", 44, False, False, False)
 
 
 @pytest.mark.parametrize("source_kind", ["chat", "memory", "trigger"])

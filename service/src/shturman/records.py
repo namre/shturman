@@ -37,6 +37,10 @@ class MessageRecord:
     is_forwarded: bool | None = None
     telegram_via_bot: bool | None = None
     telegram_sender_bot: bool | None = None
+    # Голосовые и «кружки»: длительность в секундах и file_id Bot API (только бизнес-режим) —
+    # чтобы потом скачать файл и расшифровать (voice/).
+    media_duration: int | None = None
+    media_ref: str | None = None
 
 
 @dataclass

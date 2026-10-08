@@ -115,3 +115,32 @@ def test_refusal_reason_is_a_code_not_the_description():
     assert reason_code("Conflict: can't use getUpdates method while webhook is active") == "webhook"
     assert reason_code("Bad Request: что-то с текстом «Секретный текст»") == "other"
     assert reason_code(None) == "other"
+
+
+async def test_voice_file_is_downloaded_with_the_token_only_in_the_real_address(caplog):
+    """getFile, затем файл по /file/bot<токен>/<путь>: токен появляется только в настоящем адресе."""
+    caplog.set_level(logging.DEBUG)
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path)
+        if request.url.raw_path.endswith(b"/getFile"):
+            return httpx.Response(200, json={"ok": True, "result": {"file_id": "v", "file_size": 9,
+                                                                   "file_path": "voice/file_1.oga"}})
+        return httpx.Response(200, content=b"OggS-data")
+
+    api = BotApi(TOKEN, transport=httpx.MockTransport(handle))
+    assert await api.download_file("v", max_bytes=1000) == b"OggS-data"
+    assert seen == [f"/bot{TOKEN}/getFile".encode(), f"/file/bot{TOKEN}/voice/file_1.oga".encode()]
+    assert TOKEN not in caplog.text
+    with pytest.raises(Refused) as too_big:
+        await api.download_file("v", max_bytes=5)
+    assert too_big.value.reason == "file_too_big"
+    await api.aclose()
+
+    def bad_path(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": {"file_path": "../../etc/passwd"}})
+    api = BotApi(TOKEN, transport=httpx.MockTransport(bad_path))
+    with pytest.raises(Refused):
+        await api.download_file("v", max_bytes=1000)
+    await api.aclose()

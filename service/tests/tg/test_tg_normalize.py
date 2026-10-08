@@ -26,7 +26,8 @@ NOT_INCLUDED = "(File not included. Change data exporting settings to download.)
 def export_fields(record):
     """Словарь экспорта прежний; метаданные адресации проверяются отдельно."""
     fields = dataclasses.asdict(record)
-    for key in ("telegram_entities", "topic_tg_id", "is_forwarded", "telegram_via_bot", "telegram_sender_bot"):
+    for key in ("telegram_entities", "topic_tg_id", "is_forwarded", "telegram_via_bot", "telegram_sender_bot",
+                "media_ref", "media_duration"):   # для скачивания голосового — у каждого источника своё
         fields.pop(key)
     return fields
 

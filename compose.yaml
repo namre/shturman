@@ -5,7 +5,8 @@
 #                 в режиме standalone («только архив и согласования», docs/standalone.md)
 #                 профиль выключен: контейнер не создаётся, образ не скачивается;
 #   embeddings  — локальные эмбеддинги, включаются командой ./ops/embeddings.sh on;
-#   guard       — модель защиты от внедрённых инструкций, включается командой ./ops/guard.sh on.
+#   guard       — модель защиты от внедрённых инструкций, включается командой ./ops/guard.sh on;
+#   asr         — распознавание речи для голосовых, включается командой ./ops/asr.sh on.
 # Профили записывает в .env (COMPOSE_PROFILES) и выставляет при запуске ./ops/up.sh — по режиму
 # из SHTURMAN_MODE. Режим выбирает ./ops/init-env.sh --mode, меняет ./ops/mode.sh.
 #
@@ -121,6 +122,11 @@ services:
       # включит (./ops/guard.sh on). Через API эти значения не меняются.
       SHTURMAN_GUARD: ${SHTURMAN_GUARD:-off}
       SHTURMAN_GUARD_URL: ${SHTURMAN_GUARD_URL:-}
+      # Расшифровка голосовых: включает ./ops/asr.sh on (контейнер asr ниже).
+      SHTURMAN_ASR: ${SHTURMAN_ASR:-off}
+      SHTURMAN_ASR_URL: ${SHTURMAN_ASR_URL:-}
+      SHTURMAN_ASR_DAYS: ${SHTURMAN_ASR_DAYS:-30}
+      SHTURMAN_ASR_MAX_SECONDS: ${SHTURMAN_ASR_MAX_SECONDS:-600}
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}
@@ -217,6 +223,36 @@ services:
       resources:
         limits:
           memory: 1024m
+    logging: *logging
+
+  asr:
+    # Распознавание речи для расшифровки голосовых и «кружков» (docs/voice.md). Модель —
+    # GigaAM-Multilingual от ai-sage, несжатая, как её выложил производитель: около 1,4 ГБ памяти
+    # в работе, поэтому выключено, пока владелец не включит: ./ops/asr.sh on. Через контейнер
+    # проходит звук голосовых, поэтому выхода в интернет у него нет (сеть backend закрытая);
+    # модель заранее скачивает и сверяет по контрольным суммам ./ops/asr.sh. Образ собирается
+    # на сервере из каталога asr/ по списку зависимостей с контрольными суммами.
+    profiles: ["asr"]
+    build: ./asr
+    image: shturman-asr:local
+    container_name: shturman-asr
+    restart: unless-stopped
+    environment:
+      ASR_THREADS: ${SHTURMAN_ASR_THREADS:-2}
+    volumes:
+      - ./data/asr:/data:ro
+    networks: [backend]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    shm_size: 128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          memory: 2048m
     logging: *logging
 
 networks:

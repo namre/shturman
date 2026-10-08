@@ -18,6 +18,10 @@ class AccountUnavailable(Exception):
     """Сессия аккаунта не запущена или потеряла авторизацию."""
 
 
+class MediaUnavailable(Exception):
+    """Вложения нет: сообщение удалено, файл другой или больше предела. Повторять бессмысленно."""
+
+
 class FloodWait(Exception):
     """Telegram просит подождать. Повторять раньше, чем через `seconds`, нельзя."""
 
