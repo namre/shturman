@@ -448,8 +448,17 @@ async def owner_granted(conn: Any, state: Any, task_id: int) -> bool:
     if not await valid(conn, state, task):
         await stop(conn, task_id, 'cancelled', 'context_changed')
         return False
-    data = await broker.read_for_task(conn, state, task, task['source_request'])
+    from ..sources.registry import SourceError
+    try:
+        data = await broker.read_for_task(conn, state, task, task['source_request'])
+    except SourceError:
+        data = {'status': 'unavailable'}
     if data['status'] != 'ok':
+        if not await valid(conn, state, task):
+            await stop(conn, task_id, 'cancelled', 'context_changed')
+        else:
+            await stop(conn, task_id, 'failed', 'source_unavailable')
         return False
     await add_source(conn, state, task, data)
-    return True
+    resumed = await get(conn, task_id)
+    return resumed is not None and resumed['status'] == 'generating'

@@ -116,18 +116,16 @@ async def legacy_put(conn, chat_id, record):
 
 
 async def blocked_chat(conn, s: Seed, tg_id, username, *, in_group=True):
-    """Служебный собеседник, который попал в архив в обход записи: чат не помечен исключённым."""
+    """Legacy rows bypass the writer; SQL still keeps the service chat excluded."""
     chat_id, excluded = await store.ensure_chat(
         conn, s.account, ChatRecord("user", tg_id, "personal_chat", "Telegram", username=username))
     assert excluded is True
-    await conn.execute("UPDATE chats SET excluded = false WHERE id = $1", chat_id)
     record = rec(1, SECRET_CODE, sender=tg_id, name="Telegram", at=T0 + timedelta(hours=3))
     rejected = await store.upsert_messages(conn, [(chat_id, record)],
                                            source="import", owner_tg_id=OWNER)
     assert rejected.new == 0
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE chat_id = $1", chat_id) == 0
     # Emulate old persisted data only after proving that the current writer rejects it.
-    await conn.execute("UPDATE chats SET excluded = false WHERE id = $1", chat_id)
     ids = await legacy_put(conn, chat_id, record)
     if in_group:
         ids |= await legacy_put(conn, s.family,
@@ -413,8 +411,13 @@ async def test_service_peers_with_codes_and_tokens_are_invisible(conn, tg_id, us
     if tg_id not in store.BLOCKED_USER_IDS:
         await control_peers.register(conn, tg_id)
     chat_id, ids = await blocked_chat(conn, s, tg_id, username)
-    # предусловие: признака «исключён» нет, сообщения в базе есть — скрывает только правило чтения
-    assert await conn.fetchval("SELECT NOT excluded FROM chats WHERE id = $1", chat_id)
+    # SQL protects the private service chat; message-level read guards must also
+    # hide the same sender's legacy row inside a readable ordinary group.
+    assert await conn.fetchval("SELECT excluded FROM chats WHERE id = $1", chat_id)
+    assert await conn.fetchval("SELECT NOT excluded FROM chats WHERE id = $1", s.family)
+    assert await conn.fetchval(
+        "SELECT count(*) FROM messages WHERE chat_id=$1 AND text=$2",
+        s.family, SECRET_CODE + " в группе") == 1
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE text LIKE 'Login code%'") == 2
     assert chat_id not in {c["id"] for c in await archive.list_chats(conn, limit=500)}
     assert await archive.chat_by_id(conn, chat_id) is None

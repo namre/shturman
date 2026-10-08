@@ -45,9 +45,21 @@ async def on_button(conn: Any, rest: str, user_id: int) -> dict[str, Any]:
     await conn.execute('UPDATE reply_tasks SET owner_decided_by=$2,owner_decided_at=now() WHERE id=$1',
                        task['id'], user_id)
     await workflow.record_owner_resume(conn, task['id'])
-    await workflow.owner_granted(conn, state, task['id'])
+    resumed = await workflow.owner_granted(conn, state, task['id'])
     answer = 'Этот поиск разрешён на 30 дней для того же получателя и темы.' if persistent \
         else 'Чтение разрешено для этой задачи.'
+    if not resumed:
+        current = await workflow.get(conn, task['id'])
+        if current is not None and current['status'] == 'waiting_source':
+            # A read grant is a completed owner decision; do not leave an unusable card.
+            await workflow.stop(conn, task['id'], 'failed', 'source_unavailable')
+            current = await workflow.get(conn, task['id'])
+        if current is not None and current.get('error_code') == 'context_changed':
+            answer += ' Контекст изменился; ответ не подготовлен, задача закрыта.'
+        elif current is not None and current.get('error_code') == 'source_unavailable':
+            answer += ' Источник недоступен; ответ не подготовлен, задача закрыта.'
+        else:
+            answer += ' Ответ не подготовлен; задача закрыта.'
     return {**REFUSED, 'answer': answer, 'remove_buttons': True}
 
 async def handle_command(conn: Any, state: Any, text: str, user_id: int) -> dict[str, Any]:

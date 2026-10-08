@@ -12,7 +12,57 @@ from typing import Any, Iterable, Mapping
 MAX_ALIASES = 16
 MAX_ALIAS_LENGTH = 64
 _BLOCKED = frozenset({"code", "pre", "blockquote", "expandable_blockquote"})
-_QUOTE = re.compile(r'[`"«»“”‘’]|(?:^|\n)\s*>')
+_QUOTE_LINE = re.compile(r"(?m)^[ \t]*>[^\n]*")
+
+
+def _quoted_ranges(text: str) -> list[tuple[int, int]]:
+    """Quotation/code spans in UTF-16; punctuation elsewhere does not hide an address."""
+    offsets = [0]
+    for char in text:
+        offsets.append(offsets[-1] + (2 if ord(char) > 0xFFFF else 1))
+    ranges = [(offsets[m.start()], offsets[m.end()]) for m in _QUOTE_LINE.finditer(text)]
+    opening = {'"': '"', "'": "'", '«': '»', '“': '”', '‘': '’'}
+    stack: list[str] = []
+    start = 0
+    i = 0
+    while i < len(text):
+        char = text[i]
+        end = i + 1
+        token = char
+        if char in ("'", "’") and i > 0 and end < len(text) \
+                and text[i - 1].isalnum() and text[end].isalnum():
+            i = end
+            continue  # Apostrophes within words are not quotation delimiters.
+        if char == '`':
+            while end < len(text) and text[end] == '`':
+                end += 1
+            token = text[i:end]
+        if stack and stack[-1] in ('"', "'") and token == stack[-1]:
+            backslashes = 0
+            at = i - 1
+            while at >= 0 and text[at] == '\\':
+                backslashes += 1
+                at -= 1
+            if backslashes % 2:
+                i = end
+                continue  # An escaped inner delimiter does not end the outer quotation.
+        if stack and token == stack[-1]:
+            stack.pop()
+            if not stack:
+                ranges.append((offsets[start], offsets[end]))
+        elif stack and (stack[-1].startswith('`') or stack[-1] in ('"', "'")):
+            pass  # Content inside literal quotation/code cannot open a new span.
+        elif char in opening or char == '`':
+            if not stack:
+                start = i
+            stack.append(token if char == '`' else opening[char])
+        elif char in '»”’' and not stack:
+            # A closing delimiter without an opening one is an incomplete quotation.
+            ranges.append((0, offsets[end]))
+        i = end
+    if stack:
+        ranges.append((offsets[start], offsets[-1]))
+    return ranges
 
 
 def validate_aliases(value: Any) -> list[str]:
@@ -75,13 +125,10 @@ def is_direct_address(message: Mapping[str, Any], user_ids: Iterable[int],
     if not isinstance(text, str) or not text:
         return False
     ents = _entities(message.get("telegram_entities"))
-    blocked = [span for ent in ents if ent.get("type") in _BLOCKED
-               if (span := _range(ent, text)) is not None]
+    blocked = _quoted_ranges(text) + [span for ent in ents if ent.get("type") in _BLOCKED
+                                      if (span := _range(ent, text)) is not None]
     def usable(span):
         return not any(span[0] < end and start < span[1] for start, end in blocked)
-    # Без разметки Telegram кавычки неоднозначны: в таком тексте обращения не угадываем.
-    if _QUOTE.search(text):
-        return False
     for ent in ents:
         span = _range(ent, text)
         if span is None or not usable(span):
