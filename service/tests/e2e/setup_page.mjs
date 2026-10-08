@@ -26,7 +26,10 @@ const GOOD_TOKEN = "7000000001:SENTINEL-bot-token_DoNotLeak-0123456789";
 const BUSY_TOKEN = "7000000002:BUSY-bot-token_polled-by-another-0123456789";
 const PASSWORD = "очень-секретный-пароль-77";
 const LLM_KEY = "sk-e2e-not-a-real-key-0123456789";
-const SECRETS = [GOOD_TOKEN, BUSY_TOKEN, PASSWORD, LLM_KEY, "0123456789abcdef0123456789abcdef"];
+// at-/rt-/code-SENTINEL — токены и код входа подставного OpenAI (подписка ChatGPT): ни в ответы страницы,
+// ни в журнал действий они не попадают никогда.
+const SECRETS = [GOOD_TOKEN, BUSY_TOKEN, PASSWORD, LLM_KEY, "0123456789abcdef0123456789abcdef",
+                 "at-SENTINEL", "rt-SENTINEL", "code-SENTINEL"];
 const KEY_NAME = "shturman-setup-session";
 
 mkdirSync(OUT, { recursive: true });
@@ -447,6 +450,39 @@ check("модель: смена адреса без ввода ключа не �
 check("модель: на странице сказано про https и про локальную модель",
       (await page.textContent("#llm-rules")).includes("SHTURMAN_LLM_BASE_URL") && (await page.textContent("#llm-rules")).includes("https://"));
 await page.fill("#llm-url", "https://llm.example/v1");
+
+// подписка ChatGPT вместо ключа: вход вставкой адреса. Страница входа OpenAI — подставная, в сеть не ходим.
+await context.route("https://auth.openai.com/**", (route) => route.fulfill({
+  status: 200, contentType: "text/html; charset=utf-8", body: "<!doctype html><title>ChatGPT</title><p>Подставной вход</p>" }));
+check("подписка: блок виден, кнопка «Войти через ChatGPT» есть",
+      (await page.isVisible("#sub-start")) && (await page.textContent("#sub-block")).includes("мастере Hermes"));
+const popupWait = context.waitForEvent("page", { timeout: 10000 }).catch(() => null);
+await page.click("#sub-start");                     // ключ API уже сохранён: страница спрашивает о замене — да
+await page.waitForSelector("#sub-paste:not([hidden])");
+const popup = await popupWait;
+if (popup) await popup.waitForLoadState("domcontentloaded").catch(() => {});
+const authUrl = popup ? popup.url() : (await page.getAttribute("#sub-open", "href")) || "";
+check("подписка: страница входа ChatGPT открыта в новой вкладке",
+      !!popup && authUrl.startsWith("https://auth.openai.com/api/accounts/authorize?"), authUrl.slice(0, 70));
+if (popup) await popup.close();
+check("подписка: объяснено, что вкладка покажет ошибку и адрес надо скопировать",
+      (await page.textContent("#sub-howto")).includes("127.0.0.1:1455/auth/callback"));
+await shot(page, "26a-subscription-paste-desktop-light");
+await page.fill("#sub-address", "http://127.0.0.1:1455/auth/callback?code=x&state=chuzhoy&client_id=oaiapp_x");
+await page.click("#sub-finish");
+await page.waitForFunction(() => document.querySelector("#sub-error").textContent.includes("не от последней"));
+check("подписка: адрес от чужой попытки отвергнут, поле очищено", (await page.inputValue("#sub-address")) === "");
+const { address } = await control("POST", "/chatgpt/authorize?url=" + encodeURIComponent(authUrl));
+await page.fill("#sub-address", address);
+await page.click("#sub-finish");
+await page.waitForFunction(() => document.querySelector("#sub-status").textContent.includes("Используется подписка ChatGPT"),
+                           null, { timeout: 20000 });
+check("подписка: подключена — видны учётная запись, модель и ссылка «Лимиты»",
+      (await page.textContent("#sub-status")).includes("owner@example.com") && (await page.isVisible("#sub-usage")) &&
+      (await page.isVisible("#sub-model")) && (await page.getAttribute("#sub-usage", "href")) === "https://chatgpt.com/settings/usage");
+check("подписка: заменила ключ API", (await page.textContent("#st-llm")).includes("Подписка"));
+await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("s-llm").scrollIntoView(); });
+await shot(page, "26b-subscription-connected-desktop-light");
 
 // счётчики и журнал
 await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));

@@ -1,8 +1,8 @@
 """Стенд для браузерной проверки страницы настройки: настоящий сервис, подставные Telegram и модель.
 
 Что настоящее: сервис переписки целиком (все модули, uvicorn, Postgres), страница и её файлы.
-Что подставное: Telegram для аккаунтов (подставной клиент из tests/tg), Bot API и сервер модели
-(из tests/executor). В сеть стенд не ходит.
+Что подставное: Telegram для аккаунтов (подставной клиент из tests/tg), Bot API, сервер модели и
+OpenAI для подписки ChatGPT (из tests/executor). В сеть стенд не ходит.
 
 Запуск — см. README.md в этом каталоге. Стенд пересоздаёт схему `public` в базе из
 SHTURMAN_TEST_DSN: база должна быть отдельной тестовой.
@@ -41,6 +41,7 @@ from starlette.routing import Route  # noqa: E402
 from telethon import errors  # noqa: E402
 
 import exec_fakes  # noqa: E402
+import openai_fakes  # noqa: E402
 import tg_fakes  # noqa: E402
 from shturman import db, netguard  # noqa: E402
 from shturman.app import build_app  # noqa: E402
@@ -131,9 +132,10 @@ async def main() -> None:
 
     netguard.resolver = resolve
 
-    telegram, llm = StandTelegram(), exec_fakes.FakeLlm("да")
+    telegram, llm, openai = StandTelegram(), exec_fakes.FakeLlm("да"), openai_fakes.FakeOpenAI()
     executor_service.TEST_OVERRIDES.update(
-        bot_transport=telegram.transport(), llm_transport=llm.transport(), poll=0, idle=0.2, probe=0)
+        bot_transport=telegram.transport(), llm_transport=llm.transport(), chatgpt_transport=openai.transport(),
+        poll=0, idle=0.2, probe=0)
     worlds = {"owner": make_world(tg_fakes.ME), "assistant": make_world(tg_fakes.HELPER)}
     worlds["assistant"].password = PASSWORD        # у помощника включён облачный пароль
 
@@ -183,6 +185,10 @@ async def main() -> None:
                 "text": "Добрый день! Смету пришлю к пятнице."})
         return JSONResponse({"ok": True})
 
+    async def chatgpt_authorize(request):
+        """Человек вошёл в ChatGPT по адресу входа и разрешил доступ: что окажется в адресной строке. ?url=…"""
+        return JSONResponse({"address": openai.authorize(request.query_params["url"])})
+
     async def seen(request):
         """Что видел подставной Telegram и что лежит в журнале действий — для проверок сценария."""
         rows = await conn.fetch("SELECT action, outcome, detail FROM setup_audit ORDER BY id")
@@ -200,7 +206,8 @@ async def main() -> None:
 
     control = Starlette(routes=[
         Route("/scan", scan, methods=["POST"]), Route("/start", start, methods=["POST"]),
-        Route("/last-code", last_code), Route("/business", business, methods=["POST"]), Route("/seen", seen)])
+        Route("/last-code", last_code), Route("/business", business, methods=["POST"]), Route("/seen", seen),
+        Route("/chatgpt/authorize", chatgpt_authorize, methods=["POST"])])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

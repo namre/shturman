@@ -5,7 +5,8 @@
 
   notify.owner, notify.edit — сообщение владельцу в бота согласований и его правка;
   business.send             — отправка от имени владельца через бизнес-подключение этого бота;
-  llm.structured, llm.text  — обращение к своей модели сервиса.
+  llm.structured, llm.text  — обращение к своей модели сервиса: по ключу API (`llm.py`) либо
+                              по подписке ChatGPT (`subscription.py`) — у обоих клиентов один вид вызова.
 
 Две дорожки, чтобы долгий ответ модели не задерживал нажатие владельца «Отправить»: дорожка бота
 выполняет задания по одному, дорожка модели — до двух сразу.
@@ -37,6 +38,7 @@ from . import binding
 from .bot import Bot
 from .botapi import BotApi, NeverLeft, OutcomeUnknown, Refused, keyboard
 from .llm import LlmClient, LlmError, matches_schema, parse_json, structured_messages
+from .subscription import ChatGptClient
 
 logger = logging.getLogger("shturman.executor.worker")
 
@@ -56,9 +58,9 @@ Buttons = list[list[tuple[str, str]]]
 
 
 class _Fail(Exception):
-    def __init__(self, error: str, retry_in: int | None) -> None:
+    def __init__(self, error: str, retry_in: int | None, *, postpone: bool = False) -> None:
         super().__init__(error)
-        self.error, self.retry_in = error, retry_in
+        self.error, self.retry_in, self.postpone = error, retry_in, postpone
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,8 @@ class Outcome:
     result: dict[str, Any] | None = None
     error: str = ""
     retry_in: int | None = None
+    # Вернуть в очередь, не расходуя попытки: дело в доступе к модели, а не в задании.
+    postpone: bool = False
 
     @property
     def ok(self) -> bool:
@@ -127,11 +131,12 @@ def _backoff(attempt: int) -> int:
 
 
 class Worker:
-    """api и bot — бот согласований (или None); llm — своя модель (или None)."""
+    """api и bot — бот согласований (или None); llm — своя модель (или None): по ключу API
+    либо по подписке ChatGPT."""
 
     def __init__(
         self, state: AppState, *, api: BotApi | None = None, bot: Bot | None = None,
-        llm: LlmClient | None = None, idle: float = IDLE_SECONDS, bot_timeout: float = 30.0,
+        llm: LlmClient | ChatGptClient | None = None, idle: float = IDLE_SECONDS, bot_timeout: float = 30.0,
         llm_timeout: float = 240.0, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.state, self.api, self.bot, self.llm = state, api, bot, llm
@@ -149,7 +154,9 @@ class Worker:
 
     def kinds(self, lane: str) -> tuple[str, ...]:
         if lane == "llm":
-            return LLM_KINDS if self.llm is not None else ()
+            # Пока доступ к модели на паузе (исчерпан лимит подписки, нужно войти заново),
+            # задания модели не забираются: они ждут в очереди, их попытки не тратятся.
+            return LLM_KINDS if self.llm is not None and self.llm.ready() else ()
         return BOT_KINDS if self.api is not None else ()
 
     def wake(self, lane: str = "bot") -> None:
@@ -226,6 +233,8 @@ class Worker:
                 async with self.state.pool.acquire() as conn:
                     if outcome.ok:
                         await bridge.deliver_result(conn, job_id, outcome.result or {})
+                    elif outcome.postpone and outcome.retry_in:
+                        await jobs.postpone(conn, job_id, outcome.error[:1900], delay=outcome.retry_in)
                     else:
                         await bridge.deliver_failure(conn, job_id, outcome.error[:1900], retry_in=outcome.retry_in)
                 return True
@@ -251,7 +260,7 @@ class Worker:
         except asyncio.CancelledError:
             raise
         except _Fail as exc:
-            return Outcome(error=exc.error, retry_in=exc.retry_in)
+            return Outcome(error=exc.error, retry_in=exc.retry_in, postpone=exc.postpone)
         except Exception as exc:  # noqa: BLE001 — только вид ошибки: в тексте бывают куски ответа модели
             return Outcome(error=type(exc).__name__, retry_in=_backoff(attempt))
 
@@ -262,15 +271,18 @@ class Worker:
         return max(1, min(tokens, MAX_TOKENS_CAP))
 
     async def _ask(self, kind: str, payload: Mapping[str, Any], messages: list[dict[str, str]],
-                   attempt: int, *, json_mode: bool) -> tuple[str, str]:
+                   attempt: int, *, json_mode: bool, schema: dict[str, Any] | None = None,
+                   schema_name: str | None = None) -> tuple[str, str]:
         if self.llm is None:
             raise _Fail("у сервиса нет своего доступа к модели", 300)
         try:
             return await asyncio.wait_for(
                 self.llm.chat(messages, task=payload.get("task"), max_tokens=self._max_tokens(kind, payload),
-                              json_mode=json_mode),
+                              json_mode=json_mode, schema=schema, schema_name=schema_name),
                 timeout=self.llm_timeout)
         except LlmError as exc:
+            if exc.pause:
+                raise _Fail(f"модель: {exc.code}", exc.pause, postpone=True) from None
             raise _Fail(f"модель: {exc.code}", None if exc.final else _backoff(attempt)) from None
         except asyncio.TimeoutError:
             raise _Fail("модель: timeout", _backoff(attempt)) from None
@@ -281,7 +293,7 @@ class Worker:
         name = payload.get("schema_name") if isinstance(payload.get("schema_name"), str) else None
         answer, model = await self._ask(
             bridge.LLM_STRUCTURED, payload, structured_messages(instructions, text, schema, name),
-            attempt, json_mode=True)
+            attempt, json_mode=True, schema=schema, schema_name=name)
         parsed = parse_json(answer)
         # Расхождение со схемой и неразборчивый JSON — не сбой задания: сервис проверяет ответ сам.
         valid = parsed is not None and (schema is None or matches_schema(parsed, schema))

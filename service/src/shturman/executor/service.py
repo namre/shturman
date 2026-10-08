@@ -5,8 +5,9 @@
   * задан `SHTURMAN_BOT_TOKEN` — опрос бота согласований и дорожка заданий бота; виды
     `notify.owner` и `notify.edit` объявляются своими (`bridge.set_builtin`), а с ними внутренний
     API перестаёт принимать нажатия кнопок и владельца от плагина;
-  * заданы `SHTURMAN_LLM_API_KEY` и `SHTURMAN_LLM_MODEL` — дорожка заданий модели; виды
-    `llm.structured` и `llm.text` объявляются своими;
+  * заданы `SHTURMAN_LLM_API_KEY` и `SHTURMAN_LLM_MODEL` либо на странице настройки подключена
+    подписка ChatGPT — дорожка заданий модели; виды `llm.structured` и `llm.text` объявляются
+    своими. Клиент — по ключу (`llm.py`) или по подписке (`subscription.py`), один из двух;
   * ничего не задано — модуль ничего не делает, всё выполняет плагин, как раньше.
 
 Если бот настроен, но не работает (неверный токен, нет связи, бота опрашивает кто-то ещё),
@@ -14,6 +15,8 @@
 плагину значило бы снова пустить нажатия владельца через Hermes.
 
 `GET /api/executor/status` отдаёт только признаки и счётчики: ни идентификаторов, ни текстов.
+Для подписки — способ и её состояние (ok, limit, denied, relogin); почты учётной записи ChatGPT
+там нет: этот маршрут доступен ассистенту в Hermes.
 """
 
 from __future__ import annotations
@@ -36,7 +39,9 @@ from ..app import AppState, state_of
 from . import binding
 from .bot import Bot
 from .botapi import BotApi
+from . import siwc
 from .llm import LlmClient, task_models
+from .subscription import ChatGptClient
 from .worker import Worker
 
 logger = logging.getLogger("shturman.executor")
@@ -45,8 +50,20 @@ BOT_OWNED = (bridge.NOTIFY_OWNER, bridge.NOTIFY_EDIT)
 LLM_OWNED = (bridge.LLM_STRUCTURED, bridge.LLM_TEXT)
 
 # Только для тестов: подставные Telegram и сервер модели, короткие паузы.
-# Ключи: bot_transport, llm_transport, poll, idle.
+# Ключи: bot_transport, llm_transport, chatgpt_transport (OpenAI для подписки: вход и модель), poll, idle.
 TEST_OVERRIDES: dict[str, Any] = {}
+KEEPER = "chatgpt_keeper"
+
+
+def chatgpt_keeper(state: AppState) -> siwc.TokenKeeper:
+    """Единственный на процесс хранитель токенов подписки: им пользуются и исполнитель, и
+    страница настройки, чтобы refresh_token не обновлялся дважды одновременно."""
+    keeper = state.extras.get(KEEPER)
+    if not isinstance(keeper, siwc.TokenKeeper):
+        keeper = siwc.TokenKeeper(siwc.CredentialStore(state.config.data_dir), proxy_url=state.config.proxy_url,
+                                  transport=TEST_OVERRIDES.get("chatgpt_transport"))
+        state.extras[KEEPER] = keeper
+    return keeper
 
 
 @dataclass
@@ -54,7 +71,7 @@ class Executor:
     """Действующий исполнитель — лежит в `state.extras["executor"]`."""
     api: BotApi | None = None
     bot: Bot | None = None
-    llm: LlmClient | None = None
+    llm: LlmClient | ChatGptClient | None = None
     worker: Worker | None = None
     kinds: frozenset[str] = field(default_factory=frozenset)
 
@@ -87,6 +104,10 @@ async def status(request: Request) -> JSONResponse:
         },
         "llm": {
             "configured": llm is not None,
+            # api_key | subscription (подписка ChatGPT) | null
+            "way": ("subscription" if isinstance(llm, ChatGptClient) else "api_key") if llm else None,
+            # Только для подписки: ok | limit (лимит исчерпан) | denied (нет доступа) | relogin (войти заново).
+            "subscription": llm.status() if isinstance(llm, ChatGptClient) else None,
             "model": llm.model if llm else None,
             "task_models": dict(llm.models) if llm else {},
             "problem": (llm.broken or llm.last_error) if llm else None,
@@ -136,7 +157,16 @@ class Control:
             kinds.update(BOT_OWNED)
             if api.broken:
                 logger.error("бот согласований не может работать (%s)", api.broken)
-        if config.own_llm:
+        if config.chatgpt:
+            keeper = chatgpt_keeper(state)
+            llm = ChatGptClient(keeper, model=config.chatgpt_model, models=task_models(os.environ),
+                                proxy_url=config.proxy_url, transport=TEST_OVERRIDES.get("chatgpt_transport"))
+            kinds.update(LLM_OWNED)
+            if keeper.store.status() == siwc.RELOGIN:
+                llm.state = "relogin"
+            if llm.broken:
+                logger.error("подписка ChatGPT не может работать (%s)", llm.broken)
+        elif config.own_llm:
             llm = LlmClient(
                 base_url=config.llm_base_url, api_key=config.llm_api_key, model=config.llm_model,
                 models=task_models(os.environ), proxy_url=config.proxy_url,

@@ -79,8 +79,8 @@ async def test_only_what_is_configured_is_started_and_announced(live, conn):
     await until(lambda: conn.fetchval("SELECT status = 'done' FROM jobs WHERE id = $1", job))
     assert tg.requests == [] and len(llm.requests) == 1
     status = (await client.get("/api/executor/status")).json()
-    assert status["llm"] == {"configured": True, "model": "main-model", "task_models": {}, "problem": None,
-                             "last_call_ok": True, "calls": 1, "failures": 0}
+    assert status["llm"] == {"configured": True, "way": "api_key", "subscription": None, "model": "main-model",
+                             "task_models": {}, "problem": None, "last_call_ok": True, "calls": 1, "failures": 0}
     assert status["jobs"]["done"] == {"llm.structured": 1} and status["bot"]["configured"] is False
     assert KEY not in (await client.get("/api/executor/status")).text
 

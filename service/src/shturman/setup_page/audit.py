@@ -63,6 +63,10 @@ ACTIONS = {
     "import.delete": "Загруженная выгрузка удалена",
     "llm.save": "Своя модель сервиса сохранена",
     "llm.removed": "Своя модель сервиса убрана",
+    "llm.chatgpt_start": "Начат вход через ChatGPT",
+    "llm.chatgpt": "Подключена подписка ChatGPT",
+    "llm.chatgpt_model": "Выбрана модель подписки ChatGPT",
+    "llm.chatgpt_removed": "Подписка ChatGPT отключена",
 }
 
 
@@ -73,7 +77,7 @@ IMPORTANT = frozenset({
     "login.link", "login.code", "logout.all", "setup.scenario",
     "bot.token", "bot.token_removed", "bot.bind_link",
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
-    "llm.save", "llm.removed",
+    "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
 })
 
 
@@ -81,6 +85,7 @@ IMPORTANT = frozenset({
 NOT_DONE = {
     "bot.token": "Токен бота согласований не сохранён",
     "llm.save": "Своя модель сервиса не сохранена",
+    "llm.chatgpt": "Подписка ChatGPT не подключена",
 }
 
 

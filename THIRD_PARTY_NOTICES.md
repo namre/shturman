@@ -56,6 +56,8 @@ git вызывается как отдельная программа и с ко
 | regex | Выражения наблюдателя с пределом времени | Apache-2.0 | https://pypi.org/project/regex/ |
 | python-socks | Исходящий прокси для Telegram | Apache-2.0 | https://pypi.org/project/python-socks/ |
 | tzdata | Часовые пояса | Apache-2.0 | https://pypi.org/project/tzdata/ |
+| PyJWT | Проверка подписи ID token при входе через ChatGPT (подписка как своя модель сервиса); раньше приходила только с `mcp` | MIT | https://pypi.org/project/PyJWT/ |
+| cryptography | Ключи RSA для той же проверки; раньше приходила только с PyJWT | Apache-2.0 OR BSD-3-Clause | https://pypi.org/project/cryptography/ |
 
 Лицензии транзитивных зависимостей из `service/requirements.lock` по одной не сверялись.
 

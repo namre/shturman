@@ -18,6 +18,12 @@
 
 Перед сохранением токен бота и ключ модели проверяются живым запросом. Ошибка объясняется
 простыми словами; само значение ни в текст ошибки, ни в журнал не попадает.
+
+Подписка ChatGPT вместо ключа модели (`executor/siwc.py`, `executor/subscription.py`): здесь —
+тексты для владельца и пробный вопрос после входа (`probe_subscription`). Своя модель сервиса
+работает одним способом: включение подписки убирает ключ, введённый на странице, а сохранение
+ключа выходит из подписки. Пересчёт настроек — `Settings.save` и `Settings.refresh`
+(`config.with_subscription`).
 """
 
 from __future__ import annotations
@@ -28,9 +34,12 @@ import re
 from typing import Any
 
 from .. import netguard
+from ..config import with_subscription
 from ..executor import service as executor_service
+from ..executor import siwc
 from ..executor.botapi import BotApi, BotApiError, NeverLeft, Refused
 from ..executor.llm import LlmClient, LlmError
+from ..executor.subscription import ChatGptClient
 from . import secrets_store as ss
 
 logger = logging.getLogger("shturman.setup")
@@ -87,15 +96,26 @@ class Settings:
                 raise Invalid("Сначала выйдите из подключённых аккаунтов Telegram: их сессии созданы "
                               "с прежними ключами приложения.", "accounts_connected")
             self.store.update(changes)
-            new = ss.overlay(old, self.store.load(), self.managed)
-            self.state.config = new
-            if tg is not None:
-                await tg.reconfigure(new)
-            control = self.state.extras.get("executor_control")
-            executor_changed = any(getattr(new, f) != getattr(old, f)
-                                   for f in ("bot_token", "llm_api_key", "llm_base_url", "llm_model"))
-            if control is not None and executor_changed:
-                await control.restart()
+            await self._apply(old, tg)
+
+    async def refresh(self, *, restart: bool = False) -> None:
+        """Пересчитывает настройки после смены подписки ChatGPT (вход, выход, модель) и
+        перезапускает исполнителя, если своя модель изменилась. restart — перезапустить в любом
+        случае: после нового входа у клиента подписки не должно остаться прежней паузы."""
+        async with self.lock:
+            await self._apply(self.state.config, None, restart=restart)
+
+    async def _apply(self, old: Any, tg: Any, *, restart: bool = False) -> None:
+        new = with_subscription(ss.overlay(old, self.store.load(), self.managed))
+        self.state.config = new
+        if tg is not None:
+            await tg.reconfigure(new)
+        control = self.state.extras.get("executor_control")
+        executor_changed = restart or any(getattr(new, f) != getattr(old, f)
+                                          for f in ("bot_token", "llm_api_key", "llm_base_url", "llm_model",
+                                                    "chatgpt", "chatgpt_model"))
+        if control is not None and executor_changed:
+            await control.restart()
 
 
 # --- проверки ---
@@ -288,3 +308,146 @@ async def check_llm(config: Any, *, api_key: str, base_url: str, model: str, res
 async def _no_wait(seconds: float) -> None:
     """Повторы пробного запроса идут без пауз: владелец ждёт ответа на странице."""
     await asyncio.sleep(0)
+
+
+# --- подписка ChatGPT -----------------------------------------------------------------------------
+
+SUBSCRIPTION_LOCKED = ("Ключ модели задан в настройках сервера (SHTURMAN_LLM_API_KEY) — своя модель выбрана там. "
+                       "Подписку ChatGPT можно подключить здесь, когда этот ключ уберут из настроек сервера.")
+SWITCH_NEEDED = ("Сейчас своя модель сервиса работает по ключу API. Подписка ChatGPT его заменит: ключ будет "
+                 "удалён с сервера. Подтвердите замену.")
+_NO_OPENAI = ("Сервер не смог связаться с OpenAI. Проверьте, что у сервера есть доступ в интернет (или настроен "
+              "прокси), и попробуйте ещё раз.")
+_AGAIN = "Нажмите «Войти через ChatGPT» ещё раз."
+_SIWC_PROBLEMS = {
+    "empty": "Вставьте адрес из адресной строки браузера — он начинается с http://127.0.0.1:1455/auth/callback",
+    "bad_address": "Это не похоже на адрес из адресной строки. Скопируйте его целиком: он начинается "
+                   "с http://127.0.0.1:1455/auth/callback?code=",
+    "not_callback": "Это другой адрес. Нужен тот, что открылся после того, как вы разрешили доступ: "
+                    "он начинается с http://127.0.0.1:1455/auth/callback",
+    "no_params": "В адресе нет данных входа. Скопируйте адрес целиком, вместе с частью после «?».",
+    "no_attempt": "Сначала нажмите «Войти через ChatGPT».",
+    "expired": "Попытка входа устарела: с её начала прошло больше 10 минут. " + _AGAIN,
+    "wrong_state": "Этот адрес — не от последней попытки входа. Вставьте адрес, который открылся после последнего "
+                   "нажатия «Войти через ChatGPT», или начните вход заново.",
+    "denied": "Вы не разрешили доступ в окне ChatGPT, поэтому подписка не подключена. Если передумаете, "
+              "нажмите «Войти через ChatGPT» ещё раз.",
+    "no_code": "В адресе нет кода входа. Скопируйте адрес целиком.",
+    "no_client_id": "Регистрация «Штурмана» в ChatGPT не завершилась: в адресе нет номера программы (client_id). "
+                    "Скопируйте адрес целиком; если не поможет — начните вход заново.",
+    "bad_client_id": "В адресе неверный номер программы (client_id). Скопируйте адрес целиком; если не поможет — "
+                     "начните вход заново.",
+    "client_mismatch": "Адрес относится к другой регистрации «Штурмана» в ChatGPT. " + _AGAIN,
+    "code_rejected": "Код входа уже использован или устарел. " + _AGAIN,
+    "bad_token_response": "OpenAI ответил не так, как ожидалось. Попробуйте позже.",
+    "other_account": "Вы вошли в другую учётную запись ChatGPT, чем раньше. Чтобы сменить учётную запись, нажмите "
+                     "«Войти другой учётной записью».",
+    "no_plan": "Вход выполнен, но вы не разрешили «Штурману» пользоваться подпиской ChatGPT — без этого разрешения "
+               "подписка не работает. Нажмите «Войти через ChatGPT» ещё раз и разрешите доступ к подписке.",
+    "no_models": "OpenAI не дал этой учётной записи ни одной модели для работы по подписке. Своя модель не переключена.",
+    "unknown_model": "Такой модели нет в списке, который OpenAI даёт этой учётной записи. Обновите страницу "
+                     "и выберите модель из списка.",
+    "not_connected": "Подписка ChatGPT не подключена.",
+    "proxy_needs_socksio": _BOT_PROBLEMS["proxy_needs_socksio"],
+    "bad_proxy_url": _BOT_PROBLEMS["bad_proxy_url"],
+    "locked": SUBSCRIPTION_LOCKED,
+    "switch_needed": SWITCH_NEEDED,
+}
+
+
+def siwc_problem_text(code: str) -> str:
+    """Текст для владельца по коду ошибки входа через ChatGPT."""
+    if code in _SIWC_PROBLEMS:
+        return _SIWC_PROBLEMS[code]
+    if code.startswith("oauth_error"):
+        return f"ChatGPT вернул ошибку входа (код: {code.split(':', 1)[-1]}). " + _AGAIN
+    if code.startswith(("id_token", "bad_id_token")):
+        return "Ответ OpenAI не прошёл проверку подлинности. Вход не сохранён. " + _AGAIN
+    if code.startswith(("no_connection", "http_5", "refresh_5")):
+        return _NO_OPENAI
+    if code.startswith(("token_error", "models_")):
+        return f"OpenAI не выдал доступ (код: {code.split(':', 1)[-1]}). Попробуйте позже."
+    if code in ("relogin", "no_plan_scope") or code in siwc.TERMINAL_REFRESH:
+        return SUBSCRIPTION_STATUS["relogin"]
+    return "Войти через ChatGPT не получилось. " + _AGAIN
+
+
+DENIED_TEXT = ("OpenAI отказал подписке этой учётной записи в доступе (код: {code}). Так бывает, если тариф или "
+               "рабочее пространство ChatGPT этого не разрешают либо сервер находится в стране, где услуга "
+               "недоступна.")
+SUBSCRIPTION_STATUS = {
+    "none": "Подписка ChatGPT не подключена.",
+    "signed_out": "Подписка ChatGPT не подключена: из учётной записи вышли. Войти можно снова.",
+    "connected": "Используется подписка ChatGPT.",
+    "relogin": "Нужно войти заново: OpenAI больше не принимает сохранённый вход (вышел срок или доступ отозван "
+               "в настройках ChatGPT). Задания модели ждут.",
+    "limit": "Лимит подписки исчерпан. Сервис сам повторит позже; сколько осталось — по ссылке «Лимиты».",
+    "denied": "Нет доступа. OpenAI отказал подписке этой учётной записи; сервис час не обращается к модели.",
+}
+
+
+def subscription_problem_text(code: str | None) -> str | None:
+    """Текст по коду неудачного обращения к модели по подписке."""
+    if not code:
+        return None
+    if code == "usage_limit":
+        return SUBSCRIPTION_STATUS["limit"]
+    if code == "relogin":
+        return SUBSCRIPTION_STATUS["relogin"]
+    if code.startswith("denied:"):
+        return DENIED_TEXT.format(code=code.split(":", 1)[1])
+    if code.startswith(("connect:", "network:", "no_connection", "refresh_")):
+        return _NO_OPENAI
+    if code.startswith("http_5") or code.startswith("failed:subscription_sharing_usage_unavailable"):
+        return "OpenAI сейчас не отвечает как надо. Сервис повторит позже сам."
+    if code == "timeout":
+        return "OpenAI не ответил вовремя. Сервис повторит позже сам."
+    if code.startswith("http_404"):
+        return "OpenAI не знает выбранной модели. Выберите модель из списка заново."
+    return f"Обращение к модели по подписке не удалось (код: {code})."
+
+
+class _FixedToken:
+    """Токен только что выполненного входа — для пробного вопроса до того, как вход сохранён."""
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def __repr__(self) -> str:
+        return "<_FixedToken>"
+
+    async def access_token(self, *, failed: str | None = None) -> str:
+        return self._token
+
+    async def mark_relogin(self) -> None:
+        return None
+
+
+async def probe_subscription(config: Any, access_token: str, model: str) -> tuple[str, str | None]:
+    """Задаёт модели по подписке самый короткий вопрос. Возвращает (итог, код): ok — ответила;
+    limit — лимит исчерпан (подписку подключить можно); soft — временный сбой (тоже можно);
+    hard — подписка сервису не подходит (подключать нельзя)."""
+    client = ChatGptClient(_FixedToken(access_token), model=model, proxy_url=config.proxy_url,  # type: ignore[arg-type]
+                           transport=executor_service.TEST_OVERRIDES.get("chatgpt_transport"), timeout=30.0,
+                           slots=1, sleep=_no_wait)
+    try:
+        await client.chat([{"role": "user", "content": "Ответь одним словом: да"}])
+    except LlmError as exc:
+        if exc.code == "usage_limit":
+            return "limit", exc.code
+        if exc.final or exc.code == "relogin":
+            return "hard", exc.code
+        return "soft", exc.code
+    finally:
+        await client.aclose()
+    return "ok", None
+
+
+def page_key_set(settings: Settings) -> bool:
+    """Ключ модели введён на странице (а не задан окружением)."""
+    return settings.source(ss.LLM_API_KEY) == PAGE
+
+
+def key_names(settings: Settings) -> list[str]:
+    """Значения своей модели по ключу, которыми распоряжается страница."""
+    return [n for n in (ss.LLM_API_KEY, ss.LLM_BASE_URL, ss.LLM_MODEL) if settings.editable(n)]

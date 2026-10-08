@@ -34,7 +34,8 @@
     login: null, loginLink: "", chatAccount: null, chats: [], chatsTotal: 0, chatsEnabled: 0,
     chatsLoading: false, chatsKey: "", scans: {}, scanning: {}, exclude: {}, upload: null,
     signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
-    messages: null, importOpened: false
+    messages: null, importOpened: false,
+    subUrl: ""                  // адрес входа в ChatGPT текущей попытки — только в памяти страницы
   };
 
   /* ------------------------------------------------------------ мелочи */
@@ -1162,11 +1163,19 @@
 
   function renderLlm(llm) {
     var locked = llm.key.source === "server";
-    pill("llm", llm.configured ? "Настроена" : "", llm.configured ? "done" : "");
+    var bySubscription = llm.way === "subscription";
+    pill("llm", llm.configured ? (bySubscription ? "Подписка ChatGPT" : "Ключ API") : "", llm.configured ? "done" : "");
     show("llm-server", locked);
     show("llm-form", !locked);
     show("llm-remove", llm.key.source === "page");
-    if (llm.configured) {
+    if (ui.llmWay !== undefined && ui.llmWay !== llm.way) {
+      // Способ сменился — прежние ошибки обоих способов больше не о том.
+      note("llm-error", "warn", "");
+      note("sub-error", "warn", "");
+    }
+    ui.llmWay = llm.way;
+    renderSubscription(llm.subscription || {}, bySubscription);
+    if (llm.configured && !bySubscription) {
       note("llm-status", llm.problem_text ? "warn" : "ok", llm.problem_text
         ? "Модель «" + llm.model.value + "» настроена, но последнее обращение не удалось. " + llm.problem_text
         : "Сервис обращается к модели «" + llm.model.value + "» по своему ключу." + (llm.last_call_ok === null ? " Обращений после запуска ещё не было." : ""));
@@ -1183,10 +1192,118 @@
     if (!llm.model.editable) text("llm-model-hint", "Задано в настройках сервера.");
   }
 
+  /* Подписка ChatGPT. Вход — «вставкой адреса»: сервер не на компьютере владельца, поэтому адрес
+   * возврата http://127.0.0.1:1455/… в браузере не открывается, и владелец копирует его сюда. */
+  var SUB_PILLS = { connected: ["Подключена", "done"], limit: ["Лимит исчерпан", "todo"], relogin: ["Войти заново", "todo"], denied: ["Нет доступа", "todo"] };
+
+  function renderSubscription(sub, active) {
+    var status = sub.status || "none";
+    var p = active ? SUB_PILLS[status] : null;
+    pill("sub", p ? p[0] : "", p ? p[1] : "");
+    show("sub-locked", !sub.available);
+    text("sub-locked", sub.locked_text || "");
+    if (status !== "none") {
+      var parts = [sub.status_text];
+      if (sub.email) parts.push("Учётная запись ChatGPT: " + sub.email + ".");
+      if (active && sub.model) parts.push("Модель: " + subModelName(sub) + ".");
+      if (sub.problem_text) parts.push(sub.problem_text);
+      note("sub-status", status === "connected" ? "ok" : status === "signed_out" ? "info" : "warn", parts.join(" "));
+    } else note("sub-status", "", "");
+    var pending = !!sub.attempt && sub.available;
+    show("sub-paste", pending);
+    show("sub-actions", sub.available && !pending);
+    if (!pending) ui.subUrl = "";
+    var link = $("sub-open");
+    link.hidden = !ui.subUrl;
+    if (ui.subUrl) link.href = ui.subUrl;
+    text("sub-start", status === "connected" || status === "limit" || status === "denied" ? "Войти заново" : "Войти через ChatGPT");
+    show("sub-new", !!sub.registered);
+    // Адрес лимитов приходит с сервера: в разметке страницы чужих адресов нет.
+    if (sub.usage_url) $("sub-usage").href = sub.usage_url;
+    show("sub-usage", active && !!sub.usage_url);
+    show("sub-remove", active || status === "relogin");
+    var models = sub.models || [];
+    show("sub-model-box", active && models.length > 0);
+    renderIfChanged("sub-model", [models, sub.model], function () {
+      return models.map(function (m) {
+        var option = el("option", { value: m.slug, text: m.display_name || m.slug });
+        if (m.slug === sub.model) option.selected = true;
+        return option;
+      });
+    });
+  }
+
+  function subModelName(sub) {
+    var found = (sub.models || []).filter(function (m) { return m.slug === sub.model; })[0];
+    return found ? found.display_name : sub.model;
+  }
+
+  function startSubscription(button, fresh) {
+    var body = { "new": !!fresh };
+    if (S && S.llm && S.llm.key.source === "page") {
+      if (!confirm("Сейчас своя модель сервиса работает по ключу API.\n\nПодписка ChatGPT его заменит: после входа ключ будет удалён с сервера. Продолжить?")) return;
+      body["switch"] = true;
+    }
+    busy(button, true);
+    note("sub-error", "warn", "");
+    call("POST", "llm/chatgpt/start", body).then(function (r) {
+      busy(button, false);
+      if (!r.ok) { note("sub-error", "warn", r.error); return; }
+      ui.subUrl = r.data.url;
+      try { window.open(r.data.url, "_blank", "noopener,noreferrer"); } catch (e) { /* откроют ссылкой */ }
+      refresh().then(function () { $("sub-address").focus(); });
+    });
+  }
+
+  function wireSubscription() {
+    $("sub-start").addEventListener("click", function () { startSubscription(this, false); });
+    $("sub-new").addEventListener("click", function () {
+      if (!confirm("Войти другой учётной записью ChatGPT?\n\nПосле входа сервис будет пользоваться подпиской новой учётной записи.")) return;
+      startSubscription(this, true);
+    });
+    $("sub-paste").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var input = $("sub-address"), address = input.value.trim();
+      if (!address) { note("sub-error", "warn", "Вставьте адрес из адресной строки вкладки, где вы вошли в ChatGPT."); return; }
+      input.value = "";                 // в адресе одноразовый код входа — на странице его не держим
+      var button = $("sub-finish");
+      busy(button, true);
+      note("sub-error", "warn", "");
+      call("POST", "llm/chatgpt/finish", { address: address }).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { note("sub-error", "warn", r.error); refresh(); return; }
+        ui.subUrl = "";
+        toast(r.data.probe === "ok" ? "Подписка ChatGPT подключена: модель ответила." : "Подписка ChatGPT подключена. " + (r.data.probe_text || ""), r.data.probe !== "ok");
+        refresh();
+        refreshOverview();
+      });
+    });
+    $("sub-cancel").addEventListener("click", function () {
+      ui.subUrl = "";
+      note("sub-error", "warn", "");
+      act(this, "sub-error", "POST", "llm/chatgpt/cancel", {});
+    });
+    $("sub-model").addEventListener("change", function () {
+      var model = this.value;
+      act(null, "sub-error", "PUT", "llm/chatgpt/model", { model: model }, function () { toast("Модель подписки выбрана."); });
+    });
+    $("sub-remove").addEventListener("click", function () {
+      if (!confirm("Выйти из подписки ChatGPT?\n\nСервис перестанет обращаться к модели по подписке; сессия у OpenAI будет отозвана.")) return;
+      act(this, "sub-error", "DELETE", "llm/chatgpt", {}, function (data) {
+        toast(data.revoked ? "Вы вышли из подписки ChatGPT." : "Вы вышли из подписки, но OpenAI не подтвердил отзыв. Отключить доступ можно в настройках ChatGPT.", !data.revoked);
+      });
+    });
+  }
+
   function wireLlm() {
+    wireSubscription();
     $("llm-form").addEventListener("submit", function (event) {
       event.preventDefault();
       var key = $("llm-key"), body = { api_key: key.value.trim(), base_url: $("llm-url").value.trim(), model: $("llm-model").value.trim() };
+      if (S && S.llm && S.llm.way === "subscription") {
+        if (!confirm("Сейчас своя модель сервиса работает по подписке ChatGPT.\n\nКлюч API её заменит: сервис выйдет из подписки. Продолжить?")) return;
+        body["switch"] = true;
+      }
       key.value = "";
       act($("llm-save"), "llm-error", "PUT", "llm", body, function (data) {
         ui.signatures.llm = "";

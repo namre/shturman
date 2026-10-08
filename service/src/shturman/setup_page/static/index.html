@@ -732,9 +732,53 @@
             <h3 id="h-llm">Своя модель сервиса</h3>
             <span class="pill" id="st-llm"></span>
           </div>
-          <p>Раз в сутки сервис разбирает новые сообщения: находит договорённости и обновляет заметки о людях. Для этого нужна языковая модель. Если сервис работает вместе с ассистентом Hermes, разбор делает ассистент своей моделью, и отдельный ключ не обязателен. Здесь можно дать сервису собственный ключ — тогда он обращается к модели сам.</p>
+          <p>Раз в сутки сервис разбирает новые сообщения: находит договорённости и обновляет заметки о людях. Для этого нужна языковая модель. Если сервис работает вместе с ассистентом Hermes, разбор делает ассистент своей моделью, и отдельный доступ не обязателен. Здесь можно дать сервису собственный доступ к модели — тогда он обращается к ней сам. Способов два: подписка ChatGPT или ключ API. Действует один из них.</p>
           <p class="note info" id="llm-server" hidden>Ключ модели задан в настройках сервера. Изменить его можно только там.</p>
           <p class="note" id="llm-status" role="status" hidden></p>
+
+          <!-- подписка ChatGPT -->
+          <div class="step-part" id="sub-block">
+            <div class="card-head">
+              <h4 id="h-sub">Подписка ChatGPT</h4>
+              <span class="pill" id="st-sub"></span>
+            </div>
+            <p class="small">Если у вас есть подписка ChatGPT Plus или Pro, сервис может пользоваться ею вместо ключа API: вы входите в ChatGPT и разрешаете «Штурману» доступ. Лимиты подписки общие с вашей обычной работой в ChatGPT. Если ассистент работает через Hermes, подписку для него подключают в мастере Hermes; здесь — модель самого сервиса.</p>
+            <p class="note info" id="sub-locked" hidden></p>
+            <p class="note" id="sub-status" role="status" hidden></p>
+            <div class="field inline" id="sub-model-box" hidden>
+              <label for="sub-model">Модель</label>
+              <select id="sub-model" aria-describedby="sub-model-hint"></select>
+              <p class="hint" id="sub-model-hint">Список даёт OpenAI для вашей учётной записи.</p>
+            </div>
+            <p class="note warn" id="sub-error" role="alert" hidden></p>
+            <div class="row" id="sub-actions">
+              <button class="btn" id="sub-start" type="button">Войти через ChatGPT</button>
+              <button class="btn ghost small-btn" id="sub-new" type="button" hidden>Войти другой учётной записью</button>
+              <a class="link" id="sub-usage" href="#" target="_blank" rel="noopener noreferrer" hidden>Лимиты</a>
+              <button class="btn ghost danger" id="sub-remove" type="button" hidden>Выйти из подписки</button>
+            </div>
+            <form class="col" id="sub-paste" autocomplete="off" novalidate hidden>
+              <ol class="rules small" id="sub-howto">
+                <li>В новой вкладке откроется ChatGPT. Войдите в свою учётную запись и разрешите доступ.</li>
+                <li>После этого браузер покажет ошибку вроде «Не удаётся получить доступ к сайту» или «127.0.0.1 отклонил подключение». Так и должно быть: сервис работает на сервере, а не на вашем компьютере.</li>
+                <li>Скопируйте <b>весь адрес</b> из адресной строки той вкладки — он начинается с <code>http://127.0.0.1:1455/auth/callback</code> — и вставьте его сюда.</li>
+              </ol>
+              <p class="small"><a id="sub-open" href="#" target="_blank" rel="noopener noreferrer">Вкладка не открылась? Откройте страницу входа отсюда</a></p>
+              <div class="field">
+                <label for="sub-address">Адрес из адресной строки</label>
+                <input id="sub-address" name="address" type="text" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="http://127.0.0.1:1455/auth/callback?code=…" aria-describedby="sub-address-hint">
+                <p class="hint" id="sub-address-hint">В адресе одноразовый код входа: не пересылайте его никому. Попытка действует 10 минут.</p>
+              </div>
+              <div class="row">
+                <button class="btn" id="sub-finish" type="submit">Подключить подписку</button>
+                <button class="btn ghost" id="sub-cancel" type="button">Отмена</button>
+              </div>
+            </form>
+          </div>
+
+          <!-- ключ API -->
+          <div class="step-part" id="key-block">
+          <h4 id="h-key">Ключ API провайдера модели</h4>
           <form id="llm-form" autocomplete="off" novalidate hidden>
             <div class="field">
               <label for="llm-key">Ключ API</label>
@@ -763,8 +807,10 @@
               <li>Адрес — только <b>https://</b> и только в интернете. Адреса самого сервера и домашней сети страница не принимает.</li>
               <li>Если меняете адрес, ключ нужно вставить заново: сохранённый ключ на новый адрес не отправляется.</li>
               <li>Локальную модель (например, Ollama) со страницы подключить нельзя. Её адрес задаёт тот, кто сопровождает сервер, — в настройках сервера (<code>SHTURMAN_LLM_BASE_URL</code>); здесь такой адрес не меняется.</li>
+              <li>Ключ API и подписка ChatGPT друг друга заменяют: сохранение ключа выключает подписку.</li>
             </ul>
           </form>
+          </div>
         </section>
 
         <!-- --------------------------------------------------- подробные счётчики -->

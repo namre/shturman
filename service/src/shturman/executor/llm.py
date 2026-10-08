@@ -42,14 +42,22 @@ max_completion_tokens») и дословный текст ошибки в github
 момент запроса. Адрес из окружения (`SHTURMAN_LLM_BASE_URL`) задаёт оператор, фильтра для него нет.
 
 Тексты запросов и ответов в журнал и в ошибки не попадают: только код ответа и вид ошибки.
+
+Вложения (`Attachment`: картинка или файл) прикладываются к последнему сообщению владельца:
+картинка — частью `image_url` с адресом `data:`, файл — частью `file` (`filename`, `file_data`).
+Какие файлы примет модель, решает провайдер; Chat Completions OpenAI принимает так только PDF.
+Тот же вид вызова (`chat`, `ready`, `model_for`, счётчики) у клиента подписки ChatGPT
+(`subscription.py`): исполнитель заданий работает с любым из двух.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 from urllib.parse import urlsplit
 
@@ -76,11 +84,58 @@ _CONNECT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 class LlmError(Exception):
     """Обращение к модели не удалось. `code` — короткий код без текста запроса и ответа;
-    `final` — повторять бессмысленно (неверный ключ, неизвестная модель, неверный запрос)."""
+    `final` — повторять бессмысленно (неверный ключ, неизвестная модель, неверный запрос);
+    `pause` — секунд, через которые задание стоит повторить, не расходуя его попыток (исчерпан
+    лимит подписки, нужно войти заново): дело не в задании, а в доступе к модели."""
 
-    def __init__(self, code: str, *, final: bool = False) -> None:
+    def __init__(self, code: str, *, final: bool = False, pause: int | None = None) -> None:
         super().__init__(code)
-        self.code, self.final = code, final
+        self.code, self.final, self.pause = code, final, pause
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """Вложение к сообщению владельца для модели: картинка или файл, целиком в памяти."""
+    kind: str      # "image" | "file"
+    mime: str
+    name: str
+    data: bytes
+
+    def __repr__(self) -> str:      # содержимое и имя файла в журнал не попадают
+        return f"<Attachment {self.kind} {self.mime} {len(self.data)} байт>"
+
+    def data_url(self) -> str:
+        return f"data:{self.mime};base64,{base64.b64encode(self.data).decode('ascii')}"
+
+
+def check_attachments(attachments: list[Attachment] | None) -> list[Attachment]:
+    out = list(attachments or [])
+    for item in out:
+        if not isinstance(item, Attachment) or item.kind not in ("image", "file") or not item.mime:
+            raise LlmError("bad_attachment", final=True)
+    return out
+
+
+def with_attachments(messages: list[dict[str, Any]], attachments: list[Attachment]) -> list[dict[str, Any]]:
+    """Сообщения для Chat Completions с вложениями у последнего сообщения владельца."""
+    if not attachments:
+        return messages
+    out = [dict(m) for m in messages]
+    index = next((i for i in range(len(out) - 1, -1, -1) if out[i].get("role") == "user"), None)
+    if index is None:
+        out.append({"role": "user", "content": ""})
+        index = len(out) - 1
+    parts: list[dict[str, Any]] = []
+    text = out[index].get("content")
+    if isinstance(text, str) and text:
+        parts.append({"type": "text", "text": text})
+    for item in attachments:
+        if item.kind == "image":
+            parts.append({"type": "image_url", "image_url": {"url": item.data_url()}})
+        else:
+            parts.append({"type": "file", "file": {"filename": item.name or "file", "file_data": item.data_url()}})
+    out[index]["content"] = parts
+    return out
 
 
 def structured_messages(instructions: str, text: str, schema: dict[str, Any] | None,
@@ -215,13 +270,22 @@ class LlmClient:
     def _token_param(self, model: str) -> str:
         return self._fixed_param or self._param.get(model) or self._first_param
 
+    def ready(self) -> bool:
+        """Можно ли сейчас брать задания. У доступа по ключу пауз нет."""
+        return True
+
     async def chat(self, messages: list[dict[str, str]], *, task: Any = None, max_tokens: int,
-                   json_mode: bool = False) -> tuple[str, str]:
-        """Один ответ модели: (текст, имя модели). Бросает `LlmError`."""
+                   json_mode: bool = False, schema: dict[str, Any] | None = None, schema_name: str | None = None,
+                   attachments: list[Attachment] | None = None) -> tuple[str, str]:
+        """Один ответ модели: (текст, имя модели). Бросает `LlmError`.
+
+        schema и schema_name здесь не используются: схема уже в тексте запроса
+        (`structured_messages`), а строгий режим схем есть не у всех провайдеров."""
         async with self._slots:
             self.calls += 1
             try:
-                out = await self._chat(messages, self.model_for(task), max_tokens, json_mode)
+                files = check_attachments(attachments)
+                out = await self._chat(with_attachments(messages, files), self.model_for(task), max_tokens, json_mode)
             except LlmError as exc:
                 self.failures += 1
                 self.last_ok, self.last_error = False, exc.code
@@ -229,7 +293,7 @@ class LlmClient:
             self.last_ok, self.last_error = True, None
             return out
 
-    async def _chat(self, messages: list[dict[str, str]], model: str, max_tokens: int,
+    async def _chat(self, messages: list[dict[str, Any]], model: str, max_tokens: int,
                     json_mode: bool) -> tuple[str, str]:
         if self._client is None:
             raise LlmError(self.broken or "not_configured", final=False)

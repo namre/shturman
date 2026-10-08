@@ -180,6 +180,10 @@ SETUP_PAGE = [
     "/shturman-setup/api/tg/login", "/api/../shturman-setup/", "/api/status/../../shturman-setup/",
     "/api/%2e%2e/shturman-setup/", "//shturman-setup/", "/api/shturman-setup/", "/api/setup",
     "/api/setup/link", "/api/setup-link", "/api/setup/logout-all", "/mcp", "/health",
+    # подписка ChatGPT как своя модель сервиса: вход вставкой адреса — только на странице настройки
+    "/shturman-setup/api/llm/chatgpt/start", "/shturman-setup/api/llm/chatgpt/finish",
+    "/shturman-setup/api/llm/chatgpt/cancel", "/shturman-setup/api/llm/chatgpt/model", "/shturman-setup/api/llm/chatgpt",
+    "/api/llm/chatgpt/start", "/api/llm/chatgpt/finish", "/api/llm/chatgpt",
 ]
 
 
