@@ -31,7 +31,7 @@
   GET    /shturman-setup/api/tg/accounts/{id}/dialogs   ?offset&limit&q&kind&only&refresh
   POST   /shturman-setup/api/tg/accounts/{id}/sync      {enabled, chats? | kind?}
   POST   /shturman-setup/api/tg/accounts/{id}/exclude   {peer_class, tg_id, excluded, purge?}
-  POST   /shturman-setup/api/imports                    файл result.json телом запроса
+  POST   /shturman-setup/api/imports                    result.json или архив zip телом запроса
   GET    /shturman-setup/api/imports
   GET    /shturman-setup/api/imports/{import_id}
   GET    /shturman-setup/api/imports/{import_id}/scan

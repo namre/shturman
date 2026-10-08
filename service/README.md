@@ -71,6 +71,7 @@ async def lifespan(state: AppState): ...      # запуск и остановк
 | Файл или каталог | Что в нём |
 |---|---|
 | `telegram_export.py`, `importer.py` | разбор экспорта Telegram Desktop и потоковый импорт |
+| `export_archive.py`, `media/from_export.py`, `media/files.py` | выгрузка архивом zip: result.json из архива, файлы голосовых, фото и документов на разбор, их уборка |
 | `botapi_normalize.py` | сообщение Bot API → запись архива |
 | `ingest_api.py` | приём бизнес-сообщений — от плагина и от своего бота одними функциями, — список чатов и исключения, загрузка и импорт экспорта |
 | `executor/` | свой исполнитель сервиса: клиент Bot API, опрос бота согласований, привязка владельца по одноразовой ссылке, клиент модели по ключу (`llm.py`) и по подписке ChatGPT (`siwc.py` — вход и токены, `subscription.py` — Responses API), выполнение заданий, команды `bot-bind` и `bot-status` |

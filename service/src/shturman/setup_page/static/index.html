@@ -669,15 +669,16 @@
             <span class="optional-tag">необязательно</span>
           </span>
         </summary>
-        <p><span class="only-own">Если нужна переписка глубже, чем загружает вход в аккаунт, — выгрузите её из Telegram на компьютере и загрузите сюда одним файлом.</span><span class="only-staff">Бизнес-режим видит только новые сообщения. Прошлую переписку личных чатов можно выгрузить из Telegram на компьютере и загрузить сюда одним файлом.</span> Шаг можно сделать в любое время или пропустить.</p>
+        <p><span class="only-own">Если нужна переписка глубже, чем загружает вход в аккаунт, — выгрузите её из Telegram на компьютере и загрузите сюда.</span><span class="only-staff">Бизнес-режим видит только новые сообщения. Прошлую переписку личных чатов можно выгрузить из Telegram на компьютере и загрузить сюда.</span> Шаг можно сделать в любое время или пропустить.</p>
 
         <div class="split">
           <div class="col">
             <form id="import-form" novalidate>
               <div class="field">
-                <label for="import-file">Файл result.json из папки выгрузки</label>
-                <input id="import-file" type="file" accept=".json,application/json" aria-describedby="import-hint">
-                <p class="hint" id="import-hint">Нужен только этот файл. Остальное в папке выгрузки — фото, видео, документы — загружать не надо: сервис хранит текст переписки, а не вложения. Файл может быть большим — сотни мегабайт; не закрывайте страницу, пока он загружается. После импорта удалите папку выгрузки с компьютера или уберите в надёжное место: в ней вся переписка открытым текстом.</p>
+                <label for="import-file">Архив папки выгрузки (zip) или файл result.json</label>
+                <input id="import-file" type="file" accept=".json,.zip" aria-describedby="import-hint import-howto">
+                <p class="hint" id="import-hint">Лучше загрузить архив всей папки выгрузки (zip) — тогда голосовые, фото и документы из неё тоже разберутся. Можно и один result.json — тогда только текст. Предел размера — <span id="import-limit">2 ГБ</span>. Файл может быть большим; не закрывайте страницу, пока он загружается. После импорта удалите папку выгрузки с компьютера или уберите в надёжное место: в ней вся переписка открытым текстом.</p>
+                <p class="hint" id="import-howto">Как сжать папку в zip. Windows: правой кнопкой по папке → «Отправить» → «Сжатая ZIP-папка». macOS: правой кнопкой по папке → «Сжать». Загрузите получившийся файл .zip.</p>
               </div>
               <p class="note warn" id="import-error" role="alert" hidden></p>
               <div class="row"><button class="btn" id="import-upload" type="submit">Загрузить файл</button></div>
@@ -696,7 +697,7 @@
                 <div class="row-item marked"><span class="mark" aria-hidden="true">1</span><span>Продвинутые настройки</span><span class="arrow" aria-hidden="true">›</span></div>
                 <div class="row-item marked"><span class="mark" aria-hidden="true">2</span><span>Экспорт данных из Telegram</span><span class="arrow" aria-hidden="true">›</span></div>
                 <div class="tick marked"><span class="mark" aria-hidden="true">3</span><span class="box-on" aria-hidden="true">✓</span> Личные чаты</div>
-                <div class="tick"><span class="box-off" aria-hidden="true"></span> Фотографии, видео, файлы</div>
+                <div class="tick"><span class="box-off" aria-hidden="true"></span> Голосовые, фото, файлы — по желанию</div>
                 <div class="tick marked"><span class="mark" aria-hidden="true">4</span><span class="radio-on" aria-hidden="true"></span> Машиночитаемый JSON</div>
                 <div class="key marked"><span class="mark" aria-hidden="true">5</span>ЭКСПОРТИРОВАТЬ</div>
               </div>
@@ -704,9 +705,9 @@
                 <ol>
                   <li>В Telegram на компьютере откройте «Настройки» → «Продвинутые настройки».</li>
                   <li>Внизу выберите «Экспорт данных из Telegram».</li>
-                  <li>Отметьте, что выгружать: личные чаты, при желании группы и каналы. Фотографии, видео и файлы не отмечайте: вложения сервис не хранит, а выгрузка без них в разы меньше.</li>
+                  <li>Отметьте, что выгружать: личные чаты, при желании группы и каналы. Чтобы разобрались голосовые, фото и документы, отметьте ещё «Голосовые сообщения», «Видеосообщения», «Фотографии» и «Файлы» (видео и стикеры не нужны) и ограничьте размер файла, например 20 МБ. Вся выгрузка должна уложиться в предел размера слева. Сами файлы сервис не хранит: разобрав, удаляет.</li>
                   <li>Формат — «Машиночитаемый JSON».</li>
-                  <li>Нажмите «Экспортировать». Когда выгрузка закончится, в её папке будет файл result.json — его и загрузите слева.</li>
+                  <li>Нажмите «Экспортировать». Когда выгрузка закончится, сожмите её папку в zip и загрузите архив слева. Без голосовых, фото и документов достаточно одного файла result.json из этой папки.</li>
                 </ol>
                 <div class="shot-foot">Схема. Подписи на вашем экране могут немного отличаться. При первом экспорте Telegram может попросить подождать сутки — это его защита.</div>
               </figcaption>

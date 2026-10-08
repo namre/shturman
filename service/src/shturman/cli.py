@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
+from pathlib import Path
 
 from . import db
 from .importer import import_export, scan
@@ -42,8 +44,46 @@ async def _migrate() -> None:
     print("применено: " + (", ".join(applied) if applied else "ничего, схема актуальна"))
 
 
+@contextlib.contextmanager
+def _open_export(path: str):
+    """result.json или архив zip папки выгрузки (вид — по первым байтам). Отдаёт (архив или None, поток)."""
+    from .export_archive import ArchiveError, ExportArchive, file_is_zip
+
+    if not file_is_zip(Path(path)):
+        with open(path, "rb") as fp:
+            yield None, fp
+        return
+    try:
+        archive = ExportArchive(Path(path))
+    except ArchiveError as exc:
+        sys.exit(str(exc))
+    with archive, archive.open_result() as fp:
+        yield archive, fp
+
+
+async def _attachments(conn, archive):
+    """Файлы вложений из архива — на разбор, если расшифровка или разбор включены. Команда
+    работает в контейнере сервиса с тем же каталогом данных; без него файлы не берутся."""
+    from .config import Config, ConfigError
+    from .media.from_export import Attachments, rules
+
+    try:
+        config = Config.from_env()
+    except ConfigError as exc:
+        print(f"файлы вложений из архива не берутся: {exc}", file=sys.stderr)
+        return None
+    found = await rules(conn, config)
+    if not found.any:
+        return None
+    if not os.access(config.data_dir, os.W_OK):
+        print(f"файлы вложений из архива не берутся: каталог данных {config.data_dir} недоступен для записи",
+              file=sys.stderr)
+        return None
+    return Attachments(archive, config.data_dir, found)
+
+
 def _scan(path: str) -> None:
-    with open(path, "rb") as fp:
+    with _open_export(path) as (_, fp):
         owner, chats = scan(fp)
     if owner:
         print(f"владелец: {owner.name or '—'} ({owner.tg_user_id})")
@@ -58,10 +98,12 @@ async def _import(path: str, owner_id: int | None, exclude: set[tuple[str, int]]
     conn = await db.connect(_dsn())
     try:
         await db.migrate(conn)
-        with open(path, "rb") as fp:
+        with _open_export(path) as (archive, fp):
+            attachments = await _attachments(conn, archive) if archive is not None else None
             stats = await import_export(
                 conn, fp, owner_tg_user_id=owner_id, exclude=exclude,
-                source_name=os.path.basename(path),
+                source_name="export.zip" if archive is not None else os.path.basename(path),
+                attachments=attachments,
             )
     finally:
         await conn.close()
@@ -334,9 +376,9 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="shturman", description="Сервис переписки «Штурмана»")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("migrate", help="привести схему базы к текущей версии")
-    s = sub.add_parser("scan", help="показать чаты экспорта, ничего не записывая")
+    s = sub.add_parser("scan", help="показать чаты экспорта (result.json или архив zip), ничего не записывая")
     s.add_argument("path")
-    i = sub.add_parser("import", help="импортировать экспорт Telegram Desktop (result.json)")
+    i = sub.add_parser("import", help="импортировать экспорт Telegram Desktop (result.json или архив zip папки)")
     i.add_argument("path")
     i.add_argument("--owner-id", type=int, help="идентификатор владельца — нужен для экспорта одного чата")
     i.add_argument("--exclude", action="append", default=[], metavar="КЛАСС:ID",
