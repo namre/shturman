@@ -1,6 +1,6 @@
 # Сторонние компоненты
 
-Три вида стороннего в продукте: компоненты, которые скачиваются при развёртывании; библиотеки, от которых зависит сервис переписки; фрагменты чужого кода, переработанные и включённые в этот репозиторий. Лицензии указаны по состоянию на 2026-10-06, для добавленного в версии 0.0.4 (модель защиты, `socksio`) — на 2026-10-07, для распознавания речи — на 2026-10-08, и подлежат сверке при каждом обновлении версии.
+Три вида стороннего в продукте: компоненты, которые скачиваются при развёртывании; библиотеки, от которых зависит сервис переписки; фрагменты чужого кода, переработанные и включённые в этот репозиторий. Лицензии указаны по состоянию на 2026-10-06, для добавленного в версии 0.0.4 (модель защиты, `socksio`) — на 2026-10-07, для распознавания речи и разбора фото и документов — на 2026-10-08, и подлежат сверке при каждом обновлении версии.
 
 Правило: компоненты под AGPL, LGPL и BSL в поставку не включаются без отдельной записи в `docs/decisions.md`; код под GPL в репозиторий не переносится (решение Р-18).
 
@@ -58,8 +58,17 @@ git вызывается как отдельная программа и с ко
 | tzdata | Часовые пояса | Apache-2.0 | https://pypi.org/project/tzdata/ |
 | PyJWT | Проверка подписи ID token при входе через ChatGPT (подписка как своя модель сервиса); раньше приходила только с `mcp` | MIT | https://pypi.org/project/PyJWT/ |
 | cryptography | Ключи RSA для той же проверки; раньше приходила только с PyJWT | Apache-2.0 OR BSD-3-Clause | https://pypi.org/project/cryptography/ |
+| pypdfium2 | Текст страниц PDF и картинки страниц скана (`media/extract.py`); в колесо входит собранная библиотека PDFium, см. ниже | BSD-3-Clause, Apache-2.0 (по выбору); у вложенных библиотек — свои, см. ниже | https://github.com/pypdfium2-team/pypdfium2 |
+| Pillow | Фото и страницы сканов в JPEG для модели (`media/extract.py`); в колесо входят собранные библиотеки картинок, см. ниже | MIT-CMU | https://github.com/python-pillow/Pillow |
+| openpyxl | Значения ячеек таблиц XLSX (`media/extract.py`) | MIT | https://foss.heptapod.net/openpyxl/openpyxl |
+| et-xmlfile | Нужна openpyxl (приходит с ним) | MIT | https://foss.heptapod.net/openpyxl/et_xmlfile |
 
 Лицензии транзитивных зависимостей из `service/requirements.lock` по одной не сверялись.
+
+Колёса pypdfium2 и Pillow несут собранные библиотеки на C; ставятся они вместе с колесом по контрольной сумме из `service/requirements.lock`, в репозитории их нет. Состав сверен по колёсам для `manylinux` x86_64 (pypdfium2 5.14.0, PDFium 156.0.8076.0; Pillow 12.3.0 для Python 3.12) 2026-10-08:
+
+- pypdfium2: PDFium (BSD-3-Clause), сборка pdfium-binaries (MIT), а внутри PDFium — abseil (Apache-2.0), Anti-Grain Geometry 2.3 (разрешительная лицензия автора), fast_float (MIT), FreeType (FreeType License), ICU (Unicode License v3), Little CMS (MIT), libjpeg-turbo (IJG и BSD-3-Clause), OpenJPEG (BSD-2-Clause), libpng (PNG Reference Library License v2), LLVM libc (Apache-2.0 with LLVM Exception), simdutf (MIT), zlib (zlib License). Тексты лицензий лежат в колесе, в `pypdfium2-*.dist-info/licenses/`. Документация pypdfium2 частично под CC-BY-4.0; в образ сервиса она не входит.
+- Pillow: libjpeg-turbo, libpng, libtiff, libwebp, libavif (с dav1d и aom), FreeType, HarfBuzz, raqm, Little CMS, OpenJPEG, Brotli, bzip2, zstd, libyuv, liblzma из XZ Utils, libxcb и libXau — под разрешительными лицензиями (BSD, MIT, zlib, IJG, FreeType License, общественное достояние у liblzma). FreeType выбрана под FreeType License, а не под GPL-2.0. Тексты — в `pillow-*.dist-info/licenses/LICENSE`. Библиотеку FriBiDi (LGPL) Pillow в колесо не включает и сервис её не ставит.
 
 ## Библиотеки контейнера распознавания речи
 
