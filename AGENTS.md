@@ -110,8 +110,8 @@
 | `config/Caddyfile.example` | Образец настройки обратного прокси: блок дашборда и отдельный блок страницы настройки переписки |
 | `config/caddy-admin-socket.conf` | Дополнение к службе Caddy: admin API прокси только на Unix-сокете в закрытом каталоге (контейнер Hermes в сети хоста достаёт до `localhost:2019`) |
 | `docs/decisions.md` | Принятые решения и причины |
-| `docs/runbooks/` | Процедуры: развёртывание с Hermes (`deploy.md`) и без него (`deploy-standalone.md`) |
-| `prompts/` | Стартовые промпты для агента; для режима без Hermes — `deploy-standalone.md` |
+| `docs/runbooks/` | Процедуры: подготовка пустого сервера агентом владельца (`server-prepare.md`), развёртывание с Hermes (`deploy.md`) и без него (`deploy-standalone.md`) |
+| `prompts/` | Стартовые промпты для агента: основной — `deploy-remote.md` (агент на компьютере владельца, сам готовит сервер и работает по SSH); `deploy.md` и `deploy-standalone.md` — агент на самом сервере; `guided-chat.md` — чат без терминала |
 | `ops/` | Скрипты, которыми работает оператор |
 | `ops/lib.sh`, `ops/mode.sh` | Общие функции скриптов; режим установки и профили Compose |
 | `ops/import-export.sh`, `ops/embeddings.sh` | Импорт экспорта Telegram Desktop; поиск по смыслу и выбор его модели |
