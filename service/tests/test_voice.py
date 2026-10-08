@@ -50,9 +50,12 @@ class Asr:
         self.calls = []
         self.reply = {"text": "пришлю смету по фасадам к пятнице", "seconds": 41.6}
         self.status = 200
+        self.down = False      # контейнер не отвечает совсем, и на /health тоже
 
     def transport(self):
         def handle(request: httpx.Request) -> httpx.Response:
+            if self.down:
+                raise httpx.ConnectError("нет связи")
             if request.url.path == "/health":
                 return httpx.Response(200, json={"model": "ai-sage/GigaAM-Multilingual@ctc"})
             self.calls.append(request.content)
@@ -263,3 +266,28 @@ async def test_status_route_reports_counts_without_text(make_client, conn):
 async def test_voice_text_format(conn, duration, caption, expected):
     assert await conn.fetchval("SELECT voice_text($1, 'текст', 'voice_message', $2)", caption, duration) == expected
     assert await conn.fetchval("SELECT voice_text('', '  ', 'video_message', 3)") == "[кружок, 0:03] (без слов)"
+
+
+async def test_container_coming_up_after_service_clears_the_problem(conn, rig):
+    # Сервис запустился раньше, чем контейнер загрузил модель: проверка при запуске не прошла.
+    t, asr, tg, bot = rig
+    _, chat_id = await add_chat(conn)
+    await add(conn, chat_id, rec(1))
+    tg.files = {1: b"x"}
+    t.problem, asr.down = "unreachable", True
+
+    assert await t.step() == 0                       # файлы не скачиваются, пока контейнер молчит
+    assert tg.calls == [] and t.problem == "unreachable"
+    assert (await row(conn, 1))["transcript_state"] == "pending"
+
+    asr.down = False                                 # модель загрузилась
+    assert await t.step() == 1
+    assert t.problem is None and t.asr.model == "ai-sage/GigaAM-Multilingual@ctc"
+    assert (await row(conn, 1))["transcript_state"] == "done"
+
+
+async def test_problem_clears_even_with_empty_queue(conn, rig):
+    t, asr, tg, bot = rig
+    t.problem = "unreachable"
+    assert await t.step() == 0
+    assert t.problem is None
