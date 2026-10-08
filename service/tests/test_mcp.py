@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import asyncpg
 import pytest
 
-from shturman import mcp_server, retrieval, store
+from shturman import control_peers, mcp_server, retrieval, store
 from shturman.records import ChatRecord
 
 from conftest import API_AUTH, MCP_AUTH
@@ -574,11 +574,17 @@ async def test_deleted_message_never_reaches_the_agent(service):
     assert "reply_to" not in replying and "reply_to_message_id" not in replying["messages"][0]
 
 
-@pytest.mark.parametrize("tg_id,username", [(777000, None), (93372553, "BotFather"), (178220800, "SpamBot")])
+@pytest.mark.parametrize("tg_id,username", [
+    (777000, None), (93372553, "BotFather"), (178220800, "SpamBot"),
+    (7000000001, "renamed_control_bot"),
+])
 async def test_service_peers_never_reach_the_agent(make_client, conn, tg_id, username):
-    s = await seed(conn)
-    chat_id, ids = await blocked_chat(conn, s, tg_id, username)
     client, _ = await make_client(*MODULES)
+    s = await seed(conn)
+    if tg_id not in store.BLOCKED_USER_IDS:
+        await control_peers.register(conn, tg_id)
+    chat_id, ids = await blocked_chat(conn, s, tg_id, username)
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE text LIKE 'Login code%'") == 2
     text = await everything(client, s)
     assert "Login code" not in text and "54321" not in text and "Telegram" not in text
     for message_id in ids.values():

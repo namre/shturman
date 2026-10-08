@@ -8,7 +8,7 @@
     функциями, что и при приёме от плагина (`ingest_api.accept_business_*`), с пометкой `via="service"`.
 
 Чего бот не делает: не отвечает посторонним (совсем — чтобы не выдавать, что он существует),
-не принимает команд, не читает ничего, кроме перечисленного.
+принимает только детерминированные команды текущего владельца в его личном чате.
 
 Порядок работы с обновлениями: обновление разобрано — его номер записан в базу
 (`executor_state.offset`), и следующий запрос к Telegram его подтверждает. После перезапуска
@@ -30,11 +30,12 @@ from typing import Any, Callable
 
 import asyncpg
 
-from .. import bridge, ingest_api
+from .. import authority, bridge, control_peers, ingest_api
 from ..api_core import BadRequest
 from ..app import AppState
 from ..sanitize import clean_line
-from . import binding
+from ..outbox.text import split_text
+from . import binding, owner_chat
 from .botapi import BotApi, BotApiError, NeverLeft, OutcomeUnknown, Refused
 
 logger = logging.getLogger("shturman.executor.bot")
@@ -45,9 +46,8 @@ REFUSED_TTL = 600.0               # секунд не переспрашиват
 UPDATE_RETRIES = 5                # столько раз обновление разбирается заново при временном сбое Telegram
 
 TEXT_BOUND = ("Готово: вы привязаны как владелец.\n\n"
-              "Сюда будут приходить карточки с кнопками — на согласование. Писать сюда ничего не нужно.")
-TEXT_HINT = ("Это бот согласований Штурмана: сюда приходят карточки с кнопками. "
-             "Писать сюда не нужно: на сообщения этот бот не отвечает.")
+              "Управляйте настройками и заданиями здесь: /menu. Решения по источникам приходят карточками с кнопками.")
+TEXT_HINT = "Управление Штурманом: /menu — настройки, задания ответов и источники. /help — команды."
 TEXT_REFUSED = "Кнопка недоступна."
 TEXT_FAILED = "Не получилось. Попробуйте ещё раз."
 
@@ -111,6 +111,7 @@ class Bot:
         if bot_id is None or not isinstance(username, str) or not username:
             raise OutcomeUnknown("bad_get_me")
         async with self.state.pool.acquire() as conn, conn.transaction():
+            await control_peers.register(conn, bot_id, reason="service_bot")
             await binding.put_state(conn, "bot", {"id": bot_id, "username": username})
             saved = await binding.get_state(conn, "offset")
         # Номера обновлений у каждого бота свои: место опроса другого бота не годится.
@@ -241,13 +242,21 @@ class Bot:
         if not private:
             return
         owner = await self._owner()
-        if owner is None or owner["user_id"] != user_id:
+        if owner is None or owner["user_id"] != user_id or owner["chat_id"] != chat_id:
             return                    # посторонним бот не отвечает вовсе
+        if text.startswith("/"):
+            async with self.state.pool.acquire() as conn:
+                result = await owner_chat.handle_message(conn, self.state, text, bot_id=self.bot_id,
+                                                         user_id=user_id, chat_id=chat_id)
+            if result is not None:
+                await self._say(chat_id, result.get("text", "Готово."), buttons=result.get("buttons"))
+                self.wake()
+            return
         now = self._clock()
         if self._hint_at is not None and now - self._hint_at < HINT_EVERY:
             return
         self._hint_at = now
-        await self._say(chat_id, TEXT_HINT)
+        await self._say(chat_id, TEXT_HINT, buttons=owner_chat.menu_buttons())
 
     async def _bind(self, code: str, *, user_id: int, chat_id: int, private: bool,
                     name: str | None = None) -> None:
@@ -278,12 +287,14 @@ class Bot:
         self.counters["binds"] += 1
         self._hint_at = None
         logger.info("бот согласований: владелец привязан")
-        await self._say(chat_id, TEXT_BOUND)
+        await self._say(chat_id, TEXT_BOUND, buttons=owner_chat.menu_buttons())
         self.wake()                   # карточки, ждавшие владельца, можно отправлять
 
-    async def _say(self, chat_id: int, text: str) -> None:
+    async def _say(self, chat_id: int, text: str, *, buttons: Any = None) -> None:
         try:
-            await self.api.send_message(chat_id, text, no_preview=True)
+            for index, part in enumerate(split_text(text)):
+                await self.api.send_message(chat_id, part, no_preview=True,
+                                            buttons=buttons if index == 0 else None)
         except BotApiError as exc:
             logger.warning("бот согласований: сообщение владельцу не отправлено (%s)", exc)
 
@@ -317,7 +328,11 @@ class Bot:
             return
         try:
             async with self.state.pool.acquire() as conn:
-                out = await bridge.dispatch_callback(conn, data, presser)
+                with authority.owner_context(presser, chat_id=chat_id, action="telegram.callback"):
+                    if data.startswith(bridge.CALLBACK_PREFIX + owner_chat.MODULE + ":"):
+                        out = await owner_chat.on_menu(conn, self.state, data.split(":", 2)[2], presser)
+                    else:
+                        out = await bridge.dispatch_callback(conn, data, presser)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — кнопки остаются, владелец может нажать ещё раз

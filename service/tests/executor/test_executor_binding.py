@@ -123,12 +123,12 @@ async def test_owner_set_before_the_bot_existed_is_not_trusted_until_he_binds(ri
 async def test_owner_free_text_gets_one_short_hint_per_hour(rig):
     await bind(rig)
     before = len(rig.tg.sent())
-    for text in ("привет", "что ты умеешь?", "/start", "/help"):
+    for text in ("привет", "что ты умеешь?", "ещё сообщение"):
         rig.tg.text(text)
     rig.tg.text("а мне ответишь?", user=STRANGER_USER)
     await rig.bot.poll_once()
     hints = rig.tg.sent()[before:]
-    assert len(hints) == 1 and hints[0]["text"].startswith("Это бот согласований Штурмана")
+    assert len(hints) == 1 and hints[0]["text"].startswith("Управление Штурманом")
     assert hints[0]["chat_id"] == OWNER
     # подсказка верна и без Hermes: к «ассистенту в другом чате» она не отсылает
     assert "ассистент" not in hints[0]["text"] and "Hermes" not in hints[0]["text"]
@@ -152,3 +152,4 @@ async def test_bot_bind_command_prints_a_working_link(rig, monkeypatch, capsys):
 
     await commands.bot_bind(DSN)                # повторная команда предупреждает о смене владельца
     assert "Владелец уже привязан" in capsys.readouterr().out
+

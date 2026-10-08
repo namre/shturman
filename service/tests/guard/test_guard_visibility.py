@@ -17,7 +17,7 @@ for sub in ("processing", "outbox"):       # заготовки соседних
     if str(ROOT / sub) not in sys.path:
         sys.path.insert(0, str(ROOT / sub))
 
-from shturman import archive, bridge, retrieval  # noqa: E402
+from shturman import authority, archive, bridge, retrieval  # noqa: E402
 from shturman import search as fts  # noqa: E402
 from shturman.processing import commitments, pages_build  # noqa: E402
 
@@ -26,7 +26,7 @@ from outbox_helpers import (  # noqa: E402, F401 — env это фикстура
 )
 from pages_helpers import NOW, build_with, ivan_owes_estimate, path_of, statement  # noqa: E402
 from pages_helpers import seed as pages_seed  # noqa: E402
-from proc_helpers import answer, claim, say  # noqa: E402
+from proc_helpers import OWNER, answer, claim, say  # noqa: E402
 from test_archive import seed  # noqa: E402
 from test_embeddings import add as add_plain  # noqa: E402
 from test_embeddings import add_chat as plain_chat  # noqa: E402
@@ -187,7 +187,8 @@ async def test_commitment_derived_from_a_hidden_message_disappears_and_comes_bac
     ids = await say(conn, ivan_chat, [SMETA, DOGOVOR])
     await extract_once(conn, [SMETA_ITEM])
     commitment_id = await conn.fetchval("SELECT id FROM commitments")
-    assert (await commitments.accept(conn, commitment_id))["ok"]
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        assert (await commitments.accept(conn, commitment_id))["ok"]
     today = date(2026, 10, 6)
     assert [c["id"] for c in await commitments.list_commitments(conn, view="open", today=today)] == [commitment_id]
 
@@ -250,7 +251,8 @@ async def test_autoreply_ignores_a_hidden_message_and_keeps_it_out_of_the_prompt
 
     # обычное входящее: модель спрашивают, но скрытого сообщения нет ни в ленте, ни в найденном
     await incoming(env, chat, 10, "Когда пришлёте договор на внешний адрес?")
-    asked, = await take(env.conn, bridge.LLM_TEXT, complete={"text": "Завтра.", "model": "test"})
+    asked, = await take(env.conn, bridge.LLM_STRUCTURED,
+                         complete={"parsed": {"outcome": "reply", "text": "Завтра.", "source_keys": []}})
     prompt = str(asked["payload"])
     assert "Добрый день" in prompt and SECRET not in prompt and "не говори владельцу" not in prompt
 
@@ -258,6 +260,7 @@ async def test_autoreply_ignores_a_hidden_message_and_keeps_it_out_of_the_prompt
     hidden = await add_message(env.conn, chat, 11, "И ещё: " + SECRET)
     await hide(env.conn, hidden)
     await live(env, chat, hidden, account_id=env.helper_acc)
+    assert await take(env.conn, bridge.LLM_STRUCTURED) == []
     assert await take(env.conn, bridge.LLM_TEXT) == []
 
 
@@ -268,7 +271,11 @@ async def test_reply_prepared_for_a_message_that_got_hidden_is_not_sent(env):
     chat = await add_chat(env.conn, env.helper_acc)
     message_id = await incoming(env, chat, 10, "Когда будет смета?")
     await hide(env.conn, message_id)                     # проверка успела раньше ответа модели
-    await take(env.conn, bridge.LLM_TEXT, complete={"text": "В пятницу.", "model": "test"})
+    asked, = await take(env.conn, bridge.LLM_STRUCTURED,
+                         complete={"parsed": {"outcome": "reply", "text": "В пятницу.", "source_keys": []}})
+    assert asked['kind'] == bridge.LLM_STRUCTURED
+    assert await env.conn.fetchval(
+        'SELECT status FROM reply_tasks WHERE trigger_message_id=$1', message_id) == 'cancelled'
     await settle(env)
     assert env.tg.sent == []
 

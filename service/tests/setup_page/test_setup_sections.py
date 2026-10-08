@@ -60,7 +60,7 @@ async def test_bot_token_is_checked_confirmed_and_applied_without_restart(stand,
     await s.page.login(conn)
     assert bridge.owns_bot() is False and (await s.page.get("/state")).json()["bot"]["configured"] is False
     # до своего бота плагин может сообщить владельца по внутреннему API
-    assert (await s.api.put("/api/owner", json={"user_id": STRANGER_USER["id"], "chat_id": 1})).status_code == 200
+    assert (await s.api.put("/api/owner", json={"user_id": STRANGER_USER["id"], "chat_id": STRANGER_USER["id"]})).status_code == 200
 
     asked = await s.page.post("/bot/token", {"token": TOKEN})
     assert asked.json() == {"status": "confirm", "bot": {"username": BOT_NAME, "name": "Согласования"}}

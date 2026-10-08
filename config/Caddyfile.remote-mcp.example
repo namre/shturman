@@ -1,0 +1,31 @@
+# Необязательная публикация read-only MCP по OAuth: отдельное имя, явное решение владельца.
+# Замените mcp.example.com и задайте точно этот HTTPS origin в SHTURMAN_REMOTE_MCP_ORIGIN.
+# Наличие образца не включает публикацию и не подтверждает совместимость облачного клиента.
+# При добавлении к основному Caddyfile переносите только блок сайта: глобальный admin там уже есть.
+# Каталог /run/caddy-admin: отдельный владелец Caddy, режим 0700, вне mounts Hermes;
+# создание через systemd RuntimeDirectory описано в основном config/Caddyfile.example.
+{
+	admin unix//run/caddy-admin/admin.sock
+}
+
+mcp.example.com {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		Cache-Control "no-store"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+	request_body {
+		max_size 1MB
+	}
+	# Только точные исходные пути. Ни нормализация %2f/../, ни лишний префикс не открывают
+	# /api, setup page или внутренний порт целиком. Host передаётся без подмены.
+	@remote_mcp expression `{http.request.orig_uri}.matches("^(/mcp|/oauth/(authorize|continue|register|token|revoke)|/[.]well-known/oauth-protected-resource(/mcp)?|/[.]well-known/oauth-authorization-server)([?].*)?$")`
+	handle @remote_mcp {
+		reverse_proxy 127.0.0.1:8765
+	}
+	handle {
+		respond 404
+	}
+	# Access log намеренно отсутствует: authorization code и state не должны попадать в журнал.
+}

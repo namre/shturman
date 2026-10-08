@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from typing import Any, Awaitable, Callable
@@ -182,11 +183,13 @@ async def clear_owner(conn: asyncpg.Connection) -> None:
 
 async def set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
     async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.owner.binding'))")
         previous = await get_owner(conn)
         await _set_owner(conn, user_id, chat_id)
         if previous is not None and int(previous["user_id"]) != int(user_id):
             await _owner_changed(conn, int(user_id))
-        if previous is None or int(previous["user_id"]) != int(user_id):
+        from . import authority
+        if authority.is_owner() and (previous is None or int(previous["user_id"]) != int(user_id)):
             # Владелец привязан (заново): его собственные бизнес-подключения снова принимают
             # сообщения. Если Telegram подключение отключил, отправка через него всё равно откажет.
             await conn.execute(
@@ -332,8 +335,16 @@ async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: i
     fn = _callback_handlers.get(module)
     if fn is None:
         return refused
-    async with conn.transaction():
-        out = await fn(conn, rest, int(from_user_id))
+    # The bot establishes this receipt after authenticating the actual private
+    # Telegram update. Claimed numeric IDs never establish authority here.
+    from . import authority
+    principal = authority.get_owner_principal()
+    if principal is None or principal.source != "telegram" or principal.user_id != int(from_user_id) \
+            or principal.chat_id != int(owner["chat_id"]):
+        return refused
+    with contextlib.ExitStack() as stack:
+        async with conn.transaction():
+            out = await fn(conn, rest, int(from_user_id))
     after = out.get("after_commit")
     if after is not None:
         try:
@@ -342,3 +353,4 @@ async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: i
             logger.error("нажатие разобрано, но работа после него не выполнена (%s)", type(exc).__name__)
     return {"answer": str(out.get("answer") or "")[:190], "edit_text": out.get("edit_text"),
             "remove_buttons": bool(out.get("remove_buttons"))}
+

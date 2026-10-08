@@ -47,7 +47,7 @@ def _peer_ok(alias: str, *, optional: bool = False) -> str:
     """Условие «собеседник не служебный». optional — для LEFT JOIN, где строки может не быть."""
     blocked = (
         f"({alias}.class = 'user' AND ({alias}.tg_id IN ({_BLOCKED_IDS}) "
-        f"OR lower(ltrim(COALESCE({alias}.username, ''), '@')) IN ({_BLOCKED_NAMES})))"
+        f"OR EXISTS (SELECT 1 FROM control_peers protected WHERE protected.tg_id = {alias}.tg_id)))"
     )
     return f"({alias}.id IS NULL OR NOT {blocked})" if optional else f"NOT {blocked}"
 
@@ -462,3 +462,4 @@ async def history(
     rows = await conn.fetch(_HISTORY[order], chat_id, sender_peer_id, after, before, from_me,
                             cursor_at, cursor_id, limit)
     return _message_rows(rows)
+

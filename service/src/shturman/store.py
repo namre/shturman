@@ -21,6 +21,7 @@ from typing import Iterable, Sequence
 import asyncpg
 
 from .records import ChatRecord, MessageRecord
+from . import control_peers
 
 # Чаты, в которых лежат коды входа и токены: 777000 — служебные уведомления Telegram,
 # 93372553 — @BotFather, 178220800 — @SpamBot. В архив не принимаются и агенту не отдаются.
@@ -49,7 +50,9 @@ CREATE TEMP TABLE IF NOT EXISTS import_stage (
     chat_id bigint, tg_message_id bigint, sent_at timestamptz, kind text,
     sender_class text, sender_tg_id bigint, sender_name text, is_outgoing boolean,
     text text, entities jsonb, reply_to_tg_id bigint, forwarded_from text,
-    edited_at timestamptz, media_type text, media_path text, service_action text
+    edited_at timestamptz, media_type text, media_path text, service_action text,
+    telegram_entities jsonb, topic_tg_id bigint, is_forwarded boolean,
+    telegram_via_bot boolean, telegram_sender_bot boolean
 ) ON COMMIT DELETE ROWS
 """
 
@@ -102,15 +105,37 @@ _UPSERT_MESSAGES = f"""
 INSERT INTO messages AS m (
     chat_id, tg_message_id, sent_at, kind, sender_peer_id, sender_name, is_outgoing,
     text, entities, reply_to_tg_id, forwarded_from, edited_at,
-    media_type, media_path, service_action, sources, agent_visible
+    media_type, media_path, service_action, sources, agent_visible,
+    telegram_entities, topic_tg_id, is_forwarded, telegram_via_bot, telegram_sender_bot
 )
 SELECT s.chat_id, s.tg_message_id, s.sent_at, s.kind, p.id, s.sender_name, s.is_outgoing,
        s.text, s.entities, s.reply_to_tg_id, s.forwarded_from, s.edited_at,
        s.media_type, s.media_path, s.service_action, ARRAY[$1::text],
-       NOT ($2::boolean AND s.is_outgoing IS NOT TRUE AND s.kind = 'message' AND s.text <> '')
+       NOT ($2::boolean AND s.is_outgoing IS NOT TRUE AND s.kind = 'message' AND s.text <> ''),
+       s.telegram_entities, s.topic_tg_id, s.is_forwarded, s.telegram_via_bot, s.telegram_sender_bot
 FROM import_stage s
 LEFT JOIN peers p ON p.class = s.sender_class AND p.tg_id = s.sender_tg_id
 ON CONFLICT (chat_id, tg_message_id) DO UPDATE SET
+    telegram_entities = CASE WHEN {_NEW_TEXT} THEN EXCLUDED.telegram_entities
+        WHEN $1 = 'session' AND EXCLUDED.text = m.text
+             AND COALESCE(EXCLUDED.edited_at, '-infinity') >= COALESCE(m.edited_at, '-infinity')
+        THEN EXCLUDED.telegram_entities ELSE m.telegram_entities END,
+    topic_tg_id = CASE WHEN {_NEW_TEXT} THEN EXCLUDED.topic_tg_id
+        WHEN $1 = 'session' AND EXCLUDED.text = m.text
+             AND COALESCE(EXCLUDED.edited_at, '-infinity') >= COALESCE(m.edited_at, '-infinity')
+        THEN EXCLUDED.topic_tg_id ELSE m.topic_tg_id END,
+    is_forwarded = CASE WHEN {_NEW_TEXT} THEN EXCLUDED.is_forwarded
+        WHEN $1 = 'session' AND EXCLUDED.text = m.text
+             AND COALESCE(EXCLUDED.edited_at, '-infinity') >= COALESCE(m.edited_at, '-infinity')
+        THEN EXCLUDED.is_forwarded ELSE m.is_forwarded END,
+    telegram_via_bot = CASE WHEN {_NEW_TEXT} THEN EXCLUDED.telegram_via_bot
+        WHEN $1 = 'session' AND EXCLUDED.text = m.text
+             AND COALESCE(EXCLUDED.edited_at, '-infinity') >= COALESCE(m.edited_at, '-infinity')
+        THEN EXCLUDED.telegram_via_bot ELSE m.telegram_via_bot END,
+    telegram_sender_bot = CASE WHEN {_NEW_TEXT} THEN EXCLUDED.telegram_sender_bot
+        WHEN $1 = 'session' AND EXCLUDED.text = m.text
+             AND COALESCE(EXCLUDED.edited_at, '-infinity') >= COALESCE(m.edited_at, '-infinity')
+        THEN EXCLUDED.telegram_sender_bot ELSE m.telegram_sender_bot END,
     agent_visible    = CASE WHEN {_NEW_TEXT} AND $2::boolean AND COALESCE(m.is_outgoing, EXCLUDED.is_outgoing)
                                  IS NOT TRUE AND m.kind = 'message' AND EXCLUDED.text <> ''
                             THEN false ELSE m.agent_visible END,
@@ -148,7 +173,7 @@ class UpsertResult:
 def is_blocked_peer(peer_class: str, tg_id: int, username: str | None = None) -> bool:
     if peer_class != "user":
         return False
-    return tg_id in BLOCKED_USER_IDS or (username or "").lstrip("@").lower() in BLOCKED_USERNAMES
+    return tg_id in BLOCKED_USER_IDS
 
 
 async def ensure_account(
@@ -194,7 +219,8 @@ async def ensure_chat(
         is_bot=is_bot, refresh=refresh,
     )
     exclude = (exclude or chat.type in BLOCKED_CHAT_TYPES
-               or is_blocked_peer(chat.peer_class, chat.tg_id, chat.username))
+               or is_blocked_peer(chat.peer_class, chat.tg_id, chat.username)
+               or await control_peers.is_blocked(conn, chat.peer_class, chat.tg_id))
     title = "COALESCE(EXCLUDED.title, chats.title)" if refresh else "COALESCE(chats.title, EXCLUDED.title)"
     row = await conn.fetchrow(
         f"""INSERT INTO chats (account_id, peer_id, type, title, excluded)
@@ -207,7 +233,7 @@ async def ensure_chat(
     return row["id"], row["excluded"]
 
 
-def _row(chat_id: int, m: MessageRecord, owner_tg_id: int, outgoing: bool | None) -> tuple:
+def _row(chat_id: int, m: MessageRecord, owner_tg_id: int, outgoing: bool | None, source: str = "") -> tuple:
     if outgoing is None and m.sender_tg_id is not None:
         outgoing = m.sender_class == "user" and m.sender_tg_id == owner_tg_id
     return (
@@ -217,6 +243,12 @@ def _row(chat_id: int, m: MessageRecord, owner_tg_id: int, outgoing: bool | None
         json.dumps(_clean_deep(m.entities), ensure_ascii=False) if m.entities else None,
         m.reply_to_tg_id, _clean(m.forwarded_from), m.edited_at,
         m.media_type, m.media_path, m.service_action,
+        json.dumps(_clean_deep(m.telegram_entities), ensure_ascii=False)
+        if source == "session" and m.telegram_entities is not None else None,
+        m.topic_tg_id if source == "session" else None,
+        m.is_forwarded if source == "session" else None,
+        m.telegram_via_bot if source == "session" else None,
+        m.telegram_sender_bot if source == "session" else None,
     )
 
 
@@ -240,10 +272,11 @@ async def upsert_messages(
     for item in rows:
         chat_id, record = item[0], item[1]
         outgoing = item[2] if len(item) > 2 else None
-        staged[(chat_id, record.tg_message_id)] = _row(chat_id, record, owner_tg_id, outgoing)
+        staged[(chat_id, record.tg_message_id)] = _row(chat_id, record, owner_tg_id, outgoing, source)
     if not staged:
         return UpsertResult()
     async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock_shared(hashtext($1))", control_peers.LOCK)
         banned = {
             r["id"] for r in await conn.fetch(
                 # Строки чатов блокируются до конца транзакции: исключение чата с очисткой
@@ -252,7 +285,9 @@ async def upsert_messages(
                 sorted({k[0] for k in staged}),
             ) if r["excluded"]
         }
-        records = [v for k, v in staged.items() if k[0] not in banned]
+        protected = await control_peers.blocked_ids(conn)
+        records = [v for k, v in staged.items() if k[0] not in banned
+                   and not (v[4] == "user" and v[5] in protected)]
         if not records:
             return UpsertResult()
         await conn.execute(_STAGE)
@@ -309,3 +344,4 @@ async def mark_deleted_without_chat(
         account_id, list(tg_message_ids),
     )
     return [r["id"] for r in rows]
+

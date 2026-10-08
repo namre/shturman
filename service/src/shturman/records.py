@@ -30,6 +30,13 @@ class MessageRecord:
     media_type: str | None
     media_path: str | None
     service_action: str | None
+    # Отдельно от совместимой с экспортом разметки: исходные позиции и вложенность
+    # нужны для безопасного распознавания адресата. None — источник этого не сообщил.
+    telegram_entities: list[dict[str, Any]] | None = None
+    topic_tg_id: int | None = None
+    is_forwarded: bool | None = None
+    telegram_via_bot: bool | None = None
+    telegram_sender_bot: bool | None = None
 
 
 @dataclass
@@ -42,3 +49,4 @@ class ChatRecord:
     name: str | None
     username: str | None = None
     is_bot: bool | None = None
+

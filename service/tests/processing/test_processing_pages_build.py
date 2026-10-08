@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from shturman import bridge, store
+from shturman import authority, bridge, store
 from shturman.processing import commitments, pages, pages_build, pages_git, people
 
 from pages_helpers import (
@@ -161,8 +161,10 @@ async def test_commitments_block_is_redrawn_from_the_database(conn, config):
     ]
     assert log(config)[1][1].startswith("Правка владельца: 1 страница")
 
-    await commitments.close(conn, w.estimate)
-    await commitments.cancel(conn, mine)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.cancel(conn, mine)
     await build_with(conn, config)
     table = blocks_of(w.path.read_text(encoding="utf-8")).commitments
     assert "| выполнено |" in table and "| отменено |" in table and "ждём" not in table
@@ -179,8 +181,10 @@ async def test_timeline_only_grows_and_never_repeats(conn, config):
     w.path.write_text(text + "- моя строка [сообщение](msg:%d)\n" % w.ivan_msgs[2], encoding="utf-8")
     edited = blocks_of(w.path.read_text(encoding="utf-8")).timeline
 
-    await commitments.reschedule(conn, w.estimate, "2026-10-20", tz=TZ, now=NOW)
-    await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.reschedule(conn, w.estimate, "2026-10-20", tz=TZ, now=NOW)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
     await build_with(conn, config)
     timeline = blocks_of(w.path.read_text(encoding="utf-8")).timeline
     assert timeline.startswith(edited)                                  # прежние строки — байт в байт
@@ -215,7 +219,8 @@ async def test_model_proposed_change_links_its_evidence(conn, config):
     w.estimate = await ivan_owes_estimate(conn, w)
     change = await commitments.propose_change(
         conn, commitment_id=w.estimate, kind="fulfilled", evidence_message_id=w.ivan_msgs[2], quote="бригада уже на объекте")
-    assert (await commitments.apply_change(conn, change))["ok"]
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        assert (await commitments.apply_change(conn, change))["ok"]
     await build_with(conn, config)
     w.path = await path_of(conn, config, w.ivan)
     done = [line for line in blocks_of(w.path.read_text(encoding="utf-8")).timeline.splitlines() if "выполнено" in line]
@@ -249,7 +254,8 @@ async def test_owner_block_is_never_modified_by_builds(conn, config):
     # меняется всё, что ведёт код: обязательства, хронология, сводка, имя и алиасы
     await commitment(conn, w.ivan_chat, w.ivan_msgs[1], debtor=w.owner_peer, creditor=w.ivan_peer,
                      direction="owner_owes", what="отправить договор")
-    await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
     await people.add_alias(conn, w.ivan, "Петрович с Фасада")
     await conn.execute("UPDATE people SET display_name = 'Иван Сергеевич Петров' WHERE id = $1", w.ivan)
     plan, done, _ = await build_with(conn, config, lambda job: [statement("Новая сводка", [w.ivan_msgs[1]], "owner")])
@@ -279,7 +285,8 @@ async def test_removed_marker_freezes_the_file_until_it_is_restored(conn, config
     broken = good.replace(M[gone] + "\n", "")
     w.path.write_text(broken, encoding="utf-8")
 
-    await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
     plan, done, _ = await build_with(conn, config)
     assert w.path.read_text(encoding="utf-8") == broken                 # файл не тронут вовсе
     assert done["frozen"] == 1 and done["written"] == []
@@ -346,7 +353,8 @@ async def test_owner_edit_is_committed_separately_before_the_build(conn, config)
     (config.pages_dir / ".obsidian").mkdir()
     (config.pages_dir / ".obsidian" / "workspace.json").write_text("{}")
 
-    await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
     plan, done, _ = await build_with(conn, config)
     assert sorted(done["owner_edits"]) == sorted([f"people/иван-петров-{w.ivan}.md", "people/мои-заметки.md"])
     history = log(config)
@@ -390,7 +398,8 @@ async def test_tampered_git_settings_stop_history_but_not_pages(conn, config, tm
         handle.write(f"[core]\n\tfsmonitor = {script}\n\thooksPath = {tmp_path}\n")
     (tmp_path / "pre-commit").write_text(f"#!/bin/sh\ntouch {proof}\n")
     (tmp_path / "pre-commit").chmod(0o755)
-    await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
     plan, done, _ = await build_with(conn, config)
     assert done["history"] == "без истории" and "изменены вручную" in done["history_problem"]
     assert "выполнено" in w.path.read_text(encoding="utf-8") and not proof.exists()
@@ -771,7 +780,8 @@ async def test_frozen_page_keeps_its_file_but_leaves_the_search_index(conn, conf
 async def test_deleted_file_is_recreated_with_its_timeline(conn, config):
     w = await seed(conn)
     await first_build(conn, config, w)
-    await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
     await build_with(conn, config)
     before = blocks_of(w.path.read_text(encoding="utf-8"))
     assert len(before.timeline.strip().split("\n")) == 2
@@ -911,7 +921,8 @@ async def test_build_is_resumable_and_follows_processing_runs(conn, config):
     out = await pages_build.tick(conn, config.pages_dir, tz=TZ)
     assert "build" not in out and out["finished"] is None and out["rendered"] is None
     run = await conn.fetchval("INSERT INTO processing_runs (trigger, status, finished_at) VALUES ('nightly', 'done', now()) RETURNING id")
-    await commitments.close(conn, w.estimate)
+    with authority.owner_context(OWNER, chat_id=OWNER):
+        await commitments.close(conn, w.estimate)
     out = await pages_build.tick(conn, config.pages_dir, tz=TZ)
     assert (out["build"]["status"], out["build"]["summaries_requested"]) == ("planned", 1)
     assert await conn.fetchval("SELECT run_id FROM page_builds ORDER BY id DESC LIMIT 1") == run

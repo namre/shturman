@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
-from shturman import events
+from shturman import authority, events
 from shturman.importer import import_export
 
 from conftest import IVAN, MARIA, OWNER, as_file
@@ -273,7 +273,7 @@ async def test_excluded_and_service_chats_store_nothing(linked):
     assert await conn.fetchval("SELECT text FROM messages") == "до исключения"
 
     telegram = {"id": 777000, "is_bot": False, "first_name": "Telegram"}
-    father = {"id": 424242, "is_bot": True, "first_name": "BotFather", "username": "BotFather"}
+    father = {"id": 93372553, "is_bot": True, "first_name": "BotFather", "username": "BotFather"}
     for who in (telegram, father):
         r = await svc.send(bmsg(5, "Login code: 12345", sender=who, partner=who))
         assert r.json() == {"stored": False, "message_id": None, "reason": "excluded"}
@@ -393,7 +393,8 @@ async def test_exclude_purge_and_return(linked, sample_export):
     listed = (await client.get("/api/chats", params={"excluded": "true"})).json()
     assert [c["id"] for c in listed["chats"]] == [chat_id]
 
-    r = await client.put(f"/api/chats/{chat_id}/excluded", json={"excluded": True, "purge": True})
+    with authority.setup_context("test-exclusions-owner-session", action="purge-chat"):
+        r = await client.put(f"/api/chats/{chat_id}/excluded", json={"excluded": True, "purge": True})
     assert r.json() == {"id": chat_id, "excluded": True, "purged": 6}
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE chat_id = $1", chat_id) == 0
     assert await conn.fetchval("SELECT count(*) FROM message_versions") == 0
@@ -404,7 +405,8 @@ async def test_exclude_purge_and_return(linked, sample_export):
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE chat_id = $1", chat_id) == 0
 
     # вернуть чат можно только явным отдельным действием
-    r = await client.put(f"/api/chats/{chat_id}/excluded", json={"excluded": False})
+    with authority.setup_context("test-exclusions-owner-session", action="restore-chat"):
+        r = await client.put(f"/api/chats/{chat_id}/excluded", json={"excluded": False})
     assert r.json() == {"id": chat_id, "excluded": False, "purged": 0}
     assert (await svc.send(bmsg(61, "снова в архиве"))).json()["stored"] is True
 

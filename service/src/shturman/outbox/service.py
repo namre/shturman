@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 from typing import Any, AsyncIterator
 
@@ -332,6 +333,11 @@ async def get_autoreply(request: Request) -> JSONResponse:
         return JSONResponse(await _autoreply_view(conn, state_of(request).config))
 
 
+def _preparing_on() -> bool:
+    mod = runtime.current()
+    return mod is not None and getattr(mod.state.config, "prepare_only", False) is True
+
+
 def _sending_on() -> bool:
     """Главный выключатель отправки — из настроек работающего сервиса."""
     mod = runtime.current()
@@ -344,7 +350,7 @@ async def _apply_autoreply(conn: asyncpg.Connection, payload: dict[str, Any]) ->
     notes: list[str] = []
     if "enabled" in payload:
         account_id, enabled = int(payload["account_id"]), payload["enabled"] is True
-        if enabled and not _sending_on():
+        if enabled and not (_sending_on() or _preparing_on()):
             # Иначе автоответ, включённый заранее, заработал бы сам в момент включения отправки.
             raise confirm.Refused(policy.REASONS["sending_disabled"], 409, extra={"reason": "sending_disabled"})
         label = await conn.fetchval("SELECT label FROM accounts WHERE id = $1", account_id)
@@ -394,7 +400,7 @@ async def put_autoreply(request: Request) -> JSONResponse:
             account_id = need_int(data, "account_id")
             if not isinstance(data.get("enabled"), bool):
                 raise BadRequest("поле enabled: нужно true или false")
-            if data["enabled"] and config.sending is not True:
+            if data["enabled"] and config.sending is not True and not getattr(config, "prepare_only", False):
                 return JSONResponse(policy.deny("sending_disabled").as_dict(), status_code=409)
             row = await conn.fetchrow(
                 """SELECT a.label, COALESCE(o.autoreply_enabled, false) AS enabled FROM accounts a
@@ -777,6 +783,10 @@ def routes() -> list[BaseRoute]:
 
 @contextlib.asynccontextmanager
 async def lifespan(state: AppState) -> AsyncIterator[None]:
+    async with state.pool.acquire() as conn:
+        preparation = policy._loads(await conn.fetchval("SELECT value FROM settings WHERE key='outbox.prepare_only'"))
+    if isinstance(preparation.get("enabled"), bool):
+        state.config = dataclasses.replace(state.config, prepare_only=preparation["enabled"])
     mod = runtime.Outbox(state)
     runtime.set_current(mod)
     state.extras["outbox"] = mod
@@ -815,3 +825,4 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
         mod.close()
         if runtime.current() is mod:
             runtime.set_current(None)
+

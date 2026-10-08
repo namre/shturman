@@ -3,7 +3,7 @@
 import subprocess
 from datetime import timedelta
 
-from shturman import bridge
+from shturman import authority, bridge
 from shturman.processing import commitments, pages, pages_build, people
 
 from proc_helpers import OWNER, T0, TZ, account, answer, chat, claim, peer_id, say
@@ -52,7 +52,8 @@ async def commitment(conn, chat_id, source_id, *, debtor, creditor, direction, w
         chat_id, source_id, due_message_id, debtor, creditor, direction, what, quote, due_expression, due_date,
         "ok" if due_date else "no_deadline")
     if accept:
-        assert (await commitments.accept(conn, commitment_id))["ok"]
+        with authority.owner_context(OWNER, chat_id=OWNER, action="fixture.accept"):
+            assert (await commitments.accept(conn, commitment_id))["ok"]
     return commitment_id
 
 
@@ -120,3 +121,4 @@ def log(config):
     """[(автор, заголовок)] от новых к старым."""
     out = git(config, "log", "--format=%an|%s")
     return [tuple(line.split("|", 1)) for line in out.splitlines()]
+

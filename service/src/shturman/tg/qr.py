@@ -118,10 +118,14 @@ class LoginFlow:
 
     async def start(self) -> None:
         """Подключается и выпускает первый код. Ошибки пробрасывает: вход не начался."""
-        await self._client.connect()
+        from .. import authority
+        await asyncio.get_running_loop().create_task(self._client.connect(),
+                    name="tg-qr-connect", context=authority.background_context())
         self._qr = await self._client.qr_login()
         self._deadline = self._clock().timestamp() + self._lifetime
-        self._task = asyncio.get_running_loop().create_task(self._run(), name=f"tg-login-{self.role}")
+        from .. import authority
+        self._task = asyncio.get_running_loop().create_task(self._run(), name=f"tg-login-{self.role}",
+                                                          context=authority.background_context())
 
     async def wait_finished(self) -> None:
         await self._finished.wait()
@@ -234,3 +238,4 @@ class LoginFlow:
             finally:
                 password = None  # noqa: F841 — не держим пароль дольше одной проверки
             return user
+

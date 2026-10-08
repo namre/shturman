@@ -11,7 +11,7 @@
                                          └─► failed (перед отправкой правила уже не разрешают)
 
 Главный выключатель (`config.sending`, задаётся только окружением сервиса): пока он выключен,
-черновики не создаются, нажатие не принимается, отправщик ничего не отправляет.
+обычная отправка недоступна; prepare_only создаёт проверяемые pending-черновики без отправки.
 После завершения карточка черновика заменяется итогом, кнопки под ней убираются.
 
 Автоответ доверенным рождается сразу в `approved` (правило включил владелец) и дальше идёт
@@ -45,7 +45,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from .. import bridge, jobs
+from .. import authority, bridge, confirm, jobs
 from ..tg.gateway import AccountUnavailable, FloodWait, SendForbidden
 from . import policy, runtime
 from . import text as textlib
@@ -113,6 +113,8 @@ def public(row: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
         "chat_id": row["chat_id"], "channel": row["channel"], "origin": row["origin"],
         "text": row["text"], "text_purged": row["text_purged_at"] is not None,
         "reply_to_tg_id": row["reply_to_tg_id"],
+        "task_id": row["task_id"], "prepare_only": row["prepare_only"],
+        "topic_tg_id": row["topic_tg_id"], "sources": _source_refs(row["sources"]),
         "parts_total": row["parts_total"], "parts_sent": row["parts_sent"],
         "sent_tg_message_ids": list(row["sent_tg_message_ids"]),
         "error_code": row["error_code"], "error": row["error_text"],
@@ -172,7 +174,7 @@ async def card_context(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Ta
     excerpt = None
     if row["reply_to_tg_id"] is not None:
         excerpt = await conn.fetchval(
-            "SELECT text FROM messages WHERE chat_id = $1 AND tg_message_id = $2",
+            "SELECT text FROM messages WHERE chat_id = $1 AND tg_message_id = $2 AND deleted_at IS NULL AND agent_visible",
             row["chat_id"], row["reply_to_tg_id"])
     return {"facts": facts, "reply_excerpt": excerpt}
 
@@ -190,6 +192,8 @@ def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None
     word = STATUS_WORDS[status or row["status"]]
     sends = len(policy.parts_of(row["channel"], row["text"]))
     head = [f"Кому: {_who(tgt)}"]
+    if row.get("prepare_only"):
+        head.append("Подготовлено для просмотра без отправки. Для отправки нужен новый черновик.")
     if facts:
         head.append(textlib.one_line(facts, 120))
     head.append(f"От кого: {_voice(tgt, row['channel'])}")
@@ -291,11 +295,65 @@ async def _card_failed(conn: asyncpg.Connection, job: dict[str, Any], error: str
                  message=policy.REASONS["card_not_delivered"], tell_owner=False)
 
 
+def _source_refs(value: Any) -> list[dict[str, Any]]:
+    return json.loads(value) if isinstance(value, str) else (value or [])
+
+
+async def _task_binding(conn: asyncpg.Connection, tgt: Target, task_id: int | None,
+                        sources: list[dict[str, Any]] | None) -> dict[str, Any]:
+    if not isinstance(sources, (list, type(None))) or any(not isinstance(ref, dict) for ref in sources or []):
+        raise Refused(Decision(False, "invalid_sources", "Нужен список ссылок на источники."), 422)
+    encoded = json.dumps(sources or [], ensure_ascii=False, sort_keys=True)
+    if task_id is None:
+        if sources:
+            raise Refused(Decision(False, "unbound_sources", "Источники должны быть привязаны к заданию ответа."))
+        return {"sources": encoded, "policy_revision": None, "topic_tg_id": None}
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        raise Refused(Decision(False, "invalid_task", "Неверный номер задания."), 422)
+    task = await conn.fetchrow("SELECT * FROM reply_tasks WHERE id = $1 FOR UPDATE", task_id)
+    if task is None or task["chat_id"] != tgt.chat_id or task["account_id"] != tgt.account_id:
+        raise Refused(Decision(False, "task_target_mismatch", "Задание относится к другому адресату."))
+    if task["status"] != "drafting" or await conn.fetchval("SELECT $1::timestamptz <= now()", task["expires_at"]):
+        raise Refused(Decision(False, "inactive_task", "Задание больше не готовит ответ."))
+    return {"sources": encoded, "policy_revision": str(task["policy_revision"]),
+            "topic_tg_id": task["topic_tg_id"]}
+
+
+async def _task_guard(conn: asyncpg.Connection, state: Any, row: Mapping[str, Any]) -> Decision:
+    if row["prepare_only"]:
+        return policy.deny("prepare_only")
+    if row["task_id"] is None:
+        return policy.ALLOW
+    from ..replies import workflow
+    return await workflow.presend(conn, state, row)
+
+
+async def readiness(conn: asyncpg.Connection, tg: Any, config: Any, chat_id: int,
+                    channel: str | None = None) -> dict[str, Any]:
+    """Separate preparation from sending readiness without implying an enabled transport."""
+    rules = await policy.load(conn, config)
+    tgt = await policy.target(conn, chat_id)
+    if tgt is None:
+        return {"can_prepare": False, "can_send": False, "reason": "chat_not_found"}
+    picked, decision = policy.pick_channel(tgt, channel)
+    if picked is None:
+        return {"can_prepare": False, "can_send": False, "reason": decision.code}
+    decision = await policy.check_target(conn, rules, tgt)
+    prepare = decision.ok
+    if decision.ok:
+        decision = policy.check_switch(rules)
+    if decision.ok:
+        decision = await policy.check_channel(conn, tg, rules, tgt, picked)
+    return {"can_prepare": prepare, "can_send": decision.ok, "channel": picked,
+            "reason": decision.code, "error": decision.message}
+
+
 # --- создание ---
 
 async def create(
     conn: asyncpg.Connection, state: Any, *, chat_id: int, text: str, channel: str | None = None,
     reply_to_message_id: int | None = None, idempotency_key: str | None = None,
+    prepare_only: bool = False, task_id: int | None = None, sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Создаёт черновик и ставит карточку владельцу. Отказ — исключение `Refused` с причиной.
 
@@ -312,19 +370,22 @@ async def create(
     async with conn.transaction():
         rules = await policy.load(conn, state.config)
         decision = policy.check_switch(rules)
-        if not decision.ok:
-            raise refuse(decision)   # отправка выключена на сервере: черновики не создаются вовсе
+        if not decision.ok and not prepare_only:
+            raise refuse(decision)
         tgt = await policy.target(conn, chat_id)
         if tgt is None:
             raise refuse(policy.deny("chat_not_found"))
         await policy.lock_chat(conn, chat_id)
+        binding = await _task_binding(conn, tgt, task_id, sources)
         if idempotency_key is not None:
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.outbox.key'), hashtext($1))",
                                idempotency_key)
             known = await conn.fetchrow("SELECT * FROM outbox_drafts WHERE idempotency_key = $1", idempotency_key)
             if known is not None:
                 same = (known["chat_id"] == chat_id and known["text_hash"] == text_hash
-                        and channel in (None, known["channel"]))
+                        and channel in (None, known["channel"])
+                        and known["task_id"] == task_id and _source_refs(known["sources"]) == _source_refs(binding["sources"])
+                        and known["prepare_only"] == prepare_only)
                 if not same:
                     raise refuse(policy.deny("idempotency_conflict"))
                 return public(known, replayed=True)
@@ -334,9 +395,9 @@ async def create(
         if picked is None:
             raise refuse(decision)
         for decision in (await policy.check_target(conn, rules, tgt),
-                         await policy.check_channel(conn, tg, rules, tgt, picked),
+                         (policy.ALLOW if prepare_only else await policy.check_channel(conn, tg, rules, tgt, picked)),
                          policy.check_text(rules, picked, cleaned),
-                         await policy.check_first_contact(conn, rules, tgt, picked)):
+                         (policy.ALLOW if task_id is not None else await policy.check_first_contact(conn, rules, tgt, picked))):
             if not decision.ok:
                 raise refuse(decision)
         # Из лимитов при создании важен только повтор: остальные проверяются в момент отправки.
@@ -355,7 +416,8 @@ async def create(
             "SELECT * FROM outbox_drafts WHERE chat_id = $1 AND status = 'pending' FOR UPDATE", chat_id)
         for old in waiting:
             if (old["text_hash"] == text_hash and old["channel"] == picked and idempotency_key is None
-                    and old["reply_to_tg_id"] == reply_to_tg_id
+                    and old["reply_to_tg_id"] == reply_to_tg_id and old["task_id"] == task_id
+                    and _source_refs(old["sources"]) == _source_refs(binding["sources"]) and old["prepare_only"] == prepare_only
                     and not await conn.fetchval("SELECT $1::timestamptz <= now()", old["expires_at"])):
                 return public(old, duplicate=True)
         recent = await conn.fetchval(
@@ -370,12 +432,14 @@ async def create(
         parts = policy.parts_of(picked, cleaned)
         row = await conn.fetchrow(
             """INSERT INTO outbox_drafts (account_id, chat_id, channel, text, text_hash, reply_to_tg_id,
-                                          origin, idempotency_key, nonce, status, expires_at, parts_total)
+                                          origin, idempotency_key, nonce, status, expires_at, parts_total,
+                                          task_id, sources, task_policy_revision, topic_tg_id, prepare_only)
                VALUES ($1, $2, $3, $4, $5, $6, 'agent', $7, $8, 'pending',
-                       now() + make_interval(secs => $9), $10)
+                       now() + make_interval(secs => $9), $10, $11, $12::jsonb, $13, $14, $15)
                RETURNING *""",
             tgt.account_id, chat_id, picked, cleaned, text_hash, reply_to_tg_id, idempotency_key,
-            secrets.token_urlsafe(16), float(rules["draft_ttl_seconds"]), len(parts))
+            secrets.token_urlsafe(16), float(rules["draft_ttl_seconds"]), len(parts),
+            task_id, binding["sources"], binding["policy_revision"], binding["topic_tg_id"], prepare_only)
         cards = card_parts(row, tgt, **await card_context(conn, row, tgt))
         for index, card in enumerate(cards, 1):
             await bridge.notify_owner(
@@ -387,17 +451,46 @@ async def create(
 
 async def create_autoreply(
     conn: asyncpg.Connection, tgt: Target, *, channel: str, text: str, trigger_message_id: int,
+    prepare_only: bool = False, task_id: int | None = None, sources: list[dict[str, Any]] | None = None,
 ) -> int | None:
-    """Записывает автоответ сразу согласованным. На одно входящее — не больше одной записи."""
-    return await conn.fetchval(
+    """Bound autonomous reply, or a pending card when only preparation is authorized."""
+    binding = await _task_binding(conn, tgt, task_id, sources)
+    cleaned = textlib.clean_outgoing(text)
+    if task_id is not None and not prepare_only:
+        mod = runtime.current()
+        if mod is None:
+            raise Refused(policy.deny("service_stopped"))
+        decision = await _task_guard(conn, mod.state, {
+            "task_id": task_id, "account_id": tgt.account_id, "chat_id": tgt.chat_id,
+            "task_policy_revision": binding["policy_revision"], "sources": binding["sources"],
+            "origin": "autoreply", "topic_tg_id": binding["topic_tg_id"], "prepare_only": False,
+        })
+        if not decision.ok:
+            raise Refused(decision)
+    if prepare_only:
+        # Keep the existing one-pending-draft invariant and make replacement visible to the owner.
+        await policy.lock_chat(conn, tgt.chat_id)
+        for old in await conn.fetch(
+                "SELECT * FROM outbox_drafts WHERE chat_id = $1 AND status = 'pending' FOR UPDATE", tgt.chat_id):
+            await finish(conn, old, tgt, "superseded", tell_owner=False)
+    row = await conn.fetchrow(
         """INSERT INTO outbox_drafts (account_id, chat_id, channel, text, text_hash, origin,
-                                      trigger_message_id, nonce, status, expires_at, approved_at, parts_total)
-           VALUES ($1, $2, $3, $4, $5, 'autoreply', $6, $7, 'approved', now() + interval '1 hour', now(), $8)
+                                      trigger_message_id, nonce, status, expires_at, approved_at, parts_total,
+                                      task_id, sources, task_policy_revision, topic_tg_id, prepare_only)
+           VALUES ($1, $2, $3, $4, $5, 'autoreply', $6, $7, $8, now() + interval '1 hour',
+                   CASE WHEN $8 = 'approved' THEN now() ELSE NULL END, $9, $10, $11::jsonb, $12, $13, $14)
            ON CONFLICT (trigger_message_id) WHERE origin = 'autoreply' AND trigger_message_id IS NOT NULL
-           DO NOTHING
-           RETURNING id""",
-        tgt.account_id, tgt.chat_id, channel, text, textlib.content_hash(text), trigger_message_id,
-        secrets.token_urlsafe(16), len(policy.parts_of(channel, text)))
+           DO NOTHING RETURNING *""",
+        tgt.account_id, tgt.chat_id, channel, cleaned, textlib.content_hash(cleaned), trigger_message_id,
+        secrets.token_urlsafe(16), "pending" if prepare_only else "approved", len(policy.parts_of(channel, cleaned)),
+        task_id, binding["sources"], binding["policy_revision"], binding["topic_tg_id"], prepare_only)
+    if row is not None and prepare_only:
+        cards = card_parts(row, tgt, note="Подготовлено без отправки.", **await card_context(conn, row, tgt))
+        for index, card in enumerate(cards, 1):
+            await bridge.notify_owner(conn, card, buttons=_buttons(row) if index == len(cards) else None,
+                                      handler=CARD_HANDLER, context={"draft_id": row["id"], "part": index},
+                                      dedup_key=f"outbox:card:{row['id']}:{index}")
+    return row["id"] if row is not None else None
 
 
 async def cancel(conn: asyncpg.Connection, draft_id: int) -> dict[str, Any] | None:
@@ -432,6 +525,11 @@ async def finish(
         row["id"], status, code, message)
     if done is None:
         return False
+    if done.get("task_id") is not None:
+        from ..replies import workflow
+        task_status = ("completed" if status == "sent" else "declined" if status == "rejected" else
+                       "expired" if status == "expired" else "cancelled" if status == "superseded" else "failed")
+        await workflow.stop(conn, done["task_id"], task_status, code)
     mod = runtime.current()
     if mod is not None:
         mod.stop_typing(done["account_id"], done["chat_id"])
@@ -468,6 +566,10 @@ async def finish(
 async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str, Any]:
     """Нажатие под карточкой. Вызывается в транзакции; сети здесь нет — только занять черновик."""
     refused = {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
+    try:
+        authority.requires_owner()
+    except confirm.Refused:
+        return refused
     action, _, tail = rest.partition(":")
     raw_id, _, nonce = tail.partition(":")
     if action not in ("s", "r") or not raw_id.isascii() or not raw_id.isdigit() or len(raw_id) > 18:
@@ -477,7 +579,7 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
         return refused  # мост это уже проверил; вторая проверка — на случай ошибки выше
     row = await conn.fetchrow("SELECT * FROM outbox_drafts WHERE id = $1 FOR UPDATE", int(raw_id))
     expected = row["nonce"] if row is not None else secrets.token_urlsafe(16)
-    if not hmac.compare_digest(nonce.encode(), expected.encode()) or row is None or row["origin"] != "agent":
+    if not hmac.compare_digest(nonce.encode(), expected.encode()) or row is None or (row["origin"] != "agent" and not row["prepare_only"]):
         return refused
     tgt = await policy.target(conn, row["chat_id"])
     if tgt is None:
@@ -508,10 +610,14 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
         return {"answer": policy.REASONS["service_stopped"] + " Попробуйте позже.",
                 "edit_text": None, "remove_buttons": False}
     rules = await policy.load(conn, mod.state.config)
-    decision = await policy.check_send(
-        conn, mod.tg, rules, tgt, channel=row["channel"], text=row["text"], text_hash=row["text_hash"],
-        draft_id=row["id"])
-    if not decision.ok and decision.temporary:
+    decision = policy.check_switch(rules)
+    if decision.ok:
+        decision = await _task_guard(conn, mod.state, row)
+    if decision.ok:
+        decision = await policy.check_send(
+            conn, mod.tg, rules, tgt, channel=row["channel"], text=row["text"], text_hash=row["text_hash"],
+            draft_id=row["id"], task_bound=row["task_id"] is not None)
+    if not decision.ok and (decision.temporary or decision.code in ("sending_disabled", "prepare_only")):
         # Черновик остаётся ждать: когда препятствие уйдёт, кнопку можно нажать снова.
         return {"answer": "Пока нельзя: " + decision.message, "edit_text": None, "remove_buttons": False}
     approved = await conn.fetchrow(
@@ -521,6 +627,9 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
         await finish(conn, row, tgt, "failed", code=decision.code, message=decision.message,
                      tell_owner=False, skip_part=pressed)
         return await closed("Не отправлено: " + decision.message)
+    if row['task_id'] is not None:
+        from ..replies import workflow
+        await workflow.record_owner_resume(conn, int(row['task_id']))
     await refresh_cards(conn, approved, tgt, skip_part=pressed)
     mod.kick()
     return await closed("Принято, отправляю.")
@@ -583,8 +692,11 @@ async def _give_up(conn: asyncpg.Connection, draft_id: int) -> None:
 async def _presend(conn: asyncpg.Connection, mod: runtime.Outbox, rules: dict[str, Any],
                    row: Mapping[str, Any], tgt: Target) -> Decision:
     """Последняя проверка перед отправкой: за время ожидания всё могло измениться."""
+    decision = await _task_guard(conn, mod.state, row)
+    if not decision.ok:
+        return decision
     cap = None
-    if row["origin"] == "autoreply":
+    if row["origin"] == "autoreply" and row["task_id"] is None:
         from . import autoreply  # автоответ опирается на этот модуль; обратная ссылка — только здесь
 
         settings = await autoreply.load(conn)
@@ -598,7 +710,8 @@ async def _presend(conn: asyncpg.Connection, mod: runtime.Outbox, rules: dict[st
         return policy.deny("stale")
     return await policy.check_send(
         conn, mod.tg, rules, tgt, channel=row["channel"], text=row["text"], text_hash=row["text_hash"],
-        origin=row["origin"], autoreply_daily_cap=cap, draft_id=row["id"])
+        origin=row["origin"], autoreply_daily_cap=cap, draft_id=row["id"],
+        task_bound=row["task_id"] is not None)
 
 
 async def deliver(mod: runtime.Outbox, draft_id: int) -> None:
@@ -673,10 +786,16 @@ async def _send_session(mod: runtime.Outbox, row: Mapping[str, Any], tgt: Target
             break
         if index:
             await asyncio.sleep(float(rules["part_pause_seconds"]))
+        async with pool.acquire() as conn:
+            decision = await _task_guard(conn, mod.state, row)
+        if not decision.ok:
+            outcome = ("failed", decision.code, decision.message)
+            break
         try:
+            thread = {"topic_tg_id": row["topic_tg_id"]} if row["topic_tg_id"] is not None else {}
             message_id = int(await asyncio.wait_for(
                 tg.send_text(tgt.account_id, tgt.peer_class, tgt.tg_id, part,
-                             reply_to_tg_id=row["reply_to_tg_id"] if index == 0 else None),
+                             reply_to_tg_id=row["reply_to_tg_id"] if index == 0 else None, **thread),
                 timeout=float(rules["send_timeout_seconds"])))
         except FloodWait as exc:
             async with pool.acquire() as conn:
@@ -898,3 +1017,4 @@ async def settle(mod: runtime.Outbox) -> None:
                     return
             continue
         await asyncio.gather(*tasks, return_exceptions=True)
+

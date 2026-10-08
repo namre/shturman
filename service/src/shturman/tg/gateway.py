@@ -32,7 +32,7 @@ class TgGateway(Protocol):
 
     async def send_text(
         self, account_id: int, peer_class: str, tg_id: int, text: str, *,
-        reply_to_tg_id: int | None = None,
+        reply_to_tg_id: int | None = None, topic_tg_id: int | None = None,
     ) -> int:
         """Отправляет одно сообщение (до 4096 знаков) и возвращает его идентификатор в Telegram.
 
@@ -42,3 +42,4 @@ class TgGateway(Protocol):
 
     async def set_typing(self, account_id: int, peer_class: str, tg_id: int, on: bool) -> None:
         """Показывает или гасит «печатает…». Ошибки проглатывает: индикатор не важнее ответа."""
+

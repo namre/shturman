@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from shturman import bridge, confirm, jobs, store
+from shturman import authority, bridge, confirm, jobs, store
 from shturman.app import MODULES
 from shturman.records import ChatRecord
 
@@ -42,10 +42,14 @@ async def test_owner_change_stops_what_the_previous_owner_set_up(make_client, co
         "INSERT INTO outbox_accounts (account_id, autoreply_enabled) VALUES ($1, true)", account)
 
     # тот же владелец повторно — ничего не меняется
-    await client.put("/api/owner", json={"user_id": 1000, "chat_id": 1000})
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await client.put("/api/owner", json={"user_id": 1000, "chat_id": 1000})).status_code == 200
     assert await conn.fetchval("SELECT enabled FROM business_connections") is True
 
-    await client.put("/api/owner", json={"user_id": 7777, "chat_id": 7777})
+    forged = await client.put("/api/owner", json={"user_id": 7777, "chat_id": 7777})
+    assert forged.status_code == 403 and forged.json()["code"] == "owner_required"
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await client.put("/api/owner", json={"user_id": 7777, "chat_id": 7777})).status_code == 200
     assert await conn.fetchval("SELECT enabled FROM business_connections") is False
     assert await conn.fetchval("SELECT count(*) FROM outbox_trusted") == 0
     assert await conn.fetchval("SELECT autoreply_enabled FROM outbox_accounts") is False
@@ -54,7 +58,9 @@ async def test_owner_change_stops_what_the_previous_owner_set_up(make_client, co
 async def test_unbound_owner_means_nobody_can_press_buttons(make_client, conn):
     client, _ = await make_client("shturman.api_core", "shturman.outbox.service")
     await client.put("/api/owner", json={"user_id": 1000, "chat_id": 1000})
-    assert (await client.delete("/api/owner")).json() == {"ok": True}
+    assert (await client.delete("/api/owner")).status_code == 403
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await client.delete("/api/owner")).json() == {"ok": True}
     assert await bridge.get_owner(conn) is None
     out = await client.post("/api/callbacks/telegram", json={"data": "sh:ob:s:1:x", "from_user_id": 1000})
     assert out.json()["answer"] == "Кнопка недоступна."
@@ -66,9 +72,11 @@ async def test_rebinding_the_same_owner_after_reset_restores_his_business_connec
     account = await store.ensure_account(conn, 1000, "Владелец")
     await conn.execute("INSERT INTO business_connections (id, account_id, can_reply) VALUES ('bc1', $1, true)", account)
     await client.put("/api/owner", json={"user_id": 1000, "chat_id": 1000})
-    await client.delete("/api/owner")
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await client.delete("/api/owner")).status_code == 200
     assert await conn.fetchval("SELECT enabled FROM business_connections") is False
-    await client.put("/api/owner", json={"user_id": 1000, "chat_id": 1000})
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await client.put("/api/owner", json={"user_id": 1000, "chat_id": 1000})).status_code == 200
     assert await conn.fetchval("SELECT enabled FROM business_connections") is True
 
 
@@ -186,11 +194,17 @@ async def test_sensitive_action_waits_for_owner_press_in_own_bot(conn, own_bot):
     await bridge.deliver_result(conn, card["id"], {"message_id": 77})
 
     wrong = yes.rsplit(":", 1)[0] + ":forged"
-    assert (await bridge.dispatch_callback(conn, wrong, 1000))["answer"] == "Действие уже недоступно."
+    assert (await bridge.dispatch_callback(conn, wrong, 1000))["answer"] == "Кнопка недоступна."
+    assert (await bridge.dispatch_callback(conn, yes, 1000))["answer"] == "Кнопка недоступна."
+    assert done == []
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await bridge.dispatch_callback(conn, wrong, 1000))["answer"] == "Действие уже недоступно."
     assert (await bridge.dispatch_callback(conn, yes, 6666))["answer"] == "Кнопка недоступна." and done == []
-    ok = await bridge.dispatch_callback(conn, yes, 1000)
+    with authority.owner_context(1000, chat_id=1000):
+        ok = await bridge.dispatch_callback(conn, yes, 1000)
     assert ok["answer"] == "Сделано." and done == [{"x": 1}] and "Готово" in ok["edit_text"]
-    assert (await bridge.dispatch_callback(conn, yes, 1000))["answer"] == "Действие уже недоступно."  # один раз
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await bridge.dispatch_callback(conn, yes, 1000))["answer"] == "Действие уже недоступно."  # один раз
     assert done == [{"x": 1}]
 
 
@@ -212,29 +226,37 @@ async def test_rejected_expired_and_failed_actions_change_nothing(conn, own_bot)
 
     await confirm.request(conn, "t.act", "Стереть чат", {})
     _, no = await card_buttons()
-    assert (await bridge.dispatch_callback(conn, no, 1000))["answer"] == "Отклонено."
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await bridge.dispatch_callback(conn, no, 1000))["answer"] == "Отклонено."
 
     await confirm.request(conn, "t.act", "Стереть чат ещё раз", {})
     yes, _ = await card_buttons()
     await conn.execute("UPDATE pending_actions SET expires_at = now() - interval '1 minute' WHERE status = 'pending'")
-    assert (await bridge.dispatch_callback(conn, yes, 1000))["answer"] == "Срок вышел."
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await bridge.dispatch_callback(conn, yes, 1000))["answer"] == "Срок вышел."
 
     await confirm.request(conn, "t.act", "Сломанное действие", {"boom": True})
     yes, _ = await card_buttons()
-    assert (await bridge.dispatch_callback(conn, yes, 1000))["answer"] == "Не получилось."
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await bridge.dispatch_callback(conn, yes, 1000))["answer"] == "Не получилось."
     assert done == []
     statuses = [r["status"] for r in await conn.fetch("SELECT status FROM pending_actions ORDER BY id")]
     assert statuses == ["rejected", "expired", "failed"]
 
 
-async def test_without_own_bot_action_applies_at_once(conn):
+async def test_without_own_bot_agent_action_is_refused(conn):
     done = []
 
     @confirm.applier("t.now")
     async def now(c, payload):
         done.append(1)
 
-    assert (await confirm.request(conn, "t.now", "Действие", {}))["status"] == "applied" and done == [1]
+    with pytest.raises(confirm.NoOwner):
+        await confirm.request(conn, "t.now", "Действие", {})
+    assert done == []
+    with authority.owner_context(1000, chat_id=1000):
+        assert (await confirm.request(conn, "t.now", "Действие", {}))["status"] == "applied"
+    assert done == [1]
 
 
 def test_sending_needs_own_bot(monkeypatch):

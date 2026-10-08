@@ -4,8 +4,12 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  service:
+  reply-regressions:
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -24,7 +28,54 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e './service[dev]'
+      - name: reply and ingestion regressions
+        run: >-
+          pytest -q
+          tests/replies/test_owner_resume_age.py
+          tests/replies/test_source_failures.py
+          tests/test_direct_address_quotes.py
+          tests/test_telethon_group_vertical.py
+          tests/outbox/test_outbox_drafts.py::test_late_business_confirmation_corrects_only_unknown_task_and_its_one_metric
+          tests/outbox/test_outbox_autoreply.py::test_terminal_telemetry_records_once_and_warns_only_on_missing_model_answer
+          tests/outbox/test_outbox_autoreply.py::test_trusted_list_takes_numeric_ids_only_and_owner_is_told
+          tests/outbox/test_outbox_drafts.py::test_policy_route_clamps_values_and_tells_owner
+          tests/guard/test_guard_visibility.py::test_autoreply_ignores_a_hidden_message_and_keeps_it_out_of_the_prompt
+          tests/guard/test_guard_visibility.py::test_reply_prepared_for_a_message_that_got_hidden_is_not_sent
+          tests/test_archive.py::test_service_peers_with_codes_and_tokens_are_invisible
+          tests/test_core.py
+          tests/tg/test_tg_routes.py::test_owner_becoming_known_stops_assistant_session_of_the_same_account
+        working-directory: service
+
+  service:
+    needs: reply-regressions
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg16-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: shturman_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SHTURMAN_TEST_DSN: postgresql://postgres@127.0.0.1:5432/shturman_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e './service[dev]'
+      - name: targeted security mutations
+        run: python tests/security_mutations.py --output-dir "$RUNNER_TEMP/security-mutations" --include-db
+        working-directory: service
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-mutations
+          path: ${{ runner.temp }}/security-mutations
       - run: pytest -q
+        if: ${{ !cancelled() }}
         working-directory: service
 
   plugin:
@@ -252,6 +303,9 @@ jobs:
           if grep -Ev '^[[:space:]]*#' "$f" | grep -Eq 'header_up[[:space:]]+Host|^[[:space:]]*log([[:space:]]|$)'; then echo "Host не подменяется, журнал не включается"; exit 1; fi
           # Настройку проверяет сам Caddy той версии, с которой она проверена.
           docker run --rm -v "$PWD/$f:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -v "$PWD/config/Caddyfile.remote-mcp.example:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: реальные маршруты Caddy и отсутствие TCP admin
+        run: python service/tests/proxy_smoke.py
       # Справка и неизвестные ключи. На -h и --help каждый скрипт печатает своё назначение и выходит
       # с кодом 0 до любых действий: в каталоге без .env и данных он ничего не создаёт и не зовёт
       # ни Docker, ни curl (вместо них подставлены заглушки, которые записывают вызов). На

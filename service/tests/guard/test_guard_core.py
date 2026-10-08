@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import pytest
 
-from shturman import bridge, guard, jobs, store
+from shturman import authority, bridge, guard, jobs, store
 from shturman.guard import alerts, core, rules
 from shturman.guard import service as guard_service
 from shturman.records import ChatRecord
@@ -73,6 +73,11 @@ def button(card, label):
 
 
 async def press(conn, data, user=OWNER):
+    if user == OWNER:
+        owner = await bridge.get_owner(conn)
+        assert owner is not None and owner["user_id"] == OWNER
+        with authority.owner_context(OWNER, chat_id=owner["chat_id"], action="test.telegram.callback"):
+            return await bridge.dispatch_callback(conn, data, user)
     return await bridge.dispatch_callback(conn, data, user)
 
 

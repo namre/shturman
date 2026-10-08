@@ -23,6 +23,14 @@ ENT = index_entities(ENTITIES)
 NOT_INCLUDED = "(File not included. Change data exporting settings to download.)"
 
 
+def export_fields(record):
+    """Словарь экспорта прежний; метаданные адресации проверяются отдельно."""
+    fields = dataclasses.asdict(record)
+    for key in ("telegram_entities", "topic_tg_id", "is_forwarded", "telegram_via_bot", "telegram_sender_bot"):
+        fields.pop(key)
+    return fields
+
+
 def record(message, self_id=SELF_ID):
     return message_record(message, ENT, self_id=self_id)
 
@@ -343,7 +351,7 @@ PAIRS = {
 def test_session_record_equals_export_record(name):
     raw, message = PAIRS[name]
     from_export, from_session = parse_message(raw), record(message)
-    assert dataclasses.asdict(from_session) == dataclasses.asdict(from_export)
+    assert export_fields(from_session) == export_fields(from_export)
     assert from_session.sent_at.tzinfo == timezone.utc
 
 
@@ -455,9 +463,9 @@ def test_same_message_in_three_forms_gives_one_record(name):
     from shturman.botapi_normalize import normalize_message
 
     raw_export, raw_bot, message = THREE[name]
-    from_export = dataclasses.asdict(parse_message(raw_export))
-    from_bot = dataclasses.asdict(normalize_message(raw_bot).record)
-    from_session = dataclasses.asdict(record(message))
+    from_export = export_fields(parse_message(raw_export))
+    from_bot = export_fields(normalize_message(raw_bot).record)
+    from_session = export_fields(record(message))
     assert from_session == from_export
     assert from_session == from_bot
 
@@ -481,3 +489,4 @@ async def test_three_sources_in_any_order_make_one_row_and_no_versions(conn):
         assert await conn.fetchval("SELECT count(*) FROM messages") == len(THREE), order
         assert await conn.fetchval("SELECT count(*) FROM message_versions") == 0, order
         assert await conn.fetchval("SELECT count(*) FROM messages WHERE cardinality(sources) = 3") == len(THREE)
+

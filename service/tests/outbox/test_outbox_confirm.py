@@ -1,7 +1,7 @@
 """Правила отправки, автоответ, доверенные и наблюдатель: что ждёт нажатия владельца в своём боте.
 
 Со своим ботом согласований ослабление не применяется до нажатия «да»; «нет» и истёкший срок
-ничего не меняют. Без своего бота всё применяется сразу, как раньше. Ужесточение применяется
+ничего не меняют. Без своего бота неподтверждённое расширение отклоняется. Ужесточение применяется
 сразу в обоих режимах.
 """
 
@@ -43,11 +43,10 @@ async def test_policy_card_says_in_plain_words_what_will_change(env, own_bot, ap
     assert summary in card and "Если вы этого не просили — нажмите «Нет»" in card
 
 
-async def test_without_own_bot_policy_changes_at_once(env):
-    answer = await env.client.put("/api/outbox/policy", json={"daily_cap": 600})
-    assert answer.status_code == 200 and answer.json()["policy"]["daily_cap_stored"] == 600
-    assert await stored(env, "daily_cap") == 600
-
+async def test_without_own_bot_policy_widening_is_refused(env):
+    answer = await env.client.put('/api/outbox/policy', json={'daily_cap':600})
+    assert answer.status_code == 409 and answer.json()['code']=='owner_unknown'
+    assert await stored(env,'daily_cap')==400
 
 @pytest.mark.parametrize("change, key, value", [
     ({"daily_cap": 100}, "daily_cap", 100),                       # ниже предел
@@ -118,15 +117,16 @@ async def test_account_drafting_permission_only_grows_with_the_owner(env, own_bo
     assert back.status_code == 200 and await account_default(env) is None         # обратно — сразу
 
 
-async def test_without_own_bot_account_and_chat_drafting_change_at_once(env):
-    chat = await add_chat(env.conn, env.helper_acc)
-    for value in ("deny", "allow"):
-        answer = await env.client.put("/api/outbox/policy",
-                                      json={"account_id": env.helper_acc, "drafting_default": value})
-        assert answer.status_code == 200 and await account_default(env) == value
-        answer = await env.client.put(f"/api/outbox/chats/{chat}", json={"drafting": value})
-        assert answer.status_code == 200 and answer.json()["can_draft"] is (value == "allow")
-
+async def test_without_own_bot_account_and_chat_widening_are_refused(env):
+    chat=await add_chat(env.conn,env.helper_acc)
+    for url,data in [('/api/outbox/policy',{'account_id':env.helper_acc,'drafting_default':'deny'}),
+                     (f'/api/outbox/chats/{chat}',{'drafting':'deny'})]:
+        assert (await env.client.put(url,json=data)).status_code==200
+    for url,data in [('/api/outbox/policy',{'account_id':env.helper_acc,'drafting_default':'allow'}),
+                     (f'/api/outbox/chats/{chat}',{'drafting':'allow'})]:
+        answer=await env.client.put(url,json=data)
+        assert answer.status_code==409 and answer.json()['code']=='owner_unknown'
+    assert await account_default(env)=='deny'
 
 async def test_chat_drafting_permission_only_grows_with_the_owner(env, own_bot, approvals):
     chat = await add_chat(env.conn, env.helper_acc)
@@ -176,7 +176,8 @@ async def test_autoreply_switch_without_own_bot_and_switching_off_in_both_modes(
         approvals.waiting(on)
         assert await autoreply_on(env) is False
     else:
-        assert on.status_code == 200 and await autoreply_on(env) is True
+        assert on.status_code == 409 and on.json()['code'] == 'owner_unknown'
+        assert await autoreply_on(env) is False
 
 
 async def test_approved_autoreply_is_refused_if_sending_was_switched_off_meanwhile(env, own_bot, approvals):
@@ -233,11 +234,10 @@ async def test_narrowing_search_scope_back_is_immediate(env, either_mode, approv
     assert answer.status_code == 200 and await setting(env, "search_scope") == "chat"
 
 
-async def test_without_own_bot_autoreply_settings_change_at_once(env):
-    answer = await env.client.put("/api/outbox/autoreply", json={"search_scope": "account", "daily_cap": 900})
-    assert answer.status_code == 200
-    assert (await setting(env, "search_scope"), await setting(env, "daily_cap")) == ("account", 900)
-
+async def test_without_own_bot_autoreply_settings_widening_is_refused(env):
+    answer=await env.client.put('/api/outbox/autoreply',json={'search_scope':'account','daily_cap':900})
+    assert answer.status_code==409 and answer.json()['code']=='owner_unknown'
+    assert (await setting(env,'search_scope'),await setting(env,'daily_cap'))==('chat',300)
 
 async def test_switching_off_goes_through_while_looser_settings_wait(env, own_bot, approvals):
     await env.conn.execute(
@@ -276,12 +276,10 @@ async def test_card_for_unknown_person_says_he_is_not_in_the_archive(env, own_bo
     assert "в архиве такого собеседника пока нет" in answer.json()["summary"]
 
 
-async def test_without_own_bot_trusted_person_is_added_at_once(env):
-    answer = await env.client.post("/api/outbox/trusted", json={"tg_user_id": IVAN})
-    assert answer.status_code == 200 and answer.json()["added"] is True and await trusted(env) == [IVAN]
-    again = await env.client.post("/api/outbox/trusted", json={"tg_user_id": IVAN})
-    assert again.status_code == 200 and again.json()["added"] is False
-
+async def test_without_own_bot_trusted_person_addition_is_refused(env):
+    answer=await env.client.post('/api/outbox/trusted',json={'tg_user_id':IVAN})
+    assert answer.status_code==409 and answer.json()['code']=='owner_unknown'
+    assert await trusted(env)==[]
 
 async def test_removing_a_trusted_person_is_immediate_in_both_modes(env, either_mode, approvals):
     await env.conn.execute("INSERT INTO outbox_trusted (tg_user_id) VALUES ($1), ($2)", IVAN, MARIA)
@@ -461,16 +459,16 @@ async def test_new_watch_rule_waits_for_the_owner(env, own_bot, approvals):
     assert "Просят владельца срочно ответить" in summary     # что прочитает модель — видно владельцу
 
 
-async def test_without_own_bot_watch_rule_is_created_changed_and_deleted_at_once(env):
-    chat = await group(env)
-    created = await env.client.post("/api/watch/rules", json={**RULE, "chat_ids": [chat]})
-    assert created.status_code == 200 and created.json()["name"] == "Срочное"
-    rule_id = created.json()["id"]
-    changed = await env.client.put(f"/api/watch/rules/{rule_id}", json={"keywords": ["срочно", "горит"]})
-    assert changed.status_code == 200 and changed.json()["keywords"] == ["срочно", "горит"]
-    assert (await env.client.delete(f"/api/watch/rules/{rule_id}")).json() == {"ok": True}
-    assert await rules(env) == []
-
+async def test_without_own_bot_watch_rule_widening_and_deletion_are_refused(env):
+    chat=await group(env)
+    created=await env.client.post('/api/watch/rules',json={**RULE,'chat_ids':[chat]})
+    assert created.status_code==409 and await rules(env)==[]
+    rid,_,_=await a_rule(env)
+    for method,url,data in [('PUT',f'/api/watch/rules/{rid}',{'keywords':['срочно','горит','новое']}),
+                            ('DELETE',f'/api/watch/rules/{rid}',None)]:
+        answer=await env.client.request(method,url,**({'json':data} if data is not None else {}))
+        assert answer.status_code==409 and answer.json()['code']=='owner_unknown'
+    assert len(await rules(env))==1
 
 async def a_rule(env, **extra):
     chat = await group(env)
@@ -566,3 +564,4 @@ async def test_rule_is_rechecked_when_the_owner_presses(env, own_bot, approvals)
     out = await approvals.press(action)
     assert out["answer"] == "Не получилось." and "исключён владельцем" in out["edit_text"]
     assert await rules(env) == []
+

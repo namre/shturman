@@ -569,11 +569,11 @@ async def _render(
     hashes = {r["path"]: r["file_hash"] for r in await conn.fetch("SELECT path, file_hash FROM pages")}
     result = await asyncio.to_thread(_save_found_edits, history, hashes, root)
     if only_dirty:
-        rows = await conn.fetch("SELECT * FROM pages WHERE dirty ORDER BY id")
+        rows = await conn.fetch("SELECT * FROM pages WHERE dirty AND NOT security_quarantined ORDER BY id")
     elif page_ids is not None:
-        rows = await conn.fetch("SELECT * FROM pages WHERE id = ANY($1::bigint[]) ORDER BY id", list(page_ids))
+        rows = await conn.fetch("SELECT * FROM pages WHERE id = ANY($1::bigint[]) AND NOT security_quarantined ORDER BY id", list(page_ids))
     else:
-        rows = await conn.fetch("SELECT * FROM pages ORDER BY id")
+        rows = await conn.fetch("SELECT * FROM pages WHERE NOT security_quarantined ORDER BY id")
     written: list[tuple[str, list[str]]] = []
     stopped: list[tuple[str, str]] = []
     created = frozen = 0
@@ -838,7 +838,7 @@ async def _summary_failed(conn: asyncpg.Connection, job: dict[str, Any]) -> None
 async def _apply_summary(conn: asyncpg.Connection, job: dict[str, Any], result: dict[str, Any]) -> None:
     ctx = job.get("context") or {}
     page = await conn.fetchrow(
-        "SELECT id, summary_job_id, summary_state FROM pages WHERE id = $1 FOR UPDATE",
+        "SELECT id, summary_job_id, summary_state FROM pages WHERE id = $1 AND NOT security_quarantined FOR UPDATE",
         ctx.get("page_id") if isinstance(ctx.get("page_id"), int) else None)
     if page is None or page["summary_job_id"] != job["id"] or page["summary_state"] != "pending":
         return      # страницы уже нет или ответ опоздал
@@ -1125,7 +1125,7 @@ async def _plan(
                    SELECT 1 FROM jobs j WHERE j.id = p.summary_job_id AND j.status IN ('queued', 'running'))""")
         created = await _sync_pages(conn)
         proposals = await _propose(conn, build_id, now=now, options=options)
-    rows = await conn.fetch("SELECT * FROM pages ORDER BY summary_at NULLS FIRST, id")
+    rows = await conn.fetch("SELECT * FROM pages WHERE NOT security_quarantined ORDER BY summary_at NULLS FIRST, id")
     requested = skipped = 0
     for row in rows:
         draft = await _compose(conn, root, row, zone=zone, today=today, options=options)
@@ -1293,7 +1293,7 @@ async def write_owner_block(
     today = _today(tz, now)
     async with _writing(conn):
         active = await people.active_id(conn, person_id)
-        row = await conn.fetchrow("SELECT * FROM pages WHERE person_id = $1", active)
+        row = await conn.fetchrow("SELECT * FROM pages WHERE person_id = $1 AND NOT security_quarantined", active)
         if row is None:
             raise PagesError("У этого человека нет страницы.", "not_found")
         # сначала всё, что должен записать сам сервис: правка владельца ляжет отдельным коммитом
@@ -1373,7 +1373,7 @@ def _page_dict(row: asyncpg.Record) -> dict[str, Any]:
 
 
 async def list_pages(conn: asyncpg.Connection, *, limit: int = 500) -> list[dict[str, Any]]:
-    rows = await conn.fetch("SELECT * FROM pages ORDER BY title, id LIMIT $1", max(1, min(int(limit), 2000)))
+    rows = await conn.fetch("SELECT * FROM pages WHERE NOT security_quarantined ORDER BY title, id LIMIT $1", max(1, min(int(limit), 2000)))
     return [_page_dict(r) for r in rows]
 
 
@@ -1392,7 +1392,7 @@ async def get_page(
     if active is None:
         return None
     row = await conn.fetchrow(
-        f"SELECT g.* FROM pages g WHERE g.person_id = $1 {'AND ' + _VISIBLE if visible_only else ''}", active)
+        f"SELECT g.* FROM pages g WHERE g.person_id = $1 AND NOT g.security_quarantined {'AND ' + _VISIBLE if visible_only else ''}", active)
     if row is None:
         return None
     out = _page_dict(row)
@@ -1422,7 +1422,7 @@ async def search_pages(
                    g.entity_id, g.person_id, g.title, g.updated, g.path,
                    (SELECT array_agg(x.block ORDER BY x.block) FROM hits x WHERE x.page_id = h.page_id) AS blocks
             FROM hits h JOIN pages g ON g.id = h.page_id
-            {'WHERE ' + _VISIBLE if visible_only else ''}
+            WHERE NOT g.security_quarantined {'AND ' + _VISIBLE if visible_only else ''}
             ORDER BY h.page_id, h.rank DESC, h.block""",
         query)
     found = sorted(rows, key=lambda r: (-r["rank"], r["page_id"]))[: max(1, min(int(limit), 50))]
@@ -1457,6 +1457,9 @@ async def lint(conn: asyncpg.Connection, pages_dir: Path) -> dict[str, Any]:
     links: dict[int, list[tuple[asyncpg.Record, str]]] = {}
     for row in rows:
         where = {"path": row["path"], "person_id": row["person_id"]}
+        if row["security_quarantined"]:
+            add("protected_source", "страница закрыта: её источник — служебный диалог", **where)
+            continue
         if row["merged_into"] is not None or row["no_person"]:
             add("orphan_file", "человек объединён с другой записью: перенесите заметки и удалите файл", **where)
         try:
@@ -1505,3 +1508,4 @@ async def lint(conn: asyncpg.Connection, pages_dir: Path) -> dict[str, Any]:
     for item in findings:
         counts[item["code"]] = counts.get(item["code"], 0) + 1
     return {"checked": len(rows), "findings": findings, "counts": counts}
+

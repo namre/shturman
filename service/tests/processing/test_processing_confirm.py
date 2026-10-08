@@ -34,7 +34,7 @@ async def test_accepting_a_proposed_commitment_waits_for_the_owner(make_client, 
     approvals.waiting(first)
     summary = first.json()["summary"]
     assert f"№ {proposed}" in summary and "Иван Петров → вам" in summary and "срок 09.10.2026" in summary
-    assert "смету" not in summary and "пятниц" not in summary      # формулировка из переписки в карточку не идёт
+    assert "смету" in summary      # согласие связано с конкретным обязательством, видимым владельцу
     await approvals.gate(send, lambda: status_of(conn, proposed), "proposed", "open")
     events = [r["action"] for r in await conn.fetch(
         "SELECT action FROM commitment_events WHERE commitment_id = $1 ORDER BY id", proposed)]
@@ -60,12 +60,13 @@ async def test_other_ways_to_approve_a_proposal_wait_too(make_client, conn, own_
     await approvals.gate(send, lambda: status_of(conn, proposed), before, after)
 
 
-async def test_without_own_bot_proposal_is_accepted_at_once(make_client, conn):
+async def test_without_own_bot_proposal_cannot_be_approved_by_agent(make_client, conn):
     client, _ = await make_client(*MODULES)
     w = await seed(conn)
     proposed = await ivan_owes_estimate(conn, w, accept=False)
     answer = await client.post(f"/api/commitments/{proposed}/accept")
-    assert answer.status_code == 200 and answer.json()["commitment"]["status"] == "open"
+    assert answer.status_code == 409 and answer.json()["code"] == "owner_unknown"
+    assert await status_of(conn, proposed) == "proposed"
 
 
 async def test_working_with_an_accepted_commitment_needs_no_confirmation(make_client, conn, either_mode, approvals):
@@ -73,7 +74,7 @@ async def test_working_with_an_accepted_commitment_needs_no_confirmation(make_cl
     w = await seed(conn)
     accepted = await ivan_owes_estimate(conn, w)
     for action, body, status in (("close", None, "done"), ("reopen", None, "open"),
-                                 ("reschedule", {"due": "через месяц"}, "open"), ("cancel", None, "cancelled"),
+                                 ("cancel", None, "cancelled"),
                                  ("reopen", None, "open")):
         answer = await client.post(f"/api/commitments/{accepted}/{action}", json=body)
         assert answer.status_code == 200 and answer.json()["commitment"]["status"] == status, action
@@ -169,13 +170,16 @@ async def test_splitting_a_person_waits_for_the_owner(make_client, conn, own_bot
     assert again.status_code == 409 and await approvals.pending() == 0
 
 
-async def test_without_own_bot_people_are_merged_and_split_at_once(make_client, conn):
+async def test_without_own_bot_agent_cannot_merge_or_split_people(make_client, conn):
     client, _ = await make_client(*MODULES)
     w = await seed(conn)
     merged = await client.post("/api/people/merge", json={"source_id": w.maria, "target_id": w.ivan})
-    assert merged.status_code == 200 and merged.json()["person"]["id"] == w.ivan
+    assert merged.status_code == 409 and merged.json()["code"] == "owner_unknown"
+    assert await merged_into(conn, w.maria) is None
+    await people.merge_people(conn, w.maria, w.ivan)  # fixture: already merged before this API request
     split = await client.post(f"/api/people/{w.ivan}/split", json={"peer_id": w.maria_peer})
-    assert split.status_code == 200 and split.json()["split_from"] == w.ivan
+    assert split.status_code == 409 and split.json()["code"] == "owner_unknown"
+    assert await merged_into(conn, w.maria) == w.ivan
 
 
 async def test_rejecting_a_merge_and_editing_aliases_are_immediate(make_client, conn, either_mode, approvals):
@@ -209,11 +213,12 @@ async def test_alias_for_an_unconfirmed_person_waits_because_it_confirms_him(mak
     assert (await client.post(f"/api/people/{w.maria}/aliases", json={"alias": "123"})).status_code == 409
 
 
-async def test_without_own_bot_alias_confirms_a_person_at_once(make_client, conn):
+async def test_without_own_bot_alias_cannot_confirm_a_person(make_client, conn):
     client, _ = await make_client(*MODULES)
     w = await seed(conn)
     added = await client.post(f"/api/people/{w.maria}/aliases", json={"alias": "Главный бухгалтер"})
-    assert added.status_code == 200 and added.json()["person"]["confirmed"] is True
+    assert added.status_code == 409 and added.json()["code"] == "owner_unknown"
+    assert await confirmed(conn, w.maria) is False
 
 
 # --- страницы памяти ---
@@ -257,10 +262,11 @@ async def test_long_owner_notes_are_shown_in_part_and_say_so(make_client, conn, 
     assert len(answer.json()["summary"]) < 3000
 
 
-async def test_without_own_bot_owner_notes_are_saved_at_once(make_client, conn, config):
+async def test_without_own_bot_agent_cannot_write_owner_notes(make_client, conn, config):
     client, w, path = await page_of_ivan(make_client, conn, config)
     saved = await client.put(f"/api/pages/{w.ivan}/owner-block", json={"text": "Не писать после 19:00."})
-    assert saved.status_code == 200 and saved.json()["changed"] and owner_block(path) == "Не писать после 19:00."
+    assert saved.status_code == 409 and saved.json()["code"] == "owner_unknown"
+    assert owner_block(path) == ""
 
 
 async def test_bad_owner_notes_are_refused_before_any_card(make_client, conn, config, own_bot, approvals):
@@ -299,11 +305,12 @@ async def test_declining_a_page_is_immediate_in_both_modes(make_client, conn, co
     assert await has_page(conn, w.maria) is False
 
 
-async def test_without_own_bot_page_is_accepted_at_once(make_client, conn, config):
+async def test_without_own_bot_agent_cannot_accept_a_page(make_client, conn, config):
     client, _ = await make_client(*MODULES)
     w = await seed(conn, confirm=False)
     yes = await client.post(f"/api/pages/proposals/{w.maria}", json={"accept": True})
-    assert yes.status_code == 200 and yes.json()["status"] == "accepted" and await has_page(conn, w.maria)
+    assert yes.status_code == 409 and yes.json()["code"] == "owner_unknown"
+    assert await has_page(conn, w.maria) is False
 
 
 async def test_nothing_here_becomes_a_fact_without_the_owner_even_in_a_race(make_client, conn, config, own_bot):
@@ -339,3 +346,4 @@ async def test_building_pages_and_running_processing_need_no_confirmation(make_c
     assert (await client.post("/api/pages/build")).status_code in (200, 409)
     assert (await client.post("/api/processing/run", json={"limit": 5})).status_code == 200
     assert await approvals.pending() == 0
+

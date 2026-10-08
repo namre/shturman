@@ -7,7 +7,7 @@ from shturman.outbox import text as textlib
 from shturman.outbox import watcher
 
 from outbox_helpers import (  # noqa: F401 - env — фикстура
-    MARIA, add_chat, add_message, env, live, owner_messages, settle, take, texts,
+    MARIA, add_chat, add_message, env, live, owner_messages, owner_request, settle, take, texts,
 )
 
 YES = {"parsed": {"relevant": True, "reason": "ищут подрядчика на фасады"}, "text": "", "model": "test"}
@@ -24,7 +24,7 @@ async def rule(env, chat_ids, **extra):
     data = {"name": "Подрядчики", "chat_ids": chat_ids, "keywords": ["фасад", "подрядчик"],
             "description": "Кто-то ищет подрядчика на фасадные работы"}
     data.update(extra)
-    response = await env.client.post("/api/watch/rules", json=data)
+    response = await owner_request(env, "POST", "/api/watch/rules", json=data)
     assert response.status_code == 200, response.text
     await owner_messages(env.conn)
     return response.json()
@@ -179,14 +179,14 @@ async def test_model_failure_and_disabled_rule(env):
     await post(env, chat, 2, "Нужен подрядчик на фасад")
     assert len(await take(env.conn, bridge.LLM_STRUCTURED)) == 1
     # правило выключили, пока модель думала: уведомления нет
-    await env.client.put(f"/api/watch/rules/{created['id']}", json={"enabled": False})
+    await owner_request(env, "PUT", f"/api/watch/rules/{created['id']}", json={"enabled": False})
     await env.conn.execute("UPDATE jobs SET status = 'queued', locked_until = NULL WHERE status = 'running'")
     await verdicts(env, YES)
     assert await owner_messages(env.conn) == []
     await post(env, chat, 3, "Ещё нужен подрядчик на фасад")
     assert await take(env.conn, bridge.LLM_STRUCTURED) == []
-    assert (await env.client.delete(f"/api/watch/rules/{created['id']}")).json() == {"ok": True}
-    assert (await env.client.delete(f"/api/watch/rules/{created['id']}")).status_code == 404
+    assert (await owner_request(env, "DELETE", f"/api/watch/rules/{created['id']}")).json() == {"ok": True}
+    assert (await owner_request(env, "DELETE", f"/api/watch/rules/{created['id']}")).status_code == 404
     assert (await env.client.get("/api/watch/rules")).json()["rules"] == []
 
 
@@ -245,18 +245,18 @@ async def test_rule_validation(env):
         {**base, "max_checks_per_hour": "много"}, {**base, "sql": "drop"},
     ]
     for data in bad:
-        response = await env.client.post("/api/watch/rules", json=data)
+        response = await owner_request(env, "POST", "/api/watch/rules", json=data)
         assert response.status_code == 400, data
     assert (await env.client.get("/api/watch/rules")).json()["rules"] == []
     assert await owner_messages(env.conn) == []
     created = await rule(env, [chat], regexes=[r"вакан\w+"], keywords=[], use_lemmas=True)
     assert created["regexes"] == [r"вакан\w+"] and created["max_checks_per_hour"] == 30
     rule_id = created["id"]
-    assert (await env.client.put(f"/api/watch/rules/{rule_id}", json={"regexes": []})).status_code == 400
-    assert (await env.client.put(f"/api/watch/rules/{rule_id}", json={"chat_ids": [private]})).status_code == 400
-    assert (await env.client.put(f"/api/watch/rules/{rule_id}", json={})).status_code == 400
-    assert (await env.client.put("/api/watch/rules/999", json={"name": "x"})).status_code == 404
-    updated = await env.client.put(f"/api/watch/rules/{rule_id}", json={"keywords": ["смета"], "regexes": []})
+    assert (await owner_request(env, "PUT", f"/api/watch/rules/{rule_id}", json={"regexes": []})).status_code == 400
+    assert (await owner_request(env, "PUT", f"/api/watch/rules/{rule_id}", json={"chat_ids": [private]})).status_code == 400
+    assert (await owner_request(env, "PUT", f"/api/watch/rules/{rule_id}", json={})).status_code == 400
+    assert (await owner_request(env, "PUT", "/api/watch/rules/999", json={"name": "x"})).status_code == 404
+    updated = await owner_request(env, "PUT", f"/api/watch/rules/{rule_id}", json={"keywords": ["смета"], "regexes": []})
     assert updated.json()["keywords"] == ["смета"] and updated.json()["regexes"] == []
 
 

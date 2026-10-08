@@ -5,7 +5,7 @@
 отмена входа, выключение чатов и более мелкая история применяются сразу в любом режиме.
 """
 
-from shturman import bridge
+from shturman import authority, bridge, confirm
 from shturman.tg.client import session_path
 from shturman.tg.manager import TgManager
 
@@ -26,11 +26,15 @@ async def service(make_client, config, conn, world):
 
 
 async def login(client, world, approvals, role="assistant", **extra):
-    """Вход в аккаунт в любом режиме: со своим ботом — через разрешение владельца."""
+    """Fixture login: bot approval or explicitly authenticated setup authority."""
     body = {"role": role, **extra}
     started = await client.post("/api/tg/login", json=body)
     if started.status_code == 202:
         assert (await approvals.press(approvals.waiting(started)))["answer"] == "Сделано."
+        started = await client.post("/api/tg/login", json=body)
+    elif started.status_code == 409 and started.json().get("code") == "owner_unknown":
+        with authority.setup_context("test-login", action="fixture.login"):
+            await confirm.apply_owner(approvals.conn, "tg.login", body)
         started = await client.post("/api/tg/login", json=body)
     assert started.status_code == 200, started.text
     world.last.scan.set_result(world.me)
@@ -107,12 +111,13 @@ async def test_bad_login_request_is_refused_before_any_card(make_client, config,
     assert await approvals.pending() == 0
 
 
-async def test_without_own_bot_login_starts_at_once(make_client, config, conn):
+async def test_without_own_bot_agent_cannot_start_login(make_client, config, conn):
     world = World(HELPER)
     world.authorized = False
     client, state, manager = await service(make_client, config, conn, world)
     started = await client.post("/api/tg/login", json={"role": "assistant"})
-    assert started.status_code == 200 and started.json()["status"] == "pending"
+    assert started.status_code == 409 and started.json()["code"] == "owner_unknown"
+    assert world.clients == []
 
 
 # --- пауза, снятие с паузы, выход ---
@@ -159,7 +164,7 @@ async def test_pause_and_logout_are_immediate_in_both_modes(make_client, config,
     assert await conn.fetchval("SELECT count(*) FROM tg_sessions") == 0
 
 
-async def test_without_own_bot_resume_is_immediate(make_client, config, conn, approvals):
+async def test_without_own_bot_agent_cannot_resume(make_client, config, conn, approvals):
     world = World(HELPER)
     world.authorized = False
     client, state, manager = await service(make_client, config, conn, world)
@@ -167,8 +172,9 @@ async def test_without_own_bot_resume_is_immediate(make_client, config, conn, ap
     await running(manager, "assistant")
     await client.post(f"/api/tg/accounts/{account_id}/pause")
     world.authorized = True
-    assert (await client.post(f"/api/tg/accounts/{account_id}/resume")).json() == {"ok": True}
-    assert await paused(conn, account_id) is False
+    refused = await client.post(f"/api/tg/accounts/{account_id}/resume")
+    assert refused.status_code == 409 and refused.json()["code"] == "owner_unknown"
+    assert await paused(conn, account_id) is True
 
 
 async def test_reconnect_without_the_owner_never_lifts_a_pause(make_client, config, conn, own_bot, approvals):
@@ -278,7 +284,11 @@ async def test_disabling_chats_is_immediate_in_both_modes(make_client, config, c
     if either_mode:
         await approvals.press(approvals.waiting(on))
     else:
-        assert on.status_code == 200 and on.json()["chats"][0]["enabled"] is True     # без бота — сразу
+        assert on.status_code == 409 and on.json()["code"] == "owner_unknown"
+        with authority.setup_context("test-sync", action="fixture.enable_chat"):
+            await confirm.apply_owner(conn, "tg.sync", {
+                "account_id": account_id, "enabled": True, "chats": [["user", IVAN]],
+                "types": [], "since": "account_default"})
     assert await enabled(conn, account_id) == [IVAN]
     off = await client.post(f"{base}/sync", json={"enabled": False, "chats": [{"peer_class": "user", "tg_id": IVAN}]})
     assert off.status_code == 200 and off.json()["chats"] == [{"peer_class": "user", "tg_id": IVAN, "enabled": False}]
@@ -332,9 +342,10 @@ async def test_mixed_options_tighten_now_and_ask_about_the_rest(make_client, con
     assert await option(conn, account_id, "auto_groups") is True
 
 
-async def test_without_own_bot_options_change_at_once(make_client, config, conn, approvals):
+async def test_without_own_bot_agent_cannot_expand_options(make_client, config, conn, approvals):
     client, manager, account_id, base = await owner_account(make_client, config, conn, approvals)
     answer = await client.put(f"{base}/options", json={"auto_personal": True, "backfill_months": None})
-    assert answer.status_code == 200 and answer.json() == {"ok": True}
-    assert await option(conn, account_id, "auto_personal") is True
-    assert await option(conn, account_id, "backfill_months") is None
+    assert answer.status_code == 409 and answer.json()["code"] == "owner_unknown"
+    assert await option(conn, account_id, "auto_personal") is False
+    assert await option(conn, account_id, "backfill_months") == 12
+
