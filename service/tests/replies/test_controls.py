@@ -31,6 +31,9 @@ async def test_presend_rechecks_immutable_bindings(monkeypatch, changed):
     if changed=='requires_approval': task['requires_approval']=True
     monkeypatch.setattr(workflow,'get',AsyncMock(return_value=task))
     monkeypatch.setattr(workflow,'valid',AsyncMock(return_value=changed!='revoked'))
+    # This test isolates immutable bindings; disclosure revocation has its own test below.
+    from shturman.sources import broker
+    monkeypatch.setattr(broker,'disclosure_allowed',AsyncMock(return_value=True))
     assert not (await workflow.presend(None,None,row)).ok
 
 @pytest.mark.asyncio
