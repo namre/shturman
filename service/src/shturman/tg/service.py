@@ -54,6 +54,7 @@ LOGIN = "tg.login"
 RESUME = "tg.resume"
 OPTIONS = "tg.options"
 SYNC = "tg.sync"
+FORGET = "tg.forget"      # удалить из архива аккаунт без сессии; только со страницы настройки
 _SINCE_DEFAULT = "account_default"   # в сохранённом действии: «глубина — по настройке аккаунта»
 _TYPE_NAMES = {
     "saved_messages": "«Избранное»", "personal_chat": "личные чаты", "bot_chat": "чаты с ботами",
@@ -164,6 +165,20 @@ def _tg_applier(kind: str):
                 raise confirm.Refused("Аккаунт не подключён.", 409) from None
         return confirm.applier(kind)(wrapped)
     return deco
+
+
+@confirm.applier(FORGET)
+async def _apply_forget(conn: Any, payload: dict[str, Any]) -> confirm.Done:
+    """Стирание данных: применяется только действием самого владельца (страница настройки)."""
+    if _active is None:
+        raise confirm.Refused("Модуль аккаунтов Telegram не запущен.", 503)
+    if confirm.unconfirmed():
+        raise confirm.Refused("Удалить аккаунт из архива может только владелец.", 403)
+    try:
+        out = await _active.forget(conn, int(payload["account_id"]))
+    except TgError as exc:
+        raise confirm.Refused(exc.message, exc.status) from None
+    return confirm.Done(note=f"Удалено сообщений: {out['messages']}.", result=out)
 
 
 @_tg_applier(LOGIN)

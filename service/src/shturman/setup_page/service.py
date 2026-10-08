@@ -25,6 +25,7 @@
   POST   /shturman-setup/api/tg/login/{login_id}/password    облачный пароль: {password}
   POST   /shturman-setup/api/tg/login/{login_id}/cancel
   POST   /shturman-setup/api/tg/accounts/{id}/pause | resume | logout
+  DELETE /shturman-setup/api/tg/accounts/{id}                удалить из архива аккаунт без сессии
   PUT    /shturman-setup/api/tg/accounts/{id}/options   {auto_personal?, auto_groups?, backfill_months?}
   GET    /shturman-setup/api/tg/accounts/{id}/dialogs   ?offset&limit&q&kind&only&refresh
   POST   /shturman-setup/api/tg/accounts/{id}/sync      {enabled, chats? | kind?}
@@ -76,6 +77,7 @@ from ..executor import binding
 from ..executor import commands as executor_commands
 from ..executor.botapi import BotApiError
 from ..tg import gateway
+from ..tg import service as tg_service
 from ..tg.manager import KEEP, ROLE_NAMES, TgError, TgManager
 from . import PREFIX, apply, audit, auth, shield, summary
 from . import secrets_store as ss
@@ -502,6 +504,8 @@ async def _tg_state(state: AppState, page: Page) -> dict[str, Any]:
         account["chats_loaded"] = int(row["done"]) if row else 0
         account["chats_lost"] = int(row["lost"]) if row else 0
     out["accounts"] = accounts
+    async with state.ro_pool.acquire() as conn:
+        out["detached"] = await manager.detached_accounts(conn)
     out["logins"] = [{"login_id": flow.id, "role": flow.role} for flow in manager.flows.values() if not flow.done]
     return out
 
@@ -762,6 +766,21 @@ async def tg_logout(request: Request) -> JSONResponse:
 
 
 @endpoint
+async def tg_forget(request: Request) -> JSONResponse:
+    """Удалить из архива аккаунт, из которого вышли, со всей его перепиской. Нужен, когда в роль
+    вошли не тем аккаунтом: запись о роли иначе мешает подключить правильный."""
+    await _body(request)
+    manager, state = _tg(request), state_of(request)
+    registry = state.extras.get("imports")
+    if registry is not None and registry.running() is not None:
+        raise BadRequest("Идёт импорт выгрузки. Удалите аккаунт после его окончания.", 409, "import_running")
+    async with state.pool.acquire() as conn:
+        out = (await confirm.apply_owner(conn, tg_service.FORGET, {"account_id": _account_id(request)}))["result"]
+    await _log(request, "tg.forget", detail=f"{ROLE_NAMES.get(out['role'], out['role'])}; сообщений: {out['messages']}")
+    return JSONResponse({"ok": True, "messages": out["messages"]})
+
+
+@endpoint
 async def tg_options(request: Request) -> JSONResponse:
     manager = _tg(request)
     data = await _body(request)
@@ -1010,6 +1029,7 @@ def routes() -> list[BaseRoute]:
         Route(account + "/pause", tg_pause, methods=["POST"]),
         Route(account + "/resume", tg_resume, methods=["POST"]),
         Route(account + "/logout", tg_logout, methods=["POST"]),
+        Route(account, tg_forget, methods=["DELETE"]),
         Route(account + "/options", tg_options, methods=["PUT"]),
         Route(account + "/dialogs", tg_dialogs, methods=["GET"]),
         Route(account + "/sync", tg_sync, methods=["POST"]),
