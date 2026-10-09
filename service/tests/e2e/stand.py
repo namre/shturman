@@ -10,9 +10,10 @@ SHTURMAN_TEST_DSN: база должна быть отдельной тесто�
 Рядом с сервисом поднимается «пульт» (порт сервиса + 1) — им сценарий делает то, что в жизни
 делает человек в Telegram: сканирует QR, нажимает «Запустить» в боте, подключает бизнес-режим.
 
-Для экрана «Память ассистента» пульт заводит (`POST /seed-memory`) переписку с двумя людьми, страницу
-об одном из них со сводкой — ответ «модели» подставляет сам стенд, — предложение завести страницу о
-втором и новую договорённость, ждущую решения.
+Для экрана «Память ассистента» пульт заводит (`POST /seed-memory`) переписку с двумя людьми и группу,
+страницу об одном человеке со сводкой и фактом — ответ «модели» подставляет сам стенд, — проект с
+решением и фактами, а ждущими решения — страницу о втором человеке, его договорённость, факт о
+владельце и предложенный ассистентом проект.
 
 Третий порт (порт сервиса + 2) — подставной «дашборд»: пустая страница и service worker на том же
 имени узла, что и страница настройки, но на другом порту. С неё сценарий делает то, что делал бы
@@ -201,12 +202,13 @@ async def main() -> None:
                              "llm_requests": len(llm.requests)})
 
     async def seed_memory(request):
-        """Память ассистента: страница об Ольге со сводкой и договорённостью, предложение завести
-        страницу о Сергее и его новая договорённость, ждущая решения."""
+        """Память ассистента: страница об Ольге со сводкой, фактом и договорённостью; проект
+        «Береговой» с чатом, решением и фактом. Ждут решения: страница о Сергее, его новая
+        договорённость, факт о владельце и предложенный ассистентом проект."""
         from datetime import datetime, timedelta, timezone
 
         from shturman import authority, bridge, jobs, store
-        from shturman.processing import commitments, pages_build, people
+        from shturman.processing import commitments, facts, pages_build, people, projects
         from shturman.records import ChatRecord, MessageRecord
 
         app = state["app"]
@@ -224,13 +226,23 @@ async def main() -> None:
                 5002: ("Сергей Ковалёв", [
                     (5002, "График поставок бетона пришлю до среды."),
                     (owner_tg, "Жду.")]),
+                -100555: ("Береговой: стройка", [
+                    (5001, "Решили: фасад корпуса 2 — керамогранит."),
+                    (owner_tg, "Согласен. Сдача корпуса — в марте."),
+                    (5001, "Смета по фасаду — 12 млн.")]),
+                -100556: ("Склад на Окружной: снабжение", [
+                    (5002, "Арматуру на склад привезут в четверг."),
+                    (owner_tg, "Хорошо.")]),
             }
+            names = {5001: "Ольга Смирнова", 5002: "Сергей Ковалёв"}
             ids, peers, chats = {}, {}, {}
             for tg_id, (name, lines) in talk.items():
-                chat_id, _ = await store.ensure_chat(c, account, ChatRecord("user", tg_id, "personal_chat", name))
+                record = (ChatRecord("user", tg_id, "personal_chat", name) if tg_id > 0
+                          else ChatRecord("channel", -tg_id, "private_supergroup", name))
+                chat_id, _ = await store.ensure_chat(c, account, record)
                 rows = [(chat_id, MessageRecord(
                     tg_message_id=n + 1, sent_at=start + timedelta(hours=n), kind="message", sender_class="user",
-                    sender_tg_id=who, sender_name=name if who == tg_id else "Владелец", text=text, entities=None,
+                    sender_tg_id=who, sender_name=names.get(who, "Владелец"), text=text, entities=None,
                     reply_to_tg_id=None, forwarded_from=None, edited_at=None, media_type=None, media_path=None,
                     service_action=None)) for n, (who, text) in enumerate(lines)]
                 await store.upsert_messages(c, rows, source="session", owner_tg_id=owner_tg)
@@ -254,6 +266,31 @@ async def main() -> None:
                 await commitments.accept(c, open_one)
             await promise(5002, "прислать график поставок бетона", "до среды")
 
+            async def fact(subject, message_id, text, *, kind="fact", slot=None, status="active", origin="other",
+                           person_id=None, project_id=None):
+                fact_id = await c.fetchval(
+                    """INSERT INTO facts (subject_type, person_id, project_id, kind, slot, text, text_norm, valid_from,
+                                          status, origin, source_message_id, source_quote)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $6) RETURNING id""",
+                    subject, person_id, project_id, kind, slot, text, facts.text_norm(text), start.date(), status,
+                    origin, message_id)
+                if status == "active":
+                    await facts.rechain(c, subject, person_id, project_id, slot)
+                return fact_id
+
+            with authority.setup_context("stand", action="stand.seed"):
+                project = (await projects.create_project(
+                    c, "ЖК «Береговой»", [chats[-100555]], ["Береговой"]))["project"]["id"]
+            await fact("project", ids[-100555][0], "фасад корпуса 2 — керамогранит", kind="decision", project_id=project)
+            await fact("project", ids[-100555][2], "12 млн", slot="смета фасада", project_id=project)
+            await fact("project", ids[-100555][1], "март", slot="срок сдачи корпуса", origin="owner", project_id=project)
+            await fact("person", ids[5001][3], "руководитель проектного отдела", slot="должность", person_id=olga)
+            await fact("owner", ids[5001][1], "отвечаю за бюджет фасадов", slot="роль", status="proposed",
+                       origin="owner")
+            # предложение по групповому чату: по упоминаниям оно снялось бы обходом без записей об упоминаниях
+            await projects.create_project(c, "Склад на Окружной", [chats[-100556]], origin="model",
+                                          reason={"messages": 24, "chats": [chats[-100556]]})
+
             # сводку пишет «модель» стенда: задание не должно уйти своей модели сервиса
             kept = set(bridge._builtin_kinds)
             bridge.set_builtin(kept - {bridge.LLM_STRUCTURED, bridge.LLM_TEXT})
@@ -261,21 +298,25 @@ async def main() -> None:
                 plan = await pages_build.build(c, app.config.pages_dir, tz=app.config.timezone, trigger="manual")
             finally:
                 bridge.set_builtin(kept)
-            olga_msgs = ids[5001]
+            olga_msgs, site = ids[5001], ids[-100555]
             for job in await jobs.claim(c, [bridge.LLM_STRUCTURED], worker="stand", limit=20):
+                context = (await jobs.get(c, job["id"]))["context"] or {}
+                offered = {i for i, _ in context.get("offered") or []}
+                said = [
+                    ("Руководит проектным отделом; вопросы по чертежам — к ней.", olga_msgs[3], "other"),
+                    ("Готовит проект фасада по корпусу 2.", olga_msgs[0], "other"),
+                    ("Бюджет фасада — в пределах 12 млн.", olga_msgs[1], "owner"),
+                    ("Фасад корпуса 2 — керамогранит, смета 12 млн.", site[2], "other"),
+                    ("Сдача корпуса 2 — в марте.", site[1], "owner"),
+                ]
                 await bridge.deliver_result(c, job["id"], {"parsed": {"statements": [
-                    {"text": "Руководит проектным отделом; вопросы по чертежам — к ней.", "sources": [olga_msgs[3]],
-                     "origin": "other", "contradiction": False},
-                    {"text": "Готовит проект фасада по корпусу 2.", "sources": [olga_msgs[0]], "origin": "other",
-                     "contradiction": False},
-                    {"text": "Бюджет фасада — в пределах 12 млн.", "sources": [olga_msgs[1]], "origin": "owner",
-                     "contradiction": False},
-                ]}, "text": "", "model": "stand"})
+                    {"text": text, "sources": [source], "origin": origin, "contradiction": False}
+                    for text, source, origin in said if source in offered]}, "text": "", "model": "stand"})
             await pages_build.finish_build(c, app.config.pages_dir, tz=app.config.timezone)
             await c.execute(
                 """INSERT INTO page_proposals (person_id, reason) VALUES ($1, '{"messages": 24, "commitments": 0}'::jsonb)
                    ON CONFLICT (person_id) DO NOTHING""", sergey)
-        return JSONResponse({"ok": True, "olga": olga, "sergey": sergey, "plan": plan.get("status")})
+        return JSONResponse({"ok": True, "olga": olga, "sergey": sergey, "project": project, "plan": plan.get("status")})
 
     async def dashboard_page(request):
         return HTMLResponse(DASHBOARD_PAGE)

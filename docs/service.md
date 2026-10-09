@@ -90,14 +90,26 @@
 
 | Маршрут | Что делает |
 |---|---|
-| `GET /shturman-setup/api/memory/pages` (`?q=`) | Страницы о людях: имя, дата обновления, пометки (`flags`); с запросом — совпадения в имени, затем поиск по тексту страниц (`search_pages`) с отрывком |
-| `GET /shturman-setup/api/memory/pages/{person_id}` | Страница текстом: сводка, заметки владельца, строки таблицы договорённостей, хронология; ссылки на сообщения — только счётчик `sources`, разметка снята; `editable` — можно ли сохранить заметки |
-| `PUT /shturman-setup/api/memory/pages/{person_id}/owner-block` | `{text}` — заметки владельца: `confirm.apply_owner(pages.owner_block)`, коммит «Правка владельца»; ≤ 20 000 знаков, метки блоков — отказ 400 с тем же текстом, что у `PUT /api/pages/{id}/owner-block` |
-| `GET /shturman-setup/api/memory/pending` | Что ждёт решения: предложения страниц (`pages`) и новые договорённости (`commitments`: кто кому, что, срок, цитата до 160 знаков, отпечаток) |
+| `GET /shturman-setup/api/memory/pages` (`?q=`) | Страницы о людях: имя, дата обновления, пометки (`flags`); с запросом — совпадения в имени, затем поиск по тексту страниц людей (`search_pages`) с отрывком |
+| `GET /shturman-setup/api/memory/pages/{person_id}` | Страница текстом: сводка, заметки владельца, строки таблицы договорённостей, хронология; ссылки на сообщения — только счётчик `sources`, разметка снята; `facts` — действующие факты из базы (с номером для «Неверно»); `editable` — можно ли сохранить заметки |
+| `PUT /shturman-setup/api/memory/pages/{person_id}/owner-block` | `{text}` — заметки владельца: `confirm.apply_owner(pages.owner_block)`, коммит «Правка владельца»; ≤ 20 000 знаков, метки блоков — отказ 400 с тем же текстом, что у внутреннего API |
+| `GET /shturman-setup/api/memory/projects` | Заведённые проекты: действующие, затем в архиве (предложенные — в `pending`); чаты, число открытых договорённостей, фактов и решений |
+| `POST /shturman-setup/api/memory/projects` | `{title, chat_ids?, aliases?}` — `apply_owner(projects.create)`; то же название уже есть — 409 `exists`, чужой или исключённый чат — 404 |
+| `GET /shturman-setup/api/memory/projects/{id}` | Страница проекта текстом, `facts` и `decisions` из базы, чаты (`id`, название), участники, другие названия |
+| `PUT /shturman-setup/api/memory/projects/{id}/chats` | `{chat_ids}` — весь перечень: `apply_owner(projects.chats)` |
+| `POST /shturman-setup/api/memory/projects/{id}/archive` | `apply_owner(projects.archive)`; уже в архиве — 409 |
+| `PUT /shturman-setup/api/memory/projects/{id}/owner-block` | `{text}` — заметки о проекте: `pages.owner_block` с `entity_id` `project:N` |
+| `GET /shturman-setup/api/memory/chats` | Чаты, которые читает сервис (не исключённые, с сообщениями): номер, название, вид — для выбора чатов проекта |
+| `GET /shturman-setup/api/memory/profile` | Профиль: одобренные факты о владельце и его правила (блок владельца страницы `owner:profile`) |
+| `PUT /shturman-setup/api/memory/profile/owner-block` | `{text}` — правила и указания: `pages.owner_block` с `entity_id` `owner:profile` (страница заводится при первой записи) |
+| `POST /shturman-setup/api/memory/facts/{id}/retract` | «Неверно»: `apply_owner(facts.retract)`; не действующий факт — 409 |
+| `GET /shturman-setup/api/memory/pending` | Что ждёт решения: предложенные проекты (`projects`: причина, чаты), факты о владельце (`owner_facts`: слот, текст, с какого дня, цитата до 160 знаков, отпечаток), предложения страниц (`pages`) и новые договорённости (`commitments`: кто кому, что, срок, цитата, отпечаток); `total` |
+| `POST /shturman-setup/api/memory/pending/projects/{id}` | `{accept}` — согласие через `apply_owner(projects.accept)`, отказ — `decide_project_proposal`; решённое — 409 |
+| `POST /shturman-setup/api/memory/pending/owner-facts/{id}` | `{accept, fingerprint}` — `facts.decide_owner_fact` в контексте владельца с отпечатком показанного (изменилось — 409 `changed_meanwhile`); решённое — 409 |
 | `POST /shturman-setup/api/memory/pending/pages/{person_id}` | `{accept}` — согласие через `apply_owner(pages.accept)`, отказ — сразу; решённое — 409 |
 | `POST /shturman-setup/api/memory/pending/commitments/{id}` | `{accept, fingerprint}` — принятие через `apply_owner(commitments.decide)` с отпечатком показанного (изменилось — 409 `changed_meanwhile`), отказ — `commitments.reject` от владельца; решённое — 409 |
 
-Внутренний API эти маршруты не меняют: через `/api/pages…` и `/api/commitments…` те же решения по-прежнему ждут нажатия в боте. Журнал — `memory.owner_block` (в списке важных), `memory.page_accept`, `memory.page_reject`, `memory.commitment_accept`, `memory.commitment_reject`.
+Внутренний API эти маршруты не меняют: через `/api/pages…`, `/api/commitments…`, `/api/projects…`, `/api/facts…` и `/api/owner/profile…` те же решения по-прежнему ждут нажатия в боте. Журнал — `memory.owner_block`, `memory.profile_block`, `memory.owner_fact_accept` (в списке важных), `memory.page_accept`, `memory.page_reject`, `memory.commitment_accept`, `memory.commitment_reject`, `memory.project_create`, `memory.project_chats`, `memory.project_archive`, `memory.project_accept`, `memory.project_reject`, `memory.fact_retract`, `memory.owner_fact_reject`; в записи — номера и числа, без имён, названий и текста.
 
 **Отдельный вход.** Страница — не ещё один клиент внутреннего API: её маршруты (`/shturman-setup/api/…`) зовут функции сервиса напрямую и не принимают его токены.
 

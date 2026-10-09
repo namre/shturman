@@ -466,6 +466,22 @@ body.sc-staff .only-own, body:not(.sc-staff) .only-staff { display: none !import
 .mem-item-main { display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
 .mem-quote { font-size: 14px; color: var(--muted); }
 .mem-item .row { align-items: stretch; }
+.mem-title h3 .badge { margin-left: 10px; vertical-align: middle; }
+.mem-facts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.mem-fact { display: flex; align-items: flex-start; gap: 12px; padding: 8px 0 8px 14px; border-left: 3px solid var(--line); }
+.mem-fact-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.mem-fact .btn { flex: none; }
+.mem-form { gap: 16px; max-width: 640px; }
+.mem-form-title { font-size: 22px; }
+.mem-fieldset { margin: 0; padding: 12px 14px 14px; border: 1px solid var(--line); border-radius: var(--radius); display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.mem-fieldset legend { font-weight: 600; padding: 0 6px; }
+.mem-chats { list-style: none; margin: 0; padding: 4px 10px; max-height: 300px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.mem-chats li { padding: 4px 0; overflow-wrap: anywhere; }
+.mem-chats .check { align-items: center; min-height: 40px; }
+.mem-chat { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; background: var(--surface); overflow-wrap: anywhere; }
+.mem-add { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.mem-add .field { flex: 1 1 260px; }
+.mem-archive > summary { color: var(--muted); }
 
 /* -------------------------------------------------------------- что собрано */
 
@@ -532,4 +548,8 @@ body.sc-staff .only-own, body:not(.sc-staff) .only-staff { display: none !import
   .mem-table td { border: 0; padding: 2px 0; white-space: normal !important; }
   .mem-table td::before { content: attr(data-label) ": "; color: var(--muted); font-size: 13px; font-weight: 600; }
   .mem-item .row .btn { flex: 1 1 140px; }
+  .mem-fact { flex-wrap: wrap; }
+  #mem-tabs { gap: 6px; }
+  #mem-tabs .tab { min-height: 44px; padding: 6px 12px; font-size: 15px; }
+  .mem-add .btn { flex: 1 1 100%; }
 }

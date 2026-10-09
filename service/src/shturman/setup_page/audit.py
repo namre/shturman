@@ -73,6 +73,15 @@ ACTIONS = {
     "memory.page_reject": "Страницу памяти о человеке решено не заводить",
     "memory.commitment_accept": "Договорённость из переписки принята",
     "memory.commitment_reject": "Договорённость из переписки отклонена",
+    "memory.project_create": "Заведён проект",
+    "memory.project_chats": "Изменены чаты проекта",
+    "memory.project_archive": "Проект перенесён в архив",
+    "memory.project_accept": "Заведён предложенный проект",
+    "memory.project_reject": "Предложенный проект решено не заводить",
+    "memory.fact_retract": "Факт отмечен как неверный",
+    "memory.owner_fact_accept": "Факт о вас принят в профиль",
+    "memory.owner_fact_reject": "Факт о вас отклонён",
+    "memory.profile_block": "Изменены ваши правила и указания ассистенту",
 }
 
 
@@ -85,7 +94,7 @@ IMPORTANT = frozenset({
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
     # заметки владельца ассистент читает как его собственные слова: их правку не вытеснить из вида
-    "memory.owner_block",
+    "memory.owner_block", "memory.profile_block", "memory.owner_fact_accept",
 })
 
 
