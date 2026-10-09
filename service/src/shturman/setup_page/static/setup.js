@@ -299,6 +299,9 @@
     show("screen-login", false);
     show("screen-app", true);
     ui.signatures = {};
+    mem.pages = mem.pending = mem.person = null;
+    mem.personId = null;
+    if (memOpen()) showMemory(true);
     refresh().then(function () { refreshOverview(); });
     startLoop();
   }
@@ -315,6 +318,7 @@
 
   function refreshOverview() {
     ui.lastOverview = Date.now();
+    refreshMemoryCount();
     return call("GET", "overview").then(function (r) { if (r.ok) renderSummary(r.data); });
   }
 
@@ -1412,6 +1416,339 @@
     });
   }
 
+  /* ---------------------------------------------------- память ассистента
+   * Не шаг настройки, а отдельная карточка после шагов. Разделы — вкладки из MEMORY_TABS: у каждой
+   * id, подпись, load() — запрос данных (обещание) и draw() — узлы панели; count() — число на вкладке.
+   * Новый раздел (проекты, профиль владельца) — ещё один объект в MEMORY_TABS и его маршруты
+   * /memory/… на сервере (memory.py). Пустых разделов-заглушек на странице нет.
+   * Всё, что пришло с сервера, выводится через textContent: ссылок из текста страниц нет. */
+
+  var MEM_LIMIT = 20000;
+  var mem = { tab: "people", q: "", pages: null, pending: null, person: null, personId: null, error: "", timer: null, seq: 0 };
+
+  var FLAG_WORDS = {
+    frozen: ["заморожена", "Файл страницы правили вручную, и ассистент перестал понимать, где какой блок. Пока файл не исправят, страница не обновляется, а заметки здесь не сохраняются. Исправить его может тот, кто сопровождает сервер."],
+    summary_not_updated: ["сводка не обновлена", "Сводка не обновилась при последней ночной сборке — показана прежняя. Обычно это исправляется следующей ночью."],
+    summary_pending: ["сводка пересобирается", "Ассистент как раз пересобирает сводку. Загляните через несколько минут."],
+    waiting: ["скоро обновится", "Есть новые сведения: страница обновится в ближайшие минуты."],
+    no_file: ["ещё не записана", "Страница заведена, но ещё не записана: появится после ближайшей сборки, обычно ночью. Заметки можно написать уже сейчас."]
+  };
+
+  var ORIGIN_WORDS = { "сказал владелец": "сказали вы", "сказал собеседник": "сказал собеседник", "вывела модель": "вывод ассистента" };
+
+  var MEMORY_TABS = [
+    { id: "people", label: "Люди", load: loadPeople, draw: drawPeople },
+    { id: "pending", label: "Ждут решения", load: loadPending, draw: drawPending,
+      count: function () { return mem.pending ? mem.pending.total : 0; } }
+  ];
+
+  function memTab(id) { return MEMORY_TABS.filter(function (t) { return t.id === id; })[0] || MEMORY_TABS[0]; }
+  function memOpen() { return $("memory-details").open; }
+
+  function day(iso) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+    if (!m) return "";
+    return new Date(+m[1], +m[2] - 1, +m[3]).toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+  }
+
+  function sourcesText(item) {
+    var parts = [];
+    if (item.sources) parts.push(item.sources === 1 ? "сообщение" : item.sources + " " + plural(item.sources, "сообщение", "сообщения", "сообщений"));
+    if (item.origin) parts.push(ORIGIN_WORDS[item.origin] || item.origin);
+    return parts.join(" · ");
+  }
+
+  function memPill() {
+    var n = mem.pending ? mem.pending.total : 0;
+    pill("memory", n ? "ждут решения: " + n : "", n ? "todo" : "");
+  }
+
+  /* Ждущее решения нужно и для числа на свёрнутой карточке: спрашивается вместе со счётчиками. */
+  function refreshMemoryCount() {
+    return call("GET", "memory/pending", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      var before = JSON.stringify(mem.pending);
+      mem.pending = r.data;
+      memPill();
+      if (memOpen() && before !== JSON.stringify(mem.pending)) drawMemoryTabs();
+    });
+  }
+
+  function drawMemoryTabs() {
+    var box = $("mem-tabs");
+    box.textContent = "";
+    MEMORY_TABS.forEach(function (tab) {
+      var n = tab.count ? tab.count() : 0;
+      box.appendChild(el("button", {
+        class: "tab", type: "button", role: "tab", id: "mem-tab-" + tab.id, "aria-controls": "mem-panel",
+        "aria-selected": tab.id === mem.tab ? "true" : "false",
+        onclick: function () { if (mem.tab !== tab.id) { mem.tab = tab.id; mem.personId = null; showMemory(true); } }
+      }, [tab.label, n ? el("span", { class: "tab-count", text: String(n) }) : null]));
+    });
+    $("mem-panel").setAttribute("aria-labelledby", "mem-tab-" + mem.tab);
+  }
+
+  function memPanel(nodes) {
+    var panel = $("mem-panel");
+    panel.textContent = "";
+    (Array.isArray(nodes) ? nodes : [nodes]).forEach(function (n) { if (n) panel.appendChild(n); });
+  }
+
+  /* Рисует раздел; reload — сначала заново спросить данные у сервера. */
+  function showMemory(reload) {
+    var tab = memTab(mem.tab), seq = ++mem.seq;
+    drawMemoryTabs();
+    if (!reload && !mem.error) { memPanel(tab.draw()); return Promise.resolve(); }
+    memPanel(el("p", { class: "small waiting", role: "status", text: "Загружаю…" }));
+    return tab.load().then(function (error) {
+      if (seq !== mem.seq) return;               // пока ждали, владелец ушёл в другой раздел
+      mem.error = error || "";
+      drawMemoryTabs();
+      memPanel(error ? el("p", { class: "note warn", role: "alert", text: error }) : tab.draw());
+    });
+  }
+
+  /* ---- Люди */
+
+  function loadPeople() {
+    if (mem.personId !== null) {
+      return call("GET", "memory/pages/" + mem.personId).then(function (r) {
+        if (r.ok) mem.person = r.data; else { mem.personId = null; mem.person = null; }
+        return r.ok ? "" : r.error;
+      });
+    }
+    return call("GET", "memory/pages" + (mem.q ? "?q=" + encodeURIComponent(mem.q) : "")).then(function (r) {
+      if (r.ok) mem.pages = r.data;
+      return r.ok ? "" : r.error;
+    });
+  }
+
+  function drawPeople() {
+    if (mem.personId !== null && mem.person) return drawPerson(mem.person);
+    var input = el("input", { id: "mem-q", type: "search", autocomplete: "off", value: mem.q,
+                              placeholder: "Имя или слово со страницы" });
+    input.addEventListener("input", function () {
+      clearTimeout(mem.timer);
+      mem.timer = setTimeout(function () {
+        mem.q = input.value.trim().slice(0, 200);
+        var seq = ++mem.seq;
+        loadPeople().then(function (error) {
+          if (seq !== mem.seq) return;
+          var list = $("mem-list");
+          if (!list) return;
+          list.replaceWith(error ? el("p", { id: "mem-list", class: "note warn", text: error }) : peopleList());
+        });
+      }, 300);
+    });
+    return [
+      el("div", { class: "field search mem-search" }, [el("label", { for: "mem-q", text: "Найти человека или слово на страницах" }), input]),
+      peopleList()
+    ];
+  }
+
+  function flagPills(flags) {
+    return (flags || []).map(function (f) {
+      var words = FLAG_WORDS[f.code];
+      return el("span", { class: "badge warn", text: words ? words[0] : f.text });
+    });
+  }
+
+  function peopleList() {
+    var items = (mem.pages && mem.pages.pages) || [];
+    if (!items.length) {
+      return el("p", { id: "mem-list", class: "note", text: mem.q
+        ? "Ничего не нашлось. Попробуйте другое слово или часть имени."
+        : "Страниц пока нет. Они появятся после ночной обработки переписки: ассистент предложит завести страницы о людях, с кем вы больше всего переписываетесь, — в боте согласований и во вкладке «Ждут решения»." });
+    }
+    return el("ul", { id: "mem-list", class: "mem-list" }, items.map(function (p) {
+      var meta = [p.updated ? "обновлена " + day(p.updated) : "ещё не записана"];
+      if (p.match_text && p.match !== "head") meta.push("найдено в " + p.match_text);
+      return el("li", {}, [el("button", {
+        class: "mem-row", type: "button",
+        onclick: function () { mem.personId = p.person_id; mem.person = null; showMemory(true).then(function () { $("mem-panel").focus(); }); }
+      }, [
+        el("span", { class: "mem-row-main" }, [
+          el("span", { class: "mem-name", text: p.title }),
+          el("span", { class: "mem-meta", text: meta.join(" · ") }),
+          p.snippet ? el("span", { class: "mem-snippet", text: p.snippet }) : null
+        ]),
+        el("span", { class: "mem-flags" }, flagPills(p.flags)),
+        el("span", { class: "arrow", "aria-hidden": "true", text: "›" })
+      ])]);
+    }));
+  }
+
+  function memSection(title, hint, body) {
+    return el("section", { class: "mem-block" }, [el("h4", { text: title }), hint ? el("p", { class: "small", text: hint }) : null].concat(body));
+  }
+
+  function drawPerson(p) {
+    var nodes = [
+      el("button", { class: "link mem-back", type: "button", text: "← Все люди",
+                     onclick: function () { mem.personId = null; mem.person = null; showMemory(true); } }),
+      el("div", { class: "mem-title" }, [
+        el("h3", { text: p.title }),
+        p.aliases && p.aliases.length ? el("p", { class: "small", text: "Ещё называют: " + p.aliases.join(", ") }) : null,
+        el("p", { class: "small", text: p.updated ? "Страница обновлена " + day(p.updated) : "Страница ещё не записана." })
+      ])
+    ];
+    (p.flags || []).forEach(function (f) {
+      var words = FLAG_WORDS[f.code];
+      nodes.push(el("p", { class: "note info", text: words ? words[1] : f.text }));
+    });
+    if (p.problem && !(p.flags || []).some(function (f) { return f.code === "frozen"; })) nodes.push(el("p", { class: "note info", text: FLAG_WORDS.frozen[1] }));
+
+    nodes.push(memSection("Сводка", "Пишет ассистент по переписке и пересобирает каждую ночь. Под каждой строкой — откуда она: из скольких сообщений и кто это сказал.",
+      [p.summary.length ? el("ul", { class: "mem-lines" }, p.summary.map(function (s) {
+        if (s.note) return el("li", { class: "mem-note", text: s.text });
+        return el("li", {}, [
+          s.disputed ? el("span", { class: "badge warn", text: "противоречие" }) : null,
+          el("span", { text: s.text }),
+          el("span", { class: "mem-meta", text: sourcesText(s) })
+        ]);
+      })) : el("p", { class: "mem-note", text: "Сводки пока нет." })]));
+
+    nodes.push(ownerBlock(p));
+
+    nodes.push(memSection("Договорённости", "Из таблицы договорённостей ассистента. Закрыть или перенести срок — командой ассистенту или в боте согласований.",
+      [p.commitments.length ? el("table", { class: "mem-table" }, [
+        el("thead", {}, [el("tr", {}, [el("th", { scope: "col", text: "Что" }), el("th", { scope: "col", text: "Срок" }), el("th", { scope: "col", text: "Статус" })])]),
+        el("tbody", {}, p.commitments.map(function (c) {
+          return el("tr", {}, [el("td", { "data-label": "Что", text: c.what }), el("td", { "data-label": "Срок", text: c.due }),
+                               el("td", { "data-label": "Статус", text: c.status })]);
+        }))
+      ]) : el("p", { class: "mem-note", text: "Договорённостей нет." })]));
+
+    nodes.push(memSection("Хронология", "Что и когда происходило. Строки только дописываются, старые не меняются.",
+      [p.timeline.length ? el("ol", { class: "mem-timeline" }, p.timeline.slice().reverse().map(function (t) {
+        return el("li", {}, [
+          t.day ? el("time", { datetime: t.day, text: day(t.day) }) : null,
+          el("span", { text: t.text }),
+          el("span", { class: "mem-meta", text: sourcesText(t) })
+        ]);
+      })) : el("p", { class: "mem-note", text: "Пока пусто." })]));
+    return nodes;
+  }
+
+  function ownerBlock(p) {
+    var area = el("textarea", { id: "mem-owner", rows: "6", maxlength: String(MEM_LIMIT), spellcheck: "true",
+                                "aria-describedby": "mem-owner-hint mem-owner-count mem-owner-note",
+                                placeholder: "Например: не писать после 19:00; решения по деньгам — только через меня." });
+    area.value = p.owner || "";
+    area.disabled = !p.editable;
+    var count = el("p", { class: "hint", id: "mem-owner-count", role: "status" });
+    var save = el("button", { class: "btn", id: "mem-owner-save", type: "submit", text: "Сохранить" });
+    function counted() {
+      text(count, "Знаков: " + number(area.value.length) + " из " + number(MEM_LIMIT));
+      save.disabled = !p.editable || area.value === (p.owner || "");
+    }
+    area.addEventListener("input", counted);
+    counted();
+    var form = el("form", { class: "mem-owner", id: "mem-owner-form", autocomplete: "off", novalidate: true }, [
+      el("label", { for: "mem-owner", text: "Текст заметок" }), area, count,
+      el("p", { class: "note", id: "mem-owner-note", role: "status", hidden: true }),
+      el("div", { class: "row" }, [save])
+    ]);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (save.disabled) return;
+      var value = area.value, id = p.person_id;
+      busy(save, true);
+      note("mem-owner-note", "", "");
+      call("PUT", "memory/pages/" + id + "/owner-block", { text: value }).then(function (r) {
+        if (!r.ok) { note("mem-owner-note", "warn", r.error); busy(save, false); return; }
+        p.owner = value.replace(/^\n+|\n+$/g, "");
+        if (mem.person && mem.person.person_id === id) mem.person.owner = p.owner;
+        counted();
+        note("mem-owner-note", "ok", r.data.changed ? "Сохранено. Ассистент учтёт это в следующем ответе." : "Без изменений: такой текст уже сохранён.");
+        refreshOverview();
+      });
+    });
+    return memSection("Ваши заметки", null, [
+      el("p", { class: "gives", id: "mem-owner-hint" }, [el("b", { text: "Этот блок пишете только вы. " }),
+        "Ассистент его не меняет и читает как ваши собственные слова — доверяет ему больше, чем переписке."]),
+      form
+    ]);
+  }
+
+  /* ---- Ждут решения */
+
+  function loadPending() {
+    return call("GET", "memory/pending").then(function (r) {
+      if (r.ok) { mem.pending = r.data; memPill(); }
+      return r.ok ? "" : r.error;
+    });
+  }
+
+  function decide(button, item, path, body, done) {
+    var buttons = item.querySelectorAll("button"), error = item.querySelector(".mem-error");
+    Array.prototype.forEach.call(buttons, function (b) { b.disabled = true; });
+    error.hidden = true;
+    call("POST", path, body).then(function (r) {
+      if (!r.ok) {
+        Array.prototype.forEach.call(buttons, function (b) { b.disabled = false; });
+        error.textContent = r.error;
+        error.hidden = false;
+        if (r.status === 404 || r.status === 409) loadPending().then(function () { drawMemoryTabs(); });
+        return;
+      }
+      toast(done);
+      mem.pages = null;                              // список людей мог измениться
+      refreshOverview();
+      loadPending().then(function () { if (mem.tab === "pending") showMemory(false); });
+    });
+  }
+
+  function pendingItem(head, lines, yes, no) {
+    var item = el("li", { class: "mem-item" }, [
+      el("div", { class: "mem-item-main" }, [el("b", { text: head })].concat(lines)),
+      el("p", { class: "note warn mem-error", role: "alert", hidden: true }),
+      el("div", { class: "row" }, [
+        el("button", { class: "btn small-btn", type: "button", text: yes[0], onclick: function () { yes[1](this, item); } }),
+        el("button", { class: "btn ghost small-btn", type: "button", text: no[0], onclick: function () { no[1](this, item); } })
+      ])
+    ]);
+    return item;
+  }
+
+  function drawPending() {
+    var d = mem.pending || { pages: [], commitments: [], total: 0 };
+    var nodes = [el("p", { class: "small", text: "То же, что бот согласований присылает с кнопками ✓ и ✗. Решение здесь действует сразу — как нажатие в боте." })];
+    if (!d.total) {
+      nodes.push(el("p", { class: "note ok", text: "Сейчас ничего не ждёт вашего решения." }));
+      return nodes;
+    }
+    if (d.pages.length) {
+      nodes.push(memSection("Завести страницу о человеке?", "Ассистент будет вести о нём сводку по переписке и опираться на неё в ответах.",
+        [el("ul", { class: "mem-items" }, d.pages.map(function (p) {
+          var path = "memory/pending/pages/" + p.person_id;
+          return pendingItem(p.name, [el("span", { class: "mem-meta", text: "Почему предложено: " + p.reason })],
+            ["✓ Завести страницу", function (b, item) { decide(b, item, path, { accept: true }, "Страница будет заведена."); }],
+            ["✗ Не нужно", function (b, item) { decide(b, item, path, { accept: false }, "Не заводим."); }]);
+        }))]));
+    }
+    if (d.commitments.length) {
+      nodes.push(memSection("Новые договорённости из переписки", "Верно — ассистент запишет договорённость и будет напоминать о ней. Неверно — забудет.",
+        [el("ul", { class: "mem-items" }, d.commitments.map(function (c) {
+          var path = "memory/pending/commitments/" + c.id;
+          return pendingItem(c.who, [
+            el("span", { text: c.what }),
+            el("span", { class: "mem-meta", text: c.due }),
+            c.quote ? el("q", { class: "mem-quote", text: c.quote }) : null
+          ],
+            ["✓ Верно", function (b, item) { decide(b, item, path, { accept: true, fingerprint: c.fingerprint }, "Договорённость записана."); }],
+            ["✗ Неверно", function (b, item) { decide(b, item, path, { accept: false }, "Отклонено."); }]);
+        }))]));
+    }
+    return nodes;
+  }
+
+  function wireMemory() {
+    $("memory-details").addEventListener("toggle", function () {
+      if (memOpen()) showMemory(true);
+    });
+  }
+
   function wireSession() {
     $("logout").addEventListener("click", function () {
       call("POST", "logout", {}, true).then(function () { saveKey(""); loginScreen(""); });
@@ -1433,7 +1770,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSession();
+  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireMemory(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.

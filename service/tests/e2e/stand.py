@@ -10,6 +10,10 @@ SHTURMAN_TEST_DSN: база должна быть отдельной тесто�
 Рядом с сервисом поднимается «пульт» (порт сервиса + 1) — им сценарий делает то, что в жизни
 делает человек в Telegram: сканирует QR, нажимает «Запустить» в боте, подключает бизнес-режим.
 
+Для экрана «Память ассистента» пульт заводит (`POST /seed-memory`) переписку с двумя людьми, страницу
+об одном из них со сводкой — ответ «модели» подставляет сам стенд, — предложение завести страницу о
+втором и новую договорённость, ждущую решения.
+
 Третий порт (порт сервиса + 2) — подставной «дашборд»: пустая страница и service worker на том же
 имени узла, что и страница настройки, но на другом порту. С неё сценарий делает то, что делал бы
 скрипт ассистента на адресе дашборда Hermes: `fetch` к API страницы, чтение `localStorage`,
@@ -196,6 +200,83 @@ async def main() -> None:
                              "audit": [dict(r) for r in rows],
                              "llm_requests": len(llm.requests)})
 
+    async def seed_memory(request):
+        """Память ассистента: страница об Ольге со сводкой и договорённостью, предложение завести
+        страницу о Сергее и его новая договорённость, ждущая решения."""
+        from datetime import datetime, timedelta, timezone
+
+        from shturman import authority, bridge, jobs, store
+        from shturman.processing import commitments, pages_build, people
+        from shturman.records import ChatRecord, MessageRecord
+
+        app = state["app"]
+        start = datetime.now(timezone.utc) - timedelta(days=3)
+        async with app.pool.acquire() as c:
+            account = await c.fetchval("SELECT id FROM accounts WHERE role = 'owner' ORDER BY id LIMIT 1")
+            owner_tg = await c.fetchval("SELECT tg_user_id FROM accounts WHERE id = $1", account)
+            owner_peer = await store.ensure_peer(c, "user", owner_tg, name="Владелец")
+            talk = {
+                5001: ("Ольга Смирнова", [
+                    (5001, "Добрый день! Проект фасада по корпусу 2 пришлю до пятницы."),
+                    (owner_tg, "Хорошо. Бюджет держим в пределах 12 млн."),
+                    (5001, "Поняла. Подрядчика по остеклению выберем вместе на следующей неделе."),
+                    (5001, "Я теперь руковожу проектным отделом, вопросы по чертежам — ко мне.")]),
+                5002: ("Сергей Ковалёв", [
+                    (5002, "График поставок бетона пришлю до среды."),
+                    (owner_tg, "Жду.")]),
+            }
+            ids, peers, chats = {}, {}, {}
+            for tg_id, (name, lines) in talk.items():
+                chat_id, _ = await store.ensure_chat(c, account, ChatRecord("user", tg_id, "personal_chat", name))
+                rows = [(chat_id, MessageRecord(
+                    tg_message_id=n + 1, sent_at=start + timedelta(hours=n), kind="message", sender_class="user",
+                    sender_tg_id=who, sender_name=name if who == tg_id else "Владелец", text=text, entities=None,
+                    reply_to_tg_id=None, forwarded_from=None, edited_at=None, media_type=None, media_path=None,
+                    service_action=None)) for n, (who, text) in enumerate(lines)]
+                await store.upsert_messages(c, rows, source="session", owner_tg_id=owner_tg)
+                ids[tg_id] = [r["id"] for r in await c.fetch(
+                    "SELECT id FROM messages WHERE chat_id = $1 ORDER BY tg_message_id", chat_id)]
+                peers[tg_id] = await c.fetchval("SELECT id FROM peers WHERE class = 'user' AND tg_id = $1", tg_id)
+                chats[tg_id] = chat_id
+            olga = await people.ensure_person_for_peer(c, peers[5001])
+            sergey = await people.ensure_person_for_peer(c, peers[5002])
+            await people.confirm_person(c, olga)
+
+            async def promise(tg_id, what, due):
+                return await c.fetchval(
+                    """INSERT INTO commitments (chat_id, source_message_id, debtor_peer_id, creditor_peer_id, direction,
+                                                what, source_quote, due_expression, due_reason)
+                       VALUES ($1, $2, $3, $4, 'owed_to_owner', $5, $6, $7, 'no_deadline') RETURNING id""",
+                    chats[tg_id], ids[tg_id][0], peers[tg_id], owner_peer, what, talk[tg_id][1][0][1], due)
+
+            open_one = await promise(5001, "прислать проект фасада по корпусу 2", "до пятницы")
+            with authority.setup_context("stand", action="stand.seed"):
+                await commitments.accept(c, open_one)
+            await promise(5002, "прислать график поставок бетона", "до среды")
+
+            # сводку пишет «модель» стенда: задание не должно уйти своей модели сервиса
+            kept = set(bridge._builtin_kinds)
+            bridge.set_builtin(kept - {bridge.LLM_STRUCTURED, bridge.LLM_TEXT})
+            try:
+                plan = await pages_build.build(c, app.config.pages_dir, tz=app.config.timezone, trigger="manual")
+            finally:
+                bridge.set_builtin(kept)
+            olga_msgs = ids[5001]
+            for job in await jobs.claim(c, [bridge.LLM_STRUCTURED], worker="stand", limit=20):
+                await bridge.deliver_result(c, job["id"], {"parsed": {"statements": [
+                    {"text": "Руководит проектным отделом; вопросы по чертежам — к ней.", "sources": [olga_msgs[3]],
+                     "origin": "other", "contradiction": False},
+                    {"text": "Готовит проект фасада по корпусу 2.", "sources": [olga_msgs[0]], "origin": "other",
+                     "contradiction": False},
+                    {"text": "Бюджет фасада — в пределах 12 млн.", "sources": [olga_msgs[1]], "origin": "owner",
+                     "contradiction": False},
+                ]}, "text": "", "model": "stand"})
+            await pages_build.finish_build(c, app.config.pages_dir, tz=app.config.timezone)
+            await c.execute(
+                """INSERT INTO page_proposals (person_id, reason) VALUES ($1, '{"messages": 24, "commitments": 0}'::jsonb)
+                   ON CONFLICT (person_id) DO NOTHING""", sergey)
+        return JSONResponse({"ok": True, "olga": olga, "sergey": sergey, "plan": plan.get("status")})
+
     async def dashboard_page(request):
         return HTMLResponse(DASHBOARD_PAGE)
 
@@ -207,7 +288,8 @@ async def main() -> None:
     control = Starlette(routes=[
         Route("/scan", scan, methods=["POST"]), Route("/start", start, methods=["POST"]),
         Route("/last-code", last_code), Route("/business", business, methods=["POST"]), Route("/seen", seen),
-        Route("/chatgpt/authorize", chatgpt_authorize, methods=["POST"])])
+        Route("/chatgpt/authorize", chatgpt_authorize, methods=["POST"]),
+        Route("/seed-memory", seed_memory, methods=["POST"])])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))
