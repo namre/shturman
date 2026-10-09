@@ -6,6 +6,9 @@
 `transcript_at` лежит время следующей попытки.
 
 Откуда берётся файл:
+  * файл из загруженного архива выгрузки Telegram Desktop (`messages.media_file`, его кладёт
+    импорт — media/from_export.py). Закончив с сообщением, очередь файл удаляет (`media.files.drop`).
+    Файла нет или он не читается — дальше как без него;
   * сессия аккаунта, которому принадлежит чат, — по номеру сообщения (так же, как Telegram на
     компьютере открывает вложение). Подходит и для сообщений из выгрузки и бизнес-режима этого
     аккаунта: номера у них те же;
@@ -21,11 +24,13 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import asyncpg
 
-from .. import guard
+from .. import events, guard
+from ..media import files as media_files
 from . import VOICE_TYPES
 from .asr import AsrClient, AsrRejected, AsrUnavailable
 
@@ -36,6 +41,7 @@ RETRY = timedelta(minutes=10)       # пауза после сбоя
 NO_SOURCE_WAIT = timedelta(hours=1)  # источника нет (сессия на паузе) — проверить позже
 NO_SOURCE_GIVE_UP = timedelta(days=1)
 ENQUEUE_BATCH = 500
+FRESH = timedelta(hours=1)          # расшифровку сообщения не старше этого разбирают как живое
 
 # Скачивание файла: (аккаунт, вид собеседника, его id, номер сообщения, предел байт) → (байты, секунды).
 SessionFetch = Callable[[int, str, int, int, int], Awaitable[tuple[bytes, int | None]]]
@@ -82,7 +88,7 @@ FROM todo WHERE m.id = todo.id
 """
 
 _NEXT = """
-SELECT m.id, m.tg_message_id, m.media_type, m.media_duration, m.media_ref, m.sent_at,
+SELECT m.id, m.tg_message_id, m.media_type, m.media_duration, m.media_ref, m.media_file, m.sent_at,
        m.transcript_attempts, m.first_seen_at, c.account_id, p.class AS peer_class, p.tg_id AS peer_tg_id
 FROM messages m JOIN chats c ON c.id = m.chat_id JOIN peers p ON p.id = c.peer_id
 WHERE m.transcript_state = 'pending' AND (m.transcript_at IS NULL OR m.transcript_at <= now())
@@ -97,6 +103,7 @@ LIMIT $1
 _DONE = """
 UPDATE messages SET
     transcript = $2, transcript_state = 'done', transcript_error = NULL, transcript_at = now(),
+    late_content = true,
     media_duration = COALESCE(media_duration, $3),
     text = voice_text(text, $2, media_type, COALESCE(media_duration, $3)),
     agent_visible = CASE WHEN $4 AND is_outgoing IS NOT TRUE THEN false ELSE agent_visible END,
@@ -105,7 +112,7 @@ UPDATE messages SET
     guard_model = CASE WHEN guard_label IN ('suspect', 'confirmed') THEN guard_model END,
     guard_checked_at = CASE WHEN guard_label IN ('suspect', 'confirmed') THEN guard_checked_at END
 WHERE id = $1 AND transcript_state = 'pending' AND transcript IS NULL AND deleted_at IS NULL
-RETURNING id, is_outgoing
+RETURNING id, is_outgoing, chat_id, sent_at
 """
 
 
@@ -128,8 +135,12 @@ class Transcriber:
 
     def __init__(self, pool: asyncpg.Pool, asr: AsrClient, settings: Settings, *,
                  session_fetch: Callable[[], SessionFetch | None],
-                 bot_fetch: Callable[[], BotFetch | None]) -> None:
+                 bot_fetch: Callable[[], BotFetch | None],
+                 publish: Callable[[str, dict[str, Any]], None] | None = None,
+                 data_dir: Path | None = None) -> None:
         self.pool, self.asr, self.settings = pool, asr, settings
+        self.data_dir = data_dir     # каталог данных сервиса: там файлы из архива выгрузки
+        self.publish = publish
         self._session_fetch, self._bot_fetch = session_fetch, bot_fetch
         self.problem: str | None = None       # None — в порядке; unreachable — контейнер не отвечает
         self.wake = asyncio.Event()
@@ -140,6 +151,13 @@ class Transcriber:
         from ..executor.botapi import BotApiError, Refused
         from ..tg import gateway
 
+        if row["media_file"] and self.data_dir is not None:
+            try:
+                return await asyncio.to_thread(media_files.read, self.data_dir, row["media_file"],
+                                               max_bytes=self.settings.max_bytes), None
+            except (OSError, ValueError, media_files.TooBig) as exc:
+                # Файла нет или он негоден — берём из Telegram, как без него.
+                logger.info("голосовое %s: файл из выгрузки не прочитан (%s)", row["id"], type(exc).__name__)
         session = self._session_fetch()
         if session is not None:
             try:
@@ -167,7 +185,19 @@ class Transcriber:
 
     async def process(self, row: asyncpg.Record) -> str:
         """Скачивает, распознаёт и записывает одно сообщение. Возвращает итог: done, skipped,
-        failed, later — для журнала и тестов."""
+        failed, later — для журнала и тестов. Закончив с сообщением, удаляет файл из выгрузки."""
+        outcome = await self._process(row)
+        if outcome != "later" and row["media_file"] and self.data_dir is not None:
+            try:
+                async with self.pool.acquire() as conn:
+                    await media_files.drop(conn, self.data_dir, row["id"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — файл уберёт уборка (media.files.sweep)
+                logger.warning("голосовое %s: файл из выгрузки не удалён (%s)", row["id"], type(exc).__name__)
+        return outcome
+
+    async def _process(self, row: asyncpg.Record) -> str:
         mid = row["id"]
         try:
             audio, seconds = await self._fetch(row)
@@ -217,7 +247,22 @@ class Transcriber:
             updated = await conn.fetchrow(_DONE, mid, text, duration, holding)
         if updated is not None and holding and updated["is_outgoing"] is not True:
             await guard.screen([mid])
+        if updated is not None:
+            await self._announce(mid)
         return "done"
+
+    async def _announce(self, mid: int) -> None:
+        """Свежее голосовое стало текстом — сказать модулям, которым важен текст живых сообщений."""
+        if self.publish is None:
+            return
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT m.chat_id, m.is_outgoing, c.account_id FROM messages m JOIN chats c ON c.id = m.chat_id
+                   WHERE m.id = $1 AND m.agent_visible AND m.deleted_at IS NULL
+                     AND m.sent_at > now() - make_interval(secs => $2)""", mid, FRESH.total_seconds())
+        if row is not None:
+            self.publish(events.MESSAGE_CONTENT, {"account_id": row["account_id"], "chat_id": row["chat_id"],
+                                                  "message_id": mid, "outgoing": bool(row["is_outgoing"])})
 
     async def _finish(self, mid: int, state: str, error: str) -> None:
         async with self.pool.acquire() as conn:

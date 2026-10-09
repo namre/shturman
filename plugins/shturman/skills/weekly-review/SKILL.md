@@ -19,7 +19,7 @@ metadata:
 Обзор строится только из архива переписки и списка обязательств. Больше ничего не используй: ни веб-поиск, ни терминал, ни память о прошлых разговорах.
 
 - `shturman_commitments` — обязательства и сроки.
-- Инструменты архива (MCP-сервер `shturman`): `mcp__shturman__get_chat_history`, `mcp__shturman__search_messages`, `mcp__shturman__get_context`, `mcp__shturman__list_chats`, `mcp__shturman__find_person`, а также `mcp__shturman__list_commitments`, `mcp__shturman__get_commitment`, `mcp__shturman__get_person_page`, `mcp__shturman__search_pages`.
+- Инструменты архива (MCP-сервер `shturman`): `mcp__shturman__get_chat_history`, `mcp__shturman__search_messages`, `mcp__shturman__get_context`, `mcp__shturman__list_chats`, `mcp__shturman__find_person`, а также `mcp__shturman__list_commitments`, `mcp__shturman__get_commitment`, `mcp__shturman__get_person_page`, `mcp__shturman__search_pages`, `mcp__shturman__list_projects`, `mcp__shturman__get_project_page`, `mcp__shturman__get_owner_profile` (профиль владельца: одобренные им факты и его правила — это слова владельца).
 
 Если инструмента нет или он ответил ошибкой, пропусти этот раздел и одной строкой в конце скажи, чего не удалось проверить. Не придумывай содержимое.
 

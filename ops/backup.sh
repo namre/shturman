@@ -9,6 +9,9 @@
 # В копии ключи, настройки и переписка владельца: агент её не открывает и никуда не передаёт.
 # Файлы базы и модели (эмбеддинги, защита, распознавание речи) в архив каталога не входят: база
 # сохраняется выгрузкой (pg_dump), модели скачиваются заново командой «on» своего скрипта.
+# Не входят и временные файлы сервиса: загруженные выгрузки (data/shturman/uploads) и файлы
+# вложений из архива выгрузки, ждущие разбора (data/shturman/media-files) — их может быть много,
+# и после разбора они удаляются сами. Ссылки на них в восстановленной базе сервис снимет сам.
 #   ./ops/backup.sh            — сделать копию и проверить, что она читается
 #   ./ops/backup.sh --list     — показать имеющиеся копии
 #   ./ops/backup.sh --help     — эта справка; ничего не создаётся
@@ -43,7 +46,7 @@ members="data"
 # shellcheck disable=SC2086
 tar -czf "$name" --warning=no-file-changed \
   --exclude='data/hermes/logs' --exclude='data/postgres' --exclude='data/embeddings' --exclude='data/guard' --exclude='data/asr' \
-  --exclude='data/shturman/uploads' $members || [ $? -eq 1 ]
+  --exclude='data/shturman/uploads' --exclude='data/shturman/media-files' $members || [ $? -eq 1 ]
 count="$(tar -tzf "$name" | wc -l)"
 [ "$count" -gt 0 ] || { echo "копия пустая: $name" >&2; exit 1; }
 echo "Копия готова: $name ($(du -h "$name" | cut -f1), файлов: $count)"

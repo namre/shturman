@@ -20,6 +20,11 @@ dependencies = [
   "tzdata>=2025.1",        # Apache-2.0 — часовые пояса: в урезанном образе системных может не быть
   "regex>=2024.4",        # Apache-2.0 — выражения наблюдателя с пределом времени
   "python-socks[asyncio]>=2.4",  # Apache-2.0 — исходящий прокси для Telegram
+  "pyjwt>=2.10",          # MIT — подпись ID token при входе через ChatGPT (executor/siwc.py)
+  "cryptography>=44",     # Apache-2.0 OR BSD-3-Clause — ключи RSA для этой проверки
+  "pypdfium2>=5.13,<6",   # BSD-3-Clause / Apache-2.0; PDFium в колесе — BSD-3-Clause — текст и страницы PDF (media/extract.py)
+  "pillow>=12.2,<13",     # MIT-CMU — фото и страницы сканов в JPEG для модели (media/extract.py)
+  "openpyxl>=3.1,<4",     # MIT — таблицы XLSX (media/extract.py); с ним приходит et-xmlfile (MIT)
 ]
 
 [project.optional-dependencies]

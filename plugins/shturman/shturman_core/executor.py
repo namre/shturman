@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from collections import OrderedDict
@@ -71,6 +72,11 @@ AUX_TASKS: dict[str, tuple[str, str]] = {
         "Проверка сообщений из групп и каналов по правилам наблюдателя: относится ли сообщение "
         "к тому, за чем владелец просил следить. Короткие частые запросы: подойдёт недорогая модель.",
     ),
+    "shturman_media": (
+        "Штурман: фото и документы",
+        "Краткий разбор фото, сканов и документов из переписки. Нужна модель, которая понимает "
+        "изображения; не задана — используется основная модель.",
+    ),
 }
 DEFAULT_TASK = {LLM_STRUCTURED: "shturman_extract", LLM_TEXT: "shturman_reply"}
 DEFAULT_MAX_TOKENS = {LLM_STRUCTURED: 2000, LLM_TEXT: 1500}
@@ -92,6 +98,31 @@ class NotSent(Exception):
         self.reason = reason
         self.retry_after = retry_after
         self.replied = replied          # False — Telegram не отвечал: запрос до него не дошёл
+
+
+MAX_IMAGES = 6
+MAX_IMAGE_BYTES = 2_500_000         # как bridge.MAX_IMAGE_BYTES в сервисе
+
+
+def _images(payload: Mapping[str, Any]) -> list[bytes]:
+    """Картинки задания (поле images: [{mime, data base64}]) — байтами для блоков Hermes."""
+    raw = payload.get("images")
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > MAX_IMAGES:
+        raise _Fail("поле images задано неверно", None)
+    out: list[bytes] = []
+    for item in raw:
+        data = item.get("data") if isinstance(item, dict) else None
+        if not isinstance(data, str) or item.get("mime") not in ("image/jpeg", "image/png"):
+            raise _Fail("поле images задано неверно", None)
+        try:
+            out.append(base64.b64decode(data, validate=True))
+        except ValueError:
+            raise _Fail("поле images задано неверно", None) from None
+    if sum(len(b) for b in out) > MAX_IMAGE_BYTES:
+        raise _Fail("поле images задано неверно", None)
+    return out
 
 
 class _Fail(Exception):
@@ -348,10 +379,14 @@ class Executor:
         if schema is not None:
             instructions = (f"{instructions.rstrip()}\n\nJSON schema:\n"
                             f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}")
-        # Hermes ждёт входные данные списком блоков, а не строкой (agent/plugin_llm.py:239-262).
+        # Hermes ждёт входные данные списком блоков, а не строкой (agent/plugin_llm.py:239-262):
+        # текст и картинки (фото, страницы скана — разбор вложений сервиса). Других видов блоков нет.
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        blocks += [{"type": "image", "data": data, "mime_type": "image/jpeg", "file_name": f"image-{n + 1}.jpg"}
+                   for n, data in enumerate(_images(payload))]
         result = await asyncio.wait_for(
             self.llm.acomplete_structured(
-                instructions=instructions, input=[{"type": "text", "text": text}],
+                instructions=instructions, input=blocks,
                 json_mode=True, schema_name=name, **args),
             timeout=self.llm_timeout + 15)
         parsed = getattr(result, "parsed", None)

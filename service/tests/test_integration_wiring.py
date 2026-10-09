@@ -25,7 +25,8 @@ async def test_whole_service_starts_and_lists_every_agent_tool_as_read_only(make
     tools = (await rpc(client, "tools/list"))["tools"]
     names = {t["name"] for t in tools}
     assert names == {"search_messages", "get_context", "list_chats", "get_chat_history", "find_person",
-                     "list_commitments", "get_commitment", "get_person_page", "search_pages"}
+                     "list_commitments", "get_commitment", "get_person_page", "search_pages",
+                     "list_projects", "get_project_page", "get_owner_profile"}
     assert all(t["annotations"]["readOnlyHint"] is True for t in tools)
     out = await rpc(client, "tools/call", {"name": "list_commitments", "arguments": {"view": "open"}})
     assert out["structuredContent"]["items"] == []

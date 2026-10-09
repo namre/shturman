@@ -709,6 +709,9 @@ class TgManager:
         messages = int(await conn.fetchval(
             "SELECT count(*) FROM messages m JOIN chats c ON c.id = m.chat_id WHERE c.account_id = $1", account_id))
         await conn.execute("DELETE FROM accounts WHERE id = $1", account_id)
+        # факты из удалённых сообщений ушли каскадом: закрытые ими прежние снова действуют
+        from ..processing import facts
+        await facts.repair_chains(conn)
         logger.info("аккаунт %s (%s) удалён из архива, сообщений: %s", account_id, row["role"], messages)
         return {"role": row["role"], "label": row["label"], "messages": messages}
 
@@ -1069,6 +1072,18 @@ class TgManager:
 
         Бросает AccountUnavailable (сессии нет), MediaUnavailable (сообщения или вложения нет,
         это не голосовое, файл больше max_bytes), FloodWait."""
+        data, info = await self.download_media(account_id, peer_class, tg_id, tg_message_id,
+                                               max_bytes=max_bytes, kinds=("voice_message", "video_message"))
+        return data, info.get("media_duration")
+
+    async def download_media(self, account_id: int, peer_class: str, tg_id: int, tg_message_id: int,
+                             *, max_bytes: int, kinds: tuple[str, ...]) -> tuple[bytes, dict[str, Any]]:
+        """Файл вложения сообщения, если его вид — один из kinds (photo, file, voice_message…):
+        байты и сведения (длительность, имя, тип, размер). Запросы идут с той же паузой, что и
+        чтение истории; отдельный запрос Telegram — только скачивание файла (upload.GetFile).
+
+        Бросает AccountUnavailable, MediaUnavailable (нет сообщения или вложения нужного вида,
+        файл больше max_bytes), FloodWait."""
         rt = self._running(account_id)
         key: PeerKey = (peer_class, int(tg_id))
         try:
@@ -1077,9 +1092,10 @@ class TgManager:
             found = await rt.client.get_messages(peer, ids=[int(tg_message_id)])
             message = found[0] if found else None
             media = getattr(message, "media", None)
-            if message is None or normalize.media_type(media) not in ("voice_message", "video_message"):
-                raise gateway.MediaUnavailable("сообщения нет или в нём нет голосового")
-            size = getattr(getattr(media, "document", None), "size", None) or 0
+            if message is None or normalize.media_type(media) not in kinds:
+                raise gateway.MediaUnavailable("сообщения нет или в нём нет вложения нужного вида")
+            info = {"media_duration": normalize.media_duration(media), **normalize.media_file_info(media)}
+            size = info.get("media_size") or _photo_size(media) or 0
             if size > max_bytes:
                 raise gateway.MediaUnavailable(f"файл больше предела ({size} байт)")
             await rt.pacer.wait(rt.stop)
@@ -1093,7 +1109,7 @@ class TgManager:
             raise gateway.AccountUnavailable(f"сессия аккаунта недоступна ({type(exc).__name__})") from None
         if not isinstance(data, (bytes, bytearray)) or not data or len(data) > max_bytes:
             raise gateway.MediaUnavailable("файл не скачался")
-        return bytes(data), normalize.media_duration(media)
+        return bytes(data), info
 
     async def set_typing(self, account_id: int, peer_class: str, tg_id: int, on: bool) -> None:
         if not self.can_send(account_id):
@@ -1107,3 +1123,17 @@ class TgManager:
             raise
         except Exception:
             pass  # индикатор не важнее ответа
+
+
+def _photo_size(media: Any) -> int | None:
+    """Размер самого большого варианта фото (его и скачивает Telethon)."""
+    photo = getattr(media, "photo", None)
+    best = 0
+    for size in getattr(photo, "sizes", None) or ():
+        value = getattr(size, "size", None)
+        if isinstance(value, int):
+            best = max(best, value)
+        for value in getattr(size, "sizes", None) or ():     # PhotoSizeProgressive
+            if isinstance(value, int):
+                best = max(best, value)
+    return best or None

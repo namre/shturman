@@ -338,7 +338,7 @@
       note: "Ключ API OpenAI. Оплата по расходу.",
       site: "platform.openai.com/api-keys", url: "https://platform.openai.com/api-keys", button: "Create new secret key" },
     { id: "chatgpt", slug: "openai-codex", env: "", name: "Подписка ChatGPT",
-      note: "Вход по подписке, без ключа. Для расшифровки голосовых и поиска по смыслу позже понадобится ключ." },
+      note: "Вход по подписке, без ключа. Голосовые и поиск по смыслу работают на вашем сервере, ключ им не нужен." },
   ];
   const providerById = (id) => PROVIDERS.filter((p) => p.id === id)[0] || PROVIDERS[0];
 
@@ -487,7 +487,11 @@
                        lockedText: provider.env ? "Откроется после сохранения ключа." : "Откроется после входа." },
             h("div", { className: "shturman-stack" },
               h(Field, { id: "sh-model", label: "Модель",
-                         hint: "Можно оставить предложенную. Поменять модель потом можно в любой момент." },
+                         hint: "Можно оставить предложенную. Поменять модель потом можно в любой момент. " +
+                               "Если захотите, чтобы ассистент понимал фото и сканы (шаг «Фото и документы» на странице «Переписка»), " +
+                               "модель должна понимать изображения: например, GPT-5 и GPT-6 от OpenAI (в том числе по подписке ChatGPT), " +
+                               "Gemini от Google, Claude от Anthropic. Чисто текстовая модель документы с текстом разберёт, а фото — нет. " +
+                               "На OpenRouter это видно в описании модели: среди входных данных есть изображения (image)." },
                 h("input", { id: "sh-model", type: "text", list: "sh-model-list", value: m.model || "", autoComplete: "off",
                              placeholder: "Начните вводить название",
                              onChange: (e) => patch("model", { model: e.target.value, probe: null }) }),

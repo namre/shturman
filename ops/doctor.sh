@@ -462,12 +462,14 @@ EOF4
   # Строка model с Hermes появляется, только если своя модель настроена: разбор делает ассистент.
   bot_configured=unknown; bot_polling=unknown; bot_problem=""; bot_owner=unknown; bot_business=unknown
   llm_configured=unknown; llm_model=""; llm_last=unknown; llm_problem=""; llm_calls=0; llm_failures=0
+  llm_way=""; llm_sub=""
   while IFS='=' read -r k v; do
     case "$k" in
       bot_configured) bot_configured="$v" ;; bot_polling) bot_polling="$v" ;; bot_problem) bot_problem="$v" ;;
       bot_owner) bot_owner="$v" ;; bot_business) bot_business="$v" ;;
       llm_configured) llm_configured="$v" ;; llm_model) llm_model="$v" ;; llm_last) llm_last="$v" ;;
       llm_problem) llm_problem="$v" ;; llm_calls) llm_calls="$v" ;; llm_failures) llm_failures="$v" ;;
+      llm_way) llm_way="$v" ;; llm_sub) llm_sub="$v" ;;
     esac
   done <<EOF3
 $(docker exec "$svc" shturman call GET /api/executor/status 2>/dev/null | docker exec -i "$svc" python -c '
@@ -490,7 +492,9 @@ print("llm_model=" + safe(m.get("model")))
 print("llm_last=" + yn(m.get("last_call_ok")))
 print("llm_problem=" + safe(m.get("problem")))
 print("llm_calls=" + num(m.get("calls")))
-print("llm_failures=" + num(m.get("failures")))' 2>/dev/null)
+print("llm_failures=" + num(m.get("failures")))
+print("llm_way=" + safe(m.get("way")))
+print("llm_sub=" + safe(m.get("subscription")))' 2>/dev/null)
 EOF3
 
   if [ "$bot_configured" = unknown ]; then
@@ -511,8 +515,20 @@ EOF3
 
   if [ "$llm_configured" = no ]; then
     if [ "$MODE" = standalone ]; then
-      warn model "своя модель не настроена: архив и поиск работают, а обязательства и страницы памяти не разбираются. Ключ и имя модели вводит владелец — на странице настройки переписки, раздел «Дополнительно», либо в терминале: ./ops/init-env.sh, затем ./ops/up.sh"
+      warn model "своя модель не настроена: архив и поиск работают, а обязательства и страницы памяти не разбираются. Подписку ChatGPT либо ключ и имя модели подключает владелец — на странице настройки переписки, раздел «Дополнительно»; ключ — также в терминале: ./ops/init-env.sh, затем ./ops/up.sh"
     fi
+  elif [ "$llm_configured" = yes ] && [ "$llm_way" = subscription ]; then
+    # Своя модель — по подписке ChatGPT владельца. Почты учётной записи и токенов здесь нет.
+    case "$llm_sub" in
+      relogin) fail model "модель сервиса по подписке ChatGPT: нужно войти заново — OpenAI больше не принимает сохранённый вход; задания модели ждут. Войти — на странице настройки переписки, «Дополнительно» → «Подписка ChatGPT» (это делает владелец)" ;;
+      limit) warn model "модель сервиса по подписке ChatGPT ($llm_model): лимит подписки исчерпан — сервис повторит позже сам; лимиты: https://chatgpt.com/settings/usage" ;;
+      denied) fail model "модель сервиса по подписке ChatGPT: OpenAI отказал в доступе (код: ${llm_problem:-нет}) — тариф, рабочее пространство или страна сервера; подробности на странице настройки переписки" ;;
+      *)
+        if [ "$llm_last" = no ]; then
+          warn model "модель сервиса по подписке ChatGPT ($llm_model): последнее обращение не удалось (код: ${llm_problem:-нет}); обращений $llm_calls, неудач $llm_failures"
+        elif [ "$llm_last" = yes ]; then pass model "модель сервиса по подписке ChatGPT ($llm_model): последнее обращение успешно; обращений $llm_calls, неудач $llm_failures"
+        else pass model "модель сервиса по подписке ChatGPT ($llm_model), обращений ещё не было (первое — при ночной обработке)"; fi ;;
+    esac
   elif [ "$llm_configured" = yes ]; then
     if [ "$llm_last" = no ] || { [ "$llm_last" = unknown ] && [ -n "$llm_problem" ]; }; then
       warn model "модель $llm_model: последнее обращение не удалось (код: ${llm_problem:-нет}); обращений $llm_calls, неудач $llm_failures"
@@ -583,6 +599,17 @@ EOF3
       else
         warn voice "контейнер распознавания запущен ($asr), но расшифровка в сервисе выключена — запустите ./ops/asr.sh on или off"
       fi ;;
+  esac
+
+  # Разбор фото и документов: включает владелец на странице настройки переписки. Только числа.
+  m_pending="$(num media_pending)"; m_asking="$(num media_asking)"; m_done="$(num media_done)"
+  m_failed="$(num media_failed)"; m_skipped="$(num media_skipped)"
+  case "$st" in
+    *'"media_enabled":true'*)
+      pass media "разбор фото и документов включён владельцем; готово: ${m_done:-0}, ждут: $(( ${m_pending:-0} + ${m_asking:-0} )), пропущено: ${m_skipped:-0}, не получилось: ${m_failed:-0}" ;;
+    "") ;;
+    *)
+      pass media "разбор фото и документов выключен — включает владелец на странице настройки переписки (docs/media.md)" ;;
   esac
 elif [ "$MODE" = standalone ]; then
   fail service "сервис переписки не развёрнут — запустите ./ops/up.sh"

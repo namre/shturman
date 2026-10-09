@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import BinaryIO, Iterable
+from typing import Any, BinaryIO, Iterable, Protocol
 
 import asyncpg
 
@@ -43,9 +43,22 @@ class ImportStats:
     versions_added: int = 0
     owner_tg_user_id: int | None = None
     excluded_names: list[str] = field(default_factory=list)
+    # Файлы вложений из архива выгрузки (media/from_export.py): взято на разбор, не взято,
+    # копирование остановлено — на диске кончилось место.
+    media_files: int = 0
+    media_skipped: int = 0
+    media_no_space: bool = False
 
     def as_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
+
+
+class Attachments(Protocol):
+    """Сборщик файлов вложений из архива выгрузки (`media.from_export.Attachments`)."""
+
+    def add(self, chat_id: int, record: Any) -> None: ...
+
+    async def finish(self, conn: asyncpg.Connection, stats: ImportStats) -> None: ...
 
 
 def scan(fp: BinaryIO) -> tuple[ExportOwner | None, list[ChatSummary]]:
@@ -89,12 +102,15 @@ async def import_export(
     exclude: Iterable[tuple[str, int]] = (),
     source_name: str = "result.json",
     stats: ImportStats | None = None,
+    attachments: Attachments | None = None,
 ) -> ImportStats:
     """Импортирует экспорт в архив.
 
     owner_tg_user_id обязателен для экспорта одного чата: в нём нет сведений о владельце.
     exclude — чаты (класс, идентификатор), которые не должны попасть в архив; запрет
     запоминается и действует на все будущие источники.
+    attachments — для архива выгрузки: узнаёт о каждом записываемом сообщении и после записи
+    всех сообщений копирует нужные файлы вложений.
     """
     excluded = set(exclude)
     # Счётчики можно передать снаружи, чтобы показывать ход импорта, пока он идёт.
@@ -152,10 +168,14 @@ async def import_export(
         if skip:
             continue
         rows[(chat_id, b.tg_message_id)] = (chat_id, b)
+        if attachments is not None:
+            attachments.add(chat_id, b)
         if len(rows) >= BATCH:
             await _flush(conn, rows, owner_id, stats)
 
     await _flush(conn, rows, owner_id, stats)
+    if attachments is not None:
+        await attachments.finish(conn, stats)
     if import_id is not None:
         await conn.execute(
             "UPDATE imports SET finished_at = now(), stats = $2::jsonb WHERE id = $1",

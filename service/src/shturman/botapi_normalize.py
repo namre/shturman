@@ -271,8 +271,8 @@ def _media_type(message: dict[str, Any]) -> str | None:
 
 
 def _voice_ref(message: dict[str, Any]) -> dict[str, Any]:
-    """Голосовое или «кружок»: длительность и file_id — по нему сервис потом скачает файл
-    через getFile своего бота и расшифрует (voice/). У остальных вложений — ничего."""
+    """Сведения о вложении для скачивания через getFile своего бота: голосовое и «кружок» —
+    расшифровка (voice/), фото и документ — разбор (media/). У остальных вложений — ничего."""
     for key in ("voice", "video_note"):
         media = _dict(message.get(key))
         if media is None:
@@ -283,7 +283,29 @@ def _voice_ref(message: dict[str, Any]) -> dict[str, Any]:
             "media_ref": file_id if isinstance(file_id, str) and 0 < len(file_id) <= 300 else None,
             "media_duration": duration if duration is not None and 0 <= duration < 10**7 else None,
         }
+    photo = message.get("photo")
+    if isinstance(photo, list):
+        # самый большой размер: Bot API присылает их по возрастанию
+        sizes = [p for p in photo if isinstance(p, dict) and isinstance(p.get("file_id"), str)]
+        if sizes:
+            best = sizes[-1]
+            return {"media_ref": best["file_id"] if 0 < len(best["file_id"]) <= 300 else None,
+                    "media_mime": "image/jpeg", "media_size": _size(best.get("file_size"))}
+    document = _dict(message.get("document"))
+    if document is not None:
+        file_id, name, mime = document.get("file_id"), document.get("file_name"), document.get("mime_type")
+        return {
+            "media_ref": file_id if isinstance(file_id, str) and 0 < len(file_id) <= 300 else None,
+            "media_name": name[:255] if isinstance(name, str) and name else None,
+            "media_mime": mime[:100] if isinstance(mime, str) and mime else None,
+            "media_size": _size(document.get("file_size")),
+        }
     return {}
+
+
+def _size(value: Any) -> int | None:
+    size = _int(value)
+    return size if size is not None and 0 <= size < 10**13 else None
 
 
 def _service_action(message: dict[str, Any]) -> str | None:

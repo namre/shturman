@@ -4,6 +4,10 @@
 ключи приложения Telegram, токен бота согласований, ключ, адрес и имя своей модели. Они лежат
 в файле каталога данных и подставляются здесь, если окружение их не задало: окружение главнее.
 Главный выключатель отправки к ним не относится — он читается только из окружения.
+
+Седьмое — подписка ChatGPT вместо ключа модели (вход через ChatGPT на той же странице,
+`executor/siwc.py`): её запись лежит отдельным файлом и действует, только если ключ модели не
+задан окружением (`SHTURMAN_LLM_API_KEY`). Одновременно действует один способ: ключ или подписка.
 """
 
 from __future__ import annotations
@@ -67,6 +71,10 @@ class Config:
     llm_api_key: str = field(default="", repr=False)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = ""
+    # Своя модель сервиса — по подписке ChatGPT (вход на странице настройки), а не по ключу API.
+    # Модель выбирается на странице из списка, который отдаёт OpenAI для этой учётной записи.
+    chatgpt: bool = False
+    chatgpt_model: str = ""
     # Защита от внедрённых инструкций во входящих сообщениях (guard/, docs/guard.md). По умолчанию
     # выключена; включает её ./ops/guard.sh on — он же скачивает модель и поднимает контейнер с ней.
     guard: bool = False
@@ -83,6 +91,10 @@ class Config:
     # Предел длительности (секунд) и размера файла: длиннее — не скачивается и не распознаётся.
     asr_max_seconds: int = 600
     asr_max_bytes: int = 20 * 1024 * 1024
+    # Разбор фото и документов (media/, docs/media.md). Включает и выключает владелец на странице
+    # настройки переписки (setup_state 'media'): файлы уходят модели. Здесь — только пределы.
+    media_days: int = 30
+    media_max_bytes: int = 20 * 1024 * 1024
     # Внешний адрес страницы настройки (схема, имя и порт, без пути), например
     # https://assistant.example.com:8443. Пусто — страница отвечает только под локальными именами
     # из allowed_hosts (туннель SSH). Адрес обязан отличаться от адреса дашборда Hermes хотя бы
@@ -113,7 +125,14 @@ class Config:
 
     @property
     def own_llm(self) -> bool:
-        return bool(self.llm_api_key and self.llm_model)
+        return self.chatgpt or bool(self.llm_api_key and self.llm_model)
+
+    @property
+    def llm_way(self) -> str | None:
+        """Как сервис обращается к своей модели: subscription | api_key | None (никак)."""
+        if self.chatgpt:
+            return "subscription"
+        return "api_key" if self.llm_api_key and self.llm_model else None
 
     @property
     def setup_reason(self) -> str | None:
@@ -141,6 +160,11 @@ class Config:
     @property
     def uploads_dir(self) -> Path:
         return self.data_dir / "uploads"
+
+    @property
+    def media_files_dir(self) -> Path:
+        """Файлы вложений из загруженной выгрузки: лежат до разбора (media/files.py)."""
+        return self.data_dir / "media-files"
 
     @property
     def pages_dir(self) -> Path:
@@ -199,6 +223,7 @@ class Config:
             asr_url=_env("SHTURMAN_ASR_URL").rstrip("/"),
             asr_days=min(3650, max(0, _int("SHTURMAN_ASR_DAYS", 30))),
             asr_max_seconds=min(3600, max(10, _int("SHTURMAN_ASR_MAX_SECONDS", 600))),
+            media_days=min(3650, max(0, _int("SHTURMAN_MEDIA_DAYS", 30))),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
         )
         return with_page_values(config, os.environ)
@@ -213,7 +238,24 @@ def with_page_values(config: Config, env) -> Config:
     locked = secrets_store.locked_by_env(env)
     stored = secrets_store.SecretStore(config.data_dir).load()
     managed = [name for name in secrets_store.NAMES if name not in locked and stored.get(name)]
-    return dataclasses.replace(secrets_store.overlay(config, stored, managed), locked=locked)
+    config = dataclasses.replace(secrets_store.overlay(config, stored, managed), locked=locked)
+    return with_subscription(config)
+
+
+def with_subscription(config: Config) -> Config:
+    """Подписка ChatGPT как своя модель сервиса — если она выбрана на странице и ключ модели
+    не задан окружением (окружение главнее). Ключ со страницы при включении подписки удаляется,
+    так что одновременно действует только один способ; если оба всё же оказались заданы (файл
+    правили руками), действует ключ."""
+    import dataclasses
+
+    from .executor.siwc import CredentialStore
+    from .setup_page import secrets_store
+
+    record = CredentialStore(config.data_dir)
+    if secrets_store.LLM_API_KEY in config.locked or config.llm_api_key or not record.active():
+        return dataclasses.replace(config, chatgpt=False, chatgpt_model="")
+    return dataclasses.replace(config, chatgpt=True, chatgpt_model=record.load().get("model", ""))
 
 
 def normalize_origin(raw: str, name: str, *, strict: bool = True) -> str:

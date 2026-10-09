@@ -748,3 +748,20 @@ async def test_scenario_is_chosen_on_the_page_and_suggested_from_what_is_connect
     assert ("setup.scenario", "ok", "ассистент видит всё как вы") in rows
     # внутренний API способа подключения не знает
     assert (await s.api.put("/api/scenario", json={"scenario": "own"})).status_code in (404, 405)
+
+
+async def test_media_analysis_is_switched_by_the_owner_on_the_page_only(stand, conn):
+    """Отдавать ли фото и документы модели, решает владелец на странице. Внутренний API (ассистент)
+    видит только признак и счётчики и переключить разбор не может."""
+    s = await stand()
+    await s.page.login(conn)
+    state = (await s.page.get("/state")).json()["media"]
+    assert state == {"enabled": False, "days": 30, "max_mb": 20}
+    assert (await s.page.put("/media", {})).status_code == 400
+    assert (await s.page.put("/media", {"enabled": "yes"})).status_code == 400
+    on = (await s.page.put("/media", {"enabled": True})).json()
+    assert on["ok"] is True and on["media"]["enabled"] is True
+    assert await conn.fetchval("SELECT value->>'enabled' FROM setup_state WHERE key = 'media'") == "true"
+    overview = (await s.page.get("/overview")).json()["archive"]
+    assert overview["media_enabled"] is True and overview["media_done"] == 0
+    assert (await s.page.put("/media", {"enabled": False})).json()["media"]["enabled"] is False

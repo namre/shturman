@@ -87,7 +87,8 @@ async def lifespan(state: Any) -> AsyncIterator[None]:
                              max_bytes=config.asr_max_bytes)
     transcriber = core.Transcriber(state.pool, client, settings,
                                    session_fetch=lambda: _session_fetch(state),
-                                   bot_fetch=lambda: _bot_fetch(state))
+                                   bot_fetch=lambda: _bot_fetch(state),
+                                   publish=state.events.publish, data_dir=config.data_dir)
     try:
         await client.health()
     except AsrUnavailable:

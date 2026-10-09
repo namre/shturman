@@ -8,7 +8,10 @@
   /api/chats              — список чатов без текста сообщений и переключатель «не принимать
                             в архив», в том числе с удалением уже сохранённого.
   /api/imports            — загрузка экспорта Telegram Desktop для мастера настройки: файл
-                            пишется на диск потоком, затем просмотр состава и фоновый импорт.
+                            (result.json или архив zip всей папки выгрузки) пишется на диск
+                            потоком, затем просмотр состава и фоновый импорт. Из архива импорт
+                            берёт и файлы голосовых, фото и документов — на разбор
+                            (`media/from_export.py`).
 
 Состояние загрузок живёт в памяти процесса, а итоги импорта — в таблице `imports`, которую
 ведёт `importer`. Отдельной таблицы нет намеренно: загруженный файл — временная вещь, после
@@ -41,6 +44,8 @@ import logging
 import os
 import re
 import secrets
+import zipfile
+import zlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +58,9 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
 from . import bridge, confirm, db, events, guard, store
+from .export_archive import ArchiveError, ExportArchive, is_zip
+from .media import files as media_files
+from .media.from_export import Attachments, rules as media_rules
 from .api_core import BadRequest, error_response, need_str, only_without_own_bot, settle
 from .app import AppState, state_of
 from .botapi_normalize import (
@@ -83,7 +91,7 @@ DEFAULT_UPLOAD_MAX = 2 * 1024**3      # 2 ГиБ
 MAX_KEPT_FILES = 3                    # столько загруженных файлов лежит на диске одновременно
 MAX_RECORDS = 20                      # столько записей о загрузках помнится (с итогами)
 UPLOAD_TTL = timedelta(hours=24)      # неиспользованная загрузка удаляется сама
-JANITOR_EVERY = 600                   # секунд
+JANITOR_EVERY = 600                   # секунд; заодно убираются ненужные файлы вложений (media.files.sweep)
 SCAN_WAIT_DEFAULT = 25.0              # сколько запрос scan ждёт результата, прежде чем ответить 202
 SCAN_WAIT_MAX = 60.0
 DEADLOCK_RETRIES = 3
@@ -592,6 +600,9 @@ async def _apply_chat_purge(conn: asyncpg.Connection, payload: dict[str, Any]) -
     confirm.must_not_widen(await conn.fetchval("SELECT EXISTS (SELECT 1 FROM messages WHERE chat_id = $1)", chat_id))
     status = await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
     purged = int(status.split()[-1])
+    # факты из стёртых сообщений ушли каскадом: закрытые ими прежние снова действуют
+    from .processing import facts
+    await facts.repair_chains(conn)
     logger.info("чат %s: стёрто сообщений=%s", chat_id, purged)
     return confirm.Done(note=f"Стёрто сообщений: {purged}.", result=purged,
                         after=_publish_excluded(chat_id, purged=True))
@@ -637,6 +648,8 @@ class Upload:
     live: ImportStats | None = None     # счётчики идущего импорта, если importer их отдаёт
     scan_task: asyncio.Task | None = None
     run_task: asyncio.Task | None = None
+    kind: str = "json"                  # json — один result.json; zip — архив папки выгрузки
+    read_total: int | None = None       # сколько байт читается: у архива — размер result.json в нём
 
     def has_file(self) -> bool:
         return self.path.exists()
@@ -645,16 +658,19 @@ class Upload:
         self.path.unlink(missing_ok=True)
 
     def view(self) -> dict[str, Any]:
-        read = self.reader.done if self.reader is not None else (self.size if self.state == "done" else 0)
+        total = self.read_total if self.read_total is not None else self.size
+        read = self.reader.done if self.reader is not None else (total if self.state == "done" else 0)
         progress: dict[str, Any] = {
-            "bytes_read": min(read, self.size), "bytes_total": self.size,
-            "percent": 100 if self.state == "done" else min(99, read * 100 // max(self.size, 1)),
+            "bytes_read": min(read, total), "bytes_total": total,
+            "percent": 100 if self.state == "done" else min(99, read * 100 // max(total, 1)),
         }
         if self.live is not None and self.state == "running":
             progress.update(chats=self.live.chats, messages_read=self.live.messages_read,
                             messages_new=self.live.messages_new)
+            if self.kind == "zip":
+                progress.update(media_files=getattr(self.live, "media_files", 0))
         return {
-            "import_id": self.id, "state": self.state, "size_bytes": self.size,
+            "import_id": self.id, "state": self.state, "size_bytes": self.size, "kind": self.kind,
             "uploaded_at": _iso(self.uploaded_at), "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
             "scanned": self.scan is not None, "file_kept": self.has_file(),
@@ -710,7 +726,7 @@ def _sweep(directory: Path) -> int:
     """Удаляет файлы загрузок, оставшиеся от прошлого запуска: сведений о них уже нет."""
     removed = 0
     for path in directory.glob(_UPLOAD_GLOB):
-        if path.is_file() and path.suffix in (".json", ".part"):
+        if path.is_file() and path.suffix in (".json", ".zip", ".part"):
             path.unlink(missing_ok=True)
             removed += 1
     return removed
@@ -735,7 +751,11 @@ def _owner_error(exc: BaseException) -> str:
         text = str(exc)
         if _CYRILLIC.search(text):
             return text[:500]
-        return "файл не похож на экспорт Telegram Desktop: нужен result.json из экспорта в формате JSON"
+        if isinstance(exc, _BROKEN_ZIP):
+            return ("архив zip повреждён или не дочитан — сожмите папку выгрузки заново "
+                    "или загрузите один файл result.json")
+        return ("файл не похож на экспорт Telegram Desktop: нужен result.json из экспорта в формате JSON "
+                "или архив zip папки выгрузки")
     return "внутренняя ошибка — подробности в журнале сервиса"
 
 
@@ -744,12 +764,17 @@ def _is_bad_file(exc: BaseException) -> bool:
     (asyncpg.DataError тоже наследует ValueError, но это ошибка записи, не файла.)"""
     if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError)):
         return False
-    return isinstance(exc, (ValueError, ijson.JSONError))
+    return isinstance(exc, (ValueError, ijson.JSONError) + _BROKEN_ZIP)
+
+
+# Ошибки чтения архива посреди result.json: контрольная сумма не сошлась, архив оборван.
+_BROKEN_ZIP: tuple[type[BaseException], ...] = (zipfile.BadZipFile, zlib.error, EOFError)
 
 
 @_handler
 async def upload_export(request: Request) -> JSONResponse:
-    """Принимает result.json телом запроса и пишет его на диск по мере поступления."""
+    """Принимает result.json или архив zip папки выгрузки телом запроса и пишет на диск по мере
+    поступления. Вид файла — по первым байтам, а не по имени."""
     registry = _registry(request)
     if "multipart/" in request.headers.get("content-type", "").lower():
         raise BadRequest("файл нужно прислать телом запроса как есть, а не формой", 415)
@@ -762,9 +787,8 @@ async def upload_export(request: Request) -> JSONResponse:
         raise ApiError("слишком много загруженных файлов — удалите ненужные загрузки", 409, "too_many_uploads")
 
     import_id = secrets.token_hex(16)
-    path = registry.directory / f"export-{import_id}.json"
-    part = path.with_suffix(".part")
-    size, complete = 0, False
+    part = registry.directory / f"export-{import_id}.part"
+    size, complete, head = 0, False, b""
     registry.uploading += 1
     try:
         fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -775,9 +799,13 @@ async def upload_export(request: Request) -> JSONResponse:
                 size += len(chunk)
                 if size > registry.max_bytes:
                     raise too_big
+                if len(head) < 4:
+                    head += chunk[:4 - len(head)]
                 await asyncio.to_thread(fp.write, chunk)
         if size == 0:
-            raise BadRequest("пустой файл: пришлите result.json телом запроса")
+            raise BadRequest("пустой файл: пришлите result.json или архив zip телом запроса")
+        kind = "zip" if is_zip(head) else "json"
+        path = part.with_suffix(f".{kind}")
         os.replace(part, path)
         complete = True
     except OSError as exc:
@@ -791,9 +819,10 @@ async def upload_export(request: Request) -> JSONResponse:
             part.unlink(missing_ok=True)
 
     registry.trim()
-    registry.items[import_id] = Upload(import_id, path, size, datetime.now(timezone.utc))
-    logger.info("загружен экспорт %s: %s байт", import_id, size)
-    return JSONResponse({"import_id": import_id, "size_bytes": size, "state": "uploaded"}, status_code=201)
+    registry.items[import_id] = Upload(import_id, path, size, datetime.now(timezone.utc), kind=kind)
+    logger.info("загружен экспорт %s (%s): %s байт", import_id, kind, size)
+    return JSONResponse({"import_id": import_id, "size_bytes": size, "state": "uploaded", "kind": kind},
+                        status_code=201)
 
 
 @_handler
@@ -807,10 +836,23 @@ async def import_status(request: Request) -> JSONResponse:
     return JSONResponse(_upload(request).view())
 
 
+@contextlib.contextmanager
+def _export_stream(upload: Upload):
+    """result.json загрузки — из файла или из архива — с подсчётом прочитанного.
+    Отдаёт (архив или None, поток). У архива ход считается по байтам result.json в нём."""
+    if upload.kind == "zip":
+        with ExportArchive(upload.path) as archive, archive.open_result() as fp:
+            upload.reader, upload.read_total = _ProgressFile(fp), archive.result_size
+            yield archive, upload.reader
+    else:
+        with open(upload.path, "rb") as fp:
+            upload.reader, upload.read_total = _ProgressFile(fp), None
+            yield None, upload.reader
+
+
 def _scan_file(upload: Upload):
-    with open(upload.path, "rb") as fp:
-        upload.reader = _ProgressFile(fp)
-        return scan(upload.reader)
+    with _export_stream(upload) as (_, reader):
+        return scan(reader)
 
 
 async def _scan(state: AppState, upload: Upload) -> None:
@@ -901,15 +943,22 @@ async def _close(conn: asyncpg.Connection) -> None:
 async def _import_once(state: AppState, upload: Upload, exclude: set[tuple[str, int]], owner_id: int | None) -> ImportStats:
     conn = await db.connect(state.config.dsn)
     try:
-        with open(upload.path, "rb") as fp:
-            upload.reader = _ProgressFile(fp)
+        with _export_stream(upload) as (archive, reader):
             extra: dict[str, Any] = {}
             if "stats" in inspect.signature(import_export).parameters:
                 # importer умеет отдавать счётчики по ходу работы — показываем их в прогрессе
                 upload.live = extra["stats"] = ImportStats()
+            if archive is not None:
+                # Архив папки выгрузки: файлы голосовых, фото и документов — на разбор.
+                rules = await media_rules(conn, state.config)
+                if rules.any:
+                    def check() -> None:
+                        if reader.stop:
+                            raise _Stopped()
+                    extra["attachments"] = Attachments(archive, state.config.data_dir, rules, check=check)
             return await import_export(
-                conn, upload.reader, owner_tg_user_id=owner_id, exclude=exclude,
-                source_name="result.json", **extra)
+                conn, reader, owner_tg_user_id=owner_id, exclude=exclude,
+                source_name="export.zip" if archive is not None else "result.json", **extra)
     finally:
         await _close(conn)
 
@@ -935,7 +984,7 @@ async def _run(state: AppState, upload: Upload, exclude: set[tuple[str, int]], o
         upload.state, upload.error = "failed", "импорт остановлен"
     except Exception as exc:  # noqa: BLE001
         upload.state, upload.error = "failed", _owner_error(exc)
-        if isinstance(exc, (ExportFormatError, ijson.JSONError)):
+        if isinstance(exc, (ExportFormatError, ArchiveError, ijson.JSONError) + _BROKEN_ZIP):
             upload.drop_file()   # это не экспорт; при прочих ошибках файл остаётся для повтора
         elif not _is_bad_file(exc):
             # Только вид ошибки: в её тексте могут быть значения из переписки.
@@ -1089,6 +1138,13 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
         while True:
             await asyncio.sleep(JANITOR_EVERY)
             registry.expire(datetime.now(timezone.utc))
+            try:
+                async with state.pool.acquire() as conn:
+                    await media_files.sweep(conn, state.config.data_dir)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — уборка повторится в следующий раз
+                logger.warning("уборка файлов вложений не удалась: %s", type(exc).__name__)
 
     state.spawn(janitor(), name="imports-janitor")
     try:

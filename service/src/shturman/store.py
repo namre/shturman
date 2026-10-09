@@ -53,7 +53,8 @@ CREATE TEMP TABLE IF NOT EXISTS import_stage (
     edited_at timestamptz, media_type text, media_path text, service_action text,
     telegram_entities jsonb, topic_tg_id bigint, is_forwarded boolean,
     telegram_via_bot boolean, telegram_sender_bot boolean,
-    media_duration integer, media_ref text
+    media_duration integer, media_ref text,
+    media_name text, media_mime text, media_size bigint
 ) ON COMMIT DELETE ROWS
 """
 
@@ -65,6 +66,14 @@ UPDATE import_stage s
 SET text = voice_text(s.text, m.transcript, m.media_type, COALESCE(m.media_duration, s.media_duration))
 FROM messages m
 WHERE m.chat_id = s.chat_id AND m.tg_message_id = s.tg_message_id AND m.transcript IS NOT NULL
+"""
+
+# То же для разобранного вложения (media_text, миграция 0028).
+_COMPOSE_MEDIA = """
+UPDATE import_stage s
+SET text = media_text(s.text, m.media_summary)
+FROM messages m
+WHERE m.chat_id = s.chat_id AND m.tg_message_id = s.tg_message_id AND m.media_summary IS NOT NULL
 """
 
 _UPSERT_SENDERS = """
@@ -118,14 +127,14 @@ INSERT INTO messages AS m (
     text, entities, reply_to_tg_id, forwarded_from, edited_at,
     media_type, media_path, service_action, sources, agent_visible,
     telegram_entities, topic_tg_id, is_forwarded, telegram_via_bot, telegram_sender_bot,
-    media_duration, media_ref
+    media_duration, media_ref, media_name, media_mime, media_size
 )
 SELECT s.chat_id, s.tg_message_id, s.sent_at, s.kind, p.id, s.sender_name, s.is_outgoing,
        s.text, s.entities, s.reply_to_tg_id, s.forwarded_from, s.edited_at,
        s.media_type, s.media_path, s.service_action, ARRAY[$1::text],
        NOT ($2::boolean AND s.is_outgoing IS NOT TRUE AND s.kind = 'message' AND s.text <> ''),
        s.telegram_entities, s.topic_tg_id, s.is_forwarded, s.telegram_via_bot, s.telegram_sender_bot,
-       s.media_duration, s.media_ref
+       s.media_duration, s.media_ref, s.media_name, s.media_mime, s.media_size
 FROM import_stage s
 LEFT JOIN peers p ON p.class = s.sender_class AND p.tg_id = s.sender_tg_id
 -- Номера строк архива идут в порядке сообщений, а не в том, какой выберет план запроса:
@@ -174,6 +183,9 @@ ON CONFLICT (chat_id, tg_message_id) DO UPDATE SET
     media_duration = COALESCE(m.media_duration, EXCLUDED.media_duration),
     -- file_id бизнес-режима: свежий заменяет прежний (у Bot API он со временем может смениться)
     media_ref      = COALESCE(EXCLUDED.media_ref, m.media_ref),
+    media_name     = COALESCE(m.media_name, EXCLUDED.media_name),
+    media_mime     = COALESCE(m.media_mime, EXCLUDED.media_mime),
+    media_size     = COALESCE(m.media_size, EXCLUDED.media_size),
     sources = CASE WHEN $1 = ANY (m.sources) THEN m.sources ELSE m.sources || $1::text END
 RETURNING m.id, (xmax = 0) AS inserted
 """
@@ -270,6 +282,9 @@ def _row(chat_id: int, m: MessageRecord, owner_tg_id: int, outgoing: bool | None
         m.telegram_sender_bot if source == "session" else None,
         m.media_duration if isinstance(m.media_duration, int) and 0 <= m.media_duration < 10**7 else None,
         _clean(m.media_ref)[:300] if m.media_ref else None,
+        _clean(m.media_name)[:255] if m.media_name else None,
+        _clean(m.media_mime)[:100] if m.media_mime else None,
+        m.media_size if isinstance(m.media_size, int) and 0 <= m.media_size < 10**13 else None,
     )
 
 
@@ -314,6 +329,7 @@ async def upsert_messages(
         await conn.execute(_STAGE)
         await conn.copy_records_to_table("import_stage", records=records)
         await conn.execute(_COMPOSE_VOICE)
+        await conn.execute(_COMPOSE_MEDIA)
         await conn.execute(_UPSERT_SENDERS)
         v1 = await conn.execute(_KEEP_OLD_VERSION)
         v2 = await conn.execute(_KEEP_INCOMING_AS_VERSION)

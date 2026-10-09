@@ -127,7 +127,13 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
         print("Своя модель: не настроена. Запросы к модели ждут плагин в Hermes; "
               "без Hermes выполнять их некому.")
     else:
-        print(f"Своя модель: {llm.get('model')}")
+        print(f"Своя модель: {llm.get('model')}"
+              + (" — по подписке ChatGPT" if llm.get("way") == "subscription" else ""))
+        state = {"limit": "лимит подписки исчерпан, задания ждут",
+                 "relogin": "нужно войти через ChatGPT заново — на странице настройки переписки",
+                 "denied": "OpenAI отказал подписке в доступе"}.get(llm.get("subscription") or "")
+        if state:
+            print(f"  подписка: {state}")
         for task, model in sorted((llm.get("task_models") or {}).items()):
             print(f"  для задачи {task}: {model}")
         last = llm.get("last_call_ok")

@@ -34,7 +34,8 @@
     login: null, loginLink: "", chatAccount: null, chats: [], chatsTotal: 0, chatsEnabled: 0,
     chatsLoading: false, chatsKey: "", scans: {}, scanning: {}, exclude: {}, upload: null,
     signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
-    messages: null, importOpened: false
+    messages: null, importOpened: false,
+    subUrl: ""                  // адрес входа в ChatGPT текущей попытки — только в памяти страницы
   };
 
   /* ------------------------------------------------------------ мелочи */
@@ -298,6 +299,10 @@
     show("screen-login", false);
     show("screen-app", true);
     ui.signatures = {};
+    mem.pages = mem.pending = mem.person = mem.projects = mem.project = mem.chats = mem.profile = null;
+    mem.personId = mem.projectId = null;
+    mem.creating = false;
+    if (memOpen()) showMemory(true);
     refresh().then(function () { refreshOverview(); });
     startLoop();
   }
@@ -314,6 +319,7 @@
 
   function refreshOverview() {
     ui.lastOverview = Date.now();
+    refreshMemoryCount();
     return call("GET", "overview").then(function (r) { if (r.ok) renderSummary(r.data); });
   }
 
@@ -334,6 +340,7 @@
     renderBot(S.bot);
     renderBusiness(S.bot);
     renderLlm(S.llm);
+    renderMedia(S.media || {});
     renderProgress();
   }
 
@@ -345,10 +352,10 @@
    * иначе подключённое нельзя было бы ни увидеть, ни отключить. */
   var PLAN = {
     none: ["s-bot", "s-mode"],
-    own: ["s-bot", "s-mode", "s-keys", "s-accounts", "s-chats", "s-import"],
-    staff: ["s-bot", "s-mode", "s-business", "s-keys", "s-assistant", "s-chats", "s-import"]
+    own: ["s-bot", "s-mode", "s-keys", "s-accounts", "s-chats", "s-import", "s-media"],
+    staff: ["s-bot", "s-mode", "s-business", "s-keys", "s-assistant", "s-chats", "s-import", "s-media"]
   };
-  var ALL_STEPS = ["s-bot", "s-mode", "s-business", "s-keys", "s-accounts", "s-assistant", "s-chats", "s-import"];
+  var ALL_STEPS = ["s-bot", "s-mode", "s-business", "s-keys", "s-accounts", "s-assistant", "s-chats", "s-import", "s-media"];
 
   function lockStep(id, reason, done) {
     var card = $(id), lock = card.querySelector(".step-lock");
@@ -370,7 +377,8 @@
       chats: accounts.filter(function (a) { return !sc || a.role === (sc === "staff" ? "assistant" : "owner"); })
         .reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0),
       imported: (S.imports.items || []).some(function (i) { return i.state === "done"; }),
-      importsAny: (S.imports.items || []).length > 0
+      importsAny: (S.imports.items || []).length > 0,
+      media: !!(S.media && S.media.enabled)
     };
   }
 
@@ -380,7 +388,8 @@
     var BOT = "Откроется после шага 1 — когда бот согласований будет сохранён и привязан к вам.";
     var done = {
       "s-bot": f.bot, "s-mode": !!f.sc, "s-business": f.business, "s-keys": f.keys,
-      "s-accounts": f.ownerOk, "s-assistant": f.helperOk, "s-chats": f.chats > 0, "s-import": f.imported
+      "s-accounts": f.ownerOk, "s-assistant": f.helperOk, "s-chats": f.chats > 0, "s-import": f.imported,
+      "s-media": f.media
     };
     // Какой шаг держит закрытым этот: для строки «после шага N».
     var blocker = {
@@ -400,7 +409,7 @@
     // Подключённое раньше или в другом способе остаётся видно, чтобы его можно было отключить.
     var leftover = {
       "s-accounts": !!f.owner, "s-assistant": !!f.helper, "s-business": f.business,
-      "s-chats": !!(f.owner || f.helper), "s-import": f.importsAny
+      "s-chats": !!(f.owner || f.helper), "s-import": f.importsAny, "s-media": f.media
     };
     var why = f.sc ? "Не входит в выбранный способ. Виден, потому что уже подключён; если не нужен — отключите."
                    : "Подключено раньше. Выберите способ подключения — тогда страница покажет нужные шаги.";
@@ -475,6 +484,31 @@
         act(this, "mode-error", "PUT", "scenario", { scenario: name }, function () {
           toast(name === "own" ? "Способ выбран. Дальше — шаги для входа в ваш аккаунт." : "Способ выбран. Дальше — бизнес-режим для личных чатов.");
         });
+      });
+    });
+  }
+
+  /* ----------------------------------------------- фото и документы */
+
+  function renderMedia(m) {
+    pill("media", m.enabled ? "Включён" : "Выключен", m.enabled ? "done" : "");
+    text("media-days", String(m.days || 30));
+    text("media-max", String(m.max_mb || 20));
+    show("media-on", !m.enabled);
+    show("media-off", !!m.enabled);
+    note("media-status", "info", m.enabled ? "Разбор включён. Сколько разобрано — в разделе «Дополнительно» → «Что собрано»." : "");
+  }
+
+  function wireMedia() {
+    $("media-on").addEventListener("click", function () {
+      if (!confirm("Включить разбор фото и документов?\n\nФото, сканы и текст документов из переписки будут уходить модели — её провайдеру, как уже уходит текст сообщений. Сами файлы на сервере не хранятся: разобрав, сервис их удаляет.")) return;
+      act(this, "media-error", "PUT", "media", { enabled: true }, function () {
+        toast("Разбор включён. Свежие фото и документы разберутся в ближайшие минуты.");
+      });
+    });
+    $("media-off").addEventListener("click", function () {
+      act(this, "media-error", "PUT", "media", { enabled: false }, function () {
+        toast("Разбор выключен. Уже разобранное остаётся в архиве.");
       });
     });
   }
@@ -1020,10 +1054,11 @@
     } else if (item.state === "done") {
       var st = item.stats || {};
       nodes.push(el("p", { class: "note ok", text: "Импорт завершён. Новых сообщений: " + number(st.messages_new) + ", уже были в архиве: " + number(st.messages_known) + ", чатов: " + number(st.chats) + (st.chats_excluded ? ", пропущено исключённых чатов: " + number(st.chats_excluded) : "") + "." }));
+      if (item.kind === "zip") nodes.push(el("p", { class: st.media_no_space ? "note warn" : "small", text: mediaSummary(st) }));
       nodes.push(el("p", { class: "small", text: "Файл с сервера удалён. Удалите выгрузку и со своего компьютера, если она больше не нужна: в ней вся переписка открытым текстом." }));
     } else if (item.state === "running") {
       var p = item.progress || {};
-      nodes.push(el("p", { class: "small waiting", role: "status", text: "Идёт импорт: " + (p.percent || 0) + "%" + (p.messages_read ? ", прочитано сообщений: " + number(p.messages_read) : "") + ". Страницу можно закрыть — импорт продолжится." }));
+      nodes.push(el("p", { class: "small waiting", role: "status", text: "Идёт импорт: " + (p.percent || 0) + "%" + (p.messages_read ? ", прочитано сообщений: " + number(p.messages_read) : "") + (p.media_files ? ", файлов взято на разбор: " + number(p.media_files) : "") + ". Страницу можно закрыть — импорт продолжится." }));
       nodes.push(el("progress", { max: "100", value: String(p.percent || 0), "aria-label": "Ход импорта" }));
     } else if (!scan || item.state === "scanning") {
       nodes.push(el("p", { class: "small waiting", role: "status", text: "Читаю файл и считаю чаты. Для большого файла это около минуты…" }));
@@ -1073,8 +1108,16 @@
     return el("div", { class: "import-item" }, nodes);
   }
 
+  function mediaSummary(st) {
+    var taken = st.media_files || 0, skipped = st.media_skipped || 0;
+    if (st.media_no_space) return "Файлов из архива взято на разбор: " + number(taken) + ". Остальные не взяты: на диске сервера кончилось место. Сообщения при этом импортированы.";
+    if (!taken && !skipped) return "Файлы из архива не брались: расшифровка голосовых и разбор фото и документов выключены или подходящих файлов в архиве нет.";
+    return "Файлов из архива взято на разбор: " + number(taken) + (skipped ? ", не взято: " + number(skipped) + " (нет в архиве, слишком большие или уже не нужны)" : "") + ". Разобрав файл, сервис его удаляет.";
+  }
+
   function renderImports(imports) {
     var items = imports.items || [];
+    if (imports.max_bytes) text("import-limit", megabytes(imports.max_bytes));
     var done = items.some(function (i) { return i.state === "done"; }), active = items.some(function (i) { return i.state === "running"; });
     pill("import", active ? "Идёт импорт" : done ? "Импортировано" : items.length ? "Файл загружен" : "", done && !active ? "done" : items.length ? "todo" : "");
     if (active) fast(10);
@@ -1089,9 +1132,9 @@
     $("import-form").addEventListener("submit", function (event) {
       event.preventDefault();
       var input = $("import-file"), file = input.files && input.files[0];
-      if (!file) { note("import-error", "warn", "Выберите файл result.json из папки выгрузки."); return; }
+      if (!file) { note("import-error", "warn", "Выберите архив папки выгрузки (zip) или файл result.json."); return; }
       var limit = S && S.imports.max_bytes;
-      if (limit && file.size > limit) { note("import-error", "warn", "Файл больше, чем сервис принимает (" + megabytes(limit) + "). Выгрузите чаты без вложений или частями."); return; }
+      if (limit && file.size > limit) { note("import-error", "warn", "Файл больше, чем сервис принимает (" + megabytes(limit) + "). Выгрузите заново без видео или с меньшим пределом размера файлов, частями — или загрузите один result.json."); return; }
       note("import-error", "warn", "");
       var xhr = new XMLHttpRequest();
       ui.upload = xhr;
@@ -1101,7 +1144,7 @@
       xhr.open("POST", API + "imports");
       xhr.setRequestHeader("X-Shturman-Setup", "1");
       xhr.setRequestHeader("X-Shturman-Session", key);
-      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.setRequestHeader("Content-Type", /\.zip$/i.test(file.name) ? "application/zip" : "application/json");
       xhr.upload.onprogress = function (e) {
         if (!e.lengthComputable) return;
         var percent = Math.floor(e.loaded * 100 / e.total);
@@ -1162,11 +1205,19 @@
 
   function renderLlm(llm) {
     var locked = llm.key.source === "server";
-    pill("llm", llm.configured ? "Настроена" : "", llm.configured ? "done" : "");
+    var bySubscription = llm.way === "subscription";
+    pill("llm", llm.configured ? (bySubscription ? "Подписка ChatGPT" : "Ключ API") : "", llm.configured ? "done" : "");
     show("llm-server", locked);
     show("llm-form", !locked);
     show("llm-remove", llm.key.source === "page");
-    if (llm.configured) {
+    if (ui.llmWay !== undefined && ui.llmWay !== llm.way) {
+      // Способ сменился — прежние ошибки обоих способов больше не о том.
+      note("llm-error", "warn", "");
+      note("sub-error", "warn", "");
+    }
+    ui.llmWay = llm.way;
+    renderSubscription(llm.subscription || {}, bySubscription);
+    if (llm.configured && !bySubscription) {
       note("llm-status", llm.problem_text ? "warn" : "ok", llm.problem_text
         ? "Модель «" + llm.model.value + "» настроена, но последнее обращение не удалось. " + llm.problem_text
         : "Сервис обращается к модели «" + llm.model.value + "» по своему ключу." + (llm.last_call_ok === null ? " Обращений после запуска ещё не было." : ""));
@@ -1183,10 +1234,118 @@
     if (!llm.model.editable) text("llm-model-hint", "Задано в настройках сервера.");
   }
 
+  /* Подписка ChatGPT. Вход — «вставкой адреса»: сервер не на компьютере владельца, поэтому адрес
+   * возврата http://127.0.0.1:1455/… в браузере не открывается, и владелец копирует его сюда. */
+  var SUB_PILLS = { connected: ["Подключена", "done"], limit: ["Лимит исчерпан", "todo"], relogin: ["Войти заново", "todo"], denied: ["Нет доступа", "todo"] };
+
+  function renderSubscription(sub, active) {
+    var status = sub.status || "none";
+    var p = active ? SUB_PILLS[status] : null;
+    pill("sub", p ? p[0] : "", p ? p[1] : "");
+    show("sub-locked", !sub.available);
+    text("sub-locked", sub.locked_text || "");
+    if (status !== "none") {
+      var parts = [sub.status_text];
+      if (sub.email) parts.push("Учётная запись ChatGPT: " + sub.email + ".");
+      if (active && sub.model) parts.push("Модель: " + subModelName(sub) + ".");
+      if (sub.problem_text) parts.push(sub.problem_text);
+      note("sub-status", status === "connected" ? "ok" : status === "signed_out" ? "info" : "warn", parts.join(" "));
+    } else note("sub-status", "", "");
+    var pending = !!sub.attempt && sub.available;
+    show("sub-paste", pending);
+    show("sub-actions", sub.available && !pending);
+    if (!pending) ui.subUrl = "";
+    var link = $("sub-open");
+    link.hidden = !ui.subUrl;
+    if (ui.subUrl) link.href = ui.subUrl;
+    text("sub-start", status === "connected" || status === "limit" || status === "denied" ? "Войти заново" : "Войти через ChatGPT");
+    show("sub-new", !!sub.registered);
+    // Адрес лимитов приходит с сервера: в разметке страницы чужих адресов нет.
+    if (sub.usage_url) $("sub-usage").href = sub.usage_url;
+    show("sub-usage", active && !!sub.usage_url);
+    show("sub-remove", active || status === "relogin");
+    var models = sub.models || [];
+    show("sub-model-box", active && models.length > 0);
+    renderIfChanged("sub-model", [models, sub.model], function () {
+      return models.map(function (m) {
+        var option = el("option", { value: m.slug, text: m.display_name || m.slug });
+        if (m.slug === sub.model) option.selected = true;
+        return option;
+      });
+    });
+  }
+
+  function subModelName(sub) {
+    var found = (sub.models || []).filter(function (m) { return m.slug === sub.model; })[0];
+    return found ? found.display_name : sub.model;
+  }
+
+  function startSubscription(button, fresh) {
+    var body = { "new": !!fresh };
+    if (S && S.llm && S.llm.key.source === "page") {
+      if (!confirm("Сейчас своя модель сервиса работает по ключу API.\n\nПодписка ChatGPT его заменит: после входа ключ будет удалён с сервера. Продолжить?")) return;
+      body["switch"] = true;
+    }
+    busy(button, true);
+    note("sub-error", "warn", "");
+    call("POST", "llm/chatgpt/start", body).then(function (r) {
+      busy(button, false);
+      if (!r.ok) { note("sub-error", "warn", r.error); return; }
+      ui.subUrl = r.data.url;
+      try { window.open(r.data.url, "_blank", "noopener,noreferrer"); } catch (e) { /* откроют ссылкой */ }
+      refresh().then(function () { $("sub-address").focus(); });
+    });
+  }
+
+  function wireSubscription() {
+    $("sub-start").addEventListener("click", function () { startSubscription(this, false); });
+    $("sub-new").addEventListener("click", function () {
+      if (!confirm("Войти другой учётной записью ChatGPT?\n\nПосле входа сервис будет пользоваться подпиской новой учётной записи.")) return;
+      startSubscription(this, true);
+    });
+    $("sub-paste").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var input = $("sub-address"), address = input.value.trim();
+      if (!address) { note("sub-error", "warn", "Вставьте адрес из адресной строки вкладки, где вы вошли в ChatGPT."); return; }
+      input.value = "";                 // в адресе одноразовый код входа — на странице его не держим
+      var button = $("sub-finish");
+      busy(button, true);
+      note("sub-error", "warn", "");
+      call("POST", "llm/chatgpt/finish", { address: address }).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { note("sub-error", "warn", r.error); refresh(); return; }
+        ui.subUrl = "";
+        toast(r.data.probe === "ok" ? "Подписка ChatGPT подключена: модель ответила." : "Подписка ChatGPT подключена. " + (r.data.probe_text || ""), r.data.probe !== "ok");
+        refresh();
+        refreshOverview();
+      });
+    });
+    $("sub-cancel").addEventListener("click", function () {
+      ui.subUrl = "";
+      note("sub-error", "warn", "");
+      act(this, "sub-error", "POST", "llm/chatgpt/cancel", {});
+    });
+    $("sub-model").addEventListener("change", function () {
+      var model = this.value;
+      act(null, "sub-error", "PUT", "llm/chatgpt/model", { model: model }, function () { toast("Модель подписки выбрана."); });
+    });
+    $("sub-remove").addEventListener("click", function () {
+      if (!confirm("Выйти из подписки ChatGPT?\n\nСервис перестанет обращаться к модели по подписке; сессия у OpenAI будет отозвана.")) return;
+      act(this, "sub-error", "DELETE", "llm/chatgpt", {}, function (data) {
+        toast(data.revoked ? "Вы вышли из подписки ChatGPT." : "Вы вышли из подписки, но OpenAI не подтвердил отзыв. Отключить доступ можно в настройках ChatGPT.", !data.revoked);
+      });
+    });
+  }
+
   function wireLlm() {
+    wireSubscription();
     $("llm-form").addEventListener("submit", function (event) {
       event.preventDefault();
       var key = $("llm-key"), body = { api_key: key.value.trim(), base_url: $("llm-url").value.trim(), model: $("llm-model").value.trim() };
+      if (S && S.llm && S.llm.way === "subscription") {
+        if (!confirm("Сейчас своя модель сервиса работает по подписке ChatGPT.\n\nКлюч API её заменит: сервис выйдет из подписки. Продолжить?")) return;
+        body["switch"] = true;
+      }
       key.value = "";
       act($("llm-save"), "llm-error", "PUT", "llm", body, function (data) {
         ui.signatures.llm = "";
@@ -1235,6 +1394,10 @@
           ? "Не расшифровываются: ассистент видит, что было голосовое, но не его содержание. Включает оператор на сервере: ./ops/asr.sh on"
           : a.voice_problem ? "Расшифровка включена, но распознавание сейчас не отвечает. Ждут: " + number(a.voice_pending)
           : "Расшифровываются. Готово: " + number(a.voice_done) + (a.voice_pending ? ", ждут: " + number(a.voice_pending) : "")),
+        fact("Фото и документы", !a.media_enabled
+          ? "Не разбираются: ассистент видит, что было фото или файл, но не что в нём. Включается в шаге «Фото и документы»."
+          : "Разбираются. Готово: " + number(a.media_done) + ((a.media_pending || a.media_asking) ? ", ждут: " + number((a.media_pending || 0) + (a.media_asking || 0)) : "") +
+            (a.media_skipped ? ", пропущено: " + number(a.media_skipped) : "") + (a.media_failed ? ", не получилось: " + number(a.media_failed) : "")),
         fact("Отправка сообщений", a.sending ? "Включена в настройках сервера." : "Выключена. Включается только в настройках сервера, не здесь.")
       ];
     });
@@ -1251,6 +1414,671 @@
           ]);
         });
       });
+    });
+  }
+
+  /* ---------------------------------------------------- память ассистента
+   * Не шаг настройки, а отдельная карточка после шагов. Разделы — вкладки из MEMORY_TABS: у каждой
+   * id, подпись, load() — запрос данных (обещание, итог — текст ошибки или "") и draw() — узлы
+   * панели; count() — число на вкладке. Новый раздел — ещё один объект в MEMORY_TABS и его маршруты
+   * /memory/… на сервере (memory.py). Пустых разделов-заглушек на странице нет.
+   * Всё, что пришло с сервера, выводится через textContent: ссылок из текста страниц нет. */
+
+  var MEM_LIMIT = 20000;
+  var mem = {
+    tab: "people", q: "", pages: null, pending: null, person: null, personId: null,
+    projects: null, project: null, projectId: null, creating: false, chats: null, profile: null,
+    error: "", timer: null, seq: 0
+  };
+
+  var FLAG_WORDS = {
+    frozen: ["заморожена", "Файл страницы правили вручную, и ассистент перестал понимать, где какой блок. Пока файл не исправят, страница не обновляется, а заметки здесь не сохраняются. Исправить его может тот, кто сопровождает сервер."],
+    summary_not_updated: ["сводка не обновлена", "Сводка не обновилась при последней ночной сборке — показана прежняя. Обычно это исправляется следующей ночью."],
+    summary_pending: ["сводка пересобирается", "Ассистент как раз пересобирает сводку. Загляните через несколько минут."],
+    waiting: ["скоро обновится", "Есть новые сведения: страница обновится в ближайшие минуты."],
+    no_file: ["ещё не записана", "Страница заведена, но ещё не записана: появится после ближайшей сборки, обычно ночью. Заметки можно написать уже сейчас."]
+  };
+  var ORIGIN_WORDS = { "сказал владелец": "сказали вы", "сказал собеседник": "сказал собеседник", "вывела модель": "вывод ассистента" };
+  var CHAT_KINDS = { personal: "личный чат", group: "группа", channel: "канал" };
+
+  var MEMORY_TABS = [
+    { id: "people", label: "Люди", load: loadPeople, draw: drawPeople },
+    { id: "projects", label: "Проекты", load: loadProjects, draw: drawProjects },
+    { id: "profile", label: "Профиль", load: loadProfile, draw: drawProfile },
+    { id: "pending", label: "Ждут решения", load: loadPending, draw: drawPending,
+      count: function () { return mem.pending ? mem.pending.total : 0; } }
+  ];
+
+  function memTab(id) { return MEMORY_TABS.filter(function (t) { return t.id === id; })[0] || MEMORY_TABS[0]; }
+  function memOpen() { return $("memory-details").open; }
+
+  function day(iso) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+    if (!m) return "";
+    return new Date(+m[1], +m[2] - 1, +m[3]).toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+  }
+
+  function sourcesText(item) {
+    var parts = [];
+    if (item.sources) parts.push(item.sources === 1 ? "сообщение" : item.sources + " " + plural(item.sources, "сообщение", "сообщения", "сообщений"));
+    if (item.origin) parts.push(ORIGIN_WORDS[item.origin] || item.origin);
+    return parts.join(" · ");
+  }
+
+  function memPill() {
+    var n = mem.pending ? mem.pending.total : 0;
+    pill("memory", n ? "ждут решения: " + n : "", n ? "todo" : "");
+  }
+
+  /* Ждущее решения нужно и для числа на свёрнутой карточке: спрашивается вместе со счётчиками. */
+  function refreshMemoryCount() {
+    return call("GET", "memory/pending", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      var before = JSON.stringify(mem.pending);
+      mem.pending = r.data;
+      memPill();
+      if (memOpen() && before !== JSON.stringify(mem.pending)) drawMemoryTabs();
+    });
+  }
+
+  function drawMemoryTabs() {
+    var box = $("mem-tabs");
+    box.textContent = "";
+    MEMORY_TABS.forEach(function (tab) {
+      var n = tab.count ? tab.count() : 0;
+      box.appendChild(el("button", {
+        class: "tab", type: "button", role: "tab", id: "mem-tab-" + tab.id, "aria-controls": "mem-panel",
+        "aria-selected": tab.id === mem.tab ? "true" : "false",
+        onclick: function () {
+          if (mem.tab === tab.id) return;
+          mem.tab = tab.id; mem.personId = null; mem.projectId = null; mem.creating = false;
+          showMemory(true);
+        }
+      }, [tab.label, n ? el("span", { class: "tab-count", text: String(n) }) : null]));
+    });
+    $("mem-panel").setAttribute("aria-labelledby", "mem-tab-" + mem.tab);
+  }
+
+  function memPanel(nodes) {
+    var panel = $("mem-panel");
+    panel.textContent = "";
+    (Array.isArray(nodes) ? nodes : [nodes]).forEach(function (n) { if (n) panel.appendChild(n); });
+  }
+
+  /* Рисует раздел; reload — сначала заново спросить данные у сервера. */
+  function showMemory(reload) {
+    var tab = memTab(mem.tab), seq = ++mem.seq;
+    drawMemoryTabs();
+    if (!reload && !mem.error) { memPanel(tab.draw()); return Promise.resolve(); }
+    memPanel(el("p", { class: "small waiting", role: "status", text: "Загружаю…" }));
+    return tab.load().then(function (error) {
+      if (seq !== mem.seq) return;               // пока ждали, владелец ушёл в другой раздел
+      mem.error = error || "";
+      drawMemoryTabs();
+      memPanel(error ? el("p", { class: "note warn", role: "alert", text: error }) : tab.draw());
+    });
+  }
+
+  function openAndFocus() { showMemory(true).then(function () { $("mem-panel").focus(); }); }
+
+  /* ---- общее для страниц: блоки, факты, заметки */
+
+  function memSection(title, hint, body) {
+    return el("section", { class: "mem-block" }, [el("h4", { text: title }), hint ? el("p", { class: "small", text: hint }) : null].concat(body));
+  }
+
+  function flagPills(flags) {
+    return (flags || []).map(function (f) {
+      var words = FLAG_WORDS[f.code];
+      return el("span", { class: "badge warn", text: words ? words[0] : f.text });
+    });
+  }
+
+  function flagNotes(p) {
+    var nodes = (p.flags || []).map(function (f) {
+      var words = FLAG_WORDS[f.code];
+      return el("p", { class: "note info", text: words ? words[1] : f.text });
+    });
+    if (p.problem && !(p.flags || []).some(function (f) { return f.code === "frozen"; })) nodes.push(el("p", { class: "note info", text: FLAG_WORDS.frozen[1] }));
+    return nodes;
+  }
+
+  function summarySection(p, hint) {
+    return memSection("Сводка", hint, [p.summary.length ? el("ul", { class: "mem-lines" }, p.summary.map(function (s) {
+      if (s.note) return el("li", { class: "mem-note", text: s.text });
+      return el("li", {}, [
+        s.disputed ? el("span", { class: "badge warn", text: "противоречие" }) : null,
+        el("span", { text: s.text }),
+        el("span", { class: "mem-meta", text: sourcesText(s) })
+      ]);
+    })) : el("p", { class: "mem-note", text: "Сводки пока нет." })]);
+  }
+
+  function commitmentsSection(p) {
+    return memSection("Договорённости", "Закрыть или перенести срок — командой ассистенту или в боте согласований.",
+      [p.commitments.length ? el("table", { class: "mem-table" }, [
+        el("thead", {}, [el("tr", {}, [el("th", { scope: "col", text: "Что" }), el("th", { scope: "col", text: "Срок" }), el("th", { scope: "col", text: "Статус" })])]),
+        el("tbody", {}, p.commitments.map(function (c) {
+          return el("tr", {}, [el("td", { "data-label": "Что", text: c.what }), el("td", { "data-label": "Срок", text: c.due }),
+                               el("td", { "data-label": "Статус", text: c.status })]);
+        }))
+      ]) : el("p", { class: "mem-note", text: "Договорённостей нет." })]);
+  }
+
+  function timelineSection(p) {
+    return memSection("Хронология", "Что и когда происходило. Строки только дописываются, старые не меняются.",
+      [p.timeline.length ? el("ol", { class: "mem-timeline" }, p.timeline.slice().reverse().map(function (t) {
+        return el("li", {}, [
+          t.day ? el("time", { datetime: t.day, text: day(t.day) }) : null,
+          el("span", { text: t.text }),
+          el("span", { class: "mem-meta", text: sourcesText(t) })
+        ]);
+      })) : el("p", { class: "mem-note", text: "Пока пусто." })]);
+  }
+
+  /* Факты и решения с кнопкой «Неверно»: факт перестаёт действовать, а если он сменил прежний —
+   * прежний снова действует. after — что сделать после (обычно перечитать раздел). */
+  function factsSection(title, hint, items, empty, after) {
+    var body = items.length ? el("ul", { class: "mem-facts" }, items.map(function (f) {
+      var error = el("p", { class: "note warn mem-error", role: "alert", hidden: true });
+      var meta = [f.since ? (f.kind === "decision" ? day(f.since) : "с " + day(f.since)) : "", ORIGIN_WORDS[f.origin] || f.origin || ""]
+        .filter(Boolean).join(" · ");
+      return el("li", { class: "mem-fact" }, [
+        el("div", { class: "mem-fact-main" }, [
+          el("span", {}, [f.slot ? el("b", { text: f.slot + ": " }) : null, f.text]),
+          meta ? el("span", { class: "mem-meta", text: meta }) : null,
+          error
+        ]),
+        el("button", { class: "btn ghost danger small-btn", type: "button", text: "Неверно",
+          "aria-label": "Неверно: " + (f.slot ? f.slot + ": " : "") + f.text,
+          onclick: function () {
+            if (!confirm("Отметить как неверное?\n\nАссистент перестанет на это опираться. Если это сменило прежнее, прежнее снова будет действовать.")) return;
+            var button = this;
+            busy(button, true);
+            error.hidden = true;
+            call("POST", "memory/facts/" + f.id + "/retract", {}).then(function (r) {
+              if (!r.ok) { busy(button, false); error.textContent = r.error; error.hidden = false; return; }
+              toast("Отмечено как неверное.");
+              refreshOverview();
+              after();
+            });
+          } })
+      ]);
+    })) : el("p", { class: "mem-note", text: empty });
+    return memSection(title, hint, [body]);
+  }
+
+  /* Поле заметок владельца: заметки о человеке и проекте, правила в профиле. */
+  function ownerBlock(o) {
+    var id = "mem-owner";
+    var area = el("textarea", { id: id, rows: "6", maxlength: String(MEM_LIMIT), spellcheck: "true",
+                                "aria-describedby": "mem-owner-hint mem-owner-count mem-owner-note", placeholder: o.placeholder });
+    area.value = o.value || "";
+    area.disabled = !o.editable;
+    var count = el("p", { class: "hint", id: "mem-owner-count", role: "status" });
+    var save = el("button", { class: "btn", id: "mem-owner-save", type: "submit", text: "Сохранить" });
+    var saved = o.value || "";
+    function counted() {
+      text(count, "Знаков: " + number(area.value.length) + " из " + number(MEM_LIMIT));
+      save.disabled = !o.editable || area.value === saved;
+    }
+    area.addEventListener("input", counted);
+    counted();
+    var form = el("form", { class: "mem-owner", id: "mem-owner-form", autocomplete: "off", novalidate: true }, [
+      el("label", { for: id, text: o.label }), area, count,
+      el("p", { class: "note", id: "mem-owner-note", role: "status", hidden: true }),
+      el("div", { class: "row" }, [save])
+    ]);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (save.disabled) return;
+      var value = area.value;
+      busy(save, true);
+      note("mem-owner-note", "", "");
+      call("PUT", o.path, { text: value }).then(function (r) {
+        if (!r.ok) { note("mem-owner-note", "warn", r.error); busy(save, false); return; }
+        saved = value.replace(/^\n+|\n+$/g, "");
+        if (o.saved) o.saved(saved);
+        counted();
+        note("mem-owner-note", "ok", r.data.changed ? "Сохранено. Ассистент учтёт это в следующем ответе." : "Без изменений: такой текст уже сохранён.");
+        refreshOverview();
+      });
+    });
+    return memSection(o.title, null, [
+      el("p", { class: "gives", id: "mem-owner-hint" }, [el("b", { text: o.lead + " " }), o.hint]), form
+    ]);
+  }
+
+  function personNotes(p, path, saved, placeholder) {
+    return ownerBlock({
+      title: "Ваши заметки", label: "Текст заметок", value: p.owner, editable: p.editable, path: path, saved: saved,
+      lead: "Этот блок пишете только вы.",
+      hint: "Ассистент его не меняет и читает как ваши собственные слова — доверяет ему больше, чем переписке.",
+      placeholder: placeholder || "Например: не писать после 19:00; решения по деньгам — только через меня."
+    });
+  }
+
+  /* ---- Люди */
+
+  function loadPeople() {
+    if (mem.personId !== null) {
+      return call("GET", "memory/pages/" + mem.personId).then(function (r) {
+        if (r.ok) mem.person = r.data; else { mem.personId = null; mem.person = null; }
+        return r.ok ? "" : r.error;
+      });
+    }
+    return call("GET", "memory/pages" + (mem.q ? "?q=" + encodeURIComponent(mem.q) : "")).then(function (r) {
+      if (r.ok) mem.pages = r.data;
+      return r.ok ? "" : r.error;
+    });
+  }
+
+  function drawPeople() {
+    if (mem.personId !== null && mem.person) return drawPerson(mem.person);
+    var input = el("input", { id: "mem-q", type: "search", autocomplete: "off", value: mem.q,
+                              placeholder: "Имя или слово со страницы" });
+    input.addEventListener("input", function () {
+      clearTimeout(mem.timer);
+      mem.timer = setTimeout(function () {
+        mem.q = input.value.trim().slice(0, 200);
+        var seq = ++mem.seq;
+        loadPeople().then(function (error) {
+          if (seq !== mem.seq) return;
+          var list = $("mem-list");
+          if (!list) return;
+          list.replaceWith(error ? el("p", { id: "mem-list", class: "note warn", text: error }) : peopleList());
+        });
+      }, 300);
+    });
+    return [
+      el("div", { class: "field search mem-search" }, [el("label", { for: "mem-q", text: "Найти человека или слово на страницах" }), input]),
+      peopleList()
+    ];
+  }
+
+  function peopleList() {
+    var items = (mem.pages && mem.pages.pages) || [];
+    if (!items.length) {
+      return el("p", { id: "mem-list", class: "note", text: mem.q
+        ? "Ничего не нашлось. Попробуйте другое слово или часть имени."
+        : "Страниц пока нет. Они появятся после ночной обработки переписки: ассистент предложит завести страницы о людях, с кем вы больше всего переписываетесь, — в боте согласований и во вкладке «Ждут решения»." });
+    }
+    return el("ul", { id: "mem-list", class: "mem-list" }, items.map(function (p) {
+      var meta = [p.updated ? "обновлена " + day(p.updated) : "ещё не записана"];
+      if (p.match_text && p.match !== "head") meta.push("найдено в " + p.match_text);
+      return el("li", {}, [memRow(p.title, meta.join(" · "), p.snippet, p.flags,
+        function () { mem.personId = p.person_id; mem.person = null; openAndFocus(); })]);
+    }));
+  }
+
+  function memRow(title, meta, extra, flags, open) {
+    return el("button", { class: "mem-row", type: "button", onclick: open }, [
+      el("span", { class: "mem-row-main" }, [
+        el("span", { class: "mem-name", text: title }),
+        meta ? el("span", { class: "mem-meta", text: meta }) : null,
+        extra ? el("span", { class: "mem-snippet", text: extra }) : null
+      ]),
+      el("span", { class: "mem-flags" }, flagPills(flags)),
+      el("span", { class: "arrow", "aria-hidden": "true", text: "›" })
+    ]);
+  }
+
+  function drawPerson(p) {
+    var nodes = [
+      el("button", { class: "link mem-back", type: "button", text: "← Все люди",
+                     onclick: function () { mem.personId = null; mem.person = null; showMemory(true); } }),
+      el("div", { class: "mem-title" }, [
+        el("h3", { text: p.title }),
+        p.aliases && p.aliases.length ? el("p", { class: "small", text: "Ещё называют: " + p.aliases.join(", ") }) : null,
+        el("p", { class: "small", text: p.updated ? "Страница обновлена " + day(p.updated) : "Страница ещё не записана." })
+      ])
+    ].concat(flagNotes(p));
+    nodes.push(summarySection(p, "Пишет ассистент по переписке и пересобирает каждую ночь. Под каждой строкой — откуда она: из скольких сообщений и кто это сказал."));
+    nodes.push(factsSection("Факты", "Что ассистент знает о человеке из переписки: должность, компания, телефон и подобное. Когда факт меняется, прежний уходит в хронологию.",
+      p.facts || [], "Фактов пока нет.", function () { showMemory(true); }));
+    nodes.push(personNotes(p, "memory/pages/" + p.person_id + "/owner-block", function (v) { p.owner = v; }));
+    nodes.push(commitmentsSection(p));
+    nodes.push(timelineSection(p));
+    return nodes;
+  }
+
+  /* ---- Проекты */
+
+  function loadMemoryChats() {
+    if (mem.chats) return Promise.resolve("");
+    return call("GET", "memory/chats").then(function (r) {
+      if (r.ok) mem.chats = r.data.chats;
+      return r.ok ? "" : r.error;
+    });
+  }
+
+  function loadProjects() {
+    if (mem.creating) return loadMemoryChats();
+    if (mem.projectId !== null) {
+      return Promise.all([call("GET", "memory/projects/" + mem.projectId), loadMemoryChats()]).then(function (all) {
+        var r = all[0];
+        if (r.ok) mem.project = r.data; else { mem.projectId = null; mem.project = null; }
+        return r.ok ? all[1] : r.error;
+      });
+    }
+    return call("GET", "memory/projects").then(function (r) {
+      if (r.ok) mem.projects = r.data.projects;
+      return r.ok ? "" : r.error;
+    });
+  }
+
+  function projectMeta(p) {
+    var parts = [];
+    parts.push(p.chats.length ? p.chats.length + " " + plural(p.chats.length, "чат", "чата", "чатов") : "без чатов");
+    if (p.commitments_open) parts.push("открытых договорённостей: " + p.commitments_open);
+    if (p.decisions) parts.push("решений: " + p.decisions);
+    parts.push(p.updated ? "обновлена " + day(p.updated) : "страница ещё не записана");
+    return parts.join(" · ");
+  }
+
+  function drawProjects() {
+    if (mem.creating) return drawCreateProject();
+    if (mem.projectId !== null && mem.project) return drawProject(mem.project);
+    var items = mem.projects || [];
+    var active = items.filter(function (p) { return p.status === "active"; });
+    var archived = items.filter(function (p) { return p.status === "archived"; });
+    var row = function (p) {
+      return el("li", {}, [memRow(p.title, projectMeta(p), p.chats.length ? "Чаты: " + p.chats.join(", ") : "", [],
+        function () { mem.projectId = p.id; mem.project = null; openAndFocus(); })]);
+    };
+    var nodes = [
+      el("p", { class: "small", text: "Проект — объект, сделка или направление работы. У проекта своя страница: сводка по его чатам, решения, факты и договорённости." }),
+      el("div", { class: "row" }, [el("button", { class: "btn", id: "mem-project-new", type: "button", text: "Завести проект",
+        onclick: function () { mem.creating = true; openAndFocus(); } })])
+    ];
+    nodes.push(active.length ? el("ul", { class: "mem-list", id: "mem-projects" }, active.map(row))
+      : el("p", { class: "note", text: archived.length ? "Действующих проектов нет." : "Проектов пока нет. Заведите проект сами или дождитесь предложения ассистента — оно придёт в бот согласований и во вкладку «Ждут решения»." }));
+    if (archived.length) {
+      nodes.push(el("details", { class: "sub mem-archive" }, [
+        el("summary", { text: "В архиве: " + archived.length }),
+        el("ul", { class: "mem-list" }, archived.map(row))
+      ]));
+    }
+    return nodes;
+  }
+
+  /* Выбор чатов: флажки со строкой поиска. chosen — номера уже выбранных. */
+  function chatPicker(chosen, idPrefix) {
+    var all = mem.chats || [];
+    var picked = {};
+    chosen.forEach(function (id) { picked[id] = true; });
+    var list = el("ul", { class: "mem-chats", id: idPrefix + "-list" });
+    var filter = el("input", { id: idPrefix + "-q", type: "search", autocomplete: "off", placeholder: "Начните вводить название" });
+    function draw() {
+      var q = filter.value.trim().toLowerCase();
+      list.textContent = "";
+      var shown = all.filter(function (c) { return !q || c.title.toLowerCase().indexOf(q) >= 0 || picked[c.id]; }).slice(0, 60);
+      if (!shown.length) list.appendChild(el("li", { class: "mem-note", text: all.length ? "Ничего не нашлось." : "Сервис ещё не читает ни одного чата." }));
+      shown.forEach(function (c) {
+        var box = el("input", { type: "checkbox", value: String(c.id) });
+        box.checked = !!picked[c.id];
+        box.addEventListener("change", function () { if (box.checked) picked[c.id] = true; else delete picked[c.id]; });
+        list.appendChild(el("li", {}, [el("label", { class: "check" }, [box,
+          el("span", {}, [c.title, el("span", { class: "mem-meta", text: " · " + (CHAT_KINDS[c.kind] || "") })])])]));
+      });
+    }
+    filter.addEventListener("input", draw);
+    draw();
+    return {
+      nodes: [el("div", { class: "field" }, [el("label", { for: idPrefix + "-q", text: "Найти чат" }), filter]), list],
+      value: function () { return all.filter(function (c) { return picked[c.id]; }).map(function (c) { return c.id; }); }
+    };
+  }
+
+  function drawCreateProject() {
+    var title = el("input", { id: "mem-new-title", type: "text", autocomplete: "off", maxlength: "80", placeholder: "Например: ЖК «Береговой», корпус 2" });
+    var aliases = el("input", { id: "mem-new-aliases", type: "text", autocomplete: "off", placeholder: "Береговой, Берег-2" });
+    var picker = chatPicker([], "mem-new-chats");
+    var error = el("p", { class: "note warn", id: "mem-new-error", role: "alert", hidden: true });
+    var save = el("button", { class: "btn", id: "mem-new-save", type: "submit", text: "Завести проект" });
+    var form = el("form", { class: "mem-form", autocomplete: "off", novalidate: true }, [
+      el("div", { class: "field" }, [el("label", { for: "mem-new-title", text: "Название" }), title]),
+      el("div", { class: "field" }, [el("label", { for: "mem-new-aliases", text: "Как ещё его называют — по желанию" }), aliases,
+        el("p", { class: "hint", text: "Через запятую. По этим словам ассистент узнаёт проект в переписке." })]),
+      el("fieldset", { class: "mem-fieldset" }, [el("legend", { text: "Чаты проекта — по желанию" }),
+        el("p", { class: "hint", text: "Сводка проекта собирается по сообщениям этих чатов, а договорённости из них относятся к проекту. Здесь только чаты, которые сервис уже читает." })]
+        .concat(picker.nodes)),
+      error,
+      el("div", { class: "row" }, [save, el("button", { class: "btn ghost", type: "button", text: "Отмена",
+        onclick: function () { mem.creating = false; showMemory(true); } })])
+    ]);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var names = aliases.value.split(",").map(function (a) { return a.trim(); }).filter(Boolean);
+      busy(save, true);
+      error.hidden = true;
+      call("POST", "memory/projects", { title: title.value, chat_ids: picker.value(), aliases: names }).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { error.textContent = r.error; error.hidden = false; return; }
+        toast("Проект заведён.");
+        mem.creating = false;
+        mem.projectId = r.data.project.id;
+        refreshOverview();
+        openAndFocus();
+      });
+    });
+    return [
+      el("button", { class: "link mem-back", type: "button", text: "← Все проекты",
+                     onclick: function () { mem.creating = false; showMemory(true); } }),
+      el("h3", { class: "mem-form-title", text: "Новый проект" }),
+      form
+    ];
+  }
+
+  function projectChats(p) {
+    var error = el("p", { class: "note warn mem-error", role: "alert", hidden: true });
+    function change(ids, done, button) {
+      busy(button, true);
+      error.hidden = true;
+      call("PUT", "memory/projects/" + p.id + "/chats", { chat_ids: ids }).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { error.textContent = r.error; error.hidden = false; return; }
+        toast(done);
+        refreshOverview();
+        showMemory(true);
+      });
+    }
+    var current = p.chats.map(function (c) { return c.id; });
+    var list = p.chats.length ? el("ul", { class: "mem-items", id: "mem-project-chats" }, p.chats.map(function (c) {
+      return el("li", { class: "mem-chat" }, [
+        el("span", {}, [c.title]),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать чат " + c.title,
+          onclick: function () { change(current.filter(function (id) { return id !== c.id; }), "Чат убран из проекта.", this); } })
+      ]);
+    })) : el("p", { class: "mem-note", text: "Чатов нет: сводка собирается по упоминаниям проекта в переписке." });
+    var free = (mem.chats || []).filter(function (c) { return current.indexOf(c.id) < 0; });
+    var select = el("select", { id: "mem-add-chat" }, [el("option", { value: "", text: "Выберите чат" })].concat(free.map(function (c) {
+      return el("option", { value: String(c.id), text: c.title + " · " + (CHAT_KINDS[c.kind] || "") });
+    })));
+    var add = el("button", { class: "btn ghost", id: "mem-add-chat-go", type: "button", text: "Добавить",
+      onclick: function () {
+        var id = Number(select.value);
+        if (!id) { error.textContent = "Выберите чат из списка."; error.hidden = false; return; }
+        change(current.concat([id]), "Чат добавлен в проект.", this);
+      } });
+    return memSection("Чаты проекта", "По сообщениям этих чатов ассистент собирает сводку и договорённости проекта.", [
+      list,
+      free.length ? el("div", { class: "mem-add" }, [el("div", { class: "field grow" }, [el("label", { for: "mem-add-chat", text: "Добавить чат" }), select]), add]) : null,
+      error
+    ]);
+  }
+
+  function drawProject(p) {
+    var archived = p.status === "archived";
+    var nodes = [
+      el("button", { class: "link mem-back", type: "button", text: "← Все проекты",
+                     onclick: function () { mem.projectId = null; mem.project = null; showMemory(true); } }),
+      el("div", { class: "mem-title" }, [
+        el("h3", {}, [p.title, archived ? el("span", { class: "badge", text: "в архиве" }) : null]),
+        p.aliases.length ? el("p", { class: "small", text: "Ещё называют: " + p.aliases.join(", ") }) : null,
+        p.participants.length ? el("p", { class: "small", text: "Участники: " + p.participants.join(", ") }) : null,
+        el("p", { class: "small", text: p.updated ? "Страница обновлена " + day(p.updated) : "Страница ещё не записана: появится после ближайшей сборки." })
+      ])
+    ].concat(flagNotes(p));
+    if (archived) nodes.push(el("p", { class: "note info", text: "Проект в архиве: страница сохранена, но сводка больше не обновляется, а новые договорённости к нему не относятся." }));
+    nodes.push(summarySection(p, "Пишет ассистент по сообщениям чатов проекта и упоминаниям, пересобирает каждую ночь."));
+    nodes.push(personNotes(p, "memory/projects/" + p.id + "/owner-block", function (v) { p.owner = v; },
+      "Например: главный по проекту — Иван; бюджет не превышать без моего согласия."));
+    nodes.push(factsSection("Решения", "Что решили по проекту и когда — из переписки.", p.decisions, "Решений пока нет.", function () { showMemory(true); }));
+    nodes.push(factsSection("Факты", "Цены, сроки, бюджет, статус и подобное. Когда факт меняется, прежний уходит в хронологию.", p.facts, "Фактов пока нет.", function () { showMemory(true); }));
+    nodes.push(commitmentsSection(p));
+    nodes.push(timelineSection(p));
+    nodes.push(projectChats(p));
+    if (!archived) {
+      var error = el("p", { class: "note warn mem-error", role: "alert", hidden: true });
+      nodes.push(memSection("Проект закончился?", "В архиве страница останется, но перестанет обновляться.", [
+        el("div", { class: "row" }, [el("button", { class: "btn ghost danger", id: "mem-archive", type: "button", text: "В архив",
+          onclick: function () {
+            if (!confirm("Перенести проект «" + p.title + "» в архив?\n\nСтраница останется, но сводка перестанет обновляться, а новые договорённости из его чатов не будут к нему относиться.")) return;
+            var button = this;
+            busy(button, true);
+            call("POST", "memory/projects/" + p.id + "/archive", {}).then(function (r) {
+              busy(button, false);
+              if (!r.ok) { error.textContent = r.error; error.hidden = false; return; }
+              toast("Проект перенесён в архив.");
+              refreshOverview();
+              mem.projectId = null;
+              mem.project = null;
+              showMemory(true);
+            });
+          } })]),
+        error
+      ]));
+    }
+    return nodes;
+  }
+
+  /* ---- Профиль */
+
+  function loadProfile() {
+    return call("GET", "memory/profile").then(function (r) {
+      if (r.ok) mem.profile = r.data;
+      return r.ok ? "" : r.error;
+    });
+  }
+
+  function drawProfile() {
+    var p = mem.profile || { facts: [], owner: "", editable: true };
+    return [
+      el("p", { text: "Что ассистент знает о вас и каким правилам следует. Факты о вас появляются здесь только после вашего «✓» — в боте согласований или во вкладке «Ждут решения»." }),
+      ownerBlock({
+        title: "Ваши правила и указания", label: "Текст правил", value: p.owner, editable: p.editable,
+        path: "memory/profile/owner-block", saved: function (v) { p.owner = v; },
+        lead: "Ассистент следует этим правилам и никогда их не меняет.",
+        hint: "Пишите обычным текстом: как к вам обращаться, когда не беспокоить, что решаете только вы.",
+        placeholder: "Например: отвечать коротко; по выходным не беспокоить, кроме срочного по стройке; платежи — только с моего «да»."
+      }),
+      factsSection("Что ассистент знает о вас", "Одобренные вами факты: должность, компания, город и подобное.",
+        p.facts, "Пока ничего. Когда ассистент заметит в переписке что-то о вас, он спросит — в боте согласований и во вкладке «Ждут решения».",
+        function () { showMemory(true); })
+    ];
+  }
+
+  /* ---- Ждут решения */
+
+  function loadPending() {
+    return call("GET", "memory/pending").then(function (r) {
+      if (r.ok) { mem.pending = r.data; memPill(); }
+      return r.ok ? "" : r.error;
+    });
+  }
+
+  function decide(button, item, path, body, done) {
+    var buttons = item.querySelectorAll("button"), error = item.querySelector(".mem-error");
+    Array.prototype.forEach.call(buttons, function (b) { b.disabled = true; });
+    error.hidden = true;
+    call("POST", path, body).then(function (r) {
+      if (!r.ok) {
+        Array.prototype.forEach.call(buttons, function (b) { b.disabled = false; });
+        error.textContent = r.error;
+        error.hidden = false;
+        if (r.status === 404 || r.status === 409) loadPending().then(function () { drawMemoryTabs(); });
+        return;
+      }
+      toast(done);
+      mem.pages = mem.projects = mem.profile = null;     // списки могли измениться
+      refreshOverview();
+      loadPending().then(function () { if (mem.tab === "pending") showMemory(false); });
+    });
+  }
+
+  function pendingItem(head, lines, yes, no) {
+    var item = el("li", { class: "mem-item" }, [
+      el("div", { class: "mem-item-main" }, [el("b", { text: head })].concat(lines)),
+      el("p", { class: "note warn mem-error", role: "alert", hidden: true }),
+      el("div", { class: "row" }, [
+        el("button", { class: "btn small-btn", type: "button", text: yes[0], onclick: function () { yes[1](this, item); } }),
+        el("button", { class: "btn ghost small-btn", type: "button", text: no[0], onclick: function () { no[1](this, item); } })
+      ])
+    ]);
+    return item;
+  }
+
+  function drawPending() {
+    var d = mem.pending || {};
+    var groups = { projects: d.projects || [], owner_facts: d.owner_facts || [], pages: d.pages || [], commitments: d.commitments || [] };
+    var nodes = [el("p", { class: "small", text: "То же, что бот согласований присылает с кнопками ✓ и ✗. Решение здесь действует сразу — как нажатие в боте." })];
+    if (!d.total) {
+      nodes.push(el("p", { class: "note ok", text: "Сейчас ничего не ждёт вашего решения." }));
+      return nodes;
+    }
+    if (groups.projects.length) {
+      nodes.push(memSection("Завести проект?", "Ассистент заметил в переписке объект или сделку. У проекта будет своя страница: сводка, решения, договорённости.",
+        [el("ul", { class: "mem-items" }, groups.projects.map(function (p) {
+          var path = "memory/pending/projects/" + p.id;
+          return pendingItem(p.title, [
+            el("span", { class: "mem-meta", text: "Почему предложено: " + p.reason }),
+            p.chats.length ? el("span", { class: "mem-meta", text: "Чаты: " + p.chats.join(", ") }) : null
+          ],
+            ["✓ Завести проект", function (b, item) { decide(b, item, path, { accept: true }, "Проект заведён."); }],
+            ["✗ Не нужно", function (b, item) { decide(b, item, path, { accept: false }, "Не заводим."); }]);
+        }))]));
+    }
+    if (groups.owner_facts.length) {
+      nodes.push(memSection("Факты о вас", "Верно — ассистент запомнит это в вашем профиле. Неверно — забудет и больше не спросит об этом сообщении.",
+        [el("ul", { class: "mem-items" }, groups.owner_facts.map(function (f) {
+          var path = "memory/pending/owner-facts/" + f.id;
+          return pendingItem(f.slot ? f.slot + ": " + f.text : f.text, [
+            el("span", { class: "mem-meta", text: "с " + day(f.since) + (f.said ? "; " + f.said : "") }),
+            f.quote ? el("q", { class: "mem-quote", text: f.quote }) : null
+          ],
+            ["✓ Верно", function (b, item) { decide(b, item, path, { accept: true, fingerprint: f.fingerprint }, "Запомнено в профиле."); }],
+            ["✗ Неверно", function (b, item) { decide(b, item, path, { accept: false }, "Не запоминаем."); }]);
+        }))]));
+    }
+    if (groups.pages.length) {
+      nodes.push(memSection("Завести страницу о человеке?", "Ассистент будет вести о нём сводку по переписке и опираться на неё в ответах.",
+        [el("ul", { class: "mem-items" }, groups.pages.map(function (p) {
+          var path = "memory/pending/pages/" + p.person_id;
+          return pendingItem(p.name, [el("span", { class: "mem-meta", text: "Почему предложено: " + p.reason })],
+            ["✓ Завести страницу", function (b, item) { decide(b, item, path, { accept: true }, "Страница будет заведена."); }],
+            ["✗ Не нужно", function (b, item) { decide(b, item, path, { accept: false }, "Не заводим."); }]);
+        }))]));
+    }
+    if (groups.commitments.length) {
+      nodes.push(memSection("Новые договорённости из переписки", "Верно — ассистент запишет договорённость и будет напоминать о ней. Неверно — забудет.",
+        [el("ul", { class: "mem-items" }, groups.commitments.map(function (c) {
+          var path = "memory/pending/commitments/" + c.id;
+          return pendingItem(c.who, [
+            el("span", { text: c.what }),
+            el("span", { class: "mem-meta", text: c.due }),
+            c.quote ? el("q", { class: "mem-quote", text: c.quote }) : null
+          ],
+            ["✓ Верно", function (b, item) { decide(b, item, path, { accept: true, fingerprint: c.fingerprint }, "Договорённость записана."); }],
+            ["✗ Неверно", function (b, item) { decide(b, item, path, { accept: false }, "Отклонено."); }]);
+        }))]));
+    }
+    return nodes;
+  }
+
+  function wireMemory() {
+    $("memory-details").addEventListener("toggle", function () {
+      if (memOpen()) showMemory(true);
     });
   }
 
@@ -1275,7 +2103,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireSession();
+  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireMemory(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.

@@ -126,6 +126,21 @@ async def fail(
     return "queued"
 
 
+async def postpone(conn: asyncpg.Connection, job_id: int, error: str, *, delay: int) -> str:
+    """Возвращает забранное задание в очередь через `delay` секунд и не засчитывает попытку.
+
+    Для случаев, когда дело не в задании, а в доступе к модели: исчерпан лимит подписки, нужно
+    войти заново. Иначе три таких отказа подряд закрыли бы задание навсегда. Срок ожидания в
+    очереди (`QUEUE_TTL`) считается от постановки и этим не продлевается."""
+    done = await conn.execute(
+        """UPDATE jobs SET status = 'queued', attempts = GREATEST(attempts - 1, 0), error = $2,
+                  locked_until = NULL, run_after = $3
+           WHERE id = $1 AND status = 'running'""",
+        job_id, error[:2000], datetime.now(timezone.utc) + timedelta(seconds=max(1, int(delay))),
+    )
+    return "queued" if done.endswith(" 1") else "unknown"
+
+
 async def reap(conn: asyncpg.Connection) -> list[dict[str, Any]]:
     """Закрывает как неудачные задания, у которых вышли и аренда, и попытки. Возвращает их строки."""
     rows = await conn.fetch(

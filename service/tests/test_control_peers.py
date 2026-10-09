@@ -78,12 +78,43 @@ async def test_derived_page_and_queued_model_payload_are_inaccessible(conn):
     assert row["payload"] == row["context"] == "{}" and row["result"] is None
 
 
+async def test_project_and_profile_pages_from_a_service_dialog_are_closed(conn):
+    _, c, m = await scene(conn)
+    project = await conn.fetchval(
+        """INSERT INTO projects (title, title_norm, status, origin) VALUES ('Служебный', 'служебныи', 'active', 'owner')
+           RETURNING id""")
+    proposed = await conn.fetchval(
+        """INSERT INTO projects (title, title_norm, status, origin) VALUES ('Бот', 'бот', 'proposed', 'model')
+           RETURNING id""")
+    await conn.execute("INSERT INTO project_chats (project_id, chat_id) VALUES ($1, $3), ($2, $3)", project, proposed, c)
+    page = await conn.fetchval(
+        """INSERT INTO pages (entity_type, entity_id, project_id, path, title)
+           VALUES ('project', $1, $2, 'projects/test-1.md', 'Служебный') RETURNING id""", f"project:{project}", project)
+    owner_page = await conn.fetchval(
+        """INSERT INTO pages (entity_type, entity_id, path, title)
+           VALUES ('owner', 'owner:profile', 'owner/profile.md', 'Профиль') RETURNING id""")
+    await conn.execute(
+        """INSERT INTO facts (subject_type, kind, text, text_norm, valid_from, status, origin, source_message_id,
+                              source_quote, batch)
+           VALUES ('owner', 'fact', 'код 12345678', 'код 12345678', current_date, 'proposed', 'other', $1, 'Код',
+                   'of9')""", m)
+    digest = await jobs.enqueue(conn, kind="notify.owner", payload={"text": "Код 12345678"}, context={"batch": "of9"})
+    await control_peers.register(conn, BOT)
+    assert await conn.fetchval("SELECT security_quarantined FROM pages WHERE id = $1", page)
+    assert await conn.fetchval("SELECT security_quarantined FROM pages WHERE id = $1", owner_page)
+    assert await conn.fetchval("SELECT count(*) FROM facts") == 0
+    assert await conn.fetchval("SELECT count(*) FROM project_chats") == 0
+    assert await conn.fetchval("SELECT array_agg(id) FROM projects") == [project]     # предложение по нему снято
+    assert await pages_build.get_page(conn, entity_id=f"project:{project}") is None
+    assert await conn.fetchval("SELECT payload FROM jobs WHERE id = $1", digest) == "{}"
+
+
 def test_unverified_transport_cannot_create_telegram_addressing_proof():
     record = message(telegram_entities=[], topic_tg_id=44, is_forwarded=False,
                      telegram_via_bot=False, telegram_sender_bot=False)
-    assert store._row(1, record, OWNER, False, "import")[-7:-2] == (None,) * 5
-    assert store._row(1, record, OWNER, False, "business")[-7:-2] == (None,) * 5
-    assert store._row(1, record, OWNER, False, "session")[-7:-2] == ("[]", 44, False, False, False)
+    assert store._row(1, record, OWNER, False, "import")[-10:-5] == (None,) * 5
+    assert store._row(1, record, OWNER, False, "business")[-10:-5] == (None,) * 5
+    assert store._row(1, record, OWNER, False, "session")[-10:-5] == ("[]", 44, False, False, False)
 
 
 @pytest.mark.parametrize("source_kind", ["chat", "memory", "trigger"])

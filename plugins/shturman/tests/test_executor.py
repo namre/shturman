@@ -136,6 +136,27 @@ def test_structured_request_goes_to_the_model_as_text_block_and_result_is_report
     assert stats.counters["jobs_done"] == 1 and stats.last_job_at is not None
 
 
+
+def test_structured_request_carries_images_as_hermes_image_blocks():
+    import base64
+    jpeg = b"\xff\xd8\xff\xe0 jpeg"
+    payload = {"instructions": "Опиши", "input": "фото", "schema_name": "media",
+               "images": [{"mime": "image/jpeg", "data": base64.b64encode(jpeg).decode()}]}
+    executor, service, _, llm, _ = make([job(LLM_STRUCTURED, payload)])
+    run(executor.poll("llm"))
+    _, _, kwargs = llm.calls[0]
+    assert kwargs["input"] == [{"type": "text", "text": "фото"},
+                               {"type": "image", "data": jpeg, "mime_type": "image/jpeg", "file_name": "image-1.jpg"}]
+    assert service.reports()[0][0] == "/api/jobs/1/complete"
+
+
+def test_malformed_images_fail_the_job_without_calling_the_model():
+    payload = {"instructions": "Опиши", "input": "фото", "images": [{"mime": "image/gif", "data": "AAAA"}]}
+    executor, service, _, llm, _ = make([job(LLM_STRUCTURED, payload)])
+    run(executor.poll("llm"))
+    assert llm.calls == [] and service.reports()[0][0] == "/api/jobs/1/fail"
+
+
 def test_text_request_and_task_fallback():
     payload = {"messages": [{"role": "system", "content": "Ты помощник"}, {"role": "user", "content": "Привет"}],
                "task": "vision", "max_tokens": 999_999}
@@ -493,7 +514,7 @@ def test_valid_answer_is_marked_valid():
 def test_watch_task_is_registered_and_routed():
     from shturman_core.executor import AUX_TASKS
 
-    assert set(AUX_TASKS) == {"shturman_extract", "shturman_reply", "shturman_watch"}
+    assert set(AUX_TASKS) == {"shturman_extract", "shturman_reply", "shturman_watch", "shturman_media"}
     executor, _, _, llm, _ = make([job(LLM_STRUCTURED, {"instructions": "и", "input": "т", "task": "shturman_watch"})])
     run(executor.poll("llm"))
     assert llm.calls[0][2]["task"] == "shturman_watch"

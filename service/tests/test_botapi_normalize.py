@@ -46,7 +46,7 @@ def same(export_raw, bot_raw):
     """Запись из экспорта и запись из Bot API совпадают во всём, кроме пути к файлу и того, что
     нужно для скачивания голосового (file_id и длительность есть только у Bot API)."""
     a, b = asdict(parse_message(export_raw)), asdict(normalize_message(bot_raw).record)
-    for key in ("media_path", "media_ref", "media_duration"):
+    for key in ("media_path", "media_ref", "media_duration", "media_name", "media_mime", "media_size"):
         a.pop(key), b.pop(key)
     assert a == b
     return normalize_message(bot_raw)
@@ -269,6 +269,10 @@ def test_voice_and_video_note_keep_file_id_and_duration_for_transcription():
     note = normalize_message(bot(6, video_note={"file_id": "DQACAg", "length": 240, "duration": 9})).record
     assert (note.media_type, note.media_ref, note.media_duration) == ("video_message", "DQACAg", 9)
     photo = normalize_message(bot(7, photo=[{"file_id": "p", "width": 1, "height": 1}])).record
-    assert (photo.media_ref, photo.media_duration) == (None, None)
+    assert (photo.media_ref, photo.media_duration, photo.media_mime) == ("p", None, "image/jpeg")
+    doc = normalize_message(bot(9, document={"file_id": "d", "file_name": "Смета.pdf",
+                                             "mime_type": "application/pdf", "file_size": 1234})).record
+    assert (doc.media_type, doc.media_ref, doc.media_name, doc.media_mime, doc.media_size) == \
+        ("file", "d", "Смета.pdf", "application/pdf", 1234)
     odd = normalize_message(bot(8, voice={"file_id": "x" * 400, "duration": True})).record
     assert (odd.media_ref, odd.media_duration) == (None, None)

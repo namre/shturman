@@ -5,11 +5,15 @@
   1. Берутся сообщения, записанные после прошлого прогона (отметка — наибольший обработанный
      `messages.id`, хранится в `settings`). Исключённые чаты, удалённые и служебные сообщения,
      каналы, боты и «Избранное» пропускаются.
-  2. Сообщения режутся на эпизоды; к модели идут только эпизоды с признаком обещания.
+  2. Сообщения режутся на эпизоды; к модели идут только эпизоды с признаком обещания, факта
+     или решения.
   3. Запросы ставятся в очередь (`bridge.request_structured`). Модели у сервиса нет: ответ
      вернётся позже в обработчик результата.
-  4. Ответ проверяется текстом сообщений, обязательства записываются как предложения.
-  5. Когда все запросы прогона разобраны, владельцу уходит одна сводка с кнопками.
+  4. Ответ проверяется текстом сообщений: обязательства записываются как предложения; факты
+     о людях со страницей и о проектах — сразу (facts.py), факты о владельце — как предложения;
+     незнакомые названия проектов копятся как упоминания (projects.py).
+  5. Когда все запросы прогона разобраны, владельцу уходит одна сводка с кнопками, а также
+     предложения проектов и фактов профиля — каждые одним сообщением.
 
 Стоимость ограничена: у прогона есть нижняя граница по времени сообщения (`floor`: при первом
 прогоне — последние 30 дней) и предел числа запросов к модели. Что пропущено, видно в итогах.
@@ -25,6 +29,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -35,7 +40,7 @@ from zoneinfo import ZoneInfo
 import asyncpg
 
 from .. import bridge
-from . import commitments, dates, extract, people
+from . import commitments, dates, extract, facts, people, projects
 from .extract import Episode, Msg
 
 logger = logging.getLogger("shturman.processing")
@@ -68,6 +73,7 @@ SKIP_CHAT_TYPES = frozenset({"private_channel", "public_channel", "bot_chat", "s
 class Options:
     limit: int = 200              # предел запросов на извлечение за прогон
     window: int = 20_000          # сколько годных новых сообщений берётся за прогон
+    late_window: int = 500        # сколько сообщений с поздно появившимся текстом берётся за прогон
     first_run_days: int = 30      # при первом прогоне история старше не разбирается
     context_messages: int = 4     # сколько предыдущих сообщений показывается для понимания
     context_hours: int = 12
@@ -200,7 +206,7 @@ def _who(peer_id: int | None, direction: str, labels: dict[tuple, str]) -> str:
 
 async def _enqueue_extract(
     conn: asyncpg.Connection, run_id: int, episode: Episode, chat_type: str, tz: str,
-    options: Options, attempt: int = 0,
+    options: Options, attempt: int = 0, late: bool = False,
 ) -> int | None:
     """Ставит запрос на извлечение по эпизоду. None — такой запрос уже ставился."""
     episode.context = await _context_for(conn, episode.messages[0], options)
@@ -209,10 +215,16 @@ async def _enqueue_extract(
                   if r["status"] in ("proposed", "open")][: options.known_limit]
     known = [{"who": _who(r["debtor_peer_id"], r["direction"], labels), "what": r["what"],
               "due_expression": r["due_expression"]} for r in known_rows]
+    titles = await projects.active_titles(conn)
     key = f"cm-x{extract.PROMPT_VERSION}:{episode.chat_id}:{episode.first_id}-{episode.last_id}"
+    if late:
+        # Тот же эпизод уже разбирали без расшифровки или пересказа вложения: ключ — по новому тексту.
+        digest = hashlib.md5("\n".join(m.text for m in episode.messages).encode()).hexdigest()[:16]
+        key = f"{key}:late:{digest}"
     job_id = await bridge.request_structured(
         conn, handler=HANDLER_EXTRACT, instructions=extract.EXTRACT_INSTRUCTIONS,
-        input=extract.build_extract_input(episode, labels, ZoneInfo(tz), chat_kind=_chat_kind(chat_type), known=known),
+        input=extract.build_extract_input(episode, labels, ZoneInfo(tz), chat_kind=_chat_kind(chat_type), known=known,
+                                          projects=titles),
         json_schema=extract.EXTRACT_SCHEMA, schema_name="commitments",
         context={"run_id": run_id, "chat_id": episode.chat_id, "tz": tz,
                  "message_ids": [m.id for m in episode.messages],
@@ -344,6 +356,8 @@ async def plan_run(
 
         await scrub_closed_jobs(conn)
         swept = await commitments.purge_orphans(conn)
+        swept_memory = {"facts": await facts.purge_orphans(conn),
+                        "project_chats": await projects.purge_orphans(conn)}
         expired = await commitments.expire_stale(conn)
         synced = await people.sync_people(conn)
 
@@ -358,7 +372,7 @@ async def plan_run(
 
         run_id = await conn.fetchval(
             "INSERT INTO processing_runs (trigger, stats) VALUES ($1, $2::jsonb) RETURNING id",
-            trigger, json.dumps({"tz": tz}))
+            trigger, json.dumps({"tz": tz, "planned_at": now.isoformat()}))
 
         # сначала — долги прошлых прогонов; они тоже входят в предел запросов
         replanned = await _replan_failed(conn, run_id, tz, options, limit)
@@ -369,6 +383,7 @@ async def plan_run(
         new_watermark, more, cap_reached = watermark, False, False
         episodes: list[Episode] = []
         signal: list[Episode] = []
+        fact_skipped = 0
         if budget <= 0:
             more = cap_reached = True      # новые сообщения подождут: предел ушёл на повторы
         else:
@@ -390,14 +405,50 @@ async def plan_run(
 
             # Предел запросов: окно сужается до сообщений, эпизоды которых помещаются в предел.
             # Отметка ставится на границу окна, поэтому отложенное разберёт следующий прогон.
+            # Обещания важнее фактов: при упоре в предел сначала планируются эпизоды с признаком
+            # обещания, эпизоды только с признаком факта — на оставшиеся места; не поместившиеся
+            # из них пропускаются (счётчик fact_episodes_skipped), обещания — откладываются.
             while True:
                 episodes = extract.build_episodes(eligible)
-                signal = [e for e in episodes if extract.has_promise_signal(e)]
-                if len(signal) <= budget:
+                promise = [e for e in episodes if extract.has_promise_signal(e)]
+                chosen = {id(e) for e in promise}
+                fact_only = [e for e in episodes if id(e) not in chosen and extract.has_fact_signal(e)]
+                if len(promise) + len(fact_only) <= budget:
+                    signal = sorted(promise + fact_only, key=lambda e: e.last_id)
                     break
                 cap_reached = more = True
-                new_watermark = signal[budget - 1].last_id
-                eligible = [m for m in eligible if m.id <= new_watermark]
+                if len(promise) > budget:
+                    new_watermark = promise[budget - 1].last_id
+                    eligible = [m for m in eligible if m.id <= new_watermark]
+                    continue
+                room = budget - len(promise)
+                fact_skipped = len(fact_only) - room
+                signal = sorted(promise + fact_only[:room], key=lambda e: e.last_id)
+                break
+
+        # Сообщения до прежней отметки, текст которых появился позже (расшифровка голосового,
+        # разбор вложения): прошлый прогон видел их пустыми. Эпизод — сами эти сообщения,
+        # предыдущие подтягиваются контекстом, как у любого эпизода. Делят тот же предел запросов.
+        late, late_signal, late_seen = [], [], []
+        if budget - len(signal) > 0 and watermark > 0:
+            late_rows = await conn.fetch(
+                f"""SELECT {_MSG_COLUMNS}, c.type AS chat_type {_FROM}
+                    WHERE m.late_content AND m.id <= $1 AND m.sent_at >= $2 AND ({_VERDICT}) = 'eligible'
+                    ORDER BY m.id LIMIT $3""",
+                watermark, floor, options.late_window)
+            for row in late_rows:
+                chat_types[row["chat_id"]] = row["chat_type"]
+            late = await _mark_service_sent(conn, [_msg(row) for row in late_rows])
+            room = budget - len(signal)
+            for episode in extract.build_episodes(late):
+                if extract.has_memory_signal(episode):
+                    if len(late_signal) >= room:
+                        cap_reached = more = True
+                        continue      # не поместилось: пометка остаётся до следующего прогона
+                    late_signal.append(episode)
+                late_seen.extend(m.id for m in episode.messages)
+            seen = set(late_seen)
+            late = [m for m in late if m.id in seen]
 
         # итоги — только по сообщениям до отметки; остальное отложено до следующего прогона
         counts = {"new": 0, "eligible": 0, "skipped_old": 0, "skipped_excluded": 0, "skipped_chat_type": 0,
@@ -411,9 +462,33 @@ async def plan_run(
         counts["assistant"] = sum(1 for m in eligible if m.by_service)
         counts["deferred"] = await conn.fetchval("SELECT count(*) FROM messages WHERE id > $1", new_watermark)
 
+        # Рассмотренное снимается с пометки «текст появился позже»: и поздние сообщения, и
+        # годные из окна (их текст уже был на месте). Скрытое защитой остаётся помеченным.
+        # Снимается, только если текст тот же, что прочитан: расшифровка, записанная за время
+        # прогона, оставит пометку следующему.
+        seen_ids = set(late_seen)
+        cleared = [*eligible, *(m for m in late if m.id in seen_ids)]
+        if cleared:
+            await conn.execute(
+                """UPDATE messages m SET late_content = false
+                   FROM unnest($1::bigint[], $2::text[]) AS v (id, digest)
+                   WHERE m.id = v.id AND m.late_content AND md5(m.text) = v.digest""",
+                [m.id for m in cleared], [hashlib.md5(m.text.encode()).hexdigest() for m in cleared])
+        # Пометка у того, что разбираться не будет никогда (исключённый чат, канал, бот, старое,
+        # служебное, удалённое), тоже снимается — кроме скрытого защитой: его могут открыть.
+        if watermark > 0:
+            await conn.execute(
+                f"""UPDATE messages SET late_content = false WHERE id IN (
+                        SELECT m.id {_FROM}
+                        WHERE m.late_content AND m.id <= $1 AND ({_VERDICT}) NOT IN ('eligible', 'skipped_hidden'))""",
+                watermark, floor)
+        counts["late"] = len(late_seen)
+
         planned = already = 0
-        for episode in signal:
-            job_id = await _enqueue_extract(conn, run_id, episode, chat_types[episode.chat_id], tz, options)
+        late_ids = {id(e) for e in late_signal}
+        for episode in [*signal, *late_signal]:
+            job_id = await _enqueue_extract(conn, run_id, episode, chat_types[episode.chat_id], tz, options,
+                                            late=id(episode) in late_ids)
             if job_id is None:
                 already += 1
             else:
@@ -421,7 +496,7 @@ async def plan_run(
 
         resolve_planned = 0
         by_chat: dict[int, list[Msg]] = {}
-        for message in eligible:
+        for message in [*eligible, *late]:
             by_chat.setdefault(message.chat_id, []).append(message)
         if by_chat:
             with_open = await conn.fetch(
@@ -444,10 +519,11 @@ async def plan_run(
             "retried": replanned["retried"], "retry_dropped": replanned["retry_dropped"],
             "retry_waiting": waiting["retry"], "given_up": waiting["given_up"],
             "already_planned": already, "episodes": len(episodes),
-            "episodes_without_signal": len(episodes) - len(signal),
+            "episodes_without_signal": len(episodes) - len(signal) - fact_skipped,
+            "fact_episodes_skipped": fact_skipped, "late_planned": len(late_signal),
             "messages": counts, "cap_reached": cap_reached, "more": more,
             "watermark": new_state["watermark"], "floor": new_state["floor"],
-            "expired": expired, "purged": swept, "people": synced,
+            "expired": expired, "purged": swept, "purged_memory": swept_memory, "people": synced,
         }
         await conn.execute(
             "UPDATE processing_runs SET stats = stats || $2::jsonb WHERE id = $1",
@@ -475,10 +551,14 @@ async def finish_run(conn: asyncpg.Connection, run_id: int) -> int:
                                   handler=HANDLER_DIGEST, context={"batch": digest["batch"]},
                                   dedup_key=f"cm-digest:{digest['batch']}")
     merges = await conn.fetchval("SELECT count(*) FROM person_proposals WHERE status = 'pending'")
+    # окно «за 30 дней» для предложений проектов отсчитывается от времени планирования прогона
+    planned_at = stats.get("planned_at")
+    memory = await projects.after_run(
+        conn, run_id, now=datetime.fromisoformat(planned_at) if isinstance(planned_at, str) else None)
     await conn.execute(
         """UPDATE processing_runs SET status = 'done', finished_at = now(), stats = stats || $2::jsonb
            WHERE id = $1""",
-        run_id, json.dumps({"digest_messages": len(digests), "merge_proposals_pending": merges}))
+        run_id, json.dumps({"digest_messages": len(digests), "merge_proposals_pending": merges, **memory}))
     for fn in _after_run:
         await fn(conn, run_id)
     return len(digests)
@@ -615,6 +695,8 @@ async def _apply_extraction(conn: asyncpg.Connection, ctx: dict[str, Any], resul
         hinted = None
         if candidate.duplicate_of is not None and 1 <= candidate.duplicate_of <= len(known_ids):
             hinted = known_ids[candidate.duplicate_of - 1]
+        if candidate.project is not None:
+            await _mention(conn, candidate.project, episode, ctx, stats)
         if commitments.find_duplicate(
                 existing, source_message_id=candidate.message.id, debtor_peer_id=debtor,
                 what=candidate.what, quote=candidate.quote, due_date=due.due_date, hinted_id=hinted) is not None:
@@ -623,7 +705,8 @@ async def _apply_extraction(conn: asyncpg.Connection, ctx: dict[str, Any], resul
         commitment_id = await commitments.propose(
             conn, chat_id=episode.chat_id, candidate=candidate, debtor_peer_id=debtor,
             creditor_peer_id=creditor, direction=direction, tz=tz, run_id=ctx.get("run_id"),
-            model=result.get("model") if isinstance(result.get("model"), str) else None)
+            model=result.get("model") if isinstance(result.get("model"), str) else None,
+            project_id=await projects.for_commitment(conn, episode.chat_id, candidate.project))
         existing.append({"id": commitment_id, "source_message_id": candidate.message.id,
                          "debtor_peer_id": debtor, "what": candidate.what, "source_quote": candidate.quote,
                          "due_date": due.due_date, "status": "proposed"})
@@ -631,7 +714,69 @@ async def _apply_extraction(conn: asyncpg.Connection, ctx: dict[str, Any], resul
             if peer_id is not None:
                 await people.ensure_person_for_peer(conn, peer_id)
         stats["proposed"] = stats.get("proposed", 0) + 1
+    await _apply_memory(conn, ctx, result, episode, stats)
     return stats
+
+
+def _bump(stats: dict[str, int], key: str, by: int = 1) -> None:
+    if by:
+        stats[key] = stats.get(key, 0) + by
+
+
+async def _mention(conn: asyncpg.Connection, label: str, episode: Episode, ctx: dict[str, Any],
+                   stats: dict[str, int]) -> int | None:
+    """Метка проекта от модели: действующий проект — его номер; незнакомое название, которое
+    действительно есть в тексте эпизода, — упоминание для будущего предложения владельцу."""
+    found = await projects.resolve(conn, label)
+    if found is None and extract.find_mention(label, episode) is not None:
+        _bump(stats, "project_mentions", await projects.record_mentions(
+            conn, label, episode, run_id=ctx.get("run_id")))
+    return found
+
+
+async def _subject(conn: asyncpg.Connection, fact: extract.FactCandidate, episode: Episode,
+                   ctx: dict[str, Any], stats: dict[str, int]) -> tuple[str, int | None, int | None] | None:
+    """О ком факт — решает код: владелец; подтверждённый владельцем человек (о неподтверждённом
+    факты не пишутся); действующий проект."""
+    if fact.about == "owner":
+        return "owner", None, None
+    if fact.about == "project":
+        project_id = await _mention(conn, fact.project, episode, ctx, stats) if fact.project else None
+        return ("project", None, project_id) if project_id is not None else None
+    peer_id = fact.speaker_key[1] if fact.speaker_key and fact.speaker_key[0] == "peer" else None
+    person_id = await people.person_for_peer(conn, peer_id) if peer_id is not None else None
+    if person_id is None or not await conn.fetchval(
+            "SELECT confirmed AND NOT is_owner AND merged_into IS NULL FROM people WHERE id = $1", person_id):
+        return None
+    if fact.project:
+        await _mention(conn, fact.project, episode, ctx, stats)
+    return "person", person_id, None
+
+
+async def _apply_memory(conn: asyncpg.Connection, ctx: dict[str, Any], result: dict[str, Any],
+                        episode: Episode, stats: dict[str, int]) -> None:
+    """Факты, решения и упоминания проектов из того же ответа (PROMPT_VERSION 3)."""
+    parsed = result.get("parsed")
+    found, dropped = extract.validate_facts(parsed, episode, _labels_from_context(ctx.get("labels")))
+    for key, value in dropped.items():
+        _bump(stats, f"facts_dropped_{key}", value)
+    model = result.get("model") if isinstance(result.get("model"), str) else None
+    for fact in found:
+        subject = await _subject(conn, fact, episode, ctx, stats)
+        if subject is None:
+            _bump(stats, "facts_without_subject")
+            continue
+        subject_type, person_id, project_id = subject
+        _, outcome = await facts.record(
+            conn, fact, subject_type=subject_type, person_id=person_id, project_id=project_id,
+            tz=ctx.get("tz") or "UTC", run_id=ctx.get("run_id"), model=model)
+        _bump(stats, {"active": "facts_recorded", "proposed": "owner_facts_proposed",
+                      "duplicate": "facts_duplicates"}.get(outcome, f"facts_skipped_{outcome}"))
+    mentions, dropped = extract.validate_projects(parsed, episode)
+    for key, value in dropped.items():
+        _bump(stats, f"projects_dropped_{key}", value)
+    for mention in mentions:
+        await _mention(conn, mention.title, episode, ctx, stats)
 
 
 async def _apply_resolution(conn: asyncpg.Connection, ctx: dict[str, Any], result: dict[str, Any]) -> dict[str, int]:

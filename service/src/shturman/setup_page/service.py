@@ -15,6 +15,7 @@
   GET    /shturman-setup/api/state                      состояние шагов и блока «Дополнительно»
   GET    /shturman-setup/api/overview                   счётчики архива и журнал действий
   PUT    /shturman-setup/api/scenario                   способ подключения: {scenario: own | staff}
+  PUT    /shturman-setup/api/media                      разбор фото и документов моделью: {enabled}
   POST   /shturman-setup/api/bot/token                  проверить и сохранить токен бота: {token, separate?}
   DELETE /shturman-setup/api/bot/token                  убрать токен, введённый на странице
   POST   /shturman-setup/api/bot/bind                   ссылка привязки владельца к боту
@@ -31,14 +32,20 @@
   GET    /shturman-setup/api/tg/accounts/{id}/dialogs   ?offset&limit&q&kind&only&refresh
   POST   /shturman-setup/api/tg/accounts/{id}/sync      {enabled, chats? | kind?}
   POST   /shturman-setup/api/tg/accounts/{id}/exclude   {peer_class, tg_id, excluded, purge?}
-  POST   /shturman-setup/api/imports                    файл result.json телом запроса
+  POST   /shturman-setup/api/imports                    result.json или архив zip телом запроса
   GET    /shturman-setup/api/imports
   GET    /shturman-setup/api/imports/{import_id}
   GET    /shturman-setup/api/imports/{import_id}/scan
   POST   /shturman-setup/api/imports/{import_id}/run    {exclude?, owner_id?}
   DELETE /shturman-setup/api/imports/{import_id}
-  PUT    /shturman-setup/api/llm                        {api_key?, base_url?, model}
+  PUT    /shturman-setup/api/llm                        {api_key?, base_url?, model, switch?}
   DELETE /shturman-setup/api/llm
+  POST   /shturman-setup/api/llm/chatgpt/start          начать вход через ChatGPT: {new?, switch?} → адрес входа
+  POST   /shturman-setup/api/llm/chatgpt/finish         вставленный адрес после входа: {address}
+  POST   /shturman-setup/api/llm/chatgpt/cancel         снять начатую попытку входа
+  PUT    /shturman-setup/api/llm/chatgpt/model          модель подписки из списка OpenAI: {model}
+  DELETE /shturman-setup/api/llm/chatgpt                выйти из подписки (отзыв сессии у OpenAI)
+  GET    /shturman-setup/api/memory/…                   экран «Память ассистента» — маршруты в `memory.py`
 
 Вход — по одноразовой ссылке; ответ на вход один раз отдаёт ключ сессии. Дальше страница
 присылает его в заголовке `X-Shturman-Session`; cookie нет вовсе (почему — `auth.py`).
@@ -53,7 +60,9 @@
    по ссылке, которую можно получить только на сервере. Каждое изменение пишется в журнал.
 3. **Секреты идут только в сторону сервиса.** Токен, ключ, пароль и код приходят в теле POST;
    обратно страница получает лишь «задано / не задано», имя бота и итог проверки. В журнал
-   сервиса и в журнал действий значения не попадают.
+   сервиса и в журнал действий значения не попадают. Это касается и входа через ChatGPT:
+   вставленный адрес (в нём код входа) приходит телом POST и никуда не пишется, токены
+   подписки страница не получает — только состояние, почту учётной записи и модель.
 """
 
 from __future__ import annotations
@@ -74,8 +83,10 @@ from starlette.routing import BaseRoute, Route
 from .. import __version__, api_core, bridge, confirm, ingest_api, store
 from ..api_core import BadRequest, error_response
 from ..app import AppState, state_of
-from ..executor import binding
+from ..executor import binding, siwc
 from ..executor import commands as executor_commands
+from ..executor import service as executor_service
+from ..executor.subscription import ChatGptClient
 from ..executor.botapi import BotApiError
 from ..tg import gateway
 from ..tg import service as tg_service
@@ -116,6 +127,9 @@ class Page:
     slow: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(FAIL_SLOTS))
     fail_audit_at: float = 0.0
     logins_done: set[str] = field(default_factory=set)   # входы в Telegram, уже отмеченные в журнале
+    # Начатый вход через ChatGPT — один на страницу; в памяти, перезапуск сервиса его снимает.
+    chatgpt_attempt: siwc.Attempt | None = None
+    chatgpt_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def slow_refusal(self) -> None:
         """Отказ во входе отвечает не мгновенно. Верный вход этим не задерживается, а когда
@@ -214,17 +228,17 @@ def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
     return deco(fn) if fn is not None else deco
 
 
-async def _body(request: Request) -> dict[str, Any]:
+async def _body(request: Request, limit: int = MAX_BODY) -> dict[str, Any]:
     """Тело запроса как JSON-объект, с пределом размера. Пустое тело — пустой объект."""
     import json
 
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_BODY:
+    if declared.isdigit() and int(declared) > limit:
         raise BadRequest("Запрос слишком большой.", 413)
     buf = bytearray()
     async for chunk in request.stream():
         buf += chunk
-        if len(buf) > MAX_BODY:
+        if len(buf) > limit:
             raise BadRequest("Запрос слишком большой.", 413)
     if not buf.strip():
         return {}
@@ -516,15 +530,58 @@ def _llm_state(state: AppState, page: Page) -> dict[str, Any]:
     runtime = state.extras.get("executor")
     llm = getattr(runtime, "llm", None)
     problem = (llm.broken or llm.last_error) if llm is not None else None
+    by_key = llm is not None and not isinstance(llm, ChatGptClient)
     return {
         "configured": bool(config.own_llm),
+        # Каким способом сервис обращается к своей модели: api_key | subscription | null.
+        "way": config.llm_way,
         "key": _value(page, ss.LLM_API_KEY),
         # Адрес и имя модели — не секреты: показываются как есть.
         "base_url": {**_value(page, ss.LLM_BASE_URL), "value": config.llm_base_url},
         "model": {**_value(page, ss.LLM_MODEL), "value": config.llm_model},
-        "last_call_ok": llm.last_ok if llm is not None else None,
-        "problem_text": apply.llm_problem_text(problem),
+        "last_call_ok": llm.last_ok if by_key else None,
+        "problem_text": apply.llm_problem_text(problem) if by_key else None,
+        "subscription": _subscription_state(state, page, llm),
     }
+
+
+def _subscription_state(state: AppState, page: Page, llm: Any) -> dict[str, Any]:
+    """Подписка ChatGPT для страницы. Токенов здесь нет и быть не должно: только состояние,
+    почта учётной записи (это страница самого владельца) и модель."""
+    store = executor_service.chatgpt_keeper(state).store
+    record = store.load()
+    status = store.status()
+    runtime = llm if isinstance(llm, ChatGptClient) else None
+    if status == siwc.ACTIVE:
+        status = {"ok": "connected"}.get(runtime.status(), runtime.status()) if runtime else "connected"
+    attempt = page.chatgpt_attempt
+    if attempt is not None and attempt.expired():
+        attempt = None
+    problem = runtime.last_error if runtime is not None else None
+    text = apply.SUBSCRIPTION_STATUS.get(status, "")
+    if status == "denied" and runtime is not None:
+        text = apply.DENIED_TEXT.format(code=runtime.denied_code or "forbidden") + " Сервис час не обращается к модели."
+    editable = state.config.chatgpt or page.settings.editable(ss.LLM_API_KEY)
+    return {
+        "available": bool(editable),
+        "locked_text": None if editable else apply.SUBSCRIPTION_LOCKED,
+        "status": status,
+        "status_text": text,
+        "registered": bool(record.get("client_id")),
+        "email": record.get("email") if status != "none" else None,
+        "model": record.get("model") or None,
+        "models": record.get("models") or [],
+        "last_call_ok": runtime.last_ok if runtime is not None else None,
+        "problem_text": apply.subscription_problem_text(problem) if status == "connected" else None,
+        "attempt": {"expires_at": _iso(attempt.expires_at)} if attempt is not None else None,
+        "usage_url": siwc.USAGE_URL,
+    }
+
+
+def _iso(moment: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(moment, timezone.utc).isoformat()
 
 
 def _imports_state(state: AppState) -> dict[str, Any]:
@@ -575,6 +632,37 @@ async def scenario_save(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "scenario": scenario})
 
 
+# --- разбор фото и документов ---------------------------------------------------------------------
+# Решение владельца: отдавать ли фото и документы из переписки модели. Хранится в setup_state —
+# внутренний API, доступный ассистенту, его не меняет (media/__init__.py).
+
+async def _media_state(state: AppState) -> dict[str, Any]:
+    from .. import media
+    async with state.ro_pool.acquire() as conn:
+        on = await media.enabled(conn)
+    return {"enabled": on, "days": state.config.media_days,
+            "max_mb": state.config.media_max_bytes // (1024 * 1024)}
+
+
+@endpoint
+async def media_save(request: Request) -> JSONResponse:
+    from .. import media
+    data = await _body(request)
+    on = _flag(data, "enabled")
+    if on is None:
+        raise BadRequest("Нужно поле enabled: true или false.")
+    async with state_of(request).pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO setup_state (key, value, updated_at) VALUES ($1, $2::jsonb, now())
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
+            media.ENABLED_KEY, '{"enabled": true}' if on else '{"enabled": false}')
+    analyzer = state_of(request).extras.get("media")
+    if analyzer is not None:
+        analyzer.wake.set()
+    await _log(request, "setup.media", detail="разбор фото и документов " + ("включён" if on else "выключен"))
+    return JSONResponse({"ok": True, "media": await _media_state(state_of(request))})
+
+
 @endpoint
 async def page_state(request: Request) -> JSONResponse:
     state, page = state_of(request), _page(request)
@@ -587,6 +675,7 @@ async def page_state(request: Request) -> JSONResponse:
         "tg": await _tg_state(state, page),
         "llm": _llm_state(state, page),
         "imports": _imports_state(state),
+        "media": await _media_state(state),
     })
 
 
@@ -601,7 +690,8 @@ async def page_overview(request: Request) -> JSONResponse:
             "jobs_failed", "guard_enabled", "guard_model_used", "guard_problem", "guard_checked",
             "guard_hidden", "guard_released", "guard_unchecked", "embeddings_enabled", "embeddings_model",
             "embeddings_embedded", "embeddings_left", "embeddings_problem", "sending",
-            "voice_enabled", "voice_problem", "voice_pending", "voice_done", "voice_failed", "voice_skipped")
+            "voice_enabled", "voice_problem", "voice_pending", "voice_done", "voice_failed", "voice_skipped",
+            "media_enabled", "media_pending", "media_asking", "media_done", "media_failed", "media_skipped")
     # audit_key — входы, смена ключей и аккаунтов: их не вытеснить из вида потоком мелких действий.
     return JSONResponse({"archive": {k: counts[k] for k in keep if k in counts}, "audit": log,
                          "audit_key": key_log})
@@ -1015,6 +1105,12 @@ async def llm_save(request: Request) -> JSONResponse:
             await _log(request, "llm.save", audit.REFUSED, "смена адреса без ввода ключа")
             raise apply.Invalid("Вы меняете адрес API. Вставьте ключ заново: сохранённый ключ на новый адрес "
                                 "не отправляется.", "key_required")
+    keeper = executor_service.chatgpt_keeper(state)
+    replacing = keeper.store.active()
+    if replacing and _flag(data, "switch") is not True:
+        # Своя модель работает одним способом: ключ заменит подписку — пусть владелец подтвердит.
+        raise apply.Invalid("Сейчас своя модель сервиса работает по подписке ChatGPT. Ключ API её заменит: "
+                            "сервис выйдет из подписки. Подтвердите замену.", "switch_needed")
     restricted = from_page and base_url != ss.DEFAULT_LLM_BASE_URL
     try:
         used = await apply.check_llm(config, api_key=key, base_url=base_url, model=model, restricted=restricted)
@@ -1026,6 +1122,10 @@ async def llm_save(request: Request) -> JSONResponse:
         changes[ss.LLM_BASE_URL] = None if base_url == ss.DEFAULT_LLM_BASE_URL else base_url
     if settings.editable(ss.LLM_MODEL):
         changes[ss.LLM_MODEL] = model
+    if replacing:
+        confirmed = await keeper.sign_out()
+        await _log(request, "llm.chatgpt_removed", detail="заменена ключом API"
+                   + ("" if confirmed else "; OpenAI отзыв сессии не подтвердил"))
     await settings.save(changes)
     await _log(request, "llm.save", detail="ключ проверен пробным запросом")
     return JSONResponse({"ok": True, "model": used})
@@ -1043,9 +1143,211 @@ async def llm_delete(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+# --- 7а. своя модель по подписке ChatGPT --------------------------------------------------------
+# Вход «вставкой адреса» (executor/siwc.py): сервер на другом компьютере, чем браузер владельца,
+# поэтому адрес возврата http://127.0.0.1:1455/… в браузере не открывается — владелец копирует
+# его из адресной строки сюда. Вставленный адрес несёт код входа: он не пишется ни в журнал
+# сервиса, ни в журнал действий, ни в ответ.
+
+def _subscription_allowed(page: Page, state: AppState) -> None:
+    if not page.settings.editable(ss.LLM_API_KEY) and not state.config.chatgpt:
+        raise apply.Invalid(apply.SUBSCRIPTION_LOCKED, "locked")
+
+
+def _siwc_invalid(exc: siwc.SiwcError) -> apply.Invalid:
+    return apply.Invalid(apply.siwc_problem_text(exc.code), exc.code.split(":")[0])
+
+
+@endpoint
+async def chatgpt_start(request: Request) -> JSONResponse:
+    """Новая попытка входа. Прежняя, если была, снимается. Возвращает адрес входа — его страница
+    открывает в новой вкладке браузера владельца."""
+    data = await _body(request)
+    state, page = state_of(request), _page(request)
+    _subscription_allowed(page, state)
+    switch = _flag(data, "switch") is True
+    if apply.page_key_set(page.settings) and not switch:
+        raise apply.Invalid(apply.SWITCH_NEEDED, "switch_needed")
+    store = executor_service.chatgpt_keeper(state).store
+    async with page.chatgpt_lock:
+        attempt, url = siwc.new_attempt(store, new_registration=_flag(data, "new") is True, switch=switch)
+        page.chatgpt_attempt = attempt
+    await _log(request, "llm.chatgpt_start",
+               detail="новая регистрация" if attempt.client_id is None else "повторный вход")
+    return JSONResponse({"url": url, "expires_at": _iso(attempt.expires_at), "minutes": siwc.ATTEMPT_TTL // 60,
+                         "first": attempt.client_id is None})
+
+
+@endpoint
+async def chatgpt_cancel(request: Request) -> JSONResponse:
+    await _body(request)
+    page = _page(request)
+    async with page.chatgpt_lock:
+        page.chatgpt_attempt = None
+    return JSONResponse({"ok": True})
+
+
+async def _discard(keeper: siwc.TokenKeeper, tokens: dict[str, Any], client_id: str) -> None:
+    """Отзывает сессию, которую выдал вход, если она не пригодилась."""
+    try:
+        async with keeper.http() as http:
+            await siwc.revoke(http, {"refresh_token": tokens.get("refresh_token"), "client_id": client_id})
+    except siwc.SiwcError:
+        pass
+
+
+@endpoint
+async def chatgpt_finish(request: Request) -> JSONResponse:
+    """Принимает вставленный адрес, проверяет его по попытке, меняет код на токены, проверяет
+    ID token и разрешение пользоваться подпиской, получает список моделей, задаёт модели пробный
+    вопрос — и только тогда включает подписку своей моделью сервиса."""
+    data = await _body(request)
+    state, page = state_of(request), _page(request)
+    keeper = executor_service.chatgpt_keeper(state)
+    store = keeper.store
+    async with page.chatgpt_lock:
+        attempt = page.chatgpt_attempt
+        try:
+            params = siwc.parse_callback(data.get("address"))
+            code, client_id = siwc.check_callback(attempt, params)
+        except siwc.SiwcError as exc:
+            if attempt is not None and (exc.code != "wrong_state" or attempt.tries >= siwc.ATTEMPT_TRIES):
+                if exc.code not in ("empty", "bad_address", "not_callback", "no_params"):
+                    page.chatgpt_attempt = None       # ответ этой попытки получен — она больше не нужна
+            await _log(request, "llm.chatgpt", audit.REFUSED, f"адрес не подошёл: {exc.code.split(':')[0]}")
+            raise _siwc_invalid(exc) from None
+        page.chatgpt_attempt = None                   # код одноразовый: попытка использована
+    assert attempt is not None
+    _subscription_allowed(page, state)
+    if apply.page_key_set(page.settings) and not attempt.switch:
+        await _log(request, "llm.chatgpt", audit.REFUSED, "ключ API введён во время входа")
+        raise apply.Invalid(apply.SWITCH_NEEDED, "switch_needed")
+    previous = store.load()
+    # Подписка уже работает, а повторный вход не удался — прежний вход остаётся как был:
+    # неудачная попытка не должна стирать рабочие токены.
+    keep_previous = store.active()
+
+    async def remember(record: dict[str, Any]) -> None:
+        if not keep_previous:
+            await keeper.save_signed_in(record)
+
+    try:
+        async with keeper.http() as http:
+            tokens = await siwc.exchange(http, attempt, code, client_id)
+            try:
+                claims = await siwc.verify_id_token(http, tokens["id_token"], client_id=client_id, nonce=attempt.nonce)
+            except siwc.SiwcError:
+                await siwc.revoke(http, {"refresh_token": tokens["refresh_token"], "client_id": client_id})
+                raise
+            if attempt.subject and claims["sub"] != attempt.subject:
+                await siwc.revoke(http, {"refresh_token": tokens["refresh_token"], "client_id": client_id})
+                raise siwc.SiwcError("other_account")
+            registration = {
+                **{k: previous.get(k) for k in ("model", "models") if previous.get("client_id") == client_id},
+                "email": claims.get("email") if isinstance(claims.get("email"), str) else None,
+                "issuer": siwc.ISSUER, "subject": claims["sub"], "client_id": client_id,
+                "ext_agent_host_id": attempt.host_id, "status": siwc.SIGNED_OUT,
+            }
+            if not siwc.plan_allowed(tokens):
+                await siwc.revoke(http, {"refresh_token": tokens["refresh_token"], "client_id": client_id})
+                await remember({**registration, "need_consent": True})
+                raise siwc.SiwcError("no_plan")
+            try:
+                models = await siwc.list_models(http, tokens["access_token"])
+            except siwc.SiwcError:
+                await siwc.revoke(http, {"refresh_token": tokens["refresh_token"], "client_id": client_id})
+                raise
+    except siwc.SiwcError as exc:
+        await _log(request, "llm.chatgpt", audit.REFUSED, f"вход не удался: {exc.code.split(':')[0]}")
+        raise _siwc_invalid(exc) from None
+    if not models:
+        await _discard(keeper, tokens, client_id)
+        await remember(registration)
+        await _log(request, "llm.chatgpt", audit.REFUSED, "нет моделей")
+        raise apply.Invalid(apply.siwc_problem_text("no_models"), "no_models")
+    slugs = [m["slug"] for m in models]
+    model = previous.get("model") if previous.get("client_id") == client_id and previous.get("model") in slugs \
+        else slugs[0]
+    outcome, problem = await apply.probe_subscription(state.config, tokens["access_token"], model)
+    if outcome == "hard":
+        await _discard(keeper, tokens, client_id)
+        await remember({**registration, "models": models, "model": model})
+        await _log(request, "llm.chatgpt", audit.REFUSED, f"пробный вопрос: {(problem or '').split(':')[0]}")
+        raise apply.Invalid(apply.subscription_problem_text(problem) + " Своя модель не переключена.",
+                            "probe_failed")
+    record = siwc.record_from_tokens(tokens, claims, client_id=client_id, host_id=attempt.host_id, previous=previous)
+    record.update(model=model, models=models)
+    record.pop("need_consent", None)
+    await keeper.save_signed_in(record)
+    names = apply.key_names(page.settings)
+    if apply.page_key_set(page.settings) and names:
+        await page.settings.save({name: None for name in names})       # подписка заменяет ключ
+        await _log(request, "llm.removed", detail="заменён подпиской ChatGPT")
+    else:
+        await page.settings.refresh(restart=True)
+    await _log(request, "llm.chatgpt", detail=("пробный вопрос: ответ получен" if outcome == "ok" else
+                                               "пробный вопрос: лимит подписки исчерпан" if outcome == "limit" else
+                                               f"пробный вопрос не прошёл: {(problem or '').split(':')[0]}"))
+    return JSONResponse({
+        "ok": True, "email": record.get("email"), "model": model, "models": models,
+        "probe": outcome,
+        "probe_text": None if outcome == "ok" else apply.subscription_problem_text(problem),
+    })
+
+
+@endpoint
+async def chatgpt_model(request: Request) -> JSONResponse:
+    """Модель подписки — из списка, который OpenAI сейчас даёт этой учётной записи."""
+    data = await _body(request)
+    state, page = state_of(request), _page(request)
+    keeper = executor_service.chatgpt_keeper(state)
+    slug = data.get("model")
+    if not keeper.store.active():
+        raise apply.Invalid(apply.siwc_problem_text("not_connected"), "not_connected")
+    if not isinstance(slug, str) or not slug:
+        raise apply.Invalid(apply.siwc_problem_text("unknown_model"), "unknown_model")
+    try:
+        token = await keeper.access_token()
+        async with keeper.http() as http:
+            models = await siwc.list_models(http, token)
+    except siwc.SiwcError as exc:
+        if isinstance(exc, siwc.NeedLogin):
+            await page.settings.refresh()
+        raise _siwc_invalid(exc) from None
+    if slug not in [m["slug"] for m in models]:
+        raise apply.Invalid(apply.siwc_problem_text("unknown_model"), "unknown_model")
+    async with keeper.lock:
+        record = keeper.store.load()
+        record.update(model=slug, models=models)
+        keeper.store.save(record)
+    await page.settings.refresh()
+    await _log(request, "llm.chatgpt_model", detail=f"модель: {slug}")
+    return JSONResponse({"ok": True, "model": slug, "models": models})
+
+
+@endpoint
+async def chatgpt_remove(request: Request) -> JSONResponse:
+    """Выход из подписки: отзыв сессии у OpenAI, токены стираются. Выданный client_id и номер
+    сервера остаются для следующего входа."""
+    await _body(request)
+    state, page = state_of(request), _page(request)
+    keeper = executor_service.chatgpt_keeper(state)
+    if keeper.store.status() == "none":
+        raise apply.Invalid(apply.siwc_problem_text("not_connected"), "not_connected")
+    confirmed = await keeper.sign_out()
+    async with page.chatgpt_lock:
+        page.chatgpt_attempt = None
+    await page.settings.refresh()
+    await _log(request, "llm.chatgpt_removed",
+               detail="" if confirmed else "OpenAI отзыв сессии не подтвердил")
+    return JSONResponse({"ok": True, "revoked": confirmed})
+
+
 # --- сборка ------------------------------------------------------------------------------------
 
 def routes() -> list[BaseRoute]:
+    from . import memory
+
     account = API + "/tg/accounts/{account_id:int}"
     upload = API + "/imports/{import_id}"
     return [
@@ -1060,6 +1362,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/state", page_state, methods=["GET"]),
         Route(API + "/overview", page_overview, methods=["GET"]),
         Route(API + "/scenario", scenario_save, methods=["PUT"]),
+        Route(API + "/media", media_save, methods=["PUT"]),
         Route(API + "/bot/token", bot_token_save, methods=["POST"]),
         Route(API + "/bot/token", bot_token_delete, methods=["DELETE"]),
         Route(API + "/bot/bind", bot_bind, methods=["POST"]),
@@ -1086,6 +1389,12 @@ def routes() -> list[BaseRoute]:
         Route(upload + "/run", imports_run, methods=["POST"]),
         Route(API + "/llm", llm_save, methods=["PUT"]),
         Route(API + "/llm", llm_delete, methods=["DELETE"]),
+        Route(API + "/llm/chatgpt/start", chatgpt_start, methods=["POST"]),
+        Route(API + "/llm/chatgpt/finish", chatgpt_finish, methods=["POST"]),
+        Route(API + "/llm/chatgpt/cancel", chatgpt_cancel, methods=["POST"]),
+        Route(API + "/llm/chatgpt/model", chatgpt_model, methods=["PUT"]),
+        Route(API + "/llm/chatgpt", chatgpt_remove, methods=["DELETE"]),
+        *memory.routes(),
     ]
 
 
