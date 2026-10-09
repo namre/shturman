@@ -4,7 +4,9 @@
 каждый клиент создаётся со своим перечнем пар «метод + путь» и ничего другого отправить не может.
 
   BRIDGE — исполнитель заданий и обработчики Telegram в процессе шлюза;
-  TOOLS  — инструменты агента: создать черновик, посмотреть и поправить обязательства и людей;
+  TOOLS  — инструменты агента: создать черновик, посмотреть и поправить обязательства и людей,
+           посмотреть проекты и попросить завести проект, добавить ему чат, убрать его в архив
+           (изменения проектов ждут нажатия владельца в боте согласований);
   UI     — страницы владельца в дашборде (проходят через plugin_api, уже за входом).
 
 Агенту недоступно всё, что меняет правила отправки, список доверенных, автоответ, правила
@@ -70,6 +72,11 @@ TOOLS: Routes = _compile([
     ("GET", r"/api/people"),
     ("GET", rf"/api/people/{_INT}"),
     ("POST", rf"/api/people/{_INT}/aliases"),
+    # проекты: чтение; завести, добавить чат и убрать в архив — сервис ждёт нажатия владельца в боте
+    ("GET", r"/api/projects"),
+    ("GET", rf"/api/projects/{_INT}"),
+    ("POST", r"/api/projects"),
+    ("POST", rf"/api/projects/{_INT}/(chats|archive)"),
 ])
 
 UI: Routes = _compile([
@@ -128,6 +135,17 @@ UI: Routes = _compile([
     ("POST", rf"/api/pages/proposals/{_INT}"),
     ("GET", rf"/api/pages/{_INT}"),
     ("PUT", rf"/api/pages/{_INT}/owner-block"),
+    # проекты, факты, профиль владельца (изменения — через подтверждение в боте)
+    ("GET", r"/api/projects"),
+    ("POST", r"/api/projects"),
+    ("GET", rf"/api/projects/{_INT}"),
+    ("POST", rf"/api/projects/{_INT}/(chats|archive)"),
+    ("PUT", rf"/api/projects/{_INT}/owner-block"),
+    ("POST", rf"/api/projects/proposals/{_INT}"),
+    ("GET", r"/api/facts"),
+    ("POST", rf"/api/facts/{_INT}/retract"),
+    ("GET", r"/api/owner/profile"),
+    ("PUT", r"/api/owner/profile/owner-block"),
 ])
 
 # Маршруты внутреннего API, которые плагин не вызывает ни одной ролью: то же самое владелец делает

@@ -18,14 +18,23 @@
     <!-- summary: … -->        сводка: переписывается целиком из базы
     <!-- owner: … -->          блок владельца: код его не меняет никогда
     <!-- commitments: … -->    таблица обязательств: перерисовывается из базы
+    <!-- decisions: … -->      решения (только у проекта): перерисовываются из базы
+    <!-- facts: … -->          действующие факты: перерисовываются из базы
     <!-- timeline: … -->       хронология: строки только дописываются
+
+Блоки decisions и facts необязательны: страницы версии 0.0.7 их не имеют и читаются как раньше.
+У проекта в шапке ещё два списка — chats (чаты проекта) и participants (участники); оба пишет код.
+
+Виды страниц: person — человек (`people/<имя>-<id>.md`), project — проект
+(`projects/<название>-<id>.md`), owner — профиль владельца (`owner/profile.md`).
 
 Как находится блок владельца. Метка блока — отдельная строка вида `<!-- имя… -->`. Первая метка
 в файле обязана быть summary, следующая за ней — owner; последняя — timeline, перед ней —
 commitments. Блок владельца — всё между меткой owner и этой последней меткой commitments, байт
-в байт, включая строки, похожие на метки. Если порядок нарушен (метку удалили, после хронологии
-появилась ещё одна метка), разбор отказывается (`PageError`), и файл не трогается вовсе: код не
-угадывает, где чей текст.
+в байт, включая строки, похожие на метки. Между последней меткой commitments и меткой timeline
+могут стоять метки decisions и facts — в этом порядке, каждая не больше одного раза. Если порядок
+нарушен (метку удалили, после хронологии появилась ещё одна метка), разбор отказывается
+(`PageError`), и файл не трогается вовсе: код не угадывает, где чей текст.
 
 Всё, что попадает в файл из переписки или из ответа модели, проходит `md_inline`: одна строка,
 без невидимых знаков, с экранированными знаками разметки. Поэтому чужой текст не может создать
@@ -49,13 +58,21 @@ from typing import Any, Iterable, Sequence
 from ..sanitize import clean_line
 
 SUMMARY, OWNER, COMMITMENTS, TIMELINE = "summary", "owner", "commitments", "timeline"
+DECISIONS, FACTS = "decisions", "facts"
 BLOCKS = (SUMMARY, OWNER, COMMITMENTS, TIMELINE)
+# все блоки в порядке файла; decisions и facts есть не у каждой страницы
+ALL_BLOCKS = (SUMMARY, OWNER, COMMITMENTS, DECISIONS, FACTS, TIMELINE)
+PERSON, PROJECT, OWNER_PAGE = "person", "project", "owner"
+ENTITY_TYPES = (PERSON, PROJECT, OWNER_PAGE)
+OWNER_ENTITY = "owner:profile"
 
 MARKERS = {
     SUMMARY: "<!-- summary: пересобирается ассистентом из хронологии и таблиц -->",
     OWNER: "<!-- owner: ассистент этот блок не трогает -->",
     COMMITMENTS: "<!-- commitments: перерисовывается из базы, правки здесь будут затёрты -->",
     TIMELINE: "<!-- timeline: только дописывается -->",
+    DECISIONS: "<!-- decisions: перерисовывается из базы, правки здесь будут затёрты -->",
+    FACTS: "<!-- facts: перерисовывается из базы, правки здесь будут затёрты -->",
 }
 
 ORIGINS = ("owner", "other", "model")
@@ -63,25 +80,35 @@ ORIGIN_TEXT = {"owner": "сказал владелец", "other": "сказал 
 
 NO_SUMMARY = "_Сводки пока нет._"
 NO_COMMITMENTS = "_Обязательств нет._"
+NO_FACTS = "_Фактов нет._"
+NO_DECISIONS = "_Решений нет._"
+OWNER_NO_SUMMARY = "_Сводки нет: профиль составляют только одобренные вами факты и ваши заметки._"
+OWNER_NO_COMMITMENTS = "_Обязательства на странице профиля не ведутся._"
 SUMMARY_NOT_UPDATED = "_Сводка не обновлена: модель не дала пригодного ответа, показана прежняя._"
 DISPUTED_MARK = "⚠ противоречие: "
 
 PEOPLE_DIR = "people"
+PROJECTS_DIR = "projects"
+OWNER_DIR = "owner"
+OWNER_PATH = f"{OWNER_DIR}/profile.md"
+PAGE_DIRS = (PEOPLE_DIR, PROJECTS_DIR, OWNER_DIR)
 MAX_FILE_BYTES = 2_000_000     # файл больше не читается: это уже не страница
 MAX_PAGE_BYTES = 64_000        # с этого размера проверка сообщает «страница слишком длинная»
 SLUG_CHARS = 60
 
 _MARKER_LINE = re.compile(r"<!--[ \t]*(summary|owner|commitments|timeline)\b[^\n]*?-->[ \t]*")
-_MARKER_ANYWHERE = re.compile(r"<!--\s*(?:summary|owner|commitments|timeline)\b", re.IGNORECASE)
+_TAIL_MARKER = re.compile(r"<!--[ \t]*(decisions|facts)\b[^\n]*?-->[ \t]*")
+_MARKER_ANYWHERE = re.compile(r"<!--\s*(?:summary|owner|commitments|timeline|decisions|facts)\b", re.IGNORECASE)
 # Ссылка на сообщение и скрытый ключ строки. Обратная косая перед знаком — признак чужого текста.
 _REF = re.compile(r"(?<!\\)\]\(msg:(\d{1,18})\)")
 _KEY = re.compile(r"(?<!\\)<!--[ \t]*id:([a-z0-9]{1,24})[ \t]*-->[ \t]*$")
 _MD_SPECIAL = re.compile(r"([\\\[\]<>|`])")
-_REL_PATH = re.compile(rf"{PEOPLE_DIR}/[0-9a-zа-яё]+(?:-[0-9a-zа-яё]+)*\.md")
+_REL_PATH = re.compile(
+    rf"(?:{PEOPLE_DIR}|{PROJECTS_DIR})/[0-9a-zа-яё]+(?:-[0-9a-zа-яё]+)*\.md|{OWNER_DIR}/profile\.md")
 _FRONT_KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?")
 _PLAIN_ALIAS = re.compile(r"[A-Za-zА-Яа-яЁё](?:[A-Za-zА-Яа-яЁё0-9 .-]*[A-Za-zА-Яа-яЁё0-9.])?")
 _YAML_WORDS = frozenset({"null", "true", "false", "yes", "no", "on", "off", "y", "n"})
-_OUR_KEYS = ("entity_id", "type", "aliases", "updated")
+_OUR_KEYS = ("entity_id", "type", "aliases", "chats", "participants", "updated")
 
 
 class PageError(ValueError):
@@ -156,6 +183,34 @@ def commitments_block(rows: Sequence[dict[str, Any]]) -> str:
     for row in rows:
         lines.append(f"| {row['what']} | {row['due']} | {row['status']} | {link(row['message_id'])} |")
     return "\n".join(lines)
+
+
+def said(origin: str, who: str | None = None) -> str:
+    """Пометка происхождения; `who` — имя сказавшего, когда это не сам субъект страницы."""
+    return f"{ORIGIN_TEXT[origin]}: {md_inline(who, 60)}" if who else ORIGIN_TEXT[origin]
+
+
+def facts_block(rows: Sequence[dict[str, Any]]) -> str:
+    """Действующие факты: [{"slot", "text", "since", "message_id", "origin", "who"?}]; `slot`,
+    `text` и `who` — чужой текст, экранируются здесь."""
+    if not rows:
+        return NO_FACTS
+    lines = []
+    for row in rows:
+        slot = md_inline(row.get("slot"), 40)
+        head = f"{slot}: " if slot else ""
+        lines.append(f"- {head}{md_inline(row['text'], 240)} (с {row['since']}) {link(row['message_id'])} "
+                     f"({said(row['origin'], row.get('who'))})")
+    return "\n".join(lines)
+
+
+def decisions_block(rows: Sequence[dict[str, Any]]) -> str:
+    """Решения проекта по датам: [{"day", "text", "message_id", "origin", "who"?}]; чужой текст
+    экранируется здесь."""
+    if not rows:
+        return NO_DECISIONS
+    return "\n".join(f"- {row['day']} — {md_inline(row['text'], 240)} {link(row['message_id'])} "
+                     f"({said(row['origin'], row.get('who'))})" for row in rows)
 
 
 def _split(text: str) -> list[str]:
@@ -235,6 +290,9 @@ class Page:
     entity_id: str = ""
     type: str = "person"
     aliases: list[str] = field(default_factory=list)
+    # только у проекта: названия чатов и участники (пишет код)
+    chats: list[str] = field(default_factory=list)
+    participants: list[str] = field(default_factory=list)
     updated: str = ""
     # строки шапки, которые писал не код (например, tags из Obsidian): сохраняются как есть
     front_extra: list[str] = field(default_factory=list)
@@ -245,6 +303,9 @@ class Page:
     # блок владельца — байт в байт, как в файле
     owner: str = "\n"
     commitments: str = ""
+    # None — блока в файле нет (страницы 0.0.7, человек без решений)
+    decisions: str | None = None
+    facts: str | None = None
     timeline: str = ""
 
 
@@ -280,6 +341,8 @@ def parse(text: str) -> Page:
         raise PageError("в шапке нет entity_id")
     page.entity_id, page.type = seen["entity_id"], seen.get("type", "")
     page.aliases = _parse_flow_list(seen.get("aliases", "")) or []
+    page.chats = _parse_flow_list(seen.get("chats", "")) or []
+    page.participants = _parse_flow_list(seen.get("participants", "")) or []
     page.updated = seen.get("updated", "")
 
     body = lines[end + 1:]
@@ -303,7 +366,17 @@ def parse(text: str) -> Page:
     page.head_extra = "".join(head).strip("\r\n") if "".join(head).strip() else ""
     page.summary = "".join(body[s + 1: o]).strip("\r\n")
     page.owner = "".join(body[o + 1: c])
-    page.commitments = "".join(body[c + 1: t]).strip("\r\n")
+    # между таблицей обязательств и хронологией — необязательные decisions и facts, в этом порядке
+    tail = body[c + 1: t]
+    extra = [(n, found.group(1)) for n, line in enumerate(tail)
+             if (found := _TAIL_MARKER.fullmatch(line.rstrip("\r\n")))]
+    if [name for _, name in extra] not in ([], [DECISIONS], [FACTS], [DECISIONS, FACTS]):
+        raise PageError("между commitments и timeline допустимы только блоки decisions и facts, "
+                        "в этом порядке и по одному разу")
+    bounds = [n for n, _ in extra] + [len(tail)]
+    page.commitments = "".join(tail[: bounds[0]]).strip("\r\n")
+    for k, (n, name) in enumerate(extra):
+        setattr(page, name, "".join(tail[n + 1: bounds[k + 1]]).strip("\r\n"))
     page.timeline = "".join(body[t + 1:])
     return page
 
@@ -311,15 +384,22 @@ def parse(text: str) -> Page:
 def render(page: Page) -> str:
     """Собирает файл. Блок владельца и строки хронологии выводятся как есть."""
     out = ["---\n", f"entity_id: {page.entity_id}\n", f"type: {page.type}\n",
-           f"aliases: {_flow_list(page.aliases)}\n", f"updated: {page.updated}\n"]
+           f"aliases: {_flow_list(page.aliases)}\n"]
+    if page.type == PROJECT or page.chats:
+        out.append(f"chats: {_flow_list(page.chats)}\n")
+    if page.type == PROJECT or page.participants:
+        out.append(f"participants: {_flow_list(page.participants)}\n")
+    out.append(f"updated: {page.updated}\n")
     out.extend(line + "\n" for line in page.front_extra)
     out.append("---\n")
     out.append(f"# {page.title}\n\n")
     if page.head_extra:
         out.append(page.head_extra + "\n\n")
-    for name in (SUMMARY, OWNER, COMMITMENTS, TIMELINE):
-        out.append(MARKERS[name] + "\n")
+    for name in ALL_BLOCKS:
         value = getattr(page, name)
+        if value is None:
+            continue        # необязательного блока на этой странице нет
+        out.append(MARKERS[name] + "\n")
         if name in (OWNER, TIMELINE):
             out.append(value if not value or value.endswith("\n") else value + "\n")
         else:
@@ -339,7 +419,7 @@ def digest(data: bytes | str) -> str:
 
 # --- проверки одного файла -------------------------------------------------------------------------
 
-def lint_text(text: str, *, entity_id: str) -> tuple[list[tuple[str, str]], Page | None]:
+def lint_text(text: str, *, entity_id: str, entity_type: str = PERSON) -> tuple[list[tuple[str, str]], Page | None]:
     """Проверки, которым хватает самого файла. Возвращает [(код, пояснение)] и разобранную страницу.
     В пояснениях нет текста страницы: только имена блоков и номера строк."""
     found: list[tuple[str, str]] = []
@@ -352,16 +432,16 @@ def lint_text(text: str, *, entity_id: str) -> tuple[list[tuple[str, str]], Page
         return found, None
     if page.entity_id != entity_id:
         found.append(("front_matter", "entity_id в шапке не совпадает с записью в базе"))
-    if page.type != "person":
-        found.append(("front_matter", "поле type должно быть person"))
+    if page.type != entity_type:
+        found.append(("front_matter", f"поле type должно быть {entity_type}"))
     try:
         date.fromisoformat(page.updated)
     except ValueError:
         found.append(("front_matter", "поле updated должно быть датой вида ГГГГ-ММ-ДД"))
     if not page.title:
         found.append(("front_matter", "нет заголовка страницы"))
-    for block in (SUMMARY, TIMELINE):
-        for n, line in enumerate(_split(getattr(page, block)), start=1):
+    for block in (SUMMARY, DECISIONS, FACTS, TIMELINE):
+        for n, line in enumerate(_split(getattr(page, block) or ""), start=1):
             if line.startswith("- ") and not refs(line):
                 found.append(("no_source", f"{block}: строка {n} без ссылки на сообщение"))
     return found, page
@@ -369,19 +449,24 @@ def lint_text(text: str, *, entity_id: str) -> tuple[list[tuple[str, str]], Page
 
 # --- файлы -----------------------------------------------------------------------------------------
 
-def slug(name: str | None) -> str:
-    """Часть имени файла из имени человека: только строчные буквы, цифры и дефис."""
+def slug(name: str | None, fallback: str = "person") -> str:
+    """Часть имени файла из имени человека или названия проекта: только строчные буквы, цифры и дефис."""
     text = unicodedata.normalize("NFKC", name or "").lower()
     text = re.sub(r"[^0-9a-zа-яё]+", "-", text).strip("-")[:SLUG_CHARS].strip("-")
-    return text or "person"
+    return text or fallback
 
 
 def person_path(name: str | None, person_id: int) -> str:
     return f"{PEOPLE_DIR}/{slug(name)}-{int(person_id)}.md"
 
 
+def project_path(title: str | None, project_id: int) -> str:
+    return f"{PROJECTS_DIR}/{slug(title, 'project')}-{int(project_id)}.md"
+
+
 def is_page_path(rel: Any) -> bool:
-    """Похож ли относительный путь на файл страницы: каталог людей, имя из букв, цифр и дефисов."""
+    """Похож ли относительный путь на файл страницы: каталог людей или проектов, имя из букв, цифр
+    и дефисов; либо профиль владельца."""
     return isinstance(rel, str) and bool(_REL_PATH.fullmatch(rel))
 
 
@@ -391,7 +476,7 @@ def _target(root: Path, rel: str) -> Path:
     if not is_page_path(rel):
         raise PageError("недопустимое имя файла страницы")
     base = Path(os.path.realpath(root))
-    folder = base / PEOPLE_DIR
+    folder = base / rel.split("/", 1)[0]
     if folder.is_symlink() or (folder.exists() and Path(os.path.realpath(folder)) != folder):
         raise PageError("каталог страниц подменён ссылкой")
     return folder / rel.split("/", 1)[1]
@@ -452,9 +537,12 @@ def _unlink_quietly(path: str) -> None:
 
 
 def list_files(root: Path) -> list[str]:
-    """Относительные пути файлов .md в каталоге людей (для поиска файлов без записи в базе)."""
-    base = Path(os.path.realpath(root)) / PEOPLE_DIR
-    if base.is_symlink() or not base.is_dir():
-        return []
-    return sorted(f"{PEOPLE_DIR}/{entry.name}" for entry in os.scandir(base)
-                  if entry.name.endswith(".md") and not entry.name.startswith("."))
+    """Относительные пути файлов .md в каталогах страниц (для поиска файлов без записи в базе)."""
+    out = []
+    for name in PAGE_DIRS:
+        base = Path(os.path.realpath(root)) / name
+        if base.is_symlink() or not base.is_dir():
+            continue
+        out.extend(f"{name}/{entry.name}" for entry in os.scandir(base)
+                   if entry.name.endswith(".md") and not entry.name.startswith("."))
+    return sorted(out)

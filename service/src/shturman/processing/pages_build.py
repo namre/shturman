@@ -1,6 +1,11 @@
-"""Сборка страниц памяти о людях: что на странице, откуда оно взято и когда переписывается.
+"""Сборка страниц памяти: что на странице, откуда оно взято и когда переписывается.
 
-Первая версия ведёт только страницы людей (docs/memory.md). По блокам:
+Три вида страниц (docs/memory.md): человек (person), проект (project) и профиль владельца
+(owner, одна страница `owner/profile.md`, entity_id owner:profile). У профиля нет сводки модели:
+в нём только одобренные владельцем факты о нём и блок владельца. У проекта в архиве (archived)
+страница остаётся, но сводка больше не запрашивается.
+
+По блокам:
 
   * сводка — утверждения модели, каждое со ссылками на сообщения. Модель видит хронологию,
     таблицу обязательств и ограниченную выборку последних сообщений с этим человеком и никогда
@@ -9,8 +14,10 @@
     помечается «сводка не обновлена»;
   * блок владельца — код не меняет (см. pages.py);
   * обязательства — таблица из базы при каждой сборке; правки в этом блоке затираются;
-  * хронология — только дописывается и только фактами, которые уже есть в базе и одобрены
-    владельцем: принятое обязательство, его закрытие, отмена, перенос срока. Дописанное
+  * решения (только у проекта) и действующие факты — из таблицы facts при каждой сборке;
+  * хронология — только дописывается и только тем, что уже есть в базе и одобрено владельцем
+    или записано по правилам facts.py: принятое обязательство, его закрытие, отмена, перенос
+    срока; факт появился (f<id>), факт больше не действует (fz<id>), решение (d<id>). Дописанное
     запоминается по ключу (в строке и в базе), поэтому повторно не дописывается, даже если
     владелец строку удалил. Существующие строки не переписываются и не переставляются.
 
@@ -55,9 +62,9 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from .. import bridge, jobs
+from .. import authority, bridge, jobs
 from ..sanitize import clean_line
-from . import extract, pages, people
+from . import extract, facts, pages, people
 from .pages_git import NO_HISTORY, GitError, History
 
 logger = logging.getLogger("shturman.pages")
@@ -176,11 +183,12 @@ LEFT JOIN people dpe ON dpe.id = dpp.person_id
 LEFT JOIN peers cp ON cp.id = c.creditor_peer_id
 LEFT JOIN person_peers cpp ON cpp.peer_id = c.creditor_peer_id
 LEFT JOIN people cpe ON cpe.id = cpp.person_id
-WHERE c.status IN ('open', 'done', 'cancelled')
-  AND (c.debtor_peer_id = ANY($1::bigint[]) OR c.creditor_peer_id = ANY($1::bigint[]))
+WHERE c.status IN ('open', 'done', 'cancelled') AND {who}
   AND (c.due_message_id IS NULL OR (dm.deleted_at IS NULL AND dm.agent_visible))
 ORDER BY m.sent_at, c.id
 """
+_OF_PEERS = "(c.debtor_peer_id = ANY($1::bigint[]) OR c.creditor_peer_id = ANY($1::bigint[]))"
+_OF_PROJECT = "c.project_id = $1"
 
 _EVENTS = """
 SELECT e.id, e.commitment_id, e.at, e.action, e.details,
@@ -228,12 +236,17 @@ def _status(row: asyncpg.Record) -> str:
 
 
 async def _from_base(
-    conn: asyncpg.Connection, peers: Sequence[int], zone: ZoneInfo, options: Options,
+    conn: asyncpg.Connection, peers: Sequence[int] | None, zone: ZoneInfo, options: Options, *,
+    project_id: int | None = None,
 ) -> tuple[list[Entry], list[dict[str, Any]]]:
-    """Строки хронологии и строки таблицы обязательств человека — из базы."""
-    if not peers:
+    """Строки хронологии и строки таблицы обязательств человека (по его учётным записям) или
+    проекта — из базы."""
+    if project_id is not None:
+        rows = await conn.fetch(_COMMITMENTS.format(who=_OF_PROJECT), project_id)
+    elif not peers:
         return [], []
-    rows = await conn.fetch(_COMMITMENTS, list(peers))
+    else:
+        rows = await conn.fetch(_COMMITMENTS.format(who=_OF_PEERS), list(peers))
     entries: list[Entry] = []
     by_id = {r["id"]: r for r in rows}
     for r in rows:
@@ -281,6 +294,77 @@ async def _from_base(
     return entries, table
 
 
+_FACTS = f"""
+SELECT f.id, f.kind, f.slot, f.text, f.valid_from, f.valid_to, f.status, f.origin, f.decided_at,
+       f.source_message_id, f.superseded_by, nf.source_message_id AS next_source, fm.sender_name,
+       (SELECT pp.person_id FROM person_peers pp WHERE pp.peer_id = fm.sender_peer_id) AS sender_person
+FROM facts f JOIN messages fm ON fm.id = f.source_message_id JOIN chats fc ON fc.id = fm.chat_id
+LEFT JOIN facts nf ON nf.id = f.superseded_by AND nf.status = 'active'
+WHERE {facts.VISIBLE} AND f.status IN ('active', 'retracted') AND {{who}}
+ORDER BY f.valid_from, fm.sent_at, f.id
+"""
+
+
+async def _facts_from_base(
+    conn: asyncpg.Connection, subject_type: str, subject_id: int | None,
+) -> tuple[list[Entry], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Факты и решения субъекта: строки хронологии, блок действующих фактов, блок решений.
+
+    Факт о владельце попадает сюда, только став active, — а это возможно лишь с его согласия.
+    Источник, удалённый или скрытый, убирает факт отовсюду (условие видимости в запросе)."""
+    if subject_type == "owner":
+        rows = await conn.fetch(_FACTS.format(who="f.subject_type = 'owner'"))
+    else:
+        column = "person_id" if subject_type == "person" else "project_id"
+        rows = await conn.fetch(_FACTS.format(who=f"f.subject_type = '{subject_type}' AND f.{column} = $1"),
+                                subject_id)
+    alive = await _alive(conn, [r["next_source"] for r in rows if r["next_source"]])
+    entries: list[Entry] = []
+    current: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+
+    def what(r: asyncpg.Record) -> str:
+        slot = pages.md_inline(r["slot"], 40)
+        return (f"{slot}: " if slot else "") + pages.md_inline(r["text"], 240)
+
+    def who(r: asyncpg.Record, origin: str) -> str | None:
+        """Кто сказал, если это не владелец и не сам человек страницы: у проекта — любой участник,
+        у человека — третье лицо (его слова ничего не сменяют, см. facts.record)."""
+        if origin != "other" or (subject_type == "person" and r["sender_person"] == subject_id):
+            return None
+        return clean_line(r["sender_name"], 60) or "собеседник"
+
+    for r in rows:
+        origin = r["origin"] if r["origin"] in pages.ORIGINS else "model"
+        speaker = who(r, origin)
+        said = f" со слов {pages.md_inline(speaker, 60)}" if speaker else ""
+        if r["kind"] == "decision":
+            entries.append(Entry(key=f"d{r['id']}", day=r["valid_from"].isoformat(),
+                                 text=f"решение{said}: {what(r)}", sources=(r["source_message_id"],), origin=origin))
+            if r["status"] == "active":
+                decisions.append({"day": r["valid_from"].isoformat(), "text": r["text"],
+                                  "message_id": r["source_message_id"], "origin": origin, "who": speaker})
+            continue
+        entries.append(Entry(key=f"f{r['id']}", day=r["valid_from"].isoformat(),
+                             text=f"факт{said}: {what(r)}", sources=(r["source_message_id"],), origin=origin))
+        if r["status"] == "retracted":
+            day = (r["decided_at"].date() if r["decided_at"] else r["valid_from"]).isoformat()
+            entries.append(Entry(key=f"fz{r['id']}", day=day, text=f"владелец отметил как неверное: {what(r)}",
+                                 sources=(r["source_message_id"],), origin="owner"))
+        elif r["valid_to"] is not None:
+            sources = [r["source_message_id"]]
+            if r["next_source"] in alive and r["next_source"] not in sources:
+                sources.append(r["next_source"])
+            entries.append(Entry(key=f"fz{r['id']}", day=r["valid_to"].isoformat(),
+                                 text=f"больше не действует: {what(r)}", sources=tuple(sources), origin=origin))
+        else:
+            current.append({"id": r["id"], "slot": r["slot"], "text": r["text"], "since": r["valid_from"].isoformat(),
+                            "message_id": r["source_message_id"], "origin": origin, "who": speaker})
+    current.sort(key=lambda x: (x["slot"] is None, x["slot"] or "", x["since"]))
+    entries.sort(key=lambda e: e.day)
+    return entries, current, decisions
+
+
 async def _alive(conn: asyncpg.Connection, ids: Sequence[int]) -> dict[int, bool | None]:
     """Какие сообщения ещё есть в архиве (не удалены, не скрыты защитой от внедрённых инструкций,
     чат не исключён): {id: исходящее ли}."""
@@ -324,6 +408,7 @@ class Draft:
     page: pages.Page | None = None
     record: list[Entry] = field(default_factory=list)       # ключи, которые надо запомнить в базе
     removed_keys: set[str] = field(default_factory=set)
+    reopened_keys: set[str] = field(default_factory=set)     # fz<id> фактов, которые снова действуют
     dropped_statements: list[int] = field(default_factory=list)
     name: str = ""                       # имя человека как есть (в файле оно экранировано)
     quiet: bool = False                  # об остановке этой страницы владельцу не сообщаем
@@ -347,19 +432,80 @@ GROUP BY e.id ORDER BY e.block, e.pos, e.id
 """
 
 
+@dataclass
+class Subject:
+    """О чём страница и что о нём есть в базе."""
+
+    kind: str                            # person | project | owner
+    name: str                            # как есть (в файле экранируется)
+    aliases: list[str] = field(default_factory=list)
+    chats: list[str] = field(default_factory=list)
+    participants: list[str] = field(default_factory=list)
+    entries: list[Entry] = field(default_factory=list)
+    table: list[dict[str, Any]] | None = None       # None — блок обязательств не ведётся (профиль)
+    facts: list[dict[str, Any]] = field(default_factory=list)
+    decisions: list[dict[str, Any]] | None = None    # None — блока решений нет (не проект)
+    with_summary: bool = True
+    peers: list[int] = field(default_factory=list)
+    project_id: int | None = None
+
+
+async def _project(conn: asyncpg.Connection, project_id: int) -> dict[str, Any] | None:
+    row = await conn.fetchrow("SELECT id, title, status FROM projects WHERE id = $1", project_id)
+    if row is None:
+        return None
+    aliases = [clean_line(r["alias"], 120) for r in await conn.fetch(
+        "SELECT alias FROM project_aliases WHERE project_id = $1 ORDER BY id LIMIT 20", project_id)]
+    # исключённые чаты в шапку не попадают: по странице нельзя узнать об исключённом чате
+    chats = [clean_line(r["title"], 120) or f"чат {r['id']}" for r in await conn.fetch(
+        """SELECT c.id, c.title FROM project_chats pc JOIN chats c ON c.id = pc.chat_id AND NOT c.excluded
+           WHERE pc.project_id = $1 ORDER BY pc.added_at, c.id LIMIT 30""", project_id)]
+    from . import projects as projects_
+    names = [clean_line(p["name"], 120) for p in await projects_.participants(conn, project_id, limit=20)]
+    return {"id": row["id"], "name": row["title"], "status": row["status"], "aliases": [a for a in aliases if a],
+            "chats": chats, "participants": [n for n in names if n]}
+
+
+async def _subject(
+    conn: asyncpg.Connection, row: asyncpg.Record, zone: ZoneInfo, options: Options,
+) -> tuple[Subject | None, str | None]:
+    """Субъект страницы из базы. (None, причина) — страница не ведётся; это не поломка файла,
+    а решение владельца, поэтому отдельного сообщения о ней не нужно."""
+    kind = row["entity_type"]
+    if kind == pages.PROJECT:
+        project = await _project(conn, row["project_id"])
+        if project is None or project["status"] not in ("active", "archived"):
+            return None, "проекта больше нет среди заведённых: страница не обновляется"
+        entries, table = await _from_base(conn, None, zone, options, project_id=project["id"])
+        fact_entries, current, decisions = await _facts_from_base(conn, "project", project["id"])
+        return Subject(kind=kind, name=project["name"], aliases=project["aliases"], chats=project["chats"],
+                       participants=project["participants"], entries=entries + fact_entries, table=table,
+                       facts=current, decisions=decisions, with_summary=project["status"] == "active",
+                       project_id=project["id"]), None
+    if kind == pages.OWNER_PAGE:
+        fact_entries, current, _ = await _facts_from_base(conn, "owner", None)
+        return Subject(kind=kind, name="Профиль владельца", entries=fact_entries, table=None, facts=current,
+                       with_summary=False), None
+    person = await _person(conn, row["person_id"])
+    if person is None or person["merged_into"] is not None or person["is_owner"]:
+        return None, ("человека больше нет в реестре: страница не обновляется" if person is None
+                      else "человек объединён с другой записью: страница больше не обновляется"
+                      if person["merged_into"] is not None else "это запись самого владельца: страница не ведётся")
+    entries, table = await _from_base(conn, person["peers"], zone, options)
+    fact_entries, current, _ = await _facts_from_base(conn, "person", person["id"])
+    return Subject(kind=kind, name=person["name"], aliases=person["aliases"], entries=entries + fact_entries,
+                   table=table, facts=current, peers=person["peers"]), None
+
+
 async def _compose(
     conn: asyncpg.Connection, root: Path, row: asyncpg.Record, *, zone: ZoneInfo, today: date,
     options: Options,
 ) -> Draft:
     """Читает файл страницы и собирает его новый вид. Ничего не пишет."""
     draft = Draft(row=row)
-    person = await _person(conn, row["person_id"])
-    if person is None or person["merged_into"] is not None or person["is_owner"]:
-        # это не поломка файла, а решение владельца о человеке: отдельного сообщения не нужно
-        draft.quiet = True
-        draft.problem = ("человека больше нет в реестре: страница не обновляется" if person is None
-                         else "человек объединён с другой записью: страница больше не обновляется"
-                         if person["merged_into"] is not None else "это запись самого владельца: страница не ведётся")
+    subject, reason = await _subject(conn, row, zone, options)
+    if subject is None:
+        draft.quiet, draft.problem = True, reason
         return draft
     try:
         draft.old_text = await asyncio.to_thread(pages.read_page, root, row["path"])
@@ -370,9 +516,9 @@ async def _compose(
     if draft.old_text is not None and page.entity_id != row["entity_id"]:
         draft.problem = "entity_id в шапке не совпадает с записью в базе"
         return draft
-    before = (page.summary, page.commitments)
+    before = (page.summary, page.commitments, page.facts, page.decisions)
 
-    desired, table = await _from_base(conn, person["peers"], zone, options)
+    desired = subject.entries
     stored = await conn.fetch(_ENTRIES, row["id"])
     known_ids = {i for e in stored for i in e["sources"]} | {i for d in desired for i in d.sources}
     alive = await _alive(conn, [*known_ids, *pages.refs(page.timeline)])
@@ -385,11 +531,18 @@ async def _compose(
     keys_before = pages.timeline_keys(page.timeline)
     dead_keys = {k for k, e in timeline_db.items() if e["removed_at"] is None and not grounded(e)}
     dead_ids = {i for i in pages.refs(page.timeline) if i not in alive}
+    # Факт снова действует (сменивший его отмечен неверным или удалён): строка «больше не действует»
+    # о нём ложна. Она убирается и забывается, чтобы при новой смене дописаться с новой датой.
+    reopened = {f"fz{f['id']}" for f in subject.facts if f.get("id") is not None}
+    draft.reopened_keys = reopened & (keys_before | set(timeline_db))
+    page.timeline, _ = pages.sweep_lines(page.timeline, set(), draft.reopened_keys)
+    keys_kept = pages.timeline_keys(page.timeline)
     page.timeline, removed = pages.sweep_lines(page.timeline, dead_ids, dead_keys)
-    draft.removed_keys = (dead_keys | (keys_before - pages.timeline_keys(page.timeline))) & set(timeline_db)
+    draft.removed_keys = ((dead_keys | (keys_kept - pages.timeline_keys(page.timeline))) & set(timeline_db)) \
+        - draft.reopened_keys
     new_lines = []
     # файла нет (новая страница или файл удалили): хронология пишется из базы целиком
-    written_before = set(timeline_db) if draft.old_text is not None else set()
+    written_before = set(timeline_db) - draft.reopened_keys if draft.old_text is not None else set()
     for entry in desired:
         if not all(i in alive for i in entry.sources):
             continue
@@ -401,23 +554,30 @@ async def _compose(
             draft.record.append(entry)
     page.timeline = pages.append_lines(page.timeline, new_lines)
 
-    # сводка: только утверждения, все источники которых живы
+    # сводка: только утверждения, все источники которых живы; у профиля владельца её нет
     statements = []
     for e in stored:
         if e["block"] != pages.SUMMARY:
             continue
-        if grounded(e):
+        if grounded(e) and subject.kind != pages.OWNER_PAGE:
             statements.append({"text": e["text"] or "", "sources": list(e["sources"]),
                                "origin": e["origin"] or "model", "disputed": e["disputed"]})
         else:
             draft.dropped_statements.append(e["id"])
-    page.summary = pages.summary_block(statements, not_updated=row["summary_state"] == "failed")
-    page.commitments = pages.commitments_block(table)
+    if subject.kind == pages.OWNER_PAGE:
+        page.summary, page.commitments = pages.OWNER_NO_SUMMARY, pages.OWNER_NO_COMMITMENTS
+    else:
+        page.summary = pages.summary_block(statements, not_updated=row["summary_state"] == "failed")
+        page.commitments = pages.commitments_block(subject.table or [])
+    page.decisions = pages.decisions_block(subject.decisions) if subject.decisions is not None else None
+    page.facts = pages.facts_block(subject.facts)
 
-    page.entity_id, page.type = row["entity_id"], "person"
-    draft.name = clean_line(person["name"], 120) or "Без имени"
+    page.entity_id, page.type = row["entity_id"], subject.kind
+    draft.name = clean_line(subject.name, 120) or ("Без названия" if subject.kind == pages.PROJECT else "Без имени")
     page.title = pages.md_inline(draft.name, 120)
-    page.aliases = person["aliases"]
+    page.aliases = subject.aliases
+    if subject.kind == pages.PROJECT:
+        page.chats, page.participants = subject.chats, subject.participants
     kept = page.updated
     try:
         date.fromisoformat(kept)
@@ -439,6 +599,10 @@ async def _compose(
             draft.changes.append(f"убрано по удалённому источнику: {removed}")
         if page.commitments != before[1]:
             draft.changes.append("обязательства")
+        if page.facts != before[2]:
+            draft.changes.append("факты")
+        if page.decisions != before[3]:
+            draft.changes.append("решения")
         if page.summary != before[0]:
             draft.changes.append("сводка")
         if not draft.changes:
@@ -447,17 +611,25 @@ async def _compose(
 
 
 def _index_blocks(page: pages.Page, name: str) -> dict[str, str]:
-    return {
-        "head": "\n".join([name, *page.aliases]),
+    head = [name, *page.aliases]
+    out = {
+        "head": "\n".join(head),
         pages.SUMMARY: page.summary,
         pages.OWNER: page.owner.strip(),
         pages.COMMITMENTS: page.commitments,
         pages.TIMELINE: pages.without_keys(page.timeline).strip(),
     }
+    for block in (pages.FACTS, pages.DECISIONS):
+        if getattr(page, block) is not None:
+            out[block] = getattr(page, block)
+    return out
 
 
 async def _reindex(conn: asyncpg.Connection, page_id: int, page: pages.Page, name: str) -> None:
-    for block, text in _index_blocks(page, name).items():
+    blocks = _index_blocks(page, name)
+    await conn.execute("DELETE FROM page_blocks WHERE page_id = $1 AND NOT block = ANY($2::text[])",
+                       page_id, list(blocks))
+    for block, text in blocks.items():
         await conn.execute(
             """INSERT INTO page_blocks (page_id, block, text) VALUES ($1, $2, $3)
                ON CONFLICT (page_id, block) DO UPDATE SET text = EXCLUDED.text
@@ -488,7 +660,8 @@ async def _settle_draft(conn: asyncpg.Connection, draft: Draft) -> None:
             # сообщения нельзя. Но из указателя поиска (и, значит, из ответов агенту) они уходят.
             if await conn.fetchval(f"SELECT EXISTS ({_DEAD_ENTRIES} AND e.page_id = $1)", row["id"]):
                 await conn.execute(
-                    "DELETE FROM page_blocks WHERE page_id = $1 AND block IN ('summary', 'commitments', 'timeline')",
+                    "DELETE FROM page_blocks WHERE page_id = $1 AND block IN "
+                    "('summary', 'commitments', 'timeline', 'facts', 'decisions')",
                     row["id"])
             return
         for entry in draft.record:
@@ -508,6 +681,10 @@ async def _settle_draft(conn: asyncpg.Connection, draft: Draft) -> None:
                 row["id"], sorted(draft.removed_keys))
         if draft.dropped_statements:
             await conn.execute("DELETE FROM page_entries WHERE id = ANY($1::bigint[])", draft.dropped_statements)
+        if draft.reopened_keys:
+            await conn.execute(
+                "DELETE FROM page_entries WHERE page_id = $1 AND block = 'timeline' AND key = ANY($2::text[])",
+                row["id"], sorted(draft.reopened_keys))
         file_hash = pages.digest(draft.new_text)
         await conn.execute(
             """UPDATE pages SET title = $2, updated = $3, file_hash = $4, dirty = false, problem = NULL,
@@ -651,6 +828,26 @@ SUMMARY_INSTRUCTIONS = f"""\
 7. Если сказать нечего, верни пустой список.
 """
 
+PROJECT_SUMMARY_INSTRUCTIONS = f"""\
+Ты составляешь краткую СВОДКУ о проекте (объекте, сделке) для его страницы в памяти личного ассистента.
+
+{_UNTRUSTED}
+
+Правила — соблюдай все:
+1. Верни от 0 до 8 коротких утверждений: что это за проект, на каком он этапе, кто в нём \
+участвует, что сейчас главное. Одно утверждение — одна фраза до 200 знаков, по-русски.
+2. Каждое утверждение опирается на сообщения: в sources перечисли номера из квадратных скобок, \
+от одного до пяти. Номеров, которых нет в данных, не указывай. Утверждение без источника не пиши.
+3. origin: owner — это сказал {OWNER_LABEL}; other — это сказал другой участник; model — это твой \
+вывод из нескольких сообщений или записей.
+4. Не придумывай фактов, сумм, сроков и дат, которых нет в данных. Решения, факты и \
+обязательства не пересказывай по одному: на странице они уже есть отдельными блоками.
+5. Если источники противоречат друг другу, не выбирай: опиши оба варианта одним утверждением, \
+укажи оба источника и поставь contradiction=true. Иначе contradiction=false.
+6. Не копируй ссылки, адреса, телефоны, коды и пароли.
+7. Если сказать нечего, верни пустой список.
+"""
+
 SUMMARY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -703,25 +900,55 @@ async def _sample(
     return rows
 
 
+async def _sample_project(
+    conn: asyncpg.Connection, project_id: int, *, since: datetime, options: Options,
+) -> list[asyncpg.Record]:
+    """Последние сообщения из чатов проекта. Только неисключённые чаты, неудалённые и не скрытые
+    защитой сообщения."""
+    rows = await conn.fetch(
+        """SELECT m.id, m.sent_at, m.is_outgoing, m.text, m.forwarded_from IS NOT NULL AS forwarded
+           FROM project_chats pc JOIN chats c ON c.id = pc.chat_id AND NOT c.excluded
+           JOIN messages m ON m.chat_id = c.id
+           WHERE pc.project_id = $1 AND m.deleted_at IS NULL AND m.agent_visible AND m.kind = 'message'
+             AND m.text <> '' AND m.sent_at >= $2
+           ORDER BY m.sent_at DESC, m.id DESC LIMIT $3""",
+        project_id, since, options.sample_messages)
+    return sorted(rows, key=lambda r: (r["sent_at"], r["id"]))
+
+
 def _summary_input(
     name: str, today: date, table_text: str, timeline_text: str, sample: Sequence[asyncpg.Record],
-    zone: ZoneInfo, options: Options,
+    zone: ZoneInfo, options: Options, *, kind: str = pages.PERSON, facts_text: str = "",
+    decisions_text: str = "",
 ) -> str:
     def numbered(text: str) -> str:
         return extract.clean_text(_LINK_TO_NUMBER.sub(r"[\1]", pages.without_keys(text)), 600)
 
-    parts = ["<страница>", f"Человек: {extract.clean_name(name) or 'имя неизвестно'}. Сегодня {today.isoformat()}."]
+    if kind == pages.PROJECT:
+        head = f"Проект: {extract.clean_name(name) or 'название неизвестно'}. Сегодня {today.isoformat()}."
+    else:
+        head = f"Человек: {extract.clean_name(name) or 'имя неизвестно'}. Сегодня {today.isoformat()}."
+    parts = ["<страница>", head]
     table = [line for line in table_text.split("\n") if line.startswith("| ") and "msg:" in line]
     if table:
         parts.append("Обязательства из базы (что | срок | статус | номер сообщения-источника):")
         parts.extend(numbered(line) for line in table)
+    decided = [line for line in decisions_text.split("\n") if line.startswith("- ") and "msg:" in line]
+    if decided:
+        parts.append("Решения из базы (в квадратных скобках — номера сообщений-источников):")
+        parts.extend(numbered(line) for line in decided)
+    known = [line for line in facts_text.split("\n") if line.startswith("- ") and "msg:" in line]
+    if known:
+        parts.append("Действующие факты из базы (в квадратных скобках — номера сообщений-источников):")
+        parts.extend(numbered(line) for line in known)
     timeline = [line for line in timeline_text.split("\n") if line.strip()][-options.timeline_lines:]
     if timeline:
         parts.append("Хронология из базы (в квадратных скобках — номера сообщений-источников):")
         parts.extend(numbered(line) for line in timeline)
     if sample:
+        other = "другие участники" if kind == pages.PROJECT else "этот человек"
         parts.append(f"Последние сообщения, номер в квадратных скобках ({OWNER_LABEL} — владелец "
-                     f"ассистента, {OTHER_LABEL} — этот человек):")
+                     f"ассистента, {OTHER_LABEL} — {other}):")
         spent = sum(len(p) for p in parts)
         lines = []
         for row in reversed(sample):       # при нехватке места остаются самые свежие
@@ -786,19 +1013,34 @@ def validate_summary(
 async def _plan_summary(
     conn: asyncpg.Connection, draft: Draft, *, zone: ZoneInfo, today: date, now: datetime, options: Options,
 ) -> dict[str, Any] | None:
-    """Входы сводки страницы и их отпечаток. None — сказать не о чем."""
-    page = draft.page
-    person = await _person(conn, draft.row["person_id"])
-    sample = await _sample(conn, person["peers"], since=now - timedelta(days=options.sample_days), options=options)
-    referenced = [*pages.refs(page.timeline), *pages.refs(page.commitments)]
+    """Входы сводки страницы и их отпечаток. None — сказать не о чем (или сводка у страницы не
+    ведётся: профиль владельца, проект в архиве)."""
+    page, kind = draft.page, draft.row["entity_type"]
+    since = now - timedelta(days=options.sample_days)
+    if kind == pages.PROJECT:
+        project = await conn.fetchrow("SELECT id, title, status FROM projects WHERE id = $1", draft.row["project_id"])
+        if project is None or project["status"] != "active":
+            return None
+        name = project["title"]
+        sample = await _sample_project(conn, project["id"], since=since, options=options)
+    elif kind == pages.PERSON:
+        person = await _person(conn, draft.row["person_id"])
+        name = person["name"]
+        sample = await _sample(conn, person["peers"], since=since, options=options)
+    else:
+        return None
+    referenced = [*pages.refs(page.timeline), *pages.refs(page.commitments), *pages.refs(page.facts or ""),
+                  *pages.refs(page.decisions or "")]
     if not sample and not referenced:
         return None
     offered = await _alive(conn, referenced)
     offered.update({r["id"]: r["is_outgoing"] for r in sample})
-    text = _summary_input(person["name"], today, page.commitments, page.timeline, sample, zone, options)
+    extra = {"kind": kind, "facts_text": page.facts or "", "decisions_text": page.decisions or ""}
+    text = _summary_input(name, today, page.commitments, page.timeline, sample, zone, options, **extra)
     # отпечаток не зависит от даты запроса: иначе сводка запрашивалась бы каждую ночь
-    stable = _summary_input(person["name"], date.min, page.commitments, page.timeline, sample, zone, options)
-    return {"input": text, "offered": offered, "hash": pages.digest(PROMPT_VERSION + "\n" + stable)}
+    stable = _summary_input(name, date.min, page.commitments, page.timeline, sample, zone, options, **extra)
+    return {"input": text, "offered": offered, "hash": pages.digest(PROMPT_VERSION + "\n" + stable),
+            "instructions": PROJECT_SUMMARY_INSTRUCTIONS if kind == pages.PROJECT else SUMMARY_INSTRUCTIONS}
 
 
 async def _scrub_job(conn: asyncpg.Connection, job_id: int) -> None:
@@ -915,7 +1157,42 @@ async def _sync_pages(conn: asyncpg.Connection) -> int:
     created = 0
     for r in rows:
         created += int(await ensure_page(conn, r["id"]) is not None)
+    # страницы заведённых проектов (в том числе в архиве) и профиль — когда в нём есть что показать
+    for r in await conn.fetch(
+            """SELECT p.id FROM projects p WHERE p.status IN ('active', 'archived')
+                 AND NOT EXISTS (SELECT 1 FROM pages g WHERE g.project_id = p.id) ORDER BY p.id"""):
+        created += int(await ensure_project_page(conn, r["id"]) is not None)
+    if not await conn.fetchval("SELECT 1 FROM pages WHERE entity_type = 'owner'") and await conn.fetchval(
+            "SELECT 1 FROM facts WHERE subject_type = 'owner' AND status = 'active' LIMIT 1"):
+        created += int(await ensure_owner_page(conn) is not None)
     return created
+
+
+async def ensure_project_page(conn: asyncpg.Connection, project_id: int) -> int | None:
+    """Заводит запись страницы проекта (файл появится при ближайшей записи). None — проект не
+    заведён (предложен или отклонён)."""
+    row = await conn.fetchrow(
+        "SELECT id, title FROM projects WHERE id = $1 AND status IN ('active', 'archived')", project_id)
+    if row is None:
+        return None
+    return await conn.fetchval(
+        """INSERT INTO pages (entity_type, entity_id, project_id, path, title)
+           VALUES ('project', $1, $2, $3, $4)
+           ON CONFLICT (project_id) DO UPDATE SET project_id = EXCLUDED.project_id
+           RETURNING id""",
+        f"project:{row['id']}", row["id"], pages.project_path(row["title"], row["id"]),
+        clean_line(row["title"], 120) or "Без названия")
+
+
+async def ensure_owner_page(conn: asyncpg.Connection) -> int:
+    """Заводит запись страницы профиля владельца (одна на экземпляр)."""
+    found = await conn.fetchval("SELECT id FROM pages WHERE entity_type = 'owner'")
+    if found is not None:
+        return found
+    return await conn.fetchval(
+        """INSERT INTO pages (entity_type, entity_id, path, title) VALUES ('owner', $1, $2, 'Профиль владельца')
+           ON CONFLICT (entity_id) DO UPDATE SET entity_id = EXCLUDED.entity_id RETURNING id""",
+        pages.OWNER_ENTITY, pages.OWNER_PATH)
 
 
 _CANDIDATES = """
@@ -1144,7 +1421,7 @@ async def _plan(
             continue
         async with conn.transaction():
             job_id = await bridge.request_structured(
-                conn, handler=HANDLER_SUMMARY, instructions=SUMMARY_INSTRUCTIONS, input=inputs["input"],
+                conn, handler=HANDLER_SUMMARY, instructions=inputs["instructions"], input=inputs["input"],
                 json_schema=SUMMARY_SCHEMA, schema_name="page_summary", max_tokens=1200,
                 context={"page_id": row["id"], "build_id": build_id, "inputs_hash": inputs["hash"],
                          "offered": sorted([i, flag] for i, flag in inputs["offered"].items())},
@@ -1255,6 +1532,7 @@ async def render_dirty(
     """Перерисовывает страницы, которые ждут записи вне сборки: новая страница после согласия
     владельца, удалённый источник. К модели не обращается. None — перерисовывать нечего."""
     async with _writing(conn):
+        await facts.repair_chains(conn)        # на случай стирания, прошедшего мимо уборки
         await mark_orphans(conn)
         if not await conn.fetchval("SELECT 1 FROM pages WHERE dirty LIMIT 1"):
             return None
@@ -1279,23 +1557,65 @@ async def tick(conn: asyncpg.Connection, pages_dir: Path, *, tz: str, options: O
 
 # --- блок владельца из кабинета ---------------------------------------------------------------------------
 
+_ENTITY = re.compile(r"(person|project):(\d{1,18})|owner:profile")
+
+
+async def _target_row(conn: asyncpg.Connection, target: int | str | None, *, create: bool = False,
+                      visible_only: bool = False) -> asyncpg.Record | None:
+    """Запись страницы по номеру человека или по entity_id (person:N, project:N, owner:profile).
+    Для влитой записи человека — страница той, в которую влили. create — завести страницу
+    профиля или заведённого проекта, если её ещё нет."""
+    if isinstance(target, bool):
+        return None
+    if isinstance(target, int):
+        kind, number = pages.PERSON, target
+    elif isinstance(target, str) and (found := _ENTITY.fullmatch(target.strip())):
+        kind = found.group(1) or pages.OWNER_PAGE
+        number = int(found.group(2)) if found.group(2) else None
+    else:
+        return None
+    visible = f"AND {_VISIBLE}" if visible_only else ""
+    if kind == pages.PERSON:
+        active = await people.active_id(conn, number)
+        if active is None:
+            return None
+        return await conn.fetchrow(
+            f"""SELECT g.* FROM pages g WHERE g.entity_type = 'person' AND g.person_id = $1
+                AND NOT g.security_quarantined {visible}""", active)
+    if kind == pages.PROJECT:
+        if create:
+            await ensure_project_page(conn, number)
+        return await conn.fetchrow(
+            f"""SELECT g.* FROM pages g WHERE g.project_id = $1 AND NOT g.security_quarantined {visible}""", number)
+    if create:
+        await ensure_owner_page(conn)
+    return await conn.fetchrow(
+        f"SELECT g.* FROM pages g WHERE g.entity_type = 'owner' AND NOT g.security_quarantined {visible}")
+
+
 async def write_owner_block(
-    conn: asyncpg.Connection, pages_dir: Path, person_id: int, text: str, *, tz: str,
+    conn: asyncpg.Connection, pages_dir: Path, person_id: int | str, text: str, *, tz: str,
     now: datetime | None = None, options: Options = Options(),
 ) -> dict[str, Any]:
     """Заменяет блок владельца текстом из кабинета — единственный путь записи для интерфейса.
-    Текст с метками блоков не принимается. Коммит — отдельный, «правка владельца»."""
+    Текст с метками блоков не принимается. Коммит — отдельный, «правка владельца».
+
+    `person_id` — номер человека или entity_id страницы: person:12, project:3, owner:profile
+    (страница профиля заводится при первой записи). Только владелец (authority): ассистент читает
+    этот блок как слова самого владельца."""
+    authority.requires_owner()
     if not isinstance(text, str) or len(text) > 20_000:
         raise PagesError("Текст блока владельца: строка не длиннее 20 000 знаков.")
     if pages.has_marker(text):
-        raise PagesError("В тексте не должно быть меток блоков страницы (<!-- summary …, owner, commitments, timeline).")
+        raise PagesError("В тексте не должно быть меток блоков страницы "
+                         "(<!-- summary …, owner, commitments, decisions, facts, timeline).")
     root = Path(pages_dir)
     today = _today(tz, now)
     async with _writing(conn):
-        active = await people.active_id(conn, person_id)
-        row = await conn.fetchrow("SELECT * FROM pages WHERE person_id = $1 AND NOT security_quarantined", active)
+        row = await _target_row(conn, person_id, create=True)
         if row is None:
-            raise PagesError("У этого человека нет страницы.", "not_found")
+            raise PagesError("У этого человека нет страницы." if isinstance(person_id, int) or str(person_id).startswith(
+                "person:") else "Такой страницы нет.", "not_found")
         # сначала всё, что должен записать сам сервис: правка владельца ляжет отдельным коммитом
         done = await _render(conn, root, tz=tz, today=today, subject="Обновление страниц",
                              page_ids=[row["id"]], options=options)
@@ -1331,14 +1651,22 @@ async def write_owner_block(
 
 # --- чтение: список, страница, поиск ------------------------------------------------------------------------
 
-# Страница видна агенту, только если у человека есть видимый след в архиве (или он заведён
-# владельцем без учётной записи Telegram): иначе по странице можно узнать об исключённом чате.
+# Страница видна агенту:
+#   * человека — только если у него есть видимый след в архиве (или он заведён владельцем без
+#     учётной записи Telegram): иначе по странице можно узнать об исключённом чате;
+#   * проекта — пока проект заведён (действует или в архиве);
+#   * профиля владельца — всегда (это слова и решения самого владельца).
 _VISIBLE = """
-(NOT EXISTS (SELECT 1 FROM person_peers pp WHERE pp.person_id = g.person_id)
- OR EXISTS (SELECT 1 FROM person_peers pp JOIN chats c ON c.peer_id = pp.peer_id AND NOT c.excluded
-            WHERE pp.person_id = g.person_id)
- OR EXISTS (SELECT 1 FROM person_peers pp JOIN messages m ON m.sender_peer_id = pp.peer_id AND m.deleted_at IS NULL
-            JOIN chats c ON c.id = m.chat_id AND NOT c.excluded WHERE pp.person_id = g.person_id))
+(CASE g.entity_type
+ WHEN 'person' THEN
+  (NOT EXISTS (SELECT 1 FROM person_peers pp WHERE pp.person_id = g.person_id)
+   OR EXISTS (SELECT 1 FROM person_peers pp JOIN chats c ON c.peer_id = pp.peer_id AND NOT c.excluded
+              WHERE pp.person_id = g.person_id)
+   OR EXISTS (SELECT 1 FROM person_peers pp JOIN messages m ON m.sender_peer_id = pp.peer_id AND m.deleted_at IS NULL
+              JOIN chats c ON c.id = m.chat_id AND NOT c.excluded WHERE pp.person_id = g.person_id))
+ WHEN 'project' THEN
+  EXISTS (SELECT 1 FROM projects pj WHERE pj.id = g.project_id AND pj.status IN ('active', 'archived'))
+ ELSE true END)
 """
 
 FLAG_TEXT = {
@@ -1366,14 +1694,26 @@ def _flags(row: asyncpg.Record) -> list[dict[str, str]]:
 
 
 def _page_dict(row: asyncpg.Record) -> dict[str, Any]:
-    return {"page_id": row["id"], "entity_id": row["entity_id"], "person_id": row["person_id"],
+    return {"page_id": row["id"], "entity_id": row["entity_id"], "entity_type": row["entity_type"],
+            "person_id": row["person_id"], "project_id": row["project_id"],
             "title": row["title"], "path": row["path"],
             "updated": row["updated"].isoformat() if row["updated"] else None,
             "problem": row["problem"], "flags": _flags(row)}
 
 
-async def list_pages(conn: asyncpg.Connection, *, limit: int = 500) -> list[dict[str, Any]]:
-    rows = await conn.fetch("SELECT * FROM pages WHERE NOT security_quarantined ORDER BY title, id LIMIT $1", max(1, min(int(limit), 2000)))
+async def list_pages(
+    conn: asyncpg.Connection, *, limit: int = 500, entity_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Страницы по названию. entity_type: person, project, owner или None — все.
+
+    Каждая страница: page_id, entity_id, entity_type, person_id, project_id, title, path,
+    updated, problem, flags [{code, text}] — frozen, summary_not_updated, summary_pending,
+    waiting, no_file."""
+    if entity_type is not None and entity_type not in pages.ENTITY_TYPES:
+        raise PagesError("Вид страницы: person, project или owner.")
+    rows = await conn.fetch(
+        """SELECT * FROM pages WHERE NOT security_quarantined AND ($2::text IS NULL OR entity_type = $2)
+           ORDER BY title, id LIMIT $1""", max(1, min(int(limit), 2000)), entity_type)
     return [_page_dict(r) for r in rows]
 
 
@@ -1381,18 +1721,11 @@ async def get_page(
     conn: asyncpg.Connection, person_id: int | None = None, *, entity_id: str | None = None,
     visible_only: bool = False,
 ) -> dict[str, Any] | None:
-    """Страница из указателя в базе: сведения и текст блоков. Для влитой записи человека —
-    страница той записи, в которую его влили."""
-    if person_id is None and entity_id is not None:
-        found = re.fullmatch(r"person:(\d{1,18})", entity_id.strip())
-        person_id = int(found.group(1)) if found else None
-    if person_id is None:
-        return None
-    active = await people.active_id(conn, person_id)
-    if active is None:
-        return None
-    row = await conn.fetchrow(
-        f"SELECT g.* FROM pages g WHERE g.person_id = $1 AND NOT g.security_quarantined {'AND ' + _VISIBLE if visible_only else ''}", active)
+    """Страница из указателя в базе: сведения и текст блоков (из копии для поиска, без скрытых
+    ключей строк). По номеру человека или по entity_id: person:12, project:3, owner:profile.
+    Для влитой записи человека — страница той записи, в которую его влили."""
+    target: int | str | None = person_id if person_id is not None else entity_id
+    row = await _target_row(conn, target, visible_only=visible_only)
     if row is None:
         return None
     out = _page_dict(row)
@@ -1404,9 +1737,11 @@ async def get_page(
 
 async def search_pages(
     conn: asyncpg.Connection, query: str, limit: int = 10, *, visible_only: bool = False,
+    entity_type: str | None = None,
 ) -> list[dict[str, Any]]:
     """Поиск по страницам с русской морфологией: заголовок и алиасы, сводка, заметки владельца,
-    обязательства, хронология. Одна строка на страницу — лучший блок и список совпавших."""
+    обязательства, решения, факты, хронология. Одна строка на страницу — лучший блок и список
+    совпавших. entity_type — только страницы этого вида."""
     query = (query or "").strip()[:500]
     if not query:
         return []
@@ -1419,14 +1754,16 @@ async def search_pages(
                 FROM page_blocks b, q WHERE b.fts @@ q.tsq
             )
             SELECT DISTINCT ON (h.page_id) h.page_id, h.block, h.rank, h.snippet,
-                   g.entity_id, g.person_id, g.title, g.updated, g.path,
+                   g.entity_id, g.entity_type, g.person_id, g.project_id, g.title, g.updated, g.path,
                    (SELECT array_agg(x.block ORDER BY x.block) FROM hits x WHERE x.page_id = h.page_id) AS blocks
             FROM hits h JOIN pages g ON g.id = h.page_id
-            WHERE NOT g.security_quarantined {'AND ' + _VISIBLE if visible_only else ''}
+            WHERE NOT g.security_quarantined AND ($2::text IS NULL OR g.entity_type = $2)
+                  {'AND ' + _VISIBLE if visible_only else ''}
             ORDER BY h.page_id, h.rank DESC, h.block""",
-        query)
+        query, entity_type)
     found = sorted(rows, key=lambda r: (-r["rank"], r["page_id"]))[: max(1, min(int(limit), 50))]
-    return [{"page_id": r["page_id"], "entity_id": r["entity_id"], "person_id": r["person_id"],
+    return [{"page_id": r["page_id"], "entity_id": r["entity_id"], "entity_type": r["entity_type"],
+             "person_id": r["person_id"], "project_id": r["project_id"],
              "title": r["title"], "path": r["path"], "block": r["block"], "blocks": list(r["blocks"]),
              "snippet": r["snippet"], "updated": r["updated"].isoformat() if r["updated"] else None}
             for r in found]
@@ -1442,7 +1779,8 @@ async def lint(conn: asyncpg.Connection, pages_dir: Path) -> dict[str, Any]:
     no_source — утверждение без ссылки на сообщение; broken_link — ссылка на сообщение, которого
     нет в архиве; too_long — страница слишком длинная; orphan_file — файл без человека;
     missing_file — запись без файла; duplicate_alias — два человека с одним именем;
-    history — история изменений не ведётся.
+    history — история изменений не ведётся. Проверяются страницы всех видов: людей, проектов
+    и профиль владельца; у страницы проекта в пунктах есть project_id.
     """
     root = Path(pages_dir)
     findings: list[dict[str, Any]] = []
@@ -1451,17 +1789,24 @@ async def lint(conn: asyncpg.Connection, pages_dir: Path) -> dict[str, Any]:
         findings.append({"code": code, "detail": detail, **extra})
 
     rows = await conn.fetch(
-        """SELECT g.*, p.merged_into, (p.id IS NULL OR p.is_owner) AS no_person
-           FROM pages g LEFT JOIN people p ON p.id = g.person_id ORDER BY g.id""")
+        """SELECT g.*, p.merged_into,
+                  (g.entity_type = 'person' AND (p.id IS NULL OR p.is_owner)) AS no_person,
+                  (g.entity_type = 'project' AND (pj.id IS NULL OR pj.status NOT IN ('active', 'archived'))) AS no_project
+           FROM pages g LEFT JOIN people p ON p.id = g.person_id LEFT JOIN projects pj ON pj.id = g.project_id
+           ORDER BY g.id""")
     known = {r["path"] for r in rows}
     links: dict[int, list[tuple[asyncpg.Record, str]]] = {}
     for row in rows:
         where = {"path": row["path"], "person_id": row["person_id"]}
+        if row["entity_type"] == pages.PROJECT:
+            where["project_id"] = row["project_id"]
         if row["security_quarantined"]:
             add("protected_source", "страница закрыта: её источник — служебный диалог", **where)
             continue
         if row["merged_into"] is not None or row["no_person"]:
             add("orphan_file", "человек объединён с другой записью: перенесите заметки и удалите файл", **where)
+        if row["no_project"]:
+            add("orphan_file", "проект больше не заведён: перенесите заметки и удалите файл", **where)
         try:
             text = await asyncio.to_thread(pages.read_page, root, row["path"])
         except pages.PageError as exc:
@@ -1471,12 +1816,12 @@ async def lint(conn: asyncpg.Connection, pages_dir: Path) -> dict[str, Any]:
             if row["file_hash"] is not None:
                 add("missing_file", "файл страницы исчез: он будет создан заново при сборке", **where)
             continue
-        found, page = pages.lint_text(text, entity_id=row["entity_id"])
+        found, page = pages.lint_text(text, entity_id=row["entity_id"], entity_type=row["entity_type"])
         for code, detail in found:
             add(code, detail, **where)
         if page is not None:
-            for block in pages.BLOCKS:
-                for message_id in set(pages.refs(getattr(page, block))):
+            for block in pages.ALL_BLOCKS:
+                for message_id in set(pages.refs(getattr(page, block) or "")):
                     links.setdefault(message_id, []).append((row, block))
         else:
             # разметка нарушена, блоки не различить: ссылки проверяются по всему файлу
@@ -1486,8 +1831,9 @@ async def lint(conn: asyncpg.Connection, pages_dir: Path) -> dict[str, Any]:
     for message_id, places in sorted(links.items()):
         if message_id not in alive:
             for row, block in places:
+                extra = {"project_id": row["project_id"]} if row["entity_type"] == pages.PROJECT else {}
                 add("broken_link", f"{block}: ссылка msg:{message_id} ведёт к сообщению, которого нет в архиве",
-                    path=row["path"], person_id=row["person_id"])
+                    path=row["path"], person_id=row["person_id"], **extra)
     for path in await asyncio.to_thread(pages.list_files, root):
         if path not in known:
             add("orphan_file", "файл в каталоге страниц не связан ни с одним человеком", path=path)

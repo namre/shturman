@@ -14,6 +14,7 @@ EXPECTED = {
     "tg.login", "tg.resume", "tg.options", "tg.sync", "tg.forget",
     "commitments.decide", "people.merge", "people.split", "people.alias",
     "pages.owner_block", "pages.accept",
+    "projects.create", "projects.chats", "projects.archive", "projects.accept", "facts.retract",
 }
 
 

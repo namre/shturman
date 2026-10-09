@@ -600,6 +600,9 @@ async def _apply_chat_purge(conn: asyncpg.Connection, payload: dict[str, Any]) -
     confirm.must_not_widen(await conn.fetchval("SELECT EXISTS (SELECT 1 FROM messages WHERE chat_id = $1)", chat_id))
     status = await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
     purged = int(status.split()[-1])
+    # факты из стёртых сообщений ушли каскадом: закрытые ими прежние снова действуют
+    from .processing import facts
+    await facts.repair_chains(conn)
     logger.info("чат %s: стёрто сообщений=%s", chat_id, purged)
     return confirm.Done(note=f"Стёрто сообщений: {purged}.", result=purged,
                         after=_publish_excluded(chat_id, purged=True))

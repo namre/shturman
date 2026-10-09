@@ -254,12 +254,22 @@ async def test_owner_notes_change_only_after_the_owner_agrees(make_client, conn,
     assert (await client.get(f"/api/pages/{w.ivan}")).json()["blocks"]["owner"] == text
 
 
-async def test_long_owner_notes_are_shown_in_part_and_say_so(make_client, conn, config, own_bot, approvals):
+async def test_owner_notes_longer_than_the_card_are_refused_through_the_api(make_client, conn, config, own_bot,
+                                                                          approvals):
+    """Подтвердить можно только то, что владелец видит на карточке целиком: длинный текст — на странице
+    настройки («Память»), куда ассистенту хода нет."""
     client, w, path = await page_of_ivan(make_client, conn, config)
     answer = await client.put(f"/api/pages/{w.ivan}/owner-block", json={"text": "Заметка. " * 600})
-    approvals.waiting(answer)
-    assert "знаков: 5400" in answer.json()["summary"] and "только начало" in answer.json()["summary"]
-    assert len(answer.json()["summary"]) < 3000
+    assert answer.status_code == 400 and answer.json()["code"] == "too_long_for_card"
+    assert "«Память»" in answer.json()["error"] and await approvals.pending() == 0
+    text = ("Заметка " * 300)[:1800]
+    action = approvals.waiting(await client.put(f"/api/pages/{w.ivan}/owner-block", json={"text": text}))
+    assert text.strip() in await approvals.card(action)        # на карточке — весь текст
+    # на карточке и в файле — одно и то же: невидимые знаки убраны до показа, а не после
+    hidden = await client.put(f"/api/pages/{w.ivan}/owner-block", json={"text": "Не звонить\u200b\u2067 утром"})
+    action = approvals.waiting(hidden)
+    await approvals.press(action)
+    assert owner_block(path) == "Не звонить утром"
 
 
 async def test_without_own_bot_agent_cannot_write_owner_notes(make_client, conn, config):

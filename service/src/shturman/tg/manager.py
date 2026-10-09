@@ -709,6 +709,9 @@ class TgManager:
         messages = int(await conn.fetchval(
             "SELECT count(*) FROM messages m JOIN chats c ON c.id = m.chat_id WHERE c.account_id = $1", account_id))
         await conn.execute("DELETE FROM accounts WHERE id = $1", account_id)
+        # факты из удалённых сообщений ушли каскадом: закрытые ими прежние снова действуют
+        from ..processing import facts
+        await facts.repair_chains(conn)
         logger.info("аккаунт %s (%s) удалён из архива, сообщений: %s", account_id, row["role"], messages)
         return {"role": row["role"], "label": row["label"], "messages": messages}
 

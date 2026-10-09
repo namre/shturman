@@ -27,6 +27,7 @@ from pages_helpers import (
     path_of,
     seed,
     statement,
+    write_owner_block,
 )
 from proc_helpers import OWNER, TZ, answer, buttons_of, chat, claim, peer_id, press, say
 
@@ -70,6 +71,9 @@ async def test_confirmed_person_gets_a_page_in_the_documented_format(conn, confi
         "| Что | Срок | Статус | Источник |\n"
         "|---|---|---|---|\n"
         f"| прислать смету по фасадам | 2026-10-09 | ждём | [сообщение](msg:{m1}) |\n"
+        "\n"
+        f"{M['facts']}\n"
+        "_Фактов нет._\n"
         "\n"
         f"{M['timeline']}\n"
         f"- 2026-10-06 — обязательство (Иван Петров → вам): прислать смету по фасадам; срок: 2026-10-09 "
@@ -297,7 +301,7 @@ async def test_removed_marker_freezes_the_file_until_it_is_restored(conn, config
     assert report["counts"].get("structure") == 1
     assert log(config)[0][1].startswith("Правка владельца")              # сама правка в истории сохранена
     with pytest.raises(pages_build.PagesError) as refused:
-        await pages_build.write_owner_block(conn, config.pages_dir, w.ivan, "новый текст", tz=TZ, now=NOW)
+        await write_owner_block(conn, config.pages_dir, w.ivan, "новый текст", tz=TZ, now=NOW)
     assert refused.value.code == "frozen" and w.path.read_text(encoding="utf-8") == broken
     # владелец узнаёт об остановке одним сообщением — и только один раз, сколько бы сборок ни прошло
     await build_with(conn, config)
@@ -317,27 +321,27 @@ async def test_removed_marker_freezes_the_file_until_it_is_restored(conn, config
 async def test_owner_block_from_the_cabinet(conn, config):
     w = await seed(conn)
     await first_build(conn, config, w)
-    out = await pages_build.write_owner_block(conn, config.pages_dir, w.ivan, "Не звонить по утрам.\r\nТолько письменно.",
+    out = await write_owner_block(conn, config.pages_dir, w.ivan, "Не звонить по утрам.\r\nТолько письменно.",
                                               tz=TZ, now=NOW)
     assert out["ok"] and out["changed"] and out["commit"]
     page = blocks_of(w.path.read_text(encoding="utf-8"))
     assert page.owner == "Не звонить по утрам.\nТолько письменно.\n\n"
     assert log(config)[0] == ("Владелец", "Правка владельца: 1 страница (из кабинета)")
-    same = await pages_build.write_owner_block(conn, config.pages_dir, w.ivan, "Не звонить по утрам.\nТолько письменно.",
+    same = await write_owner_block(conn, config.pages_dir, w.ivan, "Не звонить по утрам.\nТолько письменно.",
                                                tz=TZ, now=NOW)
     assert same["changed"] is False and len(log(config)) == 2
     before = w.path.read_bytes()
     for text in ("x\n<!-- timeline: y -->", "<!--commitments-->", "a <!-- OWNER --> b", "<!--\nsummary: z -->", 5, "я" * 20_001):
         with pytest.raises(pages_build.PagesError):
-            await pages_build.write_owner_block(conn, config.pages_dir, w.ivan, text, tz=TZ, now=NOW)
+            await write_owner_block(conn, config.pages_dir, w.ivan, text, tz=TZ, now=NOW)
     with pytest.raises(pages_build.PagesError) as missing:
-        await pages_build.write_owner_block(conn, config.pages_dir, w.maria, "текст", tz=TZ, now=NOW)
+        await write_owner_block(conn, config.pages_dir, w.maria, "текст", tz=TZ, now=NOW)
     assert missing.value.code == "not_found" and w.path.read_bytes() == before
     # заметка владельца находится поиском и переживает сборки
     assert [h["block"] for h in await pages_build.search_pages(conn, "письменно")] == ["owner"]
     await build_with(conn, config)
     assert blocks_of(w.path.read_text(encoding="utf-8")).owner == page.owner
-    cleared = await pages_build.write_owner_block(conn, config.pages_dir, w.ivan, "", tz=TZ, now=NOW)
+    cleared = await write_owner_block(conn, config.pages_dir, w.ivan, "", tz=TZ, now=NOW)
     assert cleared["changed"] and blocks_of(w.path.read_text(encoding="utf-8")).owner == "\n"
 
 
@@ -381,7 +385,7 @@ async def test_without_git_pages_are_built_without_history(conn, config, monkeyp
     assert w.path.exists() and not (config.pages_dir / ".git").exists()
     again = await build(conn, config)
     assert again["status"] == "done" and again["written"] == []
-    out = await pages_build.write_owner_block(conn, config.pages_dir, w.ivan, "Заметка.", tz=TZ, now=NOW)
+    out = await write_owner_block(conn, config.pages_dir, w.ivan, "Заметка.", tz=TZ, now=NOW)
     assert out["changed"] and out["commit"] is None and "Заметка.\n" in w.path.read_text(encoding="utf-8")
     report = await pages_build.lint(conn, config.pages_dir)
     assert [f["detail"] for f in report["findings"] if f["code"] == "history"] == ["git не установлен"]
@@ -872,7 +876,7 @@ async def test_search_and_get(conn, config):
     await commitment(conn, w.maria_chat, w.maria_msgs[0], debtor=w.maria_peer, creditor=w.owner_peer,
                      direction="owed_to_owner", what="подписать акт сверки")
     await first_build(conn, config, w)
-    await pages_build.write_owner_block(conn, config.pages_dir, w.ivan, "Любит созваниваться по вторникам.", tz=TZ, now=NOW)
+    await write_owner_block(conn, config.pages_dir, w.ivan, "Любит созваниваться по вторникам.", tz=TZ, now=NOW)
 
     hits = await pages_build.search_pages(conn, "сметы")                  # другая форма слова
     assert [(h["person_id"], h["title"]) for h in hits] == [(w.ivan, "Иван Петров")]
@@ -890,7 +894,7 @@ async def test_search_and_get(conn, config):
     assert (page["entity_id"], page["title"], page["updated"]) == (f"person:{w.ivan}", "Иван Петров", "2026-10-07")
     assert page["aliases"] == ["Иван Петров"] and page["flags"] == []
     assert page["blocks"]["owner"] == "Любит созваниваться по вторникам."
-    assert set(page["blocks"]) == {"summary", "owner", "commitments", "timeline"}
+    assert set(page["blocks"]) == {"summary", "owner", "commitments", "facts", "timeline"}
     assert "Подрядчик по фасадам" in page["blocks"]["summary"] and "id:c" not in page["blocks"]["timeline"]
     assert (await pages_build.get_page(conn, entity_id=f"person:{w.maria}"))["person_id"] == w.maria
     for missing in ({"person_id": 999_999}, {"entity_id": "person:999999"}, {"entity_id": "project:1"}, {}):

@@ -100,7 +100,7 @@ async def test_page_routes(make_client, conn, config, monkeypatch, own_bot, appr
     page = (await client.get(f"/api/pages/{w.ivan}")).json()
     file_text = (config.pages_dir / page["path"]).read_text(encoding="utf-8")
     assert page["markdown"] == file_text and page["entity_id"] == f"person:{w.ivan}" and page["problem"] is None
-    assert set(page["blocks"]) == {"summary", "owner", "commitments", "timeline"}
+    assert set(page["blocks"]) == {"summary", "owner", "commitments", "facts", "timeline"}
     assert page["blocks"]["owner"] == "" and "Ведёт фасады" in page["blocks"]["summary"]
     assert "прислать смету по фасадам" in page["blocks"]["commitments"]
     assert page["blocks"]["timeline"].endswith(f"<!-- id:c{estimate} -->")
@@ -214,7 +214,7 @@ async def test_agent_tools_read_pages(make_client, conn, config, monkeypatch, ow
         assert "ctx" not in tool["inputSchema"]["properties"] and "status" in tool["outputSchema"]["properties"]
     # токен внутреннего API инструменты не открывает, и записывающих инструментов о страницах нет
     assert (await client.post("/mcp", headers=JSON, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).status_code == 401
-    assert not [t["name"] for t in tools if "page" in t["name"] and t["name"] not in mine]
+    assert not [t["name"] for t in tools if "page" in t["name"] and t["name"] not in {*mine, "get_project_page"}]
 
     for person in (w.ivan, str(w.ivan), f"person:{w.ivan}", "Ивану Петрову", "с Петровым"):
         got = await call(client, "get_person_page", person=person)
