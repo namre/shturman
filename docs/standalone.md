@@ -153,7 +153,7 @@ ssh -N -L 8765:127.0.0.1:8765 пользователь@сервер
 
 ## Подключить Codex CLI или Claude Code
 
-Архив — сервер MCP по адресу `http://127.0.0.1:8765/mcp`. Транспорт — streamable HTTP; принимаются только запросы POST (на GET сервер отвечает 405 — это штатное «потока событий нет»). Инструментов девять, все только читают: `search_messages`, `get_context`, `list_chats`, `get_chat_history`, `find_person`, `list_commitments`, `get_commitment`, `get_person_page`, `search_pages`. Доступ — по токену `SHTURMAN_MCP_TOKEN` в заголовке `Authorization: Bearer …`.
+Архив — сервер MCP по адресу `http://127.0.0.1:8765/mcp`. Транспорт — streamable HTTP; принимаются только запросы POST (на GET сервер отвечает 405 — это штатное «потока событий нет»). Инструментов двенадцать, все только читают: `search_messages`, `get_context`, `list_chats`, `get_chat_history`, `find_person`, `list_commitments`, `get_commitment`, `get_person_page`, `search_pages`, `list_projects`, `get_project_page`, `get_owner_profile`. Доступ — по токену `SHTURMAN_MCP_TOKEN` в заголовке `Authorization: Bearer …`.
 
 Готовые команды под ваш сервер печатает скрипт. Токен он не печатает:
 

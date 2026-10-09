@@ -372,7 +372,7 @@ async def plan_run(
 
         run_id = await conn.fetchval(
             "INSERT INTO processing_runs (trigger, stats) VALUES ($1, $2::jsonb) RETURNING id",
-            trigger, json.dumps({"tz": tz}))
+            trigger, json.dumps({"tz": tz, "planned_at": now.isoformat()}))
 
         # сначала — долги прошлых прогонов; они тоже входят в предел запросов
         replanned = await _replan_failed(conn, run_id, tz, options, limit)
@@ -537,7 +537,10 @@ async def finish_run(conn: asyncpg.Connection, run_id: int) -> int:
                                   handler=HANDLER_DIGEST, context={"batch": digest["batch"]},
                                   dedup_key=f"cm-digest:{digest['batch']}")
     merges = await conn.fetchval("SELECT count(*) FROM person_proposals WHERE status = 'pending'")
-    memory = await projects.after_run(conn, run_id)
+    # окно «за 30 дней» для предложений проектов отсчитывается от времени планирования прогона
+    planned_at = stats.get("planned_at")
+    memory = await projects.after_run(
+        conn, run_id, now=datetime.fromisoformat(planned_at) if isinstance(planned_at, str) else None)
     await conn.execute(
         """UPDATE processing_runs SET status = 'done', finished_at = now(), stats = stats || $2::jsonb
            WHERE id = $1""",

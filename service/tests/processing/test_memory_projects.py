@@ -226,3 +226,23 @@ async def test_pending_approvals_lists_everything_waiting(conn):
     assert [(p["person_id"], p["title"], p["text"]) for p in waiting["pages"]] == [(maria, "Мария Сидорова", "messages: 25")]
     assert [(c["text"], c["title"]) for c in waiting["commitments"]] == [("прислать смету", "Иван Петров → вам")]
     assert commitments                                                       # модуль обязательств — источник
+
+
+async def test_proposal_from_an_excluded_chat_or_deleted_messages_is_withdrawn(conn):
+    w = await seed(conn)
+    await say(conn, w.group, [(IVAN, "Иван Петров", f"сообщение {n}", {"at": T0 + timedelta(minutes=n)})
+                              for n in range(20)])
+    await projects.propose(conn, now=NOW)
+    assert await conn.fetchval("SELECT count(*) FROM projects WHERE status = 'proposed'") == 1
+    await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", w.group)
+    await projects.purge_orphans(conn)
+    assert await conn.fetchval("SELECT count(*) FROM projects") == 0       # название чата больше нигде не видно
+
+    msgs = await say(conn, w.ivan_chat, [(IVAN, "Иван Петров", "По объекту Омега всё готово")])
+    await conn.execute(
+        """INSERT INTO project_mentions (title, title_norm, chat_id, message_id, episode)
+           VALUES ('Омега', 'омега', $1, $2, 'e1')""", w.ivan_chat, msgs[0])
+    await projects.create_project(conn, "Омега", origin="model", reason={"mentions": 3, "episodes": 2})
+    await conn.execute("UPDATE messages SET deleted_at = now() WHERE id = $1", msgs[0])
+    await projects.purge_for_messages(conn, msgs)
+    assert await conn.fetchval("SELECT count(*) FROM projects") == 0

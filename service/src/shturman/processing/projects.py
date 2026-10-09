@@ -581,10 +581,10 @@ async def scrub_closed_jobs(conn: asyncpg.Connection) -> int:
     return int(done.split()[-1])
 
 
-async def after_run(conn: asyncpg.Connection, run_id: int) -> dict[str, int]:
+async def after_run(conn: asyncpg.Connection, run_id: int, *, now: datetime | None = None) -> dict[str, int]:
     """Конец прогона обработки: новые предложения проектов и сообщения владельцу (проекты,
     факты профиля). Вызывается в транзакции завершения прогона."""
-    stats = await propose(conn, run_id=run_id)
+    stats = await propose(conn, run_id=run_id, now=now)
     stats["projects_shown"] = await send_digest(conn, run_id=run_id)
     stats["owner_facts_shown"] = await facts.send_owner_digest(conn, run_id=run_id)
     return stats
@@ -595,12 +595,21 @@ async def after_run(conn: asyncpg.Connection, run_id: int) -> dict[str, int]:
 async def purge_orphans(conn: asyncpg.Connection) -> int:
     """Чат исключён владельцем: он перестаёт быть чатом проекта, его упоминания забываются,
     страницы проектов ждут перерисовки."""
+    # Предложение, выведенное из исключённого чата (его название — название чата или взято из его
+    # сообщений), снимается целиком: по нему можно было бы узнать об исключённом чате.
+    await conn.execute(
+        """DELETE FROM projects p WHERE p.status = 'proposed' AND p.origin = 'model' AND (
+               EXISTS (SELECT 1 FROM project_chats pc JOIN chats c ON c.id = pc.chat_id
+                       WHERE pc.project_id = p.id AND c.excluded)
+               OR EXISTS (SELECT 1 FROM chats c WHERE c.excluded AND jsonb_typeof(p.reason->'chats') = 'array'
+                          AND p.reason->'chats' @> to_jsonb(c.id)))""")
     rows = await conn.fetch(
         """DELETE FROM project_chats pc USING chats c WHERE c.id = pc.chat_id AND c.excluded
            RETURNING pc.project_id""")
     await conn.execute(
         """DELETE FROM project_mentions pm USING chats c, messages m
            WHERE c.id = pm.chat_id AND m.id = pm.message_id AND (c.excluded OR m.deleted_at IS NOT NULL)""")
+    await _drop_unfounded(conn)
     projects_ = sorted({r["project_id"] for r in rows})
     if projects_:
         await conn.execute("UPDATE pages SET dirty = true WHERE project_id = ANY($1::bigint[])", projects_)
@@ -612,6 +621,16 @@ async def purge_for_messages(conn: asyncpg.Connection, message_ids: Sequence[int
     if not message_ids:
         return 0
     done = await conn.execute("DELETE FROM project_mentions WHERE message_id = ANY($1::bigint[])", list(message_ids))
+    await _drop_unfounded(conn)
+    return int(done.split()[-1])
+
+
+async def _drop_unfounded(conn: asyncpg.Connection) -> int:
+    """Предложение по упоминаниям, у которого не осталось ни одного упоминания (сообщения удалены),
+    снимается: его название взято из этих сообщений."""
+    done = await conn.execute(
+        """DELETE FROM projects p WHERE p.status = 'proposed' AND p.origin = 'model' AND p.reason ? 'mentions'
+             AND NOT EXISTS (SELECT 1 FROM project_mentions pm WHERE pm.title_norm = p.title_norm)""")
     return int(done.split()[-1])
 
 
