@@ -294,6 +294,14 @@ def test_setup_origin_is_compared_with_the_dashboard_origin_after_normalising(tm
         assert cfg.setup_external == "" and set(table) == {"127.0.0.1:8765", "localhost:8765"}
 
 
+@pytest.mark.parametrize("raw", ["https://0xcb.0.113.10", "https://203.0.113.010/", "https://1.2.3", "https://010.0.0.1:443"])
+def test_dashboard_origin_with_an_oddly_written_ip_is_refused_too(raw):
+    """Адрес дашборда сравнивается с адресом страницы: запись, которую браузер прочёл бы иначе, не принимается."""
+    with pytest.raises(ConfigError):
+        normalize_origin(raw, "SHTURMAN_DASHBOARD_ORIGIN", strict=False)
+    assert normalize_origin("https://203.0.113.10/dash", "SHTURMAN_DASHBOARD_ORIGIN", strict=False) == "https://203.0.113.10"
+
+
 def test_origins_come_from_the_environment_and_garbage_stops_the_service(monkeypatch, tmp_path):
     for name in ("SHTURMAN_SETUP_ORIGIN", "SHTURMAN_DASHBOARD_ORIGIN", "SHTURMAN_ALLOWED_HOSTS", "SHTURMAN_PORT",
                  "SHTURMAN_BOT_TOKEN", "SHTURMAN_LLM_API_KEY", "SHTURMAN_LLM_BASE_URL", "SHTURMAN_LLM_MODEL",

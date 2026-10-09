@@ -26,13 +26,14 @@ skip() { printf 'SKIP  %s: %s\n' "$1" "$2"; }
 # записан внешним IPv4-адресом. Сертификат на IP-адрес Let's Encrypt выдаёт только короткий —
 # на 160 часов, чуть больше 6 дней, — и продлевает его сам Caddy, заранее, за 2–3 дня до конца. Для
 # каждого такого адреса проверяется сертификат, который отдаёт прокси: запрос идёт без имени (SNI),
-# как его шлёт браузер, открывший адрес из цифр. Действителен ли он для этого IP, проходит ли проверку и сколько ему
-# осталось: меньше двух суток — WARN, просрочен или не тот — FAIL. Плюс версия Caddy, если программа
-# есть на сервере: сертификат на IP проверен с Caddy 2.11. Запросы — только рукопожатие TLS
+# как его шлёт браузер, открывший адрес из цифр. Действителен ли он для этого IP, проходит ли
+# проверку и сколько ему осталось: меньше двух суток — WARN, просрочен или не тот — FAIL; сервер
+# не достаёт до своего внешнего адреса вовсе (бывает за NAT) — WARN с просьбой проверить из
+# браузера. Плюс версия Caddy, если программа есть на сервере: сертификат на IP проверен с Caddy 2.11. Запросы — только рукопожатие TLS
 # и один GET в корень адреса; на адреса API страницы настройки проверка не ходит.
 #   $1, $2 — адрес дашборда и адрес страницы настройки (пустой или не из IP пропускается).
 ip_cert_checks() {
-  local u o host port seen="" any=no pem end left_s left_h code v
+  local u o host port seen="" any=no pem end end_s left left_h code v
   for u in "$@"; do
     o="$(url_origin "$u")"
     case "$o" in https://*) ;; *) continue ;; esac
@@ -51,10 +52,17 @@ ip_cert_checks() {
       warn proxy-cert "$host:$port — нет программы openssl, сертификат на IP-адрес не проверен"
       continue
     fi
+    # Сначала — достаёт ли сервер до своего внешнего адреса вообще (соединение TCP). Не достаёт —
+    # это не обязательно неполадка: многие хостинги не пускают сервер к его же внешнему адресу
+    # через NAT. Тогда проверить можно только из браузера.
+    if ! timeout 5 bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$host" "$port" 2> /dev/null; then
+      warn proxy-cert "$host:$port — сервер не достаёт до своего внешнего адреса (порт закрыт, прокси его не слушает или хостинг не пускает сервер к его же адресу) — проверьте адрес из браузера; если там ошибка — порт $port в firewall сервера и хостинга и journalctl -u caddy"
+      continue
+    fi
     pem="$(timeout 10 openssl s_client -connect "$host:$port" -noservername < /dev/null 2> /dev/null \
       | openssl x509 2> /dev/null)" || pem=""
     if [ -z "$pem" ]; then
-      fail proxy-cert "$host:$port — прокси не отдал сертификат: порт закрыт, Caddy не слушает его, сертификат на IP-адрес ещё не получен (journalctl -u caddy; порт 80 должен быть открыт из интернета) или сервер за NAT, а в глобальном блоке прокси нет default_sni (config/Caddyfile.example, вариант «без домена»). Если хостинг не пускает сервер к его же внешнему адресу, проверьте адрес из браузера"
+      fail proxy-cert "$host:$port — соединение есть, но прокси не отдал сертификат: сертификат на IP-адрес ещё не получен (journalctl -u caddy; порт 80 должен быть открыт из интернета) или сервер за NAT, а в глобальном блоке прокси нет default_sni (config/Caddyfile.example, вариант «без домена»)"
       continue
     fi
     if ! printf '%s\n' "$pem" | openssl x509 -noout -checkip "$host" 2> /dev/null | grep -q 'does match'; then
@@ -71,13 +79,18 @@ ip_cert_checks() {
         fail proxy-cert "$host:$port — сертификат не проходит проверку (код curl $code): его выдал не общепризнанный центр (например, внутренний центр Caddy) или цепочка неполна — сверьте блоки прокси с вариантом «без домена» (config/Caddyfile.example) и journalctl -u caddy"
         continue ;;
     esac
+    # Пороги — средствами openssl (-checkend), без разбора даты; часы — только для показа.
+    left=""
     end="$(printf '%s\n' "$pem" | openssl x509 -noout -enddate 2> /dev/null | cut -d= -f2)"
-    left_s=$(( $(date -d "$end" +%s 2> /dev/null || echo 0) - $(date +%s) ))
-    left_h=$(( left_s / 3600 ))
-    if [ "$left_s" -lt 172800 ]; then
-      warn proxy-cert "$host:$port — сертификату на IP-адрес осталось $left_h ч. Caddy обычно продлевает его за 2–3 дня до конца; раз не продлил — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (journalctl -u caddy)"
+    if end_s="$(date -d "$end" +%s 2> /dev/null)"; then
+      left_h=$(( (end_s - $(date +%s)) / 3600 ))
+      left="$((left_h / 24)) д $((left_h % 24)) ч"
+      [ "$left_h" -ge 24 ] || left="$left_h ч"
+    fi
+    if ! printf '%s\n' "$pem" | openssl x509 -noout -checkend 172800 > /dev/null 2>&1; then
+      warn proxy-cert "$host:$port — сертификату на IP-адрес осталось меньше двух суток${left:+ ($left)}. Caddy обычно продлевает его за 2–3 дня до конца; раз не продлил — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (journalctl -u caddy)"
     else
-      pass proxy-cert "$host:$port — сертификат на IP-адрес действителен, осталось $((left_h / 24)) д $((left_h % 24)) ч (живёт 160 ч, продлевает Caddy)"
+      pass proxy-cert "$host:$port — сертификат на IP-адрес действителен${left:+, осталось $left} (живёт 160 ч, продлевает Caddy)"
     fi
   done
   [ "$any" = yes ] || return 0

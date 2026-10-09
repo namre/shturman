@@ -146,7 +146,10 @@ def test_setup_origin_is_normalised(monkeypatch, tmp_path, raw, expected):
 
 
 @pytest.mark.parametrize("raw", ["assistant.example.com", "ftp://assistant.example.com", "https://assistant.example.com/setup",
-                                 "https://user:pw@assistant.example.com", "https://assistant.example.com?x=1", "https://"])
+                                 "https://user:pw@assistant.example.com", "https://assistant.example.com?x=1", "https://",
+                                 # IP-адрес в необычной записи: браузер открыл бы другой адрес
+                                 "https://0xcb.0.113.10:8443", "https://203.0.113.010:8443", "https://1.2.3:8443",
+                                 "https://203.0.113.256", "https://2130706433", "https://0x7f.1", "https://assistant.example.1"])
 def test_setup_origin_with_a_path_or_credentials_stops_the_service(monkeypatch, tmp_path, raw):
     with pytest.raises(ConfigError):
         from_env(monkeypatch, tmp_path, SHTURMAN_SETUP_ORIGIN=raw)

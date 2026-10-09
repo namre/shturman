@@ -165,7 +165,9 @@ jobs:
           # страницы настройки — нет; сам запуск стека здесь подменён отказом.
           mkdir stub; printf '#!/bin/sh\necho "docker $*" >> "%s/docker-called"\nexit 1\n' "$tmp" > stub/docker; chmod +x stub/docker
           for bad in 'SHTURMAN_PUBLIC_URL=assistant.example.com' 'SHTURMAN_PUBLIC_URL=https://user@assistant.example.com' \
-                     'SHTURMAN_SETUP_URL=https://assistant.example.com:8443/shturman-setup/' 'SHTURMAN_SETUP_URL=assistant.example.com:8443'; do
+                     'SHTURMAN_SETUP_URL=https://assistant.example.com:8443/shturman-setup/' 'SHTURMAN_SETUP_URL=assistant.example.com:8443' \
+                     'SHTURMAN_PUBLIC_URL=https://10.0.0.1' 'SHTURMAN_PUBLIC_URL=https://0xcb.0.113.10' 'SHTURMAN_SETUP_URL=https://203.0.113.010:8443' \
+                     'SHTURMAN_SETUP_URL=https://127.0.0.1:8443' 'SHTURMAN_PUBLIC_URL=http://010.0.0.1:8080'; do
             printf 'SHTURMAN_MODE=hermes\n%s\n' "$bad" > .env
             code=0; PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1 || code=$?
             [ "$code" -eq 1 ] || { echo "$bad: код $code вместо 1"; exit 1; }
@@ -175,6 +177,15 @@ jobs:
           printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com/dash/\nSHTURMAN_SETUP_URL=https://assistant.example.com:8443/\n' > .env
           if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
           if grep -q 'записан не как' out.txt; then echo "адрес с путём у дашборда и с косой чертой у страницы допустимы"; cat out.txt; exit 1; fi
+          rm -f docker-called
+          # Без домена: внешний IP по https и любой адрес по http проходят проверку, как и прежде.
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://203.0.113.10\nSHTURMAN_SETUP_URL=https://203.0.113.10:8443\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "внешний IP-адрес допустим"; cat out.txt; exit 1; fi
+          rm -f docker-called
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=http://192.168.1.10:8080\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "адрес http:// принимается, как и раньше"; cat out.txt; exit 1; fi
           test -e docker-called
           rm -rf stub docker-called out.txt
           # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
@@ -290,6 +301,12 @@ jobs:
           test "$(cat .env)" = "$before"
           ./ops/set-setup-url.sh https://203.0.113.10:9443 > out.txt
           test "$(url SHTURMAN_SETUP_URL)" = "https://203.0.113.10:9443" && grep -q 'shortlived' out.txt
+          # Адрес http:// — как и раньше: принимается с предупреждением, в том числе адрес закрытой сети.
+          ./ops/set-public-url.sh http://192.168.1.10:8080 > out.txt 2>&1
+          test "$(url SHTURMAN_PUBLIC_URL)" = "http://192.168.1.10:8080" && grep -q 'ВНИМАНИЕ: адрес без https' out.txt
+          # Необычная запись IP — отказ и по http: с ней сервис переписки не запустился бы.
+          if ./ops/set-public-url.sh http://010.0.0.1:8080 > /dev/null 2>&1; then echo "необычная запись IP не должна приниматься"; exit 1; fi
+          test "$(url SHTURMAN_PUBLIC_URL)" = "http://192.168.1.10:8080"
           ./ops/set-public-url.sh https://assistant.example.com > out.txt
           if grep -q 'shortlived' out.txt; then echo "для имени пояснения про IP-адрес не нужно"; exit 1; fi
           # Без Hermes внешний адрес не задаётся вовсе, а ссылка входа — только на локальный адрес.
