@@ -45,6 +45,7 @@
   POST   /shturman-setup/api/llm/chatgpt/cancel         снять начатую попытку входа
   PUT    /shturman-setup/api/llm/chatgpt/model          модель подписки из списка OpenAI: {model}
   DELETE /shturman-setup/api/llm/chatgpt                выйти из подписки (отзыв сессии у OpenAI)
+  GET    /shturman-setup/api/memory/…                   экран «Память ассистента» — маршруты в `memory.py`
 
 Вход — по одноразовой ссылке; ответ на вход один раз отдаёт ключ сессии. Дальше страница
 присылает его в заголовке `X-Shturman-Session`; cookie нет вовсе (почему — `auth.py`).
@@ -227,17 +228,17 @@ def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
     return deco(fn) if fn is not None else deco
 
 
-async def _body(request: Request) -> dict[str, Any]:
+async def _body(request: Request, limit: int = MAX_BODY) -> dict[str, Any]:
     """Тело запроса как JSON-объект, с пределом размера. Пустое тело — пустой объект."""
     import json
 
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_BODY:
+    if declared.isdigit() and int(declared) > limit:
         raise BadRequest("Запрос слишком большой.", 413)
     buf = bytearray()
     async for chunk in request.stream():
         buf += chunk
-        if len(buf) > MAX_BODY:
+        if len(buf) > limit:
             raise BadRequest("Запрос слишком большой.", 413)
     if not buf.strip():
         return {}
@@ -1345,6 +1346,8 @@ async def chatgpt_remove(request: Request) -> JSONResponse:
 # --- сборка ------------------------------------------------------------------------------------
 
 def routes() -> list[BaseRoute]:
+    from . import memory
+
     account = API + "/tg/accounts/{account_id:int}"
     upload = API + "/imports/{import_id}"
     return [
@@ -1391,6 +1394,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/llm/chatgpt/cancel", chatgpt_cancel, methods=["POST"]),
         Route(API + "/llm/chatgpt/model", chatgpt_model, methods=["PUT"]),
         Route(API + "/llm/chatgpt", chatgpt_remove, methods=["DELETE"]),
+        *memory.routes(),
     ]
 
 

@@ -68,6 +68,11 @@ ACTIONS = {
     "llm.chatgpt": "Подключена подписка ChatGPT",
     "llm.chatgpt_model": "Выбрана модель подписки ChatGPT",
     "llm.chatgpt_removed": "Подписка ChatGPT отключена",
+    "memory.owner_block": "Изменены ваши заметки на странице памяти",
+    "memory.page_accept": "Заведена страница памяти о человеке",
+    "memory.page_reject": "Страницу памяти о человеке решено не заводить",
+    "memory.commitment_accept": "Договорённость из переписки принята",
+    "memory.commitment_reject": "Договорённость из переписки отклонена",
 }
 
 
@@ -79,6 +84,8 @@ IMPORTANT = frozenset({
     "bot.token", "bot.token_removed", "bot.bind_link",
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
+    # заметки владельца ассистент читает как его собственные слова: их правку не вытеснить из вида
+    "memory.owner_block",
 })
 
 

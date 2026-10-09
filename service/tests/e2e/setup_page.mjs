@@ -526,6 +526,112 @@ await variants("26-extras-open", async (p) => {
 await page.evaluate(() => window.scrollTo(0, 0));
 await shot(page, "27-app-done-desktop-light");
 
+// --- память ассистента: не шаг, отдельная карточка после шагов ----------------------------------
+{
+  const seeded = await control("POST", "/seed-memory");
+  check("память: стенд завёл страницу о человеке и то, что ждёт решения", seeded.ok === true, JSON.stringify(seeded));
+  check("память: карточка после шагов и перед «Дополнительно», без номера шага, свёрнута", await page.evaluate(() => {
+    const card = document.getElementById("s-memory");
+    const after = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    return after(document.getElementById("s-media"), card) && after(card, document.getElementById("extras")) &&
+      !card.classList.contains("step") && !card.querySelector(".num") && !document.getElementById("memory-details").open;
+  }));
+  check("память: в свёрнутом виде — короткое пояснение", (await page.textContent("#s-memory .memory-lead")).includes("ваши заметки"));
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "ждут решения: 2");
+  check("память: на свёрнутой карточке видно, сколько ждёт решения", true);
+
+  await page.click("#memory-details > summary");
+  await page.waitForSelector("#mem-list li");
+  const explained = await page.textContent("#s-memory .memory-body > p");
+  check("память: объяснено, что такое страница, что сводка — каждую ночь, а «ваш блок» ассистент не меняет",
+        explained.includes("страницы") && explained.includes("каждую ночь") && explained.includes("ассистент его не меняет"));
+  check("память: вкладки «Люди» и «Ждут решения», число на второй",
+        (await page.locator("#mem-tabs [role=tab]").allTextContents()).join("|") === "Люди|Ждут решения2");
+  check("память: в списке людей — страница с датой обновления",
+        (await page.textContent("#mem-list")).includes("Ольга Смирнова") && (await page.textContent("#mem-list")).includes("обновлена"));
+
+  await page.fill("#mem-q", "чертежам");
+  await page.waitForFunction(() => document.querySelector("#mem-list").textContent.includes("найдено в"));
+  check("память: поиск по словам со страниц находит человека и показывает, где нашлось",
+        (await page.textContent("#mem-list")).includes("Ольга Смирнова"));
+  await page.fill("#mem-q", "нетакогослова");
+  await page.waitForFunction(() => document.querySelector("#mem-list").textContent.includes("Ничего не нашлось"));
+  check("память: поиск без совпадений объяснён", true);
+  await page.fill("#mem-q", "");
+  await page.waitForFunction(() => document.querySelectorAll("#mem-list .mem-row").length === 1);
+  await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("s-memory").scrollIntoView(); });
+  await shot(page, "28-memory-people-desktop-light", false);
+
+  await page.click("#mem-list .mem-row");
+  await page.waitForSelector("#mem-owner");
+  const shown = await page.textContent("#mem-panel");
+  check("память: страница — сводка, ваши заметки, договорённости, хронология",
+        ["Сводка", "Ваши заметки", "Договорённости", "Хронология", "Руководит проектным отделом",
+         "прислать проект фасада по корпусу 2"].every((t) => shown.includes(t)), shown.slice(0, 200));
+  check("память: источник — словом «сообщение», без ссылок и разметки",
+        shown.includes("сообщение · сказал собеседник") && (await page.locator("#mem-panel a").count()) === 0 &&
+        !shown.includes("msg:") && !shown.includes("](") && !shown.includes("<!--"));
+  check("память: сказано, что блок заметок пишете только вы", (await page.textContent("#mem-owner-hint")).includes("только вы"));
+  check("память: «Сохранить» недоступна, пока текст не изменён", await page.isDisabled("#mem-owner-save"));
+  await page.evaluate(() => document.getElementById("s-memory").scrollIntoView());
+  await shot(page, "29-memory-person-desktop-light", false);
+
+  const NOTE = "Не писать после 19:00.\nРешения по деньгам — только через меня.";
+  await page.fill("#mem-owner", NOTE);
+  await page.click("#mem-owner-save");
+  await page.waitForFunction(() => document.querySelector("#mem-owner-note").textContent.includes("Сохранено"));
+  await page.click(".mem-back");
+  await page.waitForSelector("#mem-list .mem-row");
+  await page.click("#mem-list .mem-row");
+  await page.waitForSelector("#mem-owner");
+  check("память: заметки сохранены и видны после повторного открытия", (await page.inputValue("#mem-owner")) === NOTE);
+  const audited = (await control("GET", "/seen")).audit.filter((r) => r.action.startsWith("memory."));
+  check("память: правка заметок — в журнале действий, без текста и имён",
+        audited.length === 1 && audited[0].action === "memory.owner_block" && !audited[0].detail.includes("19:00"),
+        JSON.stringify(audited));
+
+  await page.click("#mem-tab-pending");
+  await page.waitForSelector(".mem-item");
+  check("память: «Ждут решения» — предложенная страница и новая договорённость",
+        (await page.locator(".mem-item").count()) === 2 && (await page.textContent("#mem-panel")).includes("Сергей Ковалёв") &&
+        (await page.textContent("#mem-panel")).includes("прислать график поставок бетона"));
+  await page.evaluate(() => document.getElementById("s-memory").scrollIntoView());
+  await shot(page, "30-memory-pending-desktop-light", false);
+  await page.click(".mem-item:has-text('поставок бетона') >> text=✓ Верно");
+  await page.waitForFunction(() => document.querySelectorAll(".mem-item").length === 1);
+  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "ждут решения: 1");
+  const decided = (await control("GET", "/seen")).audit.filter((r) => r.action === "memory.commitment_accept");
+  check("память: договорённость принята со страницы сразу, без карточки в боте; в журнале — номер, без текста",
+        decided.length === 1 && /^№ \d+$/.test(decided[0].detail), JSON.stringify(decided));
+  await page.evaluate(() => { document.getElementById("toast").hidden = true; });
+
+  // те же экраны в тёмной теме и на телефоне — только карточка памяти, она длинная
+  const views = [["desktop-dark", { ...desktop, colorScheme: "dark" }], ["phone-light", phone],
+                 ["phone-dark", { ...phone, colorScheme: "dark" }],
+                 ["phone360-light", { ...phone, viewport: { width: 360, height: 740 } }]];
+  const stored = await context.storageState();
+  for (const [name, options] of views) {
+    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const p = await ctx.newPage();
+    await p.goto(URL_PAGE);
+    await p.waitForSelector("#screen-app:not([hidden])");
+    await p.click("#memory-details > summary");
+    await p.waitForSelector("#mem-list .mem-row");
+    for (const [stage, open] of [["29-memory-person", async () => { await p.click("#mem-list .mem-row"); await p.waitForSelector("#mem-owner"); }],
+                                 ["30-memory-pending", async () => { await p.click("#mem-tab-pending"); await p.waitForSelector(".mem-item"); }]]) {
+      await open();
+      await p.waitForTimeout(200);
+      // снимок одной карточки: липкая шапка страницы иначе ложится поверх её середины
+      await p.evaluate(() => { document.querySelector(".top").style.position = "static"; });
+      await p.locator("#s-memory").screenshot({ path: path.join(OUT, `${stage}-${name}.png`) });
+      const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      check(`вёрстка (${stage}, ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+    }
+    await ctx.close();
+  }
+}
+
 // --- «дашборд» на соседнем порту: тот же браузер владельца, вход на страницу выполнен -------------
 {
   const dash = await context.newPage();
