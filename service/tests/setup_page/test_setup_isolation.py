@@ -104,6 +104,25 @@ async def test_only_known_host_names_are_served(stand):
     assert got.status_code == 421
 
 
+async def test_an_ip_address_instead_of_a_name_is_served_only_on_its_own_port(stand, conn):
+    """Экземпляр без домена: дашборд — https://203.0.113.10, страница — тот же IP на порту 8443.
+    Сверка Host и Origin идёт с портом, как и для имени: с адреса дашборда страница не открывается."""
+    s = await stand(setup_origin="https://203.0.113.10:8443", dashboard_origin="https://203.0.113.10")
+    assert s.config.setup_external == "https://203.0.113.10:8443"
+    page = s.browser("https://203.0.113.10:8443")           # Host: 203.0.113.10:8443, Origin — тот же адрес
+    assert (await page.http.get(PREFIX + "/")).status_code == 200
+    await page.login(conn)
+    assert (await page.get("/state")).status_code == 200
+    for host in ("203.0.113.10", "203.0.113.10:443", "203.0.113.10:9443", "198.51.100.7:8443", "203.0.113.010:8443"):
+        got = await page.http.get(PREFIX + "/", headers={"Host": host})
+        assert got.status_code == 421, host
+    # страница, открытая на адресе дашборда, действовать на странице настройки не может
+    forged = await page.http.post(API + "/logout-all", json={},
+                                  headers=page.headers(Origin="https://203.0.113.10"))
+    assert forged.status_code == 403 and forged.json()["code"] == "bad_origin"
+    assert (await page.get("/state")).status_code == 200
+
+
 def test_origin_table_is_built_from_settings_only():
     from types import SimpleNamespace
 

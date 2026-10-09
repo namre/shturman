@@ -5,6 +5,8 @@
 # Из .env читаются только несекретные строки: режим установки и два адреса — дашборда и страницы
 # настройки переписки. По внешним адресам проверка делает по одному запросу GET к странице
 # /shturman-setup/ и смотрит только на код ответа и заголовок-метку; на адреса её API не ходит.
+# Если адрес записан IP-адресом (экземпляр без домена), ещё проверяется сертификат прокси на этом
+# адресе — сколько ему осталось (строка proxy-cert) — и версия Caddy (proxy-version).
 # Ещё читается local/plugin.sha256 — отпечаток кода плагина, с которым запущен Hermes (его пишет
 # ./ops/up.sh; секретов в нём нет).
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
@@ -19,6 +21,75 @@ pass() { printf 'PASS  %s: %s\n' "$1" "$2"; }
 warn() { printf 'WARN  %s: %s\n' "$1" "$2"; }
 fail() { printf 'FAIL  %s: %s\n' "$1" "$2"; fails=$((fails + 1)); }
 skip() { printf 'SKIP  %s: %s\n' "$1" "$2"; }
+
+# Экземпляр без домена (docs/deployment.md, «Без домена»): адрес дашборда или страницы настройки
+# записан внешним IPv4-адресом. Сертификат на IP-адрес Let's Encrypt выдаёт только короткий —
+# на 160 часов, чуть больше 6 дней, — и продлевает его сам Caddy, заранее, за 2–3 дня до конца. Для
+# каждого такого адреса проверяется сертификат, который отдаёт прокси: запрос идёт без имени (SNI),
+# как его шлёт браузер, открывший адрес из цифр. Действителен ли он для этого IP, проходит ли проверку и сколько ему
+# осталось: меньше двух суток — WARN, просрочен или не тот — FAIL. Плюс версия Caddy, если программа
+# есть на сервере: сертификат на IP проверен с Caddy 2.11. Запросы — только рукопожатие TLS
+# и один GET в корень адреса; на адреса API страницы настройки проверка не ходит.
+#   $1, $2 — адрес дашборда и адрес страницы настройки (пустой или не из IP пропускается).
+ip_cert_checks() {
+  local u o host port seen="" any=no pem end left_s left_h code v
+  for u in "$@"; do
+    o="$(url_origin "$u")"
+    case "$o" in https://*) ;; *) continue ;; esac
+    host="$(url_host "$o")"; port="$(url_port "$o")"
+    case "$(ip_kind "$host")" in
+      public) ;;
+      private)
+        # Строку вписали в .env вручную: скрипты адресов такой адрес не принимают.
+        warn proxy-cert "$o — IP-адрес закрытой сети, самого сервера или в необычной записи: снаружи он не откроется, сертификат на него не выдаётся, а мастер не даст на него ссылку. Запишите внешний адрес: ./ops/set-public-url.sh или ./ops/set-setup-url.sh"
+        continue ;;
+      *) continue ;;
+    esac
+    case " $seen " in *" $host:$port "*) continue ;; esac
+    seen="$seen $host:$port"; any=yes
+    if ! command -v openssl >/dev/null 2>&1; then
+      warn proxy-cert "$host:$port — нет программы openssl, сертификат на IP-адрес не проверен"
+      continue
+    fi
+    pem="$(timeout 10 openssl s_client -connect "$host:$port" -noservername < /dev/null 2> /dev/null \
+      | openssl x509 2> /dev/null)" || pem=""
+    if [ -z "$pem" ]; then
+      fail proxy-cert "$host:$port — прокси не отдал сертификат: порт закрыт, Caddy не слушает его, сертификат на IP-адрес ещё не получен (journalctl -u caddy; порт 80 должен быть открыт из интернета) или сервер за NAT, а в глобальном блоке прокси нет default_sni (config/Caddyfile.example, вариант «без домена»). Если хостинг не пускает сервер к его же внешнему адресу, проверьте адрес из браузера"
+      continue
+    fi
+    if ! printf '%s\n' "$pem" | openssl x509 -noout -checkip "$host" 2> /dev/null | grep -q 'does match'; then
+      fail proxy-cert "$host:$port — сертификат выдан не на этот IP-адрес: в блоке сайта прокси другой адрес или нет варианта «без домена» (config/Caddyfile.example)"
+      continue
+    fi
+    if ! printf '%s\n' "$pem" | openssl x509 -noout -checkend 0 > /dev/null 2>&1; then
+      fail proxy-cert "$host:$port — сертификат на IP-адрес просрочен: Caddy не смог его продлить — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (journalctl -u caddy)"
+      continue
+    fi
+    code=0; curl -s -o /dev/null -m 8 "https://$host:$port/" 2> /dev/null || code=$?
+    case "$code" in
+      35|51|58|59|60|77|83|90|91)
+        fail proxy-cert "$host:$port — сертификат не проходит проверку (код curl $code): его выдал не общепризнанный центр (например, внутренний центр Caddy) или цепочка неполна — сверьте блоки прокси с вариантом «без домена» (config/Caddyfile.example) и journalctl -u caddy"
+        continue ;;
+    esac
+    end="$(printf '%s\n' "$pem" | openssl x509 -noout -enddate 2> /dev/null | cut -d= -f2)"
+    left_s=$(( $(date -d "$end" +%s 2> /dev/null || echo 0) - $(date +%s) ))
+    left_h=$(( left_s / 3600 ))
+    if [ "$left_s" -lt 172800 ]; then
+      warn proxy-cert "$host:$port — сертификату на IP-адрес осталось $left_h ч. Caddy обычно продлевает его за 2–3 дня до конца; раз не продлил — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (journalctl -u caddy)"
+    else
+      pass proxy-cert "$host:$port — сертификат на IP-адрес действителен, осталось $((left_h / 24)) д $((left_h % 24)) ч (живёт 160 ч, продлевает Caddy)"
+    fi
+  done
+  [ "$any" = yes ] || return 0
+  if command -v caddy >/dev/null 2>&1; then
+    v="$(caddy version 2> /dev/null | awk 'NR == 1 {print $1}')"; v="${v#v}"
+    case "$v" in
+      2.1[1-9].*|2.[2-9][0-9].*|[3-9].*) pass proxy-version "Caddy $v — сертификаты на IP-адрес с профилем shortlived поддерживаются" ;;
+      "") warn proxy-version "версию Caddy узнать не удалось — для адреса из IP нужна 2.11 или новее" ;;
+      *) warn proxy-version "Caddy $v — для адреса из IP нужна версия 2.11 или новее (обновление прокси — стоп-точка)" ;;
+    esac
+  fi
+}
 
 if ! MODE="$(shturman_mode)"; then
   fail mode "в .env неизвестный режим — ./ops/mode.sh set hermes или ./ops/mode.sh set standalone"
@@ -120,6 +191,8 @@ if [ -n "$public_url" ]; then
     30[1-8]|401|403) warn login-page "перед адресом стоит внешняя защита (HTTP $page) — проверьте страницу входа из браузера" ;;
     *) fail login-page "страница входа не открывается (HTTP ${page:-000}) — проверьте настройку прокси по config/Caddyfile.example" ;;
   esac
+  # Без домена: адрес записан IP-адресом, сертификат на него короткий (6 дней), его продлевает Caddy.
+  ip_cert_checks "$public_url" "$(env_get SHTURMAN_SETUP_URL)"
 else
   warn public-url "внешний адрес не задан — дашборд доступен только с самого сервера (./ops/set-public-url.sh)"
 fi

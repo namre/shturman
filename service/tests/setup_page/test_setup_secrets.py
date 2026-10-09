@@ -136,6 +136,10 @@ def test_a_token_entered_on_the_page_never_turns_sending_on(monkeypatch, tmp_pat
     ("http://shturman.test:8080", "http://shturman.test:8080"),
     ("https://assistant.example.com.:8443", "https://assistant.example.com:8443"),
     ("HTTPS://пример.example", "https://xn--e1afmkfd.example"),
+    # без домена: внешний IPv4-адрес сервера (docs/deployment.md, «Без домена»)
+    ("https://203.0.113.10:8443", "https://203.0.113.10:8443"),
+    ("https://203.0.113.10:8443/", "https://203.0.113.10:8443"),
+    ("https://203.0.113.10:443", "https://203.0.113.10"),
 ])
 def test_setup_origin_is_normalised(monkeypatch, tmp_path, raw, expected):
     assert from_env(monkeypatch, tmp_path, SHTURMAN_SETUP_ORIGIN=raw).setup_origin == expected
