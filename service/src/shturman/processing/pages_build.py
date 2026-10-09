@@ -296,7 +296,8 @@ async def _from_base(
 
 _FACTS = f"""
 SELECT f.id, f.kind, f.slot, f.text, f.valid_from, f.valid_to, f.status, f.origin, f.decided_at,
-       f.source_message_id, f.superseded_by, nf.source_message_id AS next_source
+       f.source_message_id, f.superseded_by, nf.source_message_id AS next_source, fm.sender_name,
+       (SELECT pp.person_id FROM person_peers pp WHERE pp.peer_id = fm.sender_peer_id) AS sender_person
 FROM facts f JOIN messages fm ON fm.id = f.source_message_id JOIN chats fc ON fc.id = fm.chat_id
 LEFT JOIN facts nf ON nf.id = f.superseded_by AND nf.status = 'active'
 WHERE {facts.VISIBLE} AND f.status IN ('active', 'retracted') AND {{who}}
@@ -326,17 +327,26 @@ async def _facts_from_base(
         slot = pages.md_inline(r["slot"], 40)
         return (f"{slot}: " if slot else "") + pages.md_inline(r["text"], 240)
 
+    def who(r: asyncpg.Record, origin: str) -> str | None:
+        """Кто сказал, если это не владелец и не сам человек страницы: у проекта — любой участник,
+        у человека — третье лицо (его слова ничего не сменяют, см. facts.record)."""
+        if origin != "other" or (subject_type == "person" and r["sender_person"] == subject_id):
+            return None
+        return clean_line(r["sender_name"], 60) or "собеседник"
+
     for r in rows:
         origin = r["origin"] if r["origin"] in pages.ORIGINS else "model"
+        speaker = who(r, origin)
+        said = f" со слов {pages.md_inline(speaker, 60)}" if speaker else ""
         if r["kind"] == "decision":
             entries.append(Entry(key=f"d{r['id']}", day=r["valid_from"].isoformat(),
-                                 text=f"решение: {what(r)}", sources=(r["source_message_id"],), origin=origin))
+                                 text=f"решение{said}: {what(r)}", sources=(r["source_message_id"],), origin=origin))
             if r["status"] == "active":
                 decisions.append({"day": r["valid_from"].isoformat(), "text": r["text"],
-                                  "message_id": r["source_message_id"], "origin": origin})
+                                  "message_id": r["source_message_id"], "origin": origin, "who": speaker})
             continue
         entries.append(Entry(key=f"f{r['id']}", day=r["valid_from"].isoformat(),
-                             text=f"факт: {what(r)}", sources=(r["source_message_id"],), origin=origin))
+                             text=f"факт{said}: {what(r)}", sources=(r["source_message_id"],), origin=origin))
         if r["status"] == "retracted":
             day = (r["decided_at"].date() if r["decided_at"] else r["valid_from"]).isoformat()
             entries.append(Entry(key=f"fz{r['id']}", day=day, text=f"владелец отметил как неверное: {what(r)}",
@@ -348,8 +358,8 @@ async def _facts_from_base(
             entries.append(Entry(key=f"fz{r['id']}", day=r["valid_to"].isoformat(),
                                  text=f"больше не действует: {what(r)}", sources=tuple(sources), origin=origin))
         else:
-            current.append({"slot": r["slot"], "text": r["text"], "since": r["valid_from"].isoformat(),
-                            "message_id": r["source_message_id"], "origin": origin})
+            current.append({"id": r["id"], "slot": r["slot"], "text": r["text"], "since": r["valid_from"].isoformat(),
+                            "message_id": r["source_message_id"], "origin": origin, "who": speaker})
     current.sort(key=lambda x: (x["slot"] is None, x["slot"] or "", x["since"]))
     entries.sort(key=lambda e: e.day)
     return entries, current, decisions
@@ -398,6 +408,7 @@ class Draft:
     page: pages.Page | None = None
     record: list[Entry] = field(default_factory=list)       # ключи, которые надо запомнить в базе
     removed_keys: set[str] = field(default_factory=set)
+    reopened_keys: set[str] = field(default_factory=set)     # fz<id> фактов, которые снова действуют
     dropped_statements: list[int] = field(default_factory=list)
     name: str = ""                       # имя человека как есть (в файле оно экранировано)
     quiet: bool = False                  # об остановке этой страницы владельцу не сообщаем
@@ -520,11 +531,18 @@ async def _compose(
     keys_before = pages.timeline_keys(page.timeline)
     dead_keys = {k for k, e in timeline_db.items() if e["removed_at"] is None and not grounded(e)}
     dead_ids = {i for i in pages.refs(page.timeline) if i not in alive}
+    # Факт снова действует (сменивший его отмечен неверным или удалён): строка «больше не действует»
+    # о нём ложна. Она убирается и забывается, чтобы при новой смене дописаться с новой датой.
+    reopened = {f"fz{f['id']}" for f in subject.facts if f.get("id") is not None}
+    draft.reopened_keys = reopened & (keys_before | set(timeline_db))
+    page.timeline, _ = pages.sweep_lines(page.timeline, set(), draft.reopened_keys)
+    keys_kept = pages.timeline_keys(page.timeline)
     page.timeline, removed = pages.sweep_lines(page.timeline, dead_ids, dead_keys)
-    draft.removed_keys = (dead_keys | (keys_before - pages.timeline_keys(page.timeline))) & set(timeline_db)
+    draft.removed_keys = ((dead_keys | (keys_kept - pages.timeline_keys(page.timeline))) & set(timeline_db)) \
+        - draft.reopened_keys
     new_lines = []
     # файла нет (новая страница или файл удалили): хронология пишется из базы целиком
-    written_before = set(timeline_db) if draft.old_text is not None else set()
+    written_before = set(timeline_db) - draft.reopened_keys if draft.old_text is not None else set()
     for entry in desired:
         if not all(i in alive for i in entry.sources):
             continue
@@ -663,6 +681,10 @@ async def _settle_draft(conn: asyncpg.Connection, draft: Draft) -> None:
                 row["id"], sorted(draft.removed_keys))
         if draft.dropped_statements:
             await conn.execute("DELETE FROM page_entries WHERE id = ANY($1::bigint[])", draft.dropped_statements)
+        if draft.reopened_keys:
+            await conn.execute(
+                "DELETE FROM page_entries WHERE page_id = $1 AND block = 'timeline' AND key = ANY($2::text[])",
+                row["id"], sorted(draft.reopened_keys))
         file_hash = pages.digest(draft.new_text)
         await conn.execute(
             """UPDATE pages SET title = $2, updated = $3, file_hash = $4, dirty = false, problem = NULL,
@@ -1510,6 +1532,7 @@ async def render_dirty(
     """Перерисовывает страницы, которые ждут записи вне сборки: новая страница после согласия
     владельца, удалённый источник. К модели не обращается. None — перерисовывать нечего."""
     async with _writing(conn):
+        await facts.repair_chains(conn)        # на случай стирания, прошедшего мимо уборки
         await mark_orphans(conn)
         if not await conn.fetchval("SELECT 1 FROM pages WHERE dirty LIMIT 1"):
             return None

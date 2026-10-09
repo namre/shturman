@@ -112,7 +112,21 @@ async def get_page(request: Request) -> JSONResponse:
 
 OWNER_BLOCK = "pages.owner_block"
 PAGE_ACCEPT = "pages.accept"
-PREVIEW = 1800   # столько знаков нового текста блока владельца показывается на карточке
+PREVIEW = 1800   # столько знаков нового текста блока владельца помещается на карточку целиком
+
+
+def card_text(text: str) -> str:
+    """Текст блока владельца для пути через карточку в боте: ровно то, что владелец увидит на
+    карточке, — он записывается, а не исходная строка. Длиннее карточки — отказ: подтверждать
+    можно только то, что видно целиком. Длинный текст владелец правит на странице настройки
+    (экран «Память», свой вход, предел 20 000 знаков)."""
+    shown = sanitize.clean_text(text, 20_000)
+    if len(shown) > PREVIEW:
+        raise BadRequest(
+            f"Текст длиннее {PREVIEW} знаков: на карточке в боте согласований он не поместился бы "
+            "целиком, а подтвердить можно только то, что видно. Длинный текст правьте сами на странице "
+            "настройки переписки, экран «Память».", status=400, code="too_long_for_card")
+    return shown
 
 # Состояние работающего сервиса: функции применения действий его не получают.
 _state: AppState | None = None
@@ -175,13 +189,11 @@ async def put_owner_block(request: Request) -> JSONResponse:
             if await pages_build.get_page(conn, person_id) is None:
                 raise BadRequest("У этого человека нет страницы.", status=404)
             who = await _person_title(conn, person_id)
+            text = card_text(text)
             if text.strip():
-                shown = sanitize.clean_text(text, PREVIEW)
                 summary = (f"Заменить ваши заметки на странице памяти о человеке {who}. Ассистент читает этот "
                            "блок как ваши собственные слова и доверяет ему больше, чем переписке.\n"
-                           f"Новый текст (знаков: {len(text)}"
-                           + ("; ниже только начало, остальное посмотрите в кабинете" if len(text) > PREVIEW else "")
-                           + f"):\n{shown}")
+                           f"Новый текст целиком (знаков: {len(text)}):\n{text}")
             else:
                 summary = f"Очистить ваши заметки на странице памяти о человеке {who}."
         answer, result = await settle(conn, OWNER_BLOCK, {"person_id": person_id, "text": text}, summary=summary)

@@ -196,9 +196,11 @@ async def _blocks(state: Any, found: dict[str, Any] | None) -> dict[str, Any]:
 
 def _fact(item: dict[str, Any]) -> dict[str, Any]:
     """Действующий факт или решение для экрана: номер (для «Неверно»), слот, текст, с какого дня."""
+    origin = pages.ORIGIN_TEXT.get(item["origin"])
+    if origin and item.get("said_by") and item["origin"] == "other":
+        origin = f"{origin}: {clean_line(item['said_by'], 60)}"        # кто именно сказал
     return {"id": item["id"], "kind": item["kind"], "slot": clean_line(item["slot"], 40) or None,
-            "text": clean_line(item["text"], 240), "since": item["valid_from"],
-            "origin": pages.ORIGIN_TEXT.get(item["origin"])}
+            "text": clean_line(item["text"], 240), "since": item["valid_from"], "origin": origin}
 
 
 async def _facts(conn: Any, subject_type: str, subject_id: int | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -473,7 +475,7 @@ async def pending_items(conn: Any, today: date) -> dict[str, Any]:
                                   "reason": p["text"], "chats": [clean_line(c["title"], 80) for c in chats]})
     owner_facts = [{"id": f["id"], "slot": clean_line(f["title"], 40) if f["title"] != "о вас" else None,
                     "text": _short(f["text"], 240), "since": f["valid_from"], "quote": _short(f["quote"], 160),
-                    "fingerprint": f["fingerprint"]} for f in waiting["owner_facts"]]
+                    "said": f["said"], "fingerprint": f["fingerprint"]} for f in waiting["owner_facts"]]
     proposals = [{"person_id": p["person_id"], "name": clean_line(p["display_name"], 80) or "без имени",
                   "reason": pages_build._reason_text(p["reason"], days)}
                  for p in await pages_build.list_proposals(conn, status="pending")]

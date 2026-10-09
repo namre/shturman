@@ -58,7 +58,7 @@ DIGEST_MAX_ITEMS = 10      # фактов о владельце в одном с
 DIGEST_MAX_SENDS = 3       # сколько раз пункт уходит владельцу, если сообщение не доставляется
 
 SUBJECTS = ("person", "project", "owner")
-UNTRUSTED_FIELDS = ["text", "slot", "source_quote", "chat.title"]
+UNTRUSTED_FIELDS = ["text", "slot", "source_quote", "chat.title", "said_by"]
 
 STATUS_TEXT = {"proposed": "ждёт решения", "active": "действует", "rejected": "отклонён",
                "retracted": "отмечен как неверный"}
@@ -67,7 +67,10 @@ STATUS_TEXT = {"proposed": "ждёт решения", "active": "действу�
 VISIBLE = "fm.deleted_at IS NULL AND fm.agent_visible AND NOT fc.excluded"
 _FROM = """FROM facts f JOIN messages fm ON fm.id = f.source_message_id JOIN chats fc ON fc.id = fm.chat_id"""
 _SELECT = f"""SELECT f.*, fm.sent_at AS source_sent_at, fm.chat_id, fm.is_outgoing AS source_outgoing,
-                     fc.title AS chat_title {_FROM} WHERE {VISIBLE}"""
+                     fm.sender_name AS source_sender, fc.title AS chat_title,
+                     EXISTS (SELECT 1 FROM person_peers sp WHERE sp.peer_id = fm.sender_peer_id
+                             AND sp.person_id = f.person_id) AS source_by_subject
+              {_FROM} WHERE {VISIBLE}"""
 
 
 class FactsError(ValueError):
@@ -111,6 +114,8 @@ def to_dict(row: asyncpg.Record) -> dict[str, Any]:
         "source": {"message_id": row["source_message_id"], "ref": f"msg:{row['source_message_id']}",
                    "sent_at": row["source_sent_at"].isoformat()},
         "chat": {"id": row["chat_id"], "title": row["chat_title"]},
+        # кто это сказал, если не владелец и не сам человек, о котором факт: имя автора (чужой текст)
+        "said_by": None if row["source_outgoing"] or row["source_by_subject"] else (row["source_sender"] or "собеседник"),
         "created_at": row["created_at"].isoformat(),
         "decided_at": row["decided_at"].isoformat() if row["decided_at"] else None,
         "untrusted_fields": list(UNTRUSTED_FIELDS),
@@ -207,18 +212,40 @@ async def _duplicate(conn: asyncpg.Connection, subject_type: str, person_id: int
         subject_type, person_id, project_id, kind, norm, message_id, slot))
 
 
+async def _said_by(conn: asyncpg.Connection, sender_peer_id: int | None, person_id: int | None) -> bool:
+    """Автор сообщения — сам этот человек (одна из его учётных записей Telegram)."""
+    if sender_peer_id is None or person_id is None:
+        return False
+    return bool(await conn.fetchval(
+        "SELECT 1 FROM person_peers WHERE peer_id = $1 AND person_id = $2", sender_peer_id, person_id))
+
+
 async def record(
     conn: asyncpg.Connection, candidate: extract.FactCandidate, *, subject_type: str,
     person_id: int | None = None, project_id: int | None = None, tz: str = "UTC",
     run_id: int | None = None, model: str | None = None,
 ) -> tuple[int | None, str]:
     """Записывает проверенный факт. Возвращает (id, итог): duplicate — уже есть; active — записан
-    и действует (или закрыт более новым); proposed — факт о владельце, ждёт его решения."""
+    и действует (или закрыт более новым); proposed — факт о владельце, ждёт его решения;
+    not_owner_message, third_party_contact — не записан (правила ниже).
+
+    Кто может что сказать (решает код по автору сообщения, а не модель):
+      * факт о владельце — только из его собственного (исходящего) сообщения;
+      * сменяемый факт о человеке (с ключом) сменяет прежний, только если его сказал сам этот
+        человек или владелец. Со слов третьего лица контактные данные (телефон, почта, адрес,
+        реквизиты) не пишутся вовсе, остальное пишется как факт без ключа — ничего не сменяет."""
     norm = text_norm(candidate.text)
     if not norm:
         return None, "empty"
     kind = candidate.kind if subject_type == "project" else "fact"
     slot = None if kind == "decision" else candidate.slot
+    if subject_type == "owner" and not candidate.message.is_outgoing:
+        return None, "not_owner_message"
+    if subject_type == "person" and not candidate.message.is_outgoing and not await _said_by(
+            conn, candidate.message.sender_peer_id, person_id):
+        if slot in extract.CONTACT_SLOTS:
+            return None, "third_party_contact"
+        slot = None
     if await _duplicate(conn, subject_type, person_id, project_id, kind, slot, norm, candidate.message.id):
         return None, "duplicate"
     status = "proposed" if subject_type == "owner" else "active"
@@ -240,7 +267,8 @@ async def record(
 
 async def _locked(conn: asyncpg.Connection, fact_id: int) -> asyncpg.Record | None:
     return await conn.fetchrow(
-        f"""SELECT f.* {_FROM} WHERE f.id = $1 AND {VISIBLE} FOR UPDATE OF f""", fact_id)
+        f"""SELECT f.*, fm.is_outgoing AS source_outgoing {_FROM} WHERE f.id = $1 AND {VISIBLE}
+            FOR UPDATE OF f""", fact_id)
 
 
 async def retract_fact(conn: asyncpg.Connection, fact_id: int) -> dict[str, Any]:
@@ -277,6 +305,9 @@ async def decide_owner_fact(
             raise FactsError("Содержание изменилось. Подтвердите новое предложение.", "changed_meanwhile")
         if row["status"] != "proposed":
             return {"ok": True, "changed": False, "status": row["status"], "fact": await get_fact(conn, fact_id)}
+        if accept and not row["source_outgoing"]:
+            # профиль — только то, что владелец сказал о себе сам (предложения прежних версий)
+            raise FactsError("Факт о вас принимается только из ваших собственных сообщений.", "not_owner_message")
         if accept:
             await conn.execute(
                 """UPDATE facts SET status = 'active', decided_at = now(), approved_at = now(),
@@ -316,9 +347,25 @@ async def purge_for_messages(conn: asyncpg.Connection, message_ids: Sequence[int
 
 async def purge_orphans(conn: asyncpg.Connection) -> int:
     """Обход на случай пропущенного события: источник удалён или его чат исключён."""
-    return await _release(
+    gone = await _release(
         conn, """EXISTS (SELECT 1 FROM messages m JOIN chats c ON c.id = m.chat_id
                          WHERE m.id = f.source_message_id AND (m.deleted_at IS NOT NULL OR c.excluded))""")
+    await repair_chains(conn)
+    return gone
+
+
+async def repair_chains(conn: asyncpg.Connection) -> int:
+    """Чинит цепочки, которые порвало стирание сообщений целиком (стирание чата, удаление аккаунта
+    из архива, служебный диалог): факт, сменивший прежний, ушёл каскадом вместе с сообщением,
+    а прежний остался закрытым датой без преемника (superseded_by обнулён внешним ключом). Такие
+    ключи выстраиваются заново: последний действующий факт снова открыт. Возвращает число ключей."""
+    rows = await conn.fetch(
+        """SELECT DISTINCT subject_type, person_id, project_id, slot FROM facts
+           WHERE status = 'active' AND slot IS NOT NULL AND valid_to IS NOT NULL AND superseded_by IS NULL""")
+    for r in rows:
+        await rechain(conn, r["subject_type"], r["person_id"], r["project_id"], r["slot"])
+        await touch_pages(conn, r["subject_type"], r["person_id"], r["project_id"])
+    return len(rows)
 
 
 # --- сообщение владельцу: факты о нём ---------------------------------------------------------------------
@@ -328,9 +375,14 @@ def _short(text: str | None, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def said(row: Any) -> str:
+    """Кто это сказал — для карточек владельцу: факт о нём берётся только из его сообщений."""
+    return "сказали вы" if row["source_outgoing"] else "сказал собеседник"
+
+
 def _item_text(row: asyncpg.Record) -> str:
     slot = f"{row['slot']}: " if row["slot"] else ""
-    return (f"{slot}{_short(row['text'], 200)} (с {row['valid_from'].isoformat()})\n"
+    return (f"{slot}{_short(row['text'], 200)} (с {row['valid_from'].isoformat()}; {said(row)})\n"
             f"«{_short(row['source_quote'], 160)}»")
 
 

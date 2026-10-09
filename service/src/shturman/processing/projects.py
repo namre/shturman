@@ -23,6 +23,8 @@
       origin="owner" — только владелец; проект сразу действует. Если такой же проект уже
       предложен моделью, он принимается. origin="model" — предложение (для обработки).
   set_project_chats(conn, project_id, chat_ids) -> dict          только владелец
+  change_project_chats(conn, project_id, add=(), remove=()) -> dict
+      то же относительно нынешнего перечня (для решения, подтверждённого позже); только владелец
   archive_project(conn, project_id) -> dict                      только владелец
   decide_project_proposal(conn, project_id, accept) -> dict
       accept=True — только владелец; accept=False — отказаться можно и без него.
@@ -275,6 +277,29 @@ def _clean_aliases(values: Iterable[Any], title_key: str) -> list[tuple[str, str
     return out
 
 
+async def check_names(conn: asyncpg.Connection, title_key: str, aliases: Sequence[tuple[str, str]],
+                      *, project_id: int | None = None) -> None:
+    """Другое название проекта не может совпадать с названием или другим названием иного проекта
+    (предложенного, действующего, в архиве): иначе метка из переписки относилась бы к двум
+    проектам, а чужой алиас «переманивал» бы его обязательства. Название — с чужим алиасом тоже."""
+    keys = {key: alias for alias, key in aliases}
+    keys.setdefault(title_key, None)
+    rows = await conn.fetch(
+        """SELECT p.title_norm AS name, p.title FROM projects p
+           WHERE p.status <> 'rejected' AND p.id IS DISTINCT FROM $2 AND p.title_norm = ANY($1::text[])
+           UNION ALL
+           SELECT a.alias_norm, p.title FROM project_aliases a JOIN projects p ON p.id = a.project_id
+           WHERE p.status <> 'rejected' AND p.id IS DISTINCT FROM $2 AND a.alias_norm = ANY($1::text[])""",
+        list(keys), project_id)
+    for r in rows:
+        alias = keys.get(r["name"])
+        if alias is None:       # само название совпало с чужим (тот же заголовок проверяет вызывающий)
+            raise ProjectsError(f"Это название уже служит другим названием проекта «{clean_line(r['title'], 80)}».",
+                                "name_taken")
+        raise ProjectsError(f"Другое название «{clean_line(alias, 80)}» уже занято проектом "
+                            f"«{clean_line(r['title'], 80)}».", "name_taken")
+
+
 async def _link_commitments(conn: asyncpg.Connection, project_id: int, chat_ids: Sequence[int]) -> None:
     """Обязательства из чатов проекта, ещё не отнесённые ни к какому проекту, относятся к нему."""
     if chat_ids:
@@ -323,6 +348,7 @@ async def create_project(
         created = same is None
         if same is not None and (origin == "model" or same["status"] != "proposed"):
             raise ProjectsError("Проект с таким названием уже есть.", "exists")
+        await check_names(conn, key, alias_list, project_id=same["id"] if same else None)
         if same is None:
             project_id = await conn.fetchval(
                 """INSERT INTO projects (title, title_norm, description, status, origin, reason)
@@ -381,6 +407,21 @@ async def set_project_chats(conn: asyncpg.Connection, project_id: int, chat_ids:
     _wake()
     return {"ok": True, "changed": bool(added or removed), "added": added, "removed": removed,
             "project": await get_project(conn, project_id)}
+
+
+async def change_project_chats(conn: asyncpg.Connection, project_id: int, add: Iterable[int] = (),
+                               remove: Iterable[int] = ()) -> dict[str, Any]:
+    """Добавляет и убирает чаты относительно нынешнего перечня — так применяется решение,
+    подтверждённое позже: изменения, сделанные владельцем за это время, не откатываются.
+    Только владелец."""
+    authority.requires_owner()
+    add_ids, remove_ids = list(add or ()), set(remove or ())
+    async with conn.transaction():
+        await _owned(conn, project_id, ("active", "archived"))
+        current = [r["chat_id"] for r in await conn.fetch(
+            "SELECT chat_id FROM project_chats WHERE project_id = $1 ORDER BY added_at, chat_id", project_id)]
+        target = [c for c in current if c not in remove_ids] + [c for c in add_ids if c not in current]
+        return await set_project_chats(conn, project_id, target)
 
 
 async def archive_project(conn: asyncpg.Connection, project_id: int) -> dict[str, Any]:
@@ -655,6 +696,7 @@ async def pending_approvals(conn: asyncpg.Connection, *, limit: int = 100) -> di
     out["owner_facts"] = [
         {"id": r["id"], "title": r["slot"] or "о вас", "text": _short(r["text"], 240),
          "quote": _short(r["source_quote"], 200), "valid_from": r["valid_from"].isoformat(),
+         "said": facts.said(r),
          "fingerprint": facts.fingerprint(r), "created_at": r["created_at"].isoformat()}
         for r in await conn.fetch(
             f"""{facts._SELECT} AND f.subject_type = 'owner' AND f.status = 'proposed' ORDER BY f.id LIMIT $1""",

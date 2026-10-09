@@ -949,6 +949,19 @@ async def split_person(conn: asyncpg.Connection, person_id: int, peer_id: int) -
             await _add_alias_row(conn, new_id, name, "telegram", peer_id)
         if peer["username"]:
             await _add_alias_row(conn, new_id, "@" + peer["username"], "telegram", peer_id)
+        # Факты, которые сказал сам отделённый человек (его сообщения) или которые прозвучали в
+        # личном чате с ним, — о нём: переходят к новой записи, цепочки выстраиваются заново.
+        from . import facts
+        moved = await conn.fetch(
+            """UPDATE facts f SET person_id = $2 FROM messages m JOIN chats c ON c.id = m.chat_id
+               WHERE f.person_id = $1 AND m.id = f.source_message_id
+                 AND (m.sender_peer_id = $3 OR (c.type = 'personal_chat' AND c.peer_id = $3))
+               RETURNING f.slot""", person_id, new_id, peer_id)
+        for slot in {r["slot"] for r in moved if r["slot"] is not None}:
+            await facts.rechain(conn, "person", person_id, None, slot)
+            await facts.rechain(conn, "person", new_id, None, slot)
+        if moved:
+            await conn.execute("UPDATE pages SET dirty = true WHERE person_id = $1", person_id)
         # владелец решил, что это разные люди: пару больше не предлагаем
         await conn.execute(
             """INSERT INTO person_proposals (kind, person_id, other_person_id, score, status, decided_at)

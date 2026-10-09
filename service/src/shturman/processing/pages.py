@@ -185,9 +185,14 @@ def commitments_block(rows: Sequence[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def said(origin: str, who: str | None = None) -> str:
+    """Пометка происхождения; `who` — имя сказавшего, когда это не сам субъект страницы."""
+    return f"{ORIGIN_TEXT[origin]}: {md_inline(who, 60)}" if who else ORIGIN_TEXT[origin]
+
+
 def facts_block(rows: Sequence[dict[str, Any]]) -> str:
-    """Действующие факты: [{"slot", "text", "since", "message_id", "origin"}]; `slot` и `text` —
-    чужой текст, экранируются здесь."""
+    """Действующие факты: [{"slot", "text", "since", "message_id", "origin", "who"?}]; `slot`,
+    `text` и `who` — чужой текст, экранируются здесь."""
     if not rows:
         return NO_FACTS
     lines = []
@@ -195,16 +200,17 @@ def facts_block(rows: Sequence[dict[str, Any]]) -> str:
         slot = md_inline(row.get("slot"), 40)
         head = f"{slot}: " if slot else ""
         lines.append(f"- {head}{md_inline(row['text'], 240)} (с {row['since']}) {link(row['message_id'])} "
-                     f"({ORIGIN_TEXT[row['origin']]})")
+                     f"({said(row['origin'], row.get('who'))})")
     return "\n".join(lines)
 
 
 def decisions_block(rows: Sequence[dict[str, Any]]) -> str:
-    """Решения проекта по датам: [{"day", "text", "message_id", "origin"}]; `text` экранируется здесь."""
+    """Решения проекта по датам: [{"day", "text", "message_id", "origin", "who"?}]; чужой текст
+    экранируется здесь."""
     if not rows:
         return NO_DECISIONS
     return "\n".join(f"- {row['day']} — {md_inline(row['text'], 240)} {link(row['message_id'])} "
-                     f"({ORIGIN_TEXT[row['origin']]})" for row in rows)
+                     f"({said(row['origin'], row.get('who'))})" for row in rows)
 
 
 def _split(text: str) -> list[str]:

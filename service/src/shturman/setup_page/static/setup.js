@@ -2044,7 +2044,7 @@
         [el("ul", { class: "mem-items" }, groups.owner_facts.map(function (f) {
           var path = "memory/pending/owner-facts/" + f.id;
           return pendingItem(f.slot ? f.slot + ": " + f.text : f.text, [
-            el("span", { class: "mem-meta", text: "с " + day(f.since) }),
+            el("span", { class: "mem-meta", text: "с " + day(f.since) + (f.said ? "; " + f.said : "") }),
             f.quote ? el("q", { class: "mem-quote", text: f.quote }) : null
           ],
             ["✓ Верно", function (b, item) { decide(b, item, path, { accept: true, fingerprint: f.fingerprint }, "Запомнено в профиле."); }],

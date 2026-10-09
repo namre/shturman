@@ -70,9 +70,9 @@ PROJECT_ARCHIVE = "projects.archive"
 PROJECT_ACCEPT = "projects.accept"
 FACT_RETRACT = "facts.retract"
 BLOCK_TEXT = pages_service.BLOCK_TEXT
-PREVIEW = pages_service.PREVIEW
 
-_STATUS = {"not_found": 404, "bad_status": 409, "exists": 409, "bad_chat": 404, "changed_meanwhile": 409,
+DESCRIPTION_CARD = 300   # знаков описания проекта, которое показывается на карточке целиком
+_STATUS = {"name_taken": 409, "not_found": 404, "bad_status": 409, "exists": 409, "bad_chat": 404, "changed_meanwhile": 409,
            "frozen": 409, "bad_person": 409}
 
 
@@ -166,26 +166,36 @@ async def create_project(request: Request) -> JSONResponse:
         raise BadRequest("поле title: нужно название проекта")
     chat_ids, aliases = _ids(data.get("chat_ids"), "chat_ids"), _strings(data.get("aliases"), "aliases")
     description = data.get("description")
-    if description is not None and not isinstance(description, str):
-        raise BadRequest("поле description: нужна строка")
+    if description is not None and (not isinstance(description, str) or len(description) > DESCRIPTION_CARD):
+        raise BadRequest(f"поле description: строка не длиннее {DESCRIPTION_CARD} знаков — она показывается "
+                         "на карточке целиком")
     async with state_of(request).pool.acquire() as conn:
         # проверки, которые иначе сработали бы только после нажатия владельца
         try:
             clean = projects.clean_title(title)
-            projects._clean_aliases(aliases, projects.norm(clean))
+            names = projects._clean_aliases(aliases, projects.norm(clean))
             await projects._visible_chats(conn, chat_ids)
+            await projects.check_names(conn, projects.norm(clean), names, project_id=await conn.fetchval(
+                "SELECT id FROM projects WHERE title_norm = $1 AND status = 'proposed'", projects.norm(clean)))
         except projects.ProjectsError as exc:
             raise _http(exc) from None
         if await conn.fetchval("SELECT 1 FROM projects WHERE title_norm = $1 AND status IN ('active', 'archived')",
                                projects.norm(clean)):
             raise BadRequest("Проект с таким названием уже есть.", status=409, code="exists")
-        summary = (f"Завести проект «{_line(clean)}». У него будет страница в памяти ассистента; "
+        about = sanitize.clean_line(description or "", DESCRIPTION_CARD) or None
+        # На карточке — всё, что будет записано: название, другие названия, описание; чаты — названиями.
+        summary = (f"Завести проект «{clean}». У него будет страница в памяти ассистента; "
                    "обязательства, факты и решения по нему ассистент будет собирать из переписки.")
         if chat_ids:
             summary += f" Чаты проекта: {await _chat_titles(conn, chat_ids)}."
-        if aliases:
-            summary += " Другие названия: " + ", ".join(f"«{_line(a, 60)}»" for a in aliases[:10]) + "."
-        payload = {"title": title, "chat_ids": chat_ids, "aliases": aliases, "description": description}
+        if names:
+            summary += " Другие названия: " + ", ".join(f"«{alias}»" for alias, _ in names) + "."
+        if about:
+            summary += f" Описание: «{about}»."
+        if len(summary) > confirm.SUMMARY_LIMIT:
+            raise BadRequest("Запрос не помещается на карточку целиком: сократите другие названия или описание.")
+        payload = {"title": clean, "chat_ids": chat_ids, "aliases": [alias for alias, _ in names],
+                   "description": about}
         answer, result = await settle(conn, PROJECT_CREATE, payload, summary=summary)
     return answer or JSONResponse(result)
 
@@ -194,7 +204,14 @@ async def create_project(request: Request) -> JSONResponse:
 async def _apply_chats(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
     confirm.must_not_widen(True)      # перечень чатов меняет только владелец
     try:
-        result = await projects.set_project_chats(conn, int(payload["project_id"]), payload.get("chat_ids") or [])
+        if "chat_ids" in payload:
+            # весь перечень — только со страницы настройки, где действие применяется сразу
+            result = await projects.set_project_chats(conn, int(payload["project_id"]), payload["chat_ids"] or [])
+        else:
+            # изменение, а не итоговый перечень: подтверждённое позже не откатывает правки владельца,
+            # сделанные за это время
+            result = await projects.change_project_chats(
+                conn, int(payload["project_id"]), payload.get("add") or [], payload.get("remove") or [])
     except projects.ProjectsError as exc:
         raise _refused(exc) from None
     return confirm.Done(result=result)
@@ -234,7 +251,7 @@ async def project_chats(request: Request) -> JSONResponse:
             parts.append(f"убрать {await _chat_titles(conn, removed)}")
         summary = (f"Изменить чаты проекта {await _project_title(conn, project_id)}: " + "; ".join(parts)
                    + ". Сводка и обязательства проекта будут собираться по сообщениям его чатов.")
-        answer, result = await settle(conn, PROJECT_CHATS, {"project_id": project_id, "chat_ids": target},
+        answer, result = await settle(conn, PROJECT_CHATS, {"project_id": project_id, "add": added, "remove": removed},
                                       summary=summary)
     return answer or JSONResponse(result)
 
@@ -291,6 +308,10 @@ async def decide_proposal(request: Request) -> JSONResponse:
         if status is None:
             raise BadRequest("такого проекта нет", status=404)
         if data["accept"]:
+            if status == "rejected":
+                # заранее, без карточки: отклонённое не принимается (завести такой проект можно заново)
+                raise BadRequest("Это предложение уже отклонено. Если проект всё же нужен — заведите его заново.",
+                                 status=409, code="bad_status")
             summary = None if status in ("active", "archived") else (
                 f"Завести предложенный проект {await _project_title(conn, project_id)}. У него будет страница "
                 "в памяти ассистента; обязательства, факты и решения по нему ассистент будет собирать из переписки.")
@@ -369,13 +390,12 @@ async def _owner_block(request: Request, entity_id: str, what: str) -> JSONRespo
     if pages.has_marker(text):
         raise BadRequest("В тексте не должно быть меток блоков страницы "
                          "(<!-- summary …, owner, commitments, decisions, facts, timeline).")
+    text = pages_service.card_text(text)      # в карточку и в файл — один и тот же текст целиком
     async with state_of(request).pool.acquire() as conn:
         if text.strip():
-            shown = sanitize.clean_text(text, PREVIEW)
             summary = (f"Заменить ваши заметки {what}. Ассистент читает этот блок как ваши собственные слова "
                        "и доверяет ему больше, чем переписке.\n"
-                       f"Новый текст (знаков: {len(text)}"
-                       + ("; ниже только начало" if len(text) > PREVIEW else "") + f"):\n{shown}")
+                       f"Новый текст целиком (знаков: {len(text)}):\n{text}")
         else:
             summary = f"Очистить ваши заметки {what}."
         answer, result = await settle(conn, pages_service.OWNER_BLOCK, {"entity_id": entity_id, "text": text},

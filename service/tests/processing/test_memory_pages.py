@@ -82,9 +82,12 @@ async def test_project_page_with_summary_from_project_chats(conn, config):
                                                                      "ЖК Северный", ["Северный"])
     assert page.chats == ["Иван Петров", "Стройка: Северный"] and page.participants == ["Иван Петров"]
     assert page.summary.startswith("- Фасад решено делать из керамогранита")
+    # у проекта говорят разные люди: кто именно сказал — в строке
     assert page.decisions == (f"- 2026-10-06 — фасад из керамогранита [сообщение](msg:{w.group_msgs[0]}) "
-                              "(сказал собеседник)")
-    assert page.facts == f"- цена: 5 тыс за метр (с 2026-10-06) [сообщение](msg:{w.group_msgs[0]}) (сказал собеседник)"
+                              "(сказал собеседник: Иван Петров)")
+    assert page.facts == (f"- цена: 5 тыс за метр (с 2026-10-06) [сообщение](msg:{w.group_msgs[0]}) "
+                          "(сказал собеседник: Иван Петров)")
+    assert "решение со слов Иван Петров: фасад из керамогранита" in page.timeline
     assert "прислать смету по фасадам" in page.commitments
     keys = pages.timeline_keys(page.timeline)
     assert {f"c{estimate}", f"d{w.decision}", f"f{w.price}"} <= keys

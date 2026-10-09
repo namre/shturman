@@ -383,6 +383,7 @@ async def plan_run(
         new_watermark, more, cap_reached = watermark, False, False
         episodes: list[Episode] = []
         signal: list[Episode] = []
+        fact_skipped = 0
         if budget <= 0:
             more = cap_reached = True      # новые сообщения подождут: предел ушёл на повторы
         else:
@@ -404,14 +405,26 @@ async def plan_run(
 
             # Предел запросов: окно сужается до сообщений, эпизоды которых помещаются в предел.
             # Отметка ставится на границу окна, поэтому отложенное разберёт следующий прогон.
+            # Обещания важнее фактов: при упоре в предел сначала планируются эпизоды с признаком
+            # обещания, эпизоды только с признаком факта — на оставшиеся места; не поместившиеся
+            # из них пропускаются (счётчик fact_episodes_skipped), обещания — откладываются.
             while True:
                 episodes = extract.build_episodes(eligible)
-                signal = [e for e in episodes if extract.has_memory_signal(e)]
-                if len(signal) <= budget:
+                promise = [e for e in episodes if extract.has_promise_signal(e)]
+                chosen = {id(e) for e in promise}
+                fact_only = [e for e in episodes if id(e) not in chosen and extract.has_fact_signal(e)]
+                if len(promise) + len(fact_only) <= budget:
+                    signal = sorted(promise + fact_only, key=lambda e: e.last_id)
                     break
                 cap_reached = more = True
-                new_watermark = signal[budget - 1].last_id
-                eligible = [m for m in eligible if m.id <= new_watermark]
+                if len(promise) > budget:
+                    new_watermark = promise[budget - 1].last_id
+                    eligible = [m for m in eligible if m.id <= new_watermark]
+                    continue
+                room = budget - len(promise)
+                fact_skipped = len(fact_only) - room
+                signal = sorted(promise + fact_only[:room], key=lambda e: e.last_id)
+                break
 
         # Сообщения до прежней отметки, текст которых появился позже (расшифровка голосового,
         # разбор вложения): прошлый прогон видел их пустыми. Эпизод — сами эти сообщения,
@@ -506,7 +519,8 @@ async def plan_run(
             "retried": replanned["retried"], "retry_dropped": replanned["retry_dropped"],
             "retry_waiting": waiting["retry"], "given_up": waiting["given_up"],
             "already_planned": already, "episodes": len(episodes),
-            "episodes_without_signal": len(episodes) - len(signal), "late_planned": len(late_signal),
+            "episodes_without_signal": len(episodes) - len(signal) - fact_skipped,
+            "fact_episodes_skipped": fact_skipped, "late_planned": len(late_signal),
             "messages": counts, "cap_reached": cap_reached, "more": more,
             "watermark": new_state["watermark"], "floor": new_state["floor"],
             "expired": expired, "purged": swept, "purged_memory": swept_memory, "people": synced,
@@ -756,7 +770,8 @@ async def _apply_memory(conn: asyncpg.Connection, ctx: dict[str, Any], result: d
         _, outcome = await facts.record(
             conn, fact, subject_type=subject_type, person_id=person_id, project_id=project_id,
             tz=ctx.get("tz") or "UTC", run_id=ctx.get("run_id"), model=model)
-        _bump(stats, {"active": "facts_recorded", "proposed": "owner_facts_proposed"}.get(outcome, "facts_duplicates"))
+        _bump(stats, {"active": "facts_recorded", "proposed": "owner_facts_proposed",
+                      "duplicate": "facts_duplicates"}.get(outcome, f"facts_skipped_{outcome}"))
     mentions, dropped = extract.validate_projects(parsed, episode)
     for key, value in dropped.items():
         _bump(stats, f"projects_dropped_{key}", value)

@@ -70,7 +70,7 @@ async def test_extraction_writes_person_facts_and_proposes_owner_facts(conn):
     sent = await notifications(conn)
     digest = [j for j in sent if "Профиль: запомнить" in j["payload"]["text"]]
     assert len(digest) == 1 and "Профиль: запомнить это о вас?" in digest[0]["payload"]["text"]
-    assert "адрес: работает из офиса на Ленина (с 2026-10-06)" in digest[0]["payload"]["text"]
+    assert "адрес: работает из офиса на Ленина (с 2026-10-06; сказали вы)" in digest[0]["payload"]["text"]
     accept, reject = buttons(digest, "of")
     fp = facts.fingerprint(await conn.fetchrow("SELECT * FROM facts WHERE subject_type = 'owner'"))
     assert accept == f"sh:of:a:{rows[1]['id']}:{fp[:24]}" and reject == f"sh:of:r:{rows[1]['id']}"

@@ -71,6 +71,16 @@ async def register(conn: asyncpg.Connection, bot_tg_id: int, *, reason: str = "s
                       summary_state = 'failed' WHERE id = ANY($1::bigint[])""", page_ids)
         await conn.execute("DELETE FROM page_blocks WHERE page_id = ANY($1::bigint[])", page_ids)
         await conn.execute("DELETE FROM page_entries WHERE page_id = ANY($1::bigint[])", page_ids)
+        # Предложения проектов, выведенные из служебного диалога: его чат в проекте, в причине
+        # предложения или упоминание названия в его сообщениях. Их сообщения владельцу стираются ниже.
+        proposal_ids = [r["id"] for r in await conn.fetch(
+            """SELECT p.id FROM projects p WHERE p.status = 'proposed' AND (
+                   EXISTS (SELECT 1 FROM project_chats pc WHERE pc.project_id = p.id AND pc.chat_id = ANY($1::bigint[]))
+                   OR (jsonb_typeof(p.reason->'chats') = 'array' AND EXISTS (
+                       SELECT 1 FROM jsonb_array_elements_text(p.reason->'chats') x WHERE x = ANY($3::text[])))
+                   OR EXISTS (SELECT 1 FROM project_mentions pm WHERE pm.title_norm = p.title_norm
+                              AND (pm.chat_id = ANY($1::bigint[]) OR pm.message_id = ANY($2::bigint[]))))""",
+            chats, ids, [str(c) for c in chats])]
         # Reply prompts and draft cards hold copies rather than foreign keys to every
         # source message. Scrub all generations before deleting their source rows.
         task_ids = [r["id"] for r in await conn.fetch(
@@ -122,9 +132,9 @@ async def register(conn: asyncpg.Connection, bot_tg_id: int, *, reason: str = "s
                          WHERE cc.commitment_id = ANY($5::bigint[]))
                   OR j.context->>'batch' IN (SELECT f.batch FROM facts f
                          WHERE f.source_message_id::text = ANY($3::text[]) AND f.batch IS NOT NULL)
-                  OR j.context->>'batch' IN (SELECT p.batch FROM projects p JOIN project_chats pc
-                         ON pc.project_id = p.id WHERE pc.chat_id = ANY($4::bigint[]) AND p.batch IS NOT NULL)""",
-            [str(c) for c in chats], [str(p) for p in page_ids], text_ids, chats, commitment_ids)
+                  OR j.context->>'batch' IN (SELECT p.batch FROM projects p
+                         WHERE p.id = ANY($6::bigint[]) AND p.batch IS NOT NULL)""",
+            [str(c) for c in chats], [str(p) for p in page_ids], text_ids, chats, commitment_ids, proposal_ids)
         await conn.execute(
             """UPDATE processing_requests SET state = 'failed' WHERE chat_id = ANY($1::bigint[])
                OR job_id IN (SELECT id FROM jobs WHERE error = 'protected_control_peer')""", chats)
@@ -134,12 +144,14 @@ async def register(conn: asyncpg.Connection, bot_tg_id: int, *, reason: str = "s
                WHERE payload->>'commitment_id' = ANY($1::text[])""",
             [str(i) for i in commitment_ids])
         await conn.execute("DELETE FROM outbox_drafts WHERE chat_id = ANY($1::bigint[]) OR trigger_message_id = ANY($2::bigint[])", chats, ids)
-        # Служебный диалог не может быть чатом проекта; предложение проекта по нему снимается.
-        await conn.execute("DELETE FROM projects WHERE status = 'proposed' AND id IN "
-                           "(SELECT project_id FROM project_chats WHERE chat_id = ANY($1::bigint[]))", chats)
+        # Служебный диалог не может быть чатом проекта; предложения проектов из него сняты выше.
+        await conn.execute("DELETE FROM projects WHERE id = ANY($1::bigint[])", proposal_ids)
         await conn.execute("DELETE FROM project_chats WHERE chat_id = ANY($1::bigint[])", chats)
         # CASCADE удаляет версии, векторы, обязательства, факты, упоминания проектов и источники страниц.
         await conn.execute("DELETE FROM messages WHERE id = ANY($1::bigint[])", ids)
+        # факты из этих сообщений ушли каскадом: закрытые ими прежние снова действуют
+        from .processing import facts
+        await facts.repair_chains(conn)
 
 
 async def reconcile(conn: asyncpg.Connection) -> None:
