@@ -632,12 +632,22 @@ _LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
 _URL_RE = re.compile(r"(?:https?://|www\.|t\.me/|tg://)\S+", re.IGNORECASE)
 
 
+_QUOTE_PAIRS = {"«": "»", '"': '"', "“": "”", "„": "“", "'": "'"}
+
+
+def strip_outer(text: str) -> str:
+    """Название без пробелов, знаков препинания и парных кавычек по краям: «ЖК «Северный»» → ЖК «Северный»."""
+    text = re.sub(r"\s+", " ", text).strip(" .,;:—-")
+    while len(text) >= 2 and text[0] in _QUOTE_PAIRS and text[-1] == _QUOTE_PAIRS[text[0]]:
+        text = text[1:-1].strip(" .,;:—-")
+    return text
+
+
 def project_label(value: Any) -> str | None:
     """Название проекта из ответа модели: одна строка, без кавычек по краям, с буквами."""
     if not isinstance(value, str):
         return None
-    text = _URL_RE.sub("", clean_text(value, 400).replace("⏎", " "))
-    text = re.sub(r"\s+", " ", text).strip(" .,;:—-«»\"'“”„")
+    text = strip_outer(_URL_RE.sub("", clean_text(value, 400).replace("⏎", " ")))
     if not _LETTER_RE.search(text) or len(text) > PROJECT_TITLE_LIMIT:
         return None
     return text

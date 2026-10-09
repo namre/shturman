@@ -82,7 +82,7 @@ def clean_title(value: Any) -> str:
     """Название проекта от владельца или из переписки: одна строка, с буквами, до 80 знаков."""
     if not isinstance(value, str):
         raise ProjectsError("Название проекта: нужна строка.")
-    title = clean_line(value, 400).strip(" .,;:—-«»\"'“”„")
+    title = extract.strip_outer(clean_line(value, 400))
     if not norm(title) or not extract._LETTER_RE.search(title):
         raise ProjectsError("В названии проекта должны быть буквы.")
     if len(title) > TITLE_LIMIT:
@@ -445,10 +445,14 @@ async def propose(conn: asyncpg.Connection, *, now: datetime | None = None,
            ORDER BY count(*) DESC, pm.title_norm LIMIT 50""",
         since, PROPOSE_MENTIONS, PROPOSE_EPISODES)
     for r in rows:
-        if await _known_name(conn, r["title_norm"]):
+        try:
+            title = clean_title(r["title"])
+        except ProjectsError:
+            continue
+        if await _known_name(conn, r["title_norm"]) or await _known_name(conn, norm(title)):
             continue
         try:
-            await create_project(conn, r["title"], origin="model", reason={
+            await create_project(conn, title, origin="model", reason={
                 "mentions": r["mentions"], "episodes": r["episodes"], "chats": list(r["chats"])[:10]})
         except ProjectsError:
             continue
