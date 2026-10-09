@@ -56,6 +56,7 @@ MODULES = (
     "shturman.media.service",      # так же скачивает фото и документы; ответы модели — через задания
     "shturman.processing.service",
     "shturman.processing.pages_service",
+    "shturman.processing.memory_service",   # проекты, факты, профиль владельца: маршруты и инструменты
     "shturman.processing.mcp_tools",
     "shturman.outbox.service",
     "shturman.replies.service",    # продолжение задач после Telegram-решений владельца
