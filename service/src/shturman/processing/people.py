@@ -918,6 +918,13 @@ async def merge_people(conn: asyncpg.Connection, source_id: int, target_id: int)
         await conn.execute(
             "DELETE FROM person_proposals WHERE status = 'pending' AND (person_id = $1 OR other_person_id = $1)",
             source_id)
+        # факты о человеке переходят вместе с ним; сменяемые выстраиваются заново по датам
+        from . import facts
+        await conn.execute("UPDATE facts SET person_id = $2 WHERE person_id = $1", source_id, target_id)
+        for row in await conn.fetch(
+                "SELECT DISTINCT slot FROM facts WHERE person_id = $1 AND slot IS NOT NULL", target_id):
+            await facts.rechain(conn, "person", target_id, None, row["slot"])
+        await conn.execute("UPDATE pages SET dirty = true WHERE person_id = $1", target_id)
         await rebuild_forms(conn, target_id)
     return {"ok": True, "person_id": target_id, "merged": source_id}
 

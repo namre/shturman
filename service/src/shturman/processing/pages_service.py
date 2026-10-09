@@ -95,6 +95,9 @@ async def get_page(request: Request) -> JSONResponse:
             parsed = pages.parse(markdown)
             blocks = {"summary": parsed.summary, "owner": parsed.owner.strip("\r\n"),
                       "commitments": parsed.commitments, "timeline": parsed.timeline.strip("\r\n")}
+            for name in (pages.DECISIONS, pages.FACTS):
+                if getattr(parsed, name) is not None:
+                    blocks[name] = getattr(parsed, name)
     except pages.PageError as exc:
         page["problem"] = page["problem"] or str(exc)
     return JSONResponse({**page, "markdown": markdown, "blocks": blocks})
@@ -116,11 +119,11 @@ async def _apply_owner_block(conn: asyncpg.Connection, payload: dict[str, Any]) 
     confirm.must_not_widen(True)      # слова «от владельца» — только с его нажатия
     # На отдельном соединении и вне транзакции действия: запись страницы меняет и файлы, и базу
     # своими шагами, и откат «снаружи» разошёл бы их между собой.
+    target = payload.get("entity_id") if isinstance(payload.get("entity_id"), str) else int(payload["person_id"])
     async with state.pool.acquire() as own:
         try:
             result = await pages_build.write_owner_block(
-                own, state.config.pages_dir, int(payload["person_id"]), payload.get("text"),
-                tz=state.config.timezone)
+                own, state.config.pages_dir, target, payload.get("text"), tz=state.config.timezone)
         except pages_build.PagesError as exc:
             raise confirm.Refused(str(exc), _status_of(exc)) from None
     return confirm.Done(result=result)

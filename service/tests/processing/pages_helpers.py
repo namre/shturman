@@ -117,6 +117,13 @@ def git(config, *args):
     return done.stdout
 
 
+async def write_owner_block(conn, pages_dir, target, text, **kw):
+    """Блок владельца так, как его записывает сам владелец: на странице настройки или нажатием
+    в боте согласований. Без проверенного владельца запись отклоняется (authority)."""
+    with authority.owner_context(OWNER, chat_id=OWNER, action="test.owner_block"):
+        return await pages_build.write_owner_block(conn, pages_dir, target, text, **kw)
+
+
 def log(config):
     """[(автор, заголовок)] от новых к старым."""
     out = git(config, "log", "--format=%an|%s")

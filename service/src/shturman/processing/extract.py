@@ -6,12 +6,16 @@
 # Идея (не код) из getzep/graphiti (Apache-2.0), graphiti_core/prompts/dedupe_edges.py@689de29:
 # модель получает новое утверждение и список уже записанных и возвращает номера дублей;
 # решение принимает код.
-"""Извлечение обязательств: всё, что делается без базы.
+"""Извлечение обязательств, фактов, решений и упоминаний проектов: всё, что делается без базы.
 
   * нарезка сообщений чата на эпизоды по паузам;
-  * предварительный отбор: к модели идут только эпизоды, где есть похожее на обещание;
+  * предварительный отбор: к модели идут только эпизоды, где есть похожее на обещание или на
+    факт и решение (числа с единицами, деньги, даты, «решили», «теперь», «новый номер»…);
   * запрос к модели: пронумерованные сообщения с метками говорящих;
-  * проверка ответа: типы, номера, дословность цитаты и срока, оговорки и вопросы.
+  * проверка ответа: типы, номера, дословность цитаты и срока, оговорки и вопросы. У факта —
+    дословная цитата из сообщения эпизода, которое можно считать источником (не пересланное,
+    не написанное сервисом, не скрытое и не удалённое); у упоминания проекта — название,
+    которое действительно есть в тексте сообщений эпизода.
 
 Текст сообщений — чужой и недоверенный. В запросе он отделён и помечен как данные; из ответа
 модели принимается только то, что подтверждается самим текстом сообщения: цитата обязана в нём
@@ -32,7 +36,7 @@ from typing import Any, Sequence
 
 from .dates import find_due_expression
 
-PROMPT_VERSION = "2"
+PROMPT_VERSION = "3"
 
 OWNER_LABEL = "ВЛАДЕЛЕЦ"
 EPISODE_GAP = timedelta(minutes=45)   # пауза, после которой начинается новый эпизод
@@ -42,6 +46,23 @@ MESSAGE_CHARS = 1200                  # сколько знаков одного
 MAX_ITEMS = 20                        # больше обязательств из одного ответа не принимаем
 WHAT_LIMIT = 200
 QUOTE_LIMIT = 400
+MAX_FACTS = 8                         # больше фактов из одного эпизода не принимаем
+MAX_PROJECTS = 5                      # и упоминаний проектов
+FACT_LIMIT = 240
+PROJECT_TITLE_LIMIT = 80
+
+# Ключи сменяющих друг друга фактов. Ключ модели сводится к одному из них; незнакомый — None
+# (факт ничего не сменяет): ошибочный ключ закрыл бы верный факт.
+SLOTS: dict[str, str] = {
+    "должность": "должность", "позиция": "должность", "роль": "должность",
+    "компания": "компания", "организация": "компания", "место работы": "компания", "работа": "компания",
+    "телефон": "телефон", "номер": "телефон", "номер телефона": "телефон",
+    "почта": "почта", "email": "почта", "e-mail": "почта", "электронная почта": "почта",
+    "адрес": "адрес", "город": "город",
+    "цена": "цена", "стоимость": "цена", "сумма": "цена",
+    "бюджет": "бюджет", "срок": "срок", "дедлайн": "срок", "статус": "статус", "этап": "статус",
+    "площадь": "площадь", "подрядчик": "подрядчик", "ответственный": "ответственный",
+}
 
 
 @dataclass(frozen=True)
@@ -196,6 +217,30 @@ def has_promise_signal(episode: Episode) -> bool:
     return False
 
 
+# Признаки факта или решения: числа с единицами и деньги, даты, слова о смене и решении.
+_FACT_RE = re.compile(
+    r"\d[\d\s.,]*\s*(?:₽|\$|€|руб\w*|р\.|тыс\w*|т\.р|млн\w*|млрд\w*|%|процент\w*|м2|м²|кв\.?\s*м|"
+    r"квадрат\w*|сот\w*|га\b|шт\b|штук\w*|этаж\w*|кг\b|тонн\w*|дн\w*|недел\w*|месяц\w*|мес\b|лет\b|год\w*)|"
+    r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b|"
+    r"\b(?:реш(?:или|ил|ила|ено)|договорил\w*|утверд\w*|согласова\w*|теперь|отныне|"
+    r"перешел|перешла|перешли|перевел\w*|назначен\w*|уволил\w*|"
+    r"нов(?:ый|ая|ое)\s+(?:номер|телефон|адрес|почта|email|офис|директор|руководитель)|"
+    r"цен[аеуы]|стоимост\w*|бюджет\w*)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def has_fact_signal(episode: Episode) -> bool:
+    """Есть ли в эпизоде похожее на факт или решение. Как и для обещаний, правила широкие."""
+    return any(message.is_source and _FACT_RE.search(_plain(message.text))
+               for message in episode.messages if message.text.strip())
+
+
+def has_memory_signal(episode: Episode) -> bool:
+    """Отбор эпизодов для запроса к модели: обещание, факт или решение."""
+    return has_promise_signal(episode) or has_fact_signal(episode)
+
+
 # --- текст для модели ------------------------------------------------------------------------
 
 def clean_text(text: str, limit: int = MESSAGE_CHARS) -> str:
@@ -290,7 +335,7 @@ EXTRACT_INSTRUCTIONS = f"""\
 
 {_UNTRUSTED}
 
-Правила — соблюдай все:
+Правила для обязательств — соблюдай все:
 1. Только явные обязательства. Вопросы, мнения, планы без обязательства, просьбы без согласия и \
 высказывания с оговорками («постараюсь», «попробую», «если получится», «возможно», «наверное») — \
 НЕ обязательства.
@@ -310,11 +355,37 @@ EXTRACT_INSTRUCTIONS = f"""\
 на языке переписки, без имён и без срока.
 9. duplicate_of — если это то же обязательство, что уже есть в списке «Уже записано», укажи его \
 номер; иначе null.
-10. Если обязательств нет, верни пустой список.
+10. project — название проекта (объекта, сделки), к которому относится обязательство, как оно \
+написано в переписке или в списке «Проекты владельца»; если не ясно — null.
+11. Если обязательств нет, верни пустой список.
+
+Кроме обязательств, извлеки ФАКТЫ и РЕШЕНИЯ, которые стоит помнить: о человеке — должность, \
+компания, телефон, адрес, город («я теперь в „Альфе“», «мой новый номер …»); о проекте — цена, \
+бюджет, срок, статус, площадь, подрядчик; о {OWNER_LABEL} — то, что он прямо сказал о себе или \
+о своих постоянных правилах; РЕШЕНИЕ по проекту — что именно решили, договорились, утвердили.
+
+Правила для фактов — соблюдай все:
+12. message — номер сообщения в квадратных скобках, где факт сказан; source_quote — фрагмент \
+этого сообщения, скопированный ДОСЛОВНО. Из блока «Ранее», пересланных сообщений и сообщений, \
+написанных ассистентом, ничего не извлекай.
+13. about — о ком или о чём факт: {OWNER_LABEL}, метка участника (У1, У2…) или ПРОЕКТ. Для ПРОЕКТ \
+обязательно укажи project.
+14. slot — что за сведение, если оно сменяет прежнее: должность, компания, телефон, почта, адрес, \
+город, цена, бюджет, срок, статус, площадь, подрядчик, ответственный. Если факт ничего не \
+сменяет — null.
+15. text — сам факт одной короткой фразой до 200 знаков на языке переписки. Ничего не додумывай \
+и не вычисляй: только то, что прямо сказано.
+16. kind: decision — решение по проекту; fact — всё остальное.
+17. Не больше 8 фактов. Предположения, слухи, вопросы и высказывания с оговорками — не факты. \
+Пароли, коды подтверждения и номера карт не извлекай никогда.
+18. projects — названия проектов, объектов и сделок, которые обсуждаются в сообщениях, ровно \
+так, как они написаны. Если таких нет — пустой список.
 
 Ответ — один JSON-объект: {{"commitments": [{{"message": 1, "source_quote": "…", "what": "…", \
 "due_expression": "…" или null, "due_message": номер или null, "recipient": "У1" или null, \
-"duplicate_of": номер или null}}]}}
+"duplicate_of": номер или null, "project": "…" или null}}], "facts": [{{"message": 1, \
+"source_quote": "…", "about": "У1", "project": "…" или null, "slot": "должность" или null, \
+"text": "…", "kind": "fact"}}], "projects": ["…"]}}
 """
 
 # Схема намеренно нестрогая. Исполнитель сверяет ответ модели со схемой и при любом расхождении
@@ -325,7 +396,10 @@ EXTRACT_SCHEMA: dict[str, Any] = {
     "required": ["commitments"],
     "description": "commitments: array of objects {message: integer, source_quote: string, what: string, "
                    "due_expression: string or null, due_message: integer or null, "
-                   "recipient: string or null, duplicate_of: integer or null}",
+                   "recipient: string or null, duplicate_of: integer or null, project: string or null}; "
+                   "facts: array of objects {message: integer, source_quote: string, about: string, "
+                   "project: string or null, slot: string or null, text: string, kind: fact | decision}; "
+                   "projects: array of strings",
 }
 
 RESOLVE_INSTRUCTIONS = f"""\
@@ -367,14 +441,19 @@ def _known_line(n: int, item: dict[str, Any]) -> str:
 
 def build_extract_input(
     episode: Episode, labels: dict[tuple, str], tz: tzinfo | None, *, chat_kind: str,
-    known: Sequence[dict[str, Any]] = (),
+    known: Sequence[dict[str, Any]] = (), projects: Sequence[str] = (),
 ) -> str:
     """Данные запроса на извлечение. `known` — уже записанные обязательства чата:
-    [{"who": метка или имя, "what": ..., "due_expression": ...}] — для отметки дублей."""
+    [{"who": метка или имя, "what": ..., "due_expression": ...}] — для отметки дублей;
+    `projects` — названия действующих проектов владельца (чтобы модель называла их одинаково)."""
     parts = ["<переписка>", render_conversation(episode, labels, tz, chat_kind=chat_kind)]
     if known:
         parts.append("Уже записано:")
         parts.extend(_known_line(n, item) for n, item in enumerate(known, start=1))
+    names = [clean_text(name, PROJECT_TITLE_LIMIT) for name in projects]
+    names = [name for name in names if name]
+    if names:
+        parts.append("Проекты владельца: " + "; ".join(names) + ".")
     parts.append("</переписка>")
     return "\n".join(parts)
 
@@ -445,6 +524,7 @@ class Candidate:
     due_dropped: bool               # модель назвала срок, которого нет в тексте
     recipient_key: tuple | None     # ключ говорящего (speaker_key), которому обещано
     duplicate_of: int | None        # номер в списке «Уже записано»
+    project: str | None = None      # метка проекта от модели (чужой текст, ещё не сопоставлена)
 
 
 def well_formed(parsed: Any, key: str) -> bool:
@@ -538,8 +618,208 @@ def validate_extraction(
         accepted.append(Candidate(
             message=message, quote=quote, what=what, due_expression=due, due_message=due_message,
             due_dropped=due_dropped, recipient_key=recipient_key, duplicate_of=_int(item.get("duplicate_of")),
+            project=project_label(item.get("project")),
         ))
     return accepted, dropped
+
+
+# --- факты, решения, проекты -------------------------------------------------------------------
+
+_SENSITIVE_RE = re.compile(r"парол\w*|\bпин\b|pin-?код|cvv|cvc|код\s+(?:из\s+смс|подтвержден\w*|доступа)",
+                           flags=re.IGNORECASE)
+_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+_LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
+_URL_RE = re.compile(r"(?:https?://|www\.|t\.me/|tg://)\S+", re.IGNORECASE)
+
+
+def project_label(value: Any) -> str | None:
+    """Название проекта из ответа модели: одна строка, без кавычек по краям, с буквами."""
+    if not isinstance(value, str):
+        return None
+    text = _URL_RE.sub("", clean_text(value, 400).replace("⏎", " "))
+    text = re.sub(r"\s+", " ", text).strip(" .,;:—-«»\"'“”„")
+    if not _LETTER_RE.search(text) or len(text) > PROJECT_TITLE_LIMIT:
+        return None
+    return text
+
+
+def norm_title(text: str | None) -> str:
+    """Ключ сравнения названий проектов: регистр, ё, только буквы и цифры через пробел."""
+    return " ".join(re.findall(r"[0-9a-zа-я]+", normalize(text or "")))
+
+
+def slot_of(value: Any) -> str | None:
+    """Ключ сменяемого факта из перечня SLOTS; незнакомый — None."""
+    if not isinstance(value, str):
+        return None
+    return SLOTS.get(re.sub(r"\s+", " ", value.strip().lower().replace("ё", "е")))
+
+
+@dataclass(frozen=True)
+class FactCandidate:
+    """Факт или решение из ответа модели, прошедшие проверку текстом. О ком — решает код."""
+
+    message: Msg
+    quote: str
+    about: str                    # owner | peer | project
+    speaker_key: tuple | None     # для peer: ключ говорящего (speaker_key) из меток эпизода
+    project: str | None           # метка проекта (чужой текст, ещё не сопоставлена)
+    slot: str | None
+    text: str
+    kind: str                     # fact | decision
+
+    @property
+    def origin(self) -> str:
+        """Кто это сказал: владелец (его сообщение) или собеседник."""
+        return "owner" if self.message.is_outgoing else "other"
+
+
+def sanitize_fact(text: str) -> str:
+    """Формулировка факта от модели: одной строкой, без ссылок, не длиннее FACT_LIMIT."""
+    cleaned = _URL_RE.sub("[ссылка]", clean_text(text, 1000).replace("⏎", " "))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ;:—-")
+    return cleaned[:FACT_LIMIT].rstrip()
+
+
+def _sensitive(text: str, quote: str, slot: str | None) -> bool:
+    if _SENSITIVE_RE.search(text) or _SENSITIVE_RE.search(quote):
+        return True
+    return slot != "телефон" and bool(_CARD_RE.search(text) or _CARD_RE.search(quote))
+
+
+def validate_facts(
+    parsed: Any, episode: Episode, labels: dict[tuple, str],
+) -> tuple[list[FactCandidate], dict[str, int]]:
+    """Проверяет факты и решения из ответа модели по тексту эпизода. Возвращает принятое и
+    счётчики отброшенного. Нет ключа facts — не ошибка: так отвечала модель до версии 3."""
+    dropped = {"malformed": 0, "bad_index": 0, "forwarded": 0, "by_service": 0, "ungrounded_quote": 0,
+               "hedged": 0, "question": 0, "empty": 0, "bad_subject": 0, "sensitive": 0, "over_limit": 0}
+    items = parsed.get("facts") if isinstance(parsed, dict) else None
+    if items is None:
+        return [], dropped
+    if not isinstance(items, list):
+        dropped["malformed"] += 1
+        return [], dropped
+    key_by_label = {label: key for key, label in labels.items() if label != OWNER_LABEL}
+    accepted: list[FactCandidate] = []
+    seen: set[tuple[int, str]] = set()
+    for item in items:
+        if len(accepted) >= MAX_FACTS:
+            dropped["over_limit"] += 1
+            continue
+        if not isinstance(item, dict):
+            dropped["malformed"] += 1
+            continue
+        index, quote, text = _int(item.get("message")), item.get("source_quote"), item.get("text")
+        about = item.get("about").strip() if isinstance(item.get("about"), str) else None
+        if index is None or not isinstance(quote, str) or not isinstance(text, str) or not about:
+            dropped["malformed"] += 1
+            continue
+        if not 1 <= index <= len(episode.messages):
+            dropped["bad_index"] += 1
+            continue
+        message = episode.messages[index - 1]
+        if not message.is_source:
+            dropped["by_service" if message.by_service else "forwarded"] += 1
+            continue
+        quote = quote.strip()[:QUOTE_LIMIT]
+        if not grounded(quote, message.text):
+            dropped["ungrounded_quote"] += 1
+            continue
+        around = quote_context(quote, message.text)
+        if any(is_hedged(part) for part in around) or is_hedged(quote):
+            dropped["hedged"] += 1
+            continue
+        if any(part.rstrip().endswith("?") for part in around):
+            dropped["question"] += 1
+            continue
+        text = sanitize_fact(text)
+        if len(text) < 3:
+            dropped["empty"] += 1
+            continue
+        kind = item.get("kind") if item.get("kind") in ("fact", "decision") else "fact"
+        slot = slot_of(item.get("slot"))
+        if _sensitive(text, quote, slot):
+            dropped["sensitive"] += 1
+            continue
+        project = project_label(item.get("project"))
+        speaker = None
+        if about == OWNER_LABEL:
+            subject = "owner"
+        elif about.upper() == "ПРОЕКТ":
+            subject = "project"
+        elif about in key_by_label and key_by_label[about][0] == "peer":
+            subject, speaker = "peer", key_by_label[about]
+        else:
+            dropped["bad_subject"] += 1
+            continue
+        if subject == "project" and project is None:
+            dropped["bad_subject"] += 1
+            continue
+        if kind == "decision":
+            if project is None:
+                kind = "fact"           # решение без проекта — просто факт о том, о ком сказано
+            else:
+                subject, speaker, slot = "project", None, None
+        marker = (message.id, normalize(text))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        accepted.append(FactCandidate(message=message, quote=quote, about=subject, speaker_key=speaker,
+                                      project=project, slot=slot, text=text, kind=kind))
+    return accepted, dropped
+
+
+@dataclass(frozen=True)
+class Mention:
+    """Название проекта, которое действительно есть в тексте сообщения эпизода."""
+
+    title: str
+    message: Msg
+
+
+def find_mention(title: str, episode: Episode) -> Mention | None:
+    """Сообщение эпизода (только источники, без блока «Ранее»), в тексте которого есть название."""
+    needle = norm_title(title)
+    if not needle:
+        return None
+    padded = f" {needle} "
+    for message in episode.messages:
+        if message.is_source and padded in f" {norm_title(message.text)} ":
+            return Mention(title, message)
+    return None
+
+
+def validate_projects(parsed: Any, episode: Episode) -> tuple[list[Mention], dict[str, int]]:
+    """Упоминания проектов из ответа модели. Принимается только название, которое есть в тексте
+    сообщений эпизода: модель не может «придумать» проект, которого в переписке нет."""
+    dropped = {"malformed": 0, "ungrounded": 0, "over_limit": 0}
+    items = parsed.get("projects") if isinstance(parsed, dict) else None
+    if items is None:
+        return [], dropped
+    if not isinstance(items, list):
+        dropped["malformed"] += 1
+        return [], dropped
+    out: list[Mention] = []
+    seen: set[str] = set()
+    for item in items:
+        title = project_label(item)
+        if title is None:
+            dropped["malformed"] += 1
+            continue
+        key = norm_title(title)
+        if key in seen:
+            continue
+        if len(out) >= MAX_PROJECTS:
+            dropped["over_limit"] += 1
+            continue
+        found = find_mention(title, episode)
+        if found is None:
+            dropped["ungrounded"] += 1
+            continue
+        seen.add(key)
+        out.append(found)
+    return out, dropped
 
 
 @dataclass(frozen=True)

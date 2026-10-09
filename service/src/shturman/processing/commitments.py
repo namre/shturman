@@ -121,6 +121,7 @@ def to_dict(row: asyncpg.Record, today: date | None = None) -> dict[str, Any]:
         "source": {"message_id": row["source_message_id"], "tg_message_id": row["source_tg_message_id"],
                    "sent_at": row["source_sent_at"].isoformat(), "ref": f"msg:{row['source_message_id']}"},
         "chat": {"id": row["chat_id"], "title": row["chat_title"], "type": row["chat_type"]},
+        "project_id": row["project_id"],
         "created_at": row["created_at"].isoformat(),
         "decided_at": row["decided_at"].isoformat() if row["decided_at"] else None,
         "closed_at": row["closed_at"].isoformat() if row["closed_at"] else None,
@@ -150,6 +151,7 @@ async def get_commitment(
 async def list_commitments(
     conn: asyncpg.Connection, *, view: str = "open", today: date, person_id: int | None = None,
     peer_id: int | None = None, chat_id: int | None = None, direction: str | None = None, limit: int = 100,
+    project_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Выборка обязательств.
 
@@ -157,7 +159,7 @@ async def list_commitments(
     week — срок с сегодня до конца недели; next_week — срок с понедельника по воскресенье
     следующей недели; proposed — ждут решения владельца; closed — выполненные и отменённые; all — все.
     `person_id` — обязательства, где человек должен или ему должны (по всем его учётным записям);
-    `peer_id` — то же по одной учётной записи Telegram (peers.id).
+    `peer_id` — то же по одной учётной записи Telegram (peers.id); `project_id` — обязательства проекта.
     Обязательства исключённых чатов и удалённых сообщений не возвращаются.
     """
     if view not in VIEWS:
@@ -198,6 +200,8 @@ async def list_commitments(
         where.append(f"c.chat_id = {arg(chat_id)}")
     if direction is not None:
         where.append(f"c.direction = {arg(direction)}")
+    if project_id is not None:
+        where.append(f"c.project_id = {arg(project_id)}")
     sql = _SELECT + "".join(f" AND {condition}" for condition in where)
     sql += f" ORDER BY c.due_date NULLS LAST, c.due_time NULLS LAST, c.id LIMIT {arg(max(1, min(int(limit), 500)))}"
     return [to_dict(r, today) for r in await conn.fetch(sql, *args)]
@@ -277,21 +281,22 @@ def candidate_due(candidate: Candidate, tz: tzinfo | str | None) -> dates.Resolu
 async def propose(
     conn: asyncpg.Connection, *, chat_id: int, candidate: Candidate, debtor_peer_id: int | None,
     creditor_peer_id: int | None, direction: str, tz: tzinfo | str | None,
-    run_id: int | None = None, model: str | None = None,
+    run_id: int | None = None, model: str | None = None, project_id: int | None = None,
 ) -> int:
-    """Записывает обязательство как предложение владельцу (статус proposed)."""
+    """Записывает обязательство как предложение владельцу (статус proposed). project_id — проект,
+    к которому оно относится (projects.for_commitment), или None."""
     due = candidate_due(candidate, tz)
     commitment_id = await conn.fetchval(
         """INSERT INTO commitments (chat_id, source_message_id, due_message_id, debtor_peer_id, creditor_peer_id,
                                     direction, what, source_quote, due_expression, due_date, due_time, due_part,
-                                    due_reason, status, run_id, model)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'proposed', $14, $15)
+                                    due_reason, status, run_id, model, project_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'proposed', $14, $15, $16)
            RETURNING id""",
         chat_id, candidate.message.id,
         candidate.due_message.id if candidate.due_expression and candidate.due_message else None,
         debtor_peer_id, creditor_peer_id, direction, candidate.what, candidate.quote,
         candidate.due_expression, due.due_date, due.due_time, due.part_of_day, due.reason.value,
-        run_id, (model or "")[:120] or None,
+        run_id, (model or "")[:120] or None, project_id,
     )
     await log_event(conn, commitment_id, actor="model", action="proposed", from_status=None,
                     to_status="proposed", details={"due_reason": due.reason.value})
