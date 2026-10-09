@@ -138,6 +138,9 @@ async def get_project(request: Request) -> JSONResponse:
         page = await pages_build.get_page(conn, entity_id=f"project:{project_id}")
     item["page_blocks"] = page["blocks"] if page else None
     item["page_flags"] = page["flags"] if page else []
+    # выведенное из переписки — чужой текст; блок владельца — его собственные слова
+    item["untrusted_fields"] += [f"page_blocks.{block}" for block in
+                                 ("summary", "commitments", "decisions", "facts", "timeline")]
     return JSONResponse(item)
 
 

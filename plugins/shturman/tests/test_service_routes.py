@@ -27,6 +27,11 @@ OWNER_ONLY = [
     ("DELETE", "/api/people/7/aliases"),
     ("POST", "/api/people/proposals/7/reject"),
     ("POST", "/api/processing/run"),
+    # память: решения о предложениях, факты и блоки владельца — только владелец в интерфейсе
+    ("POST", "/api/projects/proposals/7"),
+    ("PUT", "/api/projects/7/owner-block"),
+    ("POST", "/api/facts/7/retract"),
+    ("PUT", "/api/owner/profile/owner-block"),
 ]
 # Вход в аккаунт Telegram, управление аккаунтами, выбор их чатов и импорт выгрузки — только на
 # странице настройки переписки, которую сервис отдаёт мимо Hermes. Через плагин — никому.
@@ -103,13 +108,26 @@ def test_owner_ui_keeps_only_reading_of_telegram_accounts():
     ("GET", "/api/people"),
     ("GET", "/api/people/7"),
     ("POST", "/api/people/7/aliases"),
+    ("GET", "/api/projects"),
+    ("GET", "/api/projects/7"),
+    ("POST", "/api/projects"),
+    ("POST", "/api/projects/7/chats"),
+    ("POST", "/api/projects/7/archive"),
 ])
 def test_agent_tools_reach_exactly_their_routes(method, path):
     assert allowed(TOOLS, method, path)
 
 
 def test_agent_tool_list_has_nothing_else():
-    assert len(TOOLS) == 7
+    assert len(TOOLS) == 11
+
+
+@pytest.mark.parametrize("method, path", [
+    ("GET", "/api/facts"), ("GET", "/api/owner/profile"), ("PUT", "/api/owner"), ("DELETE", "/api/projects/7"),
+    ("POST", "/api/projects/7"), ("PUT", "/api/projects/7"), ("POST", "/api/projects/7/unarchive"),
+])
+def test_agent_tools_do_not_reach_profile_facts_or_owner(method, path):
+    assert not allowed(TOOLS, method, path)
 
 
 @pytest.mark.parametrize("method, path", INTERNAL + [
@@ -129,6 +147,9 @@ def test_owner_ui_cannot_reach_internal_routes(method, path):
     ("GET", "/api/commitments"), ("GET", "/api/commitments/7"), ("POST", "/api/commitments/7/close"),
     ("GET", "/api/people"), ("GET", "/api/people/proposals"), ("GET", "/api/people/7"),
     ("POST", "/api/people/7/aliases"),
+    ("GET", "/api/projects"), ("POST", "/api/projects"), ("GET", "/api/projects/7"),
+    ("POST", "/api/projects/7/chats"), ("POST", "/api/projects/7/archive"), ("GET", "/api/facts"),
+    ("GET", "/api/owner/profile"),
 ])
 def test_owner_ui_reaches_what_its_pages_need(method, path):
     assert allowed(UI, method, path)

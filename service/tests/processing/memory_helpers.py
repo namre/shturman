@@ -45,3 +45,31 @@ def buttons(jobs, module):
 
 async def press_button(conn, data):
     return await press(conn, data)
+
+
+# --- MCP ------------------------------------------------------------------------------------------
+
+MCP_JSON = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+
+
+async def mcp_call(client, tool, **arguments):
+    """Вызов инструмента архива; возвращает структурированный ответ (ошибка инструмента — провал)."""
+    import json
+
+    from conftest import MCP_AUTH
+
+    response = await client.post("/mcp", headers={**MCP_AUTH, **MCP_JSON}, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}})
+    assert response.status_code == 200, response.text
+    result = response.json()["result"]
+    assert result.get("isError") is not True, result
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+    return result["structuredContent"]
+
+
+async def mcp_tools(client):
+    from conftest import MCP_AUTH
+
+    response = await client.post("/mcp", headers={**MCP_AUTH, **MCP_JSON},
+                                 json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    return {t["name"]: t for t in response.json()["result"]["tools"]}

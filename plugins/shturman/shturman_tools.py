@@ -31,6 +31,7 @@ EMOJI = {
     "shturman_commitments": "📋",
     "shturman_commitment_update": "✅",
     "shturman_people": "👤",
+    "shturman_projects": "🏗️",
 }
 
 

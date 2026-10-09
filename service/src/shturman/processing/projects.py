@@ -398,7 +398,6 @@ async def archive_project(conn: asyncpg.Connection, project_id: int) -> dict[str
 
 async def decide_project_proposal(conn: asyncpg.Connection, project_id: int, accept: bool) -> dict[str, Any]:
     """Решение владельца о предложенном проекте. Согласие — только по проверенному владельцу."""
-    principal = authority.requires_owner() if accept else None
     async with conn.transaction():
         row = await conn.fetchrow("SELECT * FROM projects WHERE id = $1 FOR UPDATE", project_id)
         if row is None:
@@ -410,7 +409,8 @@ async def decide_project_proposal(conn: asyncpg.Connection, project_id: int, acc
                         "project": await get_project(conn, project_id)}
             raise ProjectsError("Уже решено.", "bad_status")
         if accept:
-            await _activate(conn, project_id, principal)
+            # повтор уже принятого решения выше ничего не меняет; новое согласие — только владельца
+            await _activate(conn, project_id, authority.requires_owner())
         else:
             await conn.execute(
                 "UPDATE projects SET status = 'rejected', decided_at = now(), updated_at = now() WHERE id = $1",
