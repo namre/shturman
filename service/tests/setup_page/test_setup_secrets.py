@@ -136,13 +136,20 @@ def test_a_token_entered_on_the_page_never_turns_sending_on(monkeypatch, tmp_pat
     ("http://shturman.test:8080", "http://shturman.test:8080"),
     ("https://assistant.example.com.:8443", "https://assistant.example.com:8443"),
     ("HTTPS://пример.example", "https://xn--e1afmkfd.example"),
+    # без домена: внешний IPv4-адрес сервера (docs/deployment.md, «Без домена»)
+    ("https://203.0.113.10:8443", "https://203.0.113.10:8443"),
+    ("https://203.0.113.10:8443/", "https://203.0.113.10:8443"),
+    ("https://203.0.113.10:443", "https://203.0.113.10"),
 ])
 def test_setup_origin_is_normalised(monkeypatch, tmp_path, raw, expected):
     assert from_env(monkeypatch, tmp_path, SHTURMAN_SETUP_ORIGIN=raw).setup_origin == expected
 
 
 @pytest.mark.parametrize("raw", ["assistant.example.com", "ftp://assistant.example.com", "https://assistant.example.com/setup",
-                                 "https://user:pw@assistant.example.com", "https://assistant.example.com?x=1", "https://"])
+                                 "https://user:pw@assistant.example.com", "https://assistant.example.com?x=1", "https://",
+                                 # IP-адрес в необычной записи: браузер открыл бы другой адрес
+                                 "https://0xcb.0.113.10:8443", "https://203.0.113.010:8443", "https://1.2.3:8443",
+                                 "https://203.0.113.256", "https://2130706433", "https://0x7f.1", "https://assistant.example.1"])
 def test_setup_origin_with_a_path_or_credentials_stops_the_service(monkeypatch, tmp_path, raw):
     with pytest.raises(ConfigError):
         from_env(monkeypatch, tmp_path, SHTURMAN_SETUP_ORIGIN=raw)

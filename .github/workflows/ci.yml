@@ -165,7 +165,9 @@ jobs:
           # страницы настройки — нет; сам запуск стека здесь подменён отказом.
           mkdir stub; printf '#!/bin/sh\necho "docker $*" >> "%s/docker-called"\nexit 1\n' "$tmp" > stub/docker; chmod +x stub/docker
           for bad in 'SHTURMAN_PUBLIC_URL=assistant.example.com' 'SHTURMAN_PUBLIC_URL=https://user@assistant.example.com' \
-                     'SHTURMAN_SETUP_URL=https://assistant.example.com:8443/shturman-setup/' 'SHTURMAN_SETUP_URL=assistant.example.com:8443'; do
+                     'SHTURMAN_SETUP_URL=https://assistant.example.com:8443/shturman-setup/' 'SHTURMAN_SETUP_URL=assistant.example.com:8443' \
+                     'SHTURMAN_PUBLIC_URL=https://10.0.0.1' 'SHTURMAN_PUBLIC_URL=https://0xcb.0.113.10' 'SHTURMAN_SETUP_URL=https://203.0.113.010:8443' \
+                     'SHTURMAN_SETUP_URL=https://127.0.0.1:8443' 'SHTURMAN_PUBLIC_URL=http://010.0.0.1:8080'; do
             printf 'SHTURMAN_MODE=hermes\n%s\n' "$bad" > .env
             code=0; PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1 || code=$?
             [ "$code" -eq 1 ] || { echo "$bad: код $code вместо 1"; exit 1; }
@@ -175,6 +177,15 @@ jobs:
           printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com/dash/\nSHTURMAN_SETUP_URL=https://assistant.example.com:8443/\n' > .env
           if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
           if grep -q 'записан не как' out.txt; then echo "адрес с путём у дашборда и с косой чертой у страницы допустимы"; cat out.txt; exit 1; fi
+          rm -f docker-called
+          # Без домена: внешний IP по https и любой адрес по http проходят проверку, как и прежде.
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://203.0.113.10\nSHTURMAN_SETUP_URL=https://203.0.113.10:8443\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "внешний IP-адрес допустим"; cat out.txt; exit 1; fi
+          rm -f docker-called
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=http://192.168.1.10:8080\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "адрес http:// принимается, как и раньше"; cat out.txt; exit 1; fi
           test -e docker-called
           rm -rf stub docker-called out.txt
           # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
@@ -269,6 +280,35 @@ jobs:
           # Адрес дашборда без https или уже на порту 8443: адреса по умолчанию нет, строка не появляется.
           printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=http://assistant.example.com\n' > .env
           bash ensure.sh hermes; if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "для http адреса по умолчанию нет"; exit 1; fi
+          # Без домена: внешний IPv4-адрес вместо имени. Адрес страницы по умолчанию — тот же IP на порту
+          # 8443, и скрипт объясняет, что ещё нужно (профиль shortlived, порт 80). Адрес закрытой сети,
+          # самого сервера, служебный и IP в необычной записи — отказ с кодом 2, .env не меняется.
+          printf 'SHTURMAN_MODE=hermes\n' > .env; chmod 600 .env
+          ./ops/set-public-url.sh https://203.0.113.10 > out.txt
+          test "$(url SHTURMAN_PUBLIC_URL)" = "https://203.0.113.10"
+          test "$(url SHTURMAN_SETUP_URL)" = "https://203.0.113.10:8443"
+          grep -q 'shortlived' out.txt && grep -q 'порт 80' out.txt
+          before="$(cat .env)"
+          for bad in https://10.0.0.1 https://127.0.0.1 https://192.168.1.10 https://172.16.0.1 https://100.64.0.1 \
+                     https://169.254.169.254 https://0.0.0.0 https://224.0.0.1 https://203.0.113.010 https://0x7f.0.0.1 https://203.0.113; do
+            code=0; ./ops/set-public-url.sh "$bad" > out.txt 2>&1 || code=$?
+            [ "$code" -eq 2 ] || { echo "$bad: код $code вместо 2"; exit 1; }
+            grep -q 'Ничего не записано' out.txt
+          done
+          for bad in https://203.0.113.10 https://203.0.113.10:443 https://192.168.1.10:8443 https://127.0.0.1:8443 https://203.0.113.010:8443; do
+            if ./ops/set-setup-url.sh "$bad" > /dev/null 2>&1; then echo "$bad: адрес не должен приниматься"; exit 1; fi
+          done
+          test "$(cat .env)" = "$before"
+          ./ops/set-setup-url.sh https://203.0.113.10:9443 > out.txt
+          test "$(url SHTURMAN_SETUP_URL)" = "https://203.0.113.10:9443" && grep -q 'shortlived' out.txt
+          # Адрес http:// — как и раньше: принимается с предупреждением, в том числе адрес закрытой сети.
+          ./ops/set-public-url.sh http://192.168.1.10:8080 > out.txt 2>&1
+          test "$(url SHTURMAN_PUBLIC_URL)" = "http://192.168.1.10:8080" && grep -q 'ВНИМАНИЕ: адрес без https' out.txt
+          # Необычная запись IP — отказ и по http: с ней сервис переписки не запустился бы.
+          if ./ops/set-public-url.sh http://010.0.0.1:8080 > /dev/null 2>&1; then echo "необычная запись IP не должна приниматься"; exit 1; fi
+          test "$(url SHTURMAN_PUBLIC_URL)" = "http://192.168.1.10:8080"
+          ./ops/set-public-url.sh https://assistant.example.com > out.txt
+          if grep -q 'shortlived' out.txt; then echo "для имени пояснения про IP-адрес не нужно"; exit 1; fi
           # Без Hermes внешний адрес не задаётся вовсе, а ссылка входа — только на локальный адрес.
           printf 'SHTURMAN_MODE=standalone\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\n' > .env
           bash ensure.sh standalone; if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "без Hermes адрес не пишется"; exit 1; fi
@@ -304,6 +344,31 @@ jobs:
           # Настройку проверяет сам Caddy той версии, с которой она проверена.
           docker run --rm -v "$PWD/$f:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           docker run --rm -v "$PWD/config/Caddyfile.remote-mcp.example:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          # Вариант без домена (конец образца): те же два блока на IP-адресе, в каждом — профиль
+          # сертификата shortlived (Let's Encrypt выдаёт сертификат на IP только с ним), в глобальном
+          # блоке — default_sni (сервер за NAT). Вариант собирается ровно по описанию из образца,
+          # отличается от него только этими строками, и его проверяет Caddy той версии, с которой
+          # он проверен.
+          grep -Eq '^#[[:space:]]+203\.0\.113\.10 \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com \{$' "$f"
+          grep -Eq '^#[[:space:]]+203\.0\.113\.10:8443 \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com:8443 \{$' "$f"
+          grep -A4 -E '^#[[:space:]]+tls \{$' "$f" | grep -Eq '^#[[:space:]]+profile shortlived$'
+          grep -Eq '^#[[:space:]]+default_sni 203\.0\.113\.10$' "$f"
+          python3 - "$f" ip.Caddyfile <<'PY'
+          import sys
+          text = open(sys.argv[1], encoding="utf-8").read()
+          tls = "\ttls {\n\t\tissuer acme {\n\t\t\tprofile shortlived\n\t\t}\n\t}\n\n"
+          for head, new in (("assistant.example.com {\n", "203.0.113.10 {\n"), ("assistant.example.com:8443 {\n", "203.0.113.10:8443 {\n")):
+              assert text.count("\n" + head) == 1, head
+              text = text.replace("\n" + head, "\n" + new + tls, 1)
+          admin = "{\n\tadmin unix//run/caddy-admin/admin.sock\n}\n"
+          assert text.count(admin) == 1
+          text = text.replace(admin, "{\n\tdefault_sni 203.0.113.10\n" + admin[2:])
+          open(sys.argv[2], "w", encoding="utf-8").write(text)
+          PY
+          added="$(diff <(grep -Ev '^[[:space:]]*#' "$f") <(grep -Ev '^[[:space:]]*#' ip.Caddyfile) | grep -c '^>' || true)"
+          test "$added" = "15"
+          grep -qx $'\tdefault_sni 203.0.113.10' ip.Caddyfile
+          docker run --rm -v "$PWD/ip.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       - name: реальные маршруты Caddy и отсутствие TCP admin
         run: python service/tests/proxy_smoke.py
       # Справка и неизвестные ключи. На -h и --help каждый скрипт печатает своё назначение и выходит

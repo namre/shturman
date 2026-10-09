@@ -266,7 +266,12 @@ def normalize_origin(raw: str, name: str, *, strict: bool = True) -> str:
     адреса, которые после этого совпали, для браузера — один origin.
 
     strict — путь, запрос и фрагмент запрещены (так задаётся адрес страницы настройки). Без
-    него они отбрасываются: адрес дашборда нужен только для сравнения."""
+    него они отбрасываются: адрес дашборда нужен только для сравнения.
+
+    Имя, последняя часть которого — число или `0x…`, браузер читает как IPv4-адрес (`0x7f.1` —
+    это 127.0.0.1, `010` — восьмеричное 8). Такое имя принимается только в обычной записи:
+    четыре числа от 0 до 255 без ведущих нулей (экземпляр без домена, docs/deployment.md,
+    «Без домена»). Иначе origin, который увидит браузер, не совпал бы с записанным."""
     if not raw:
         return ""
     from urllib.parse import urlsplit
@@ -290,10 +295,22 @@ def normalize_origin(raw: str, name: str, *, strict: bool = True) -> str:
             raise ConfigError(f"{name}: имя узла записано неверно") from None
     if not host or port == 0:
         raise ConfigError(f"{name}: нужен адрес вида {example}")
+    if ":" not in host and not _dotted_quad(host):
+        last = host.rsplit(".", 1)[-1]
+        if last.isdigit() or last.startswith("0x"):
+            raise ConfigError(f"{name}: IP-адрес записан необычно — нужны четыре числа от 0 до 255 через точку, "
+                              "без ведущих нулей, например https://203.0.113.10:8443")
     if ":" in host:
         host = f"[{host}]"
     default = {"http": 80, "https": 443}[parts.scheme]
     return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
+def _dotted_quad(host: str) -> bool:
+    """IPv4-адрес в обычной записи: четыре числа от 0 до 255 через точку, без ведущих нулей."""
+    parts = host.split(".")
+    return len(parts) == 4 and all(p.isascii() and p.isdigit() and (p == "0" or p[0] != "0") and int(p) <= 255
+                                   for p in parts)
 
 
 def _setup_origin(raw: str) -> str:

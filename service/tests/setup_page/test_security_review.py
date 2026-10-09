@@ -278,6 +278,9 @@ async def test_page_body_is_the_same_for_everyone_and_carries_the_marker(stand, 
     ("https://пример.example:8443", "https://xn--e1afmkfd.example:8443", "same_origin"),         # punycode
     ("http://assistant.example.com:80", "http://assistant.example.com", "same_origin"),
     ("https://[2001:db8::1]:8443", "https://[2001:DB8:0::1]:8443/", None),   # разная запись IPv6: сравнение строгое
+    ("https://203.0.113.10:8443", "https://203.0.113.10", None),             # без домена: тот же IP, другой порт
+    ("https://203.0.113.10", "https://203.0.113.10:443/", "same_origin"),    # тот же IP и порт — тот же адрес
+    ("https://203.0.113.10:8443", "https://198.51.100.7:8443", None),        # другой IP — другой адрес
 ])
 def test_setup_origin_is_compared_with_the_dashboard_origin_after_normalising(tmp_path, setup, dashboard, reason):
     cfg = Config(dsn=DSN, api_token=API_TOKEN, mcp_token=MCP_TOKEN, data_dir=tmp_path,
@@ -289,6 +292,14 @@ def test_setup_origin_is_compared_with_the_dashboard_origin_after_normalising(tm
         assert cfg.setup_external and table[cfg.setup_external.split("://")[1]] == cfg.setup_external
     else:
         assert cfg.setup_external == "" and set(table) == {"127.0.0.1:8765", "localhost:8765"}
+
+
+@pytest.mark.parametrize("raw", ["https://0xcb.0.113.10", "https://203.0.113.010/", "https://1.2.3", "https://010.0.0.1:443"])
+def test_dashboard_origin_with_an_oddly_written_ip_is_refused_too(raw):
+    """Адрес дашборда сравнивается с адресом страницы: запись, которую браузер прочёл бы иначе, не принимается."""
+    with pytest.raises(ConfigError):
+        normalize_origin(raw, "SHTURMAN_DASHBOARD_ORIGIN", strict=False)
+    assert normalize_origin("https://203.0.113.10/dash", "SHTURMAN_DASHBOARD_ORIGIN", strict=False) == "https://203.0.113.10"
 
 
 def test_origins_come_from_the_environment_and_garbage_stops_the_service(monkeypatch, tmp_path):
