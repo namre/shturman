@@ -31,7 +31,11 @@ Hermes нет, поэтому данные входа ассистент под�
     привязана к подписи Telegram, а не к записи строки) в течение срока их действия — отказ.
     Строку initData перехватить можно (она живёт в адресе страницы у Telegram), поэтому окно
     повтора закрыто, а не только сужено сроком;
-  * действует, только пока бот тот же и владелец тот же: смена токена или владельца гасит её;
+  * действует, только пока бот тот же и владелец тот же. Любая привязка или отвязка владельца и
+    смена токена бота согласований её завершают (`revoke_all`), а не «усыпляют»: привязка A → B → A
+    или тот же токен, введённый заново, её не оживят. Срок `IDLE` сдвигается только после сверки;
+  * пока ботом согласований пользуется кто-то ещё (опрос получает 409 или включён webhook —
+    так выглядит и тот же токен у бота Hermes), вход закрыт и сессии не действуют (`conflicted`);
   * «выйти везде» на странице и `./ops/logout-all.sh` гасят и её (`auth.revoke_all`);
   * ключ сессии страницы здесь не действует, ключ приложения — на странице (тест это проверяет).
 
@@ -40,7 +44,8 @@ Hermes нет, поэтому данные входа ассистент под�
 в контексте владельца из Telegram (`authority.miniapp_context`). Ничего сверх того, что уже умеют
 кнопки бота: ни настроек, ни правил, ни текста переписки за пределами карточек.
 
-Журнал действий: `app.login`, `app.login_failed` (не чаще раза в минуту), `app.logout`,
+Журнал действий: `app.login`, `app.login_failed` (не чаще раза в минуту; повтор уже использованных
+данных входа — всегда, и владельцу уходит сообщение в бот), `app.logout`,
 `app.decide` — вид и номер пункта и подпись кнопки, без имён и текстов.
 """
 
@@ -74,6 +79,8 @@ LOGIN_FAILED = ("Не получилось войти. Закройте прил
                 "в боте согласований.")
 SIGNED_OUT = "Вход в приложение устарел. Закройте его и откройте снова кнопкой «Штурман» в боте согласований."
 
+REVOKE_ALL = "UPDATE miniapp_sessions SET revoked_at = now() WHERE revoked_at IS NULL"
+
 # Часы проверки срока данных входа. Тесты подменяют.
 now: Callable[[], float] = time.time
 
@@ -105,15 +112,28 @@ async def create_session(conn: asyncpg.Connection, init: initdata.InitData, bot_
 
 
 async def find_session(conn: asyncpg.Connection, token: Any) -> asyncpg.Record | None:
-    """Действующая сессия по ключу из заголовка; заодно отмечает обращение (сдвигает `IDLE`)."""
+    """Действующая сессия по ключу из заголовка. Обращение не отмечает: срок `IDLE` сдвигает
+    `touch` — и только после того, как сверены бот и владелец."""
     if not auth.well_formed(token):
         return None
     return await conn.fetchrow(
-        """UPDATE miniapp_sessions SET last_seen_at = now()
+        """SELECT id, bot_id, user_id, expires_at FROM miniapp_sessions
            WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
-             AND last_seen_at > now() - make_interval(secs => $2)
-           RETURNING id, bot_id, user_id, expires_at""",
+             AND last_seen_at > now() - make_interval(secs => $2)""",
         auth.token_hash(token), float(IDLE))
+
+
+async def touch(conn: asyncpg.Connection, session_id: int) -> None:
+    await conn.execute("UPDATE miniapp_sessions SET last_seen_at = now() WHERE id = $1", session_id)
+
+
+async def revoke_all(conn: asyncpg.Connection) -> int:
+    """Завершает все сессии приложения. Так делают привязка и отвязка владельца (`bridge.set_owner`,
+    `bridge.clear_owner`) и смена токена бота согласований (`executor/service.py`): сессия не
+    «засыпает» до возврата прежнего владельца или бота, а кончается — иначе привязка A → B → A или
+    тот же токен, введённый заново, оживили бы её."""
+    done = await conn.execute(REVOKE_ALL)
+    return int(done.split()[-1])
 
 
 async def cleanup(conn: asyncpg.Connection) -> None:
@@ -133,15 +153,28 @@ async def _signed_in(request: Request) -> AppSession:
     if not token:
         raise refused
     state = state_of(request)
-    bot, _ = page._runtime_bot(state)
-    if bot is None or bot.bot_id is None:
+    bot, api = page._runtime_bot(state)
+    if bot is None or bot.bot_id is None or conflicted(bot, api):
         raise refused
     async with state.pool.acquire() as conn:
         row = await find_session(conn, token)
         owner = await binding.bound_owner(conn, bot.bot_id)
-    if row is None or owner is None or row["bot_id"] != bot.bot_id or row["user_id"] != owner["user_id"]:
-        raise refused
+        if row is None or owner is None or row["bot_id"] != bot.bot_id or row["user_id"] != owner["user_id"]:
+            raise refused
+        await touch(conn, row["id"])
     return AppSession(row["id"], row["bot_id"], row["user_id"], owner["chat_id"], row["expires_at"])
+
+
+# Ботом согласований пользуется кто-то ещё: Telegram отвечает 409 на опрос (тот же токен опрашивает
+# другая программа) или у бота включён webhook. Так выглядит и ошибка «токен бота согласований — тот
+# же, что у бота ассистента в Hermes»: тогда токен есть у Hermes, и он мог бы сам подписать данные
+# входа. Пока это так, вход в приложение закрыт и сессии не действуют. Номер бота Hermes сервис
+# узнать не может, не читая секретов Hermes, — поэтому судит по опросу.
+CONFLICTS = frozenset({"other_poller", "conflict", "webhook"})
+
+
+def conflicted(bot: Any, api: Any) -> bool:
+    return bot.problem in CONFLICTS or bool(api is not None and api.broken in CONFLICTS)
 
 
 # --- обёртка маршрутов ----------------------------------------------------------------------------
@@ -180,8 +213,27 @@ async def index(request: Request) -> Response:
     return Response(page._static("app.html"), media_type="text/html; charset=utf-8")
 
 
-async def _failed(request: Request, code: str) -> None:
+REPLAY_TEXT = ("Кто-то открыл приложение «Штурман» с теми же данными входа Telegram, по которым уже был вход. "
+               "Если вы сейчас не смогли войти в приложение — значит, кто-то вошёл с вашими данными раньше вас. "
+               "Тогда откройте страницу «Переписка» и нажмите «Выйти на всех устройствах» (или выполните на сервере "
+               "./ops/logout-all.sh), затем снова откройте приложение кнопкой «Штурман». Если вы просто открыли "
+               "приложение повторно, ничего делать не нужно.")
+REPLAY_NOTICES = 200          # столько подписей помнится, чтобы не писать владельцу дважды об одной
+
+
+async def _failed(request: Request, code: str, init: initdata.InitData | None = None) -> None:
     holder = page._page(request)
+    if code == "replayed" and init is not None:
+        # Повтор уже использованных данных входа — всегда в журнал и владельцу в бот: это либо он
+        # сам, либо тот, кто перехватил его данные входа. Об одной подписи — одно сообщение.
+        await page._log(request, "app.login_failed", audit.REFUSED, "причина: replayed")
+        mark = _init_hash(init)
+        if mark not in holder.app_replays:
+            if len(holder.app_replays) >= REPLAY_NOTICES:
+                holder.app_replays.clear()
+            holder.app_replays.add(mark)
+            page._tell_owner(state_of(request), REPLAY_TEXT)
+        return
     moment = time.monotonic()
     if holder.app_fail_audit_at == 0.0 or moment - holder.app_fail_audit_at >= FAIL_AUDIT_EVERY:
         holder.app_fail_audit_at = moment
@@ -192,13 +244,15 @@ async def _failed(request: Request, code: str) -> None:
 async def login(request: Request) -> JSONResponse:
     data = await page._body(request)
     state, holder = state_of(request), page._page(request)
-    bot, _ = page._runtime_bot(state)
+    bot, api = page._runtime_bot(state)
     bot_token = state.config.bot_token
-    created = None
+    created = init = None
     try:
         # Токен, которым проверяем, — именно того бота, который сейчас работает.
         if bot is None or bot.bot_id is None or not bot_token or bot_token.split(":", 1)[0] != str(bot.bot_id):
             raise initdata.Invalid("no_bot")
+        if conflicted(bot, api):
+            raise initdata.Invalid("bot_conflict")
         init = initdata.check(data.get("init_data"), bot_token, now=now())
         async with state.pool.acquire() as conn:
             owner = await binding.bound_owner(conn, bot.bot_id)
@@ -209,7 +263,7 @@ async def login(request: Request) -> JSONResponse:
             raise initdata.Invalid("replayed")
     except initdata.Invalid as exc:
         await holder.slow_refusal()
-        await _failed(request, exc.code)
+        await _failed(request, exc.code, init)
         raise BadRequest(LOGIN_FAILED, 401, "app_login_failed") from None
     await page._log(request, "app.login")
     key, expires_at = created

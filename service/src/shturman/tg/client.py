@@ -92,6 +92,13 @@ SEND_REQUESTS: frozenset[type] = frozenset({
     functions.messages.SetTypingRequest,
 })
 
+# Запросов Mini App (`messages.RequestWebView`, `RequestSimpleWebView`, `RequestMainWebView`,
+# `RequestAppWebView`, `ProlongWebView` и любых других `*WebView*`) в перечнях нет и быть не
+# должно: ими клиент Telegram получает подписанные данные входа (`initData`) для приложения бота.
+# С сессией основного аккаунта сервис сам выпустил бы данные входа владельца в приложение
+# «Штурман» (setup_page/miniapp.py) — то есть нажимал бы кнопки бота согласований за него.
+# Тест tests/tg/test_tg_policy.py это сверяет.
+
 # Обёртки: проверяется то, что внутри.
 _WRAPPERS: tuple[type, ...] = (
     functions.InvokeWithoutUpdatesRequest,

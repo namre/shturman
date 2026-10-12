@@ -134,6 +134,7 @@ class Page:
     slow: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(FAIL_SLOTS))
     fail_audit_at: float = 0.0
     app_fail_audit_at: float = 0.0                 # то же для входа в Mini App (miniapp.py)
+    app_replays: set[str] = field(default_factory=set)   # подписи, о повторе которых владельцу уже сообщено
     logins_done: set[str] = field(default_factory=set)   # входы в Telegram, уже отмеченные в журнале
     # Начатый вход через ChatGPT — один на страницу; в памяти, перезапуск сервиса его снимает.
     chatgpt_attempt: siwc.Attempt | None = None

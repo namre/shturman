@@ -150,6 +150,14 @@ def test_init_data_is_checked_exactly_as_telegram_describes():
             assert refused.value.code == code, (code, value)
     with pytest.raises(initdata.Invalid):
         initdata.check(good, "", now=now)
+    # перевод строки в значении — разделитель строки проверки: такое значение не принимается,
+    # даже с верной подписью
+    for value in ('{"id":1000,"first_name":"Е"}\nauth_date=1', '{"id":1000,"first_name":"Е\r"}'):
+        fields = {"auth_date": str(int(now)), "user": value}
+        fields["hash"] = initdata.sign(fields, TOKEN)
+        with pytest.raises(initdata.Invalid) as split:
+            initdata.check(urlencode(fields), TOKEN, now=now)
+        assert split.value.code == "malformed"
     # без пользователя или с пользователем без числового id — тоже нет, даже с верной подписью
     for user in ("{}", '{"id": "1000"}', '{"id": true}', '{"id": -5}', "[]", "не json"):
         fields = {"auth_date": str(int(now)), "user": user}
@@ -197,7 +205,14 @@ async def test_every_refusal_looks_the_same_and_tells_nothing(stand, conn, monke
     assert await conn.fetchval("SELECT count(*) FROM miniapp_sessions") == 1
     # причина — только в журнале, кодом, и не чаще раза в минуту
     failed = [r for r in await app_audit(conn) if r[0] == "app.login_failed"]
-    assert failed == [("app.login_failed", "refused", "причина: not_owner")]
+    # обычные причины — не чаще раза в минуту; повтор использованных данных входа — всегда
+    assert failed == [("app.login_failed", "refused", "причина: not_owner"),
+                      ("app.login_failed", "refused", "причина: replayed"),
+                      ("app.login_failed", "refused", "причина: replayed")]
+    # и владелец узнаёт о повторе в боте — один раз на одни данные входа
+    await exec_fakes.until(lambda: [m for m in s.telegram.sent() if m["text"] == miniapp.REPLAY_TEXT])
+    assert len([m for m in s.telegram.sent() if m["text"] == miniapp.REPLAY_TEXT]) == 1
+    assert "Выйти на всех устройствах" in miniapp.REPLAY_TEXT and "./ops/logout-all.sh" in miniapp.REPLAY_TEXT
     dumped = json.dumps(await app_audit(conn), ensure_ascii=False)
     assert not any(word in dumped for word in SECRET_WORDS) and "Некто" not in dumped
 
@@ -280,6 +295,63 @@ async def test_session_ends_when_idle_when_owner_changes_and_on_logout_all(stand
     assert (await s.app.get("/approvals")).status_code == 200
     assert (await s.page.post("/logout-all")).status_code == 200
     assert (await s.app.get("/approvals")).status_code == 401
+
+
+async def test_rebinding_back_to_the_same_owner_does_not_revive_old_sessions(stand, conn):
+    s = await ready(stand, conn)
+    await s.app.sign_in(signed(query_id="a"))
+    old = s.app.key
+    assert (await s.app.get("/approvals")).status_code == 200
+    await rebind(s, exec_fakes.IVAN_USER)
+    await rebind(s, OWNER)                           # A → B → A
+    assert (await s.app.get("/approvals")).status_code == 401
+    assert await conn.fetchval("SELECT revoked_at IS NOT NULL FROM miniapp_sessions WHERE user_id = $1",
+                               OWNER["id"])
+    # и привязка того же владельца заново (A → A) тоже завершает сессии
+    await s.app.sign_in(signed(query_id="b"))
+    assert s.app.key != old and (await s.app.get("/approvals")).status_code == 200
+    link = (await s.page.post("/bot/bind")).json()["link"]
+    s.telegram.text("/start " + link.split("start=")[1], user=OWNER)
+    await exec_fakes.until(lambda: conn.fetchval(
+        "SELECT count(*) = 0 FROM miniapp_sessions WHERE revoked_at IS NULL"))
+    assert (await s.app.get("/approvals")).status_code == 401
+
+
+async def test_same_bot_token_entered_again_does_not_revive_old_sessions(stand, conn):
+    from setup_fakes import save_bot
+
+    s = await stand(modules=MODULES)                 # токен бота вводится на странице, а не в .env
+    await s.page.login(conn)
+    assert (await save_bot(s)).status_code == 200
+    await bind_owner(s)
+    s.app = App(s.api._transport, ORIGIN)
+    await s.app.sign_in(signed())
+    assert (await s.app.get("/approvals")).status_code == 200
+    assert (await s.page.delete("/bot/token")).status_code == 200
+    await exec_fakes.until(lambda: s.state.extras["executor"].bot is None)
+    assert (await save_bot(s)).status_code == 200    # тот же бот, тот же владелец
+    await exec_fakes.until(lambda: getattr(s.state.extras["executor"].bot, "identity", None))
+    assert (await s.page.get("/state")).json()["bot"]["owner_bound"] is True
+    assert (await s.app.get("/approvals")).status_code == 401
+    assert await conn.fetchval("SELECT count(*) FROM miniapp_sessions WHERE revoked_at IS NULL") == 0
+
+
+async def test_shared_bot_token_closes_the_app_until_resolved(stand, conn):
+    """Ботом согласований пользуется ещё кто-то (409 на опрос) — так выглядит и тот же токен у бота
+    Hermes. Пока это так, вход закрыт и сессии не действуют; отказ не сдвигает срок сессии."""
+    s = await ready(stand, conn)
+    await s.app.sign_in(signed(query_id="before"))
+    bot = s.state.extras["executor"].bot
+    seen = await conn.fetchval("SELECT last_seen_at FROM miniapp_sessions")
+    for problem in ("other_poller", "conflict", "webhook"):
+        bot.problem = problem
+        assert (await s.app.get("/approvals")).status_code == 401
+        refused = await App(s.api._transport, ORIGIN).sign_in(signed(query_id=problem))
+        assert refused.status_code == 401 and refused.json()["code"] == "app_login_failed"
+    assert await conn.fetchval("SELECT last_seen_at FROM miniapp_sessions WHERE revoked_at IS NULL") == seen
+    assert ("app.login_failed", "refused", "причина: bot_conflict") in await app_audit(conn)
+    bot.problem = None
+    assert (await s.app.get("/approvals")).status_code == 200
 
 
 # --- адрес и рамка ------------------------------------------------------------------------------------

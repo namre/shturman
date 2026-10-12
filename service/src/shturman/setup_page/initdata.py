@@ -20,7 +20,8 @@
 
 Что ещё здесь проверяется сверх документа (строже, ничего не ослабляет):
   * строка не длиннее `MAX_LEN`, каждый ключ встречается один раз, запись разбирается без
-    поблажек (`strict_parsing`);
+    поблажек (`strict_parsing`), в значениях нет перевода строки и возврата каретки (они —
+    разделитель data-check-string);
   * `user` — объект JSON с целым положительным `id`; кто это, решает вызывающий (сверка с
     привязанным владельцем — `miniapp.py`).
 
@@ -84,7 +85,9 @@ def parse(raw: object) -> dict[str, str]:
         raise Invalid("malformed") from None
     fields: dict[str, str] = {}
     for key, value in pairs:
-        if not _KEY.match(key) or key in fields:
+        # Перевод строки — разделитель строки data-check-string: значение с ним могло бы выдать
+        # себя за несколько полей. У настоящих данных Telegram его в значениях нет.
+        if not _KEY.match(key) or key in fields or "\n" in value or "\r" in value:
             raise Invalid("malformed")
         fields[key] = value
     return fields

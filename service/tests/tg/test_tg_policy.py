@@ -263,3 +263,27 @@ def test_proxy_is_never_silently_bypassed():
         assert tg_client.parse_proxy("socks5://user:p%40ss@proxy.local:1080") == {
             "proxy_type": "socks5", "addr": "proxy.local", "port": 1080,
             "username": "user", "password": "p@ss", "rdns": True}
+
+
+def test_no_role_can_mint_mini_app_sign_in_data():
+    """Запросы Mini App (*WebView*) дают клиенту подписанные данные входа в приложение бота.
+    С сессией основного аккаунта сервис выпустил бы данные входа владельца в приложение «Штурман»
+    и нажимал бы кнопки бота согласований за него (docs/miniapp.md). Ни в одном перечне их нет,
+    ни у одной роли и ни на каком этапе (вход, отправка) они не проходят."""
+    web_view = set()
+    for _, name, _ in pkgutil.iter_modules(functions.__path__):
+        module = importlib.import_module(f"{functions.__name__}.{name}")
+        for cls_name, cls in inspect.getmembers(module, inspect.isclass):
+            if "webview" in cls_name.lower() and issubclass(cls, TLRequest):
+                web_view.add(cls)
+    names = {cls.__name__ for cls in web_view}
+    assert {"RequestWebViewRequest", "RequestSimpleWebViewRequest", "ProlongWebViewRequest"} <= names, names
+    allowed = tg_client.READ_REQUESTS | tg_client.LOGIN_REQUESTS | tg_client.SEND_REQUESTS
+    assert not any("webview" in cls.__name__.lower() for cls in allowed)
+    for role in tg_client.ROLES:
+        for login in (False, True):
+            policy = RequestPolicy(role, login=login, sending=True)
+            for cls in web_view:
+                request = cls.__new__(cls)
+                assert not policy.allows(request), (role, login, cls.__name__)
+                assert not policy.allows(functions.InvokeWithoutUpdatesRequest(request)), (role, cls.__name__)
