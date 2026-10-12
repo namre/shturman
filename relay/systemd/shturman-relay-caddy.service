@@ -1,0 +1,33 @@
+# Caddy посредника: https://relay.<зона>/api/* (relay/Caddyfile). Ставит relay/install.sh.
+# Слушает только 127.0.0.1:9080 и 9443 — порты 80 и 443 занимает frps; снаружи сюда приходят через
+# frps и служебный frpc (shturman-relay-frpc). Сертификат и учётная запись ACME — в StateDirectory.
+[Unit]
+Description=Caddy посредника «Штурмана» (relay.<зона>)
+After=network-online.target shturman-relayd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=shturman-relay-caddy
+StateDirectoryMode=0700
+Environment=HOME=%S/shturman-relay-caddy XDG_DATA_HOME=%S/shturman-relay-caddy XDG_CONFIG_HOME=%S/shturman-relay-caddy
+ExecStart=/opt/shturman-relay/bin/caddy run --config /etc/shturman-relay/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

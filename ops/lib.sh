@@ -290,7 +290,9 @@ shturman_mode() {
 
 # Профили Compose для режима: hermes — контейнер Hermes, embeddings — поиск по смыслу.
 #   $1 — режим; $2 — эмбеддинги: on, off или keep (как записано в .env сейчас).
-# Прочие профили, если владелец добавил свои, сохраняются.
+# Прочие профили, если владелец добавил свои, сохраняются. Исключение — relay (подключение
+# к посреднику, ./ops/relay.sh): он только для режима с Hermes — без Hermes экземпляр наружу
+# ничего не публикует, поэтому в режиме standalone профиль relay убирается.
 compose_profiles() {
   local mode="$1" emb="${2:-keep}" cur out="" p
   cur="$(env_get COMPOSE_PROFILES)"
@@ -302,7 +304,11 @@ compose_profiles() {
   local IFS=,
   # shellcheck disable=SC2086
   for p in $cur; do
-    case "$p" in ""|hermes|embeddings) ;; *) out="${out:+$out,}$p" ;; esac
+    case "$p" in
+      ""|hermes|embeddings) ;;
+      relay) [ "$mode" = hermes ] && out="${out:+$out,}$p" ;;
+      *) out="${out:+$out,}$p" ;;
+    esac
   done
   printf '%s\n' "$out"
 }

@@ -1,0 +1,36 @@
+# frps посредника «Штурмана» (docs/relay.md). Ставит relay/install.sh.
+# Работает без прав root: DynamicUser, только право занимать порты ниже 1024 (80, 443).
+# Общий токен — из /etc/frp/token.env, сертификат и ключ TLS — через LoadCredential: сам файл ключа
+# читает только root, службе systemd отдаёт копию в её закрытый каталог ($CREDENTIALS_DIRECTORY).
+[Unit]
+Description=frps — посредник «Штурмана»
+After=network-online.target shturman-relayd.service
+Wants=network-online.target shturman-relayd.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+EnvironmentFile=/etc/frp/token.env
+LoadCredential=frps.crt:/etc/frp/frps.crt
+LoadCredential=frps.key:/etc/frp/frps.key
+ExecStart=/opt/shturman-relay/bin/frps -c /etc/frp/frps.toml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

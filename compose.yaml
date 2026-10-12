@@ -6,7 +6,9 @@
 #                 профиль выключен: контейнер не создаётся, образ не скачивается;
 #   embeddings  — локальные эмбеддинги, включаются командой ./ops/embeddings.sh on;
 #   guard       — модель защиты от внедрённых инструкций, включается командой ./ops/guard.sh on;
-#   asr         — распознавание речи для голосовых, включается командой ./ops/asr.sh on.
+#   asr         — распознавание речи для голосовых, включается командой ./ops/asr.sh on;
+#   relay       — подключение к посреднику (frpc), включается командой ./ops/relay.sh join;
+#                 только в режиме с Hermes.
 # Профили записывает в .env (COMPOSE_PROFILES) и выставляет при запуске ./ops/up.sh — по режиму
 # из SHTURMAN_MODE. Режим выбирает ./ops/init-env.sh --mode, меняет ./ops/mode.sh.
 #
@@ -255,6 +257,37 @@ services:
       resources:
         limits:
           memory: 2048m
+    logging: *logging
+
+  relay:
+    # Подключение к посреднику (docs/relay.md): frpc держит исходящее соединение к посреднику и
+    # получает по нему соединения браузеров к двум именам экземпляра — дашборду и странице настройки
+    # переписки. Выключено, пока владелец не подключит экземпляр: ./ops/relay.sh join. Только в режиме
+    # с Hermes (без него экземпляр наружу ничего не публикует; ./ops/up.sh профиль не включит).
+    # Сеть хоста — чтобы дойти до обратного прокси Caddy этого сервера на 127.0.0.1:443 и :80;
+    # протокол PROXY Caddy принимает только с 127.0.0.1. Образ собирается из каталога frpc/ с
+    # проверкой контрольной суммы выпуска frp. Значения — из .env; ключ экземпляра и токен посредника —
+    # секреты (./ops/relay.sh их не печатает). Сертификат посредника — data/relay/ca.pem.
+    profiles: ["relay"]
+    build: ./frpc
+    image: shturman-frpc:local
+    container_name: shturman-relay
+    restart: unless-stopped
+    network_mode: host
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    environment:
+      SHTURMAN_RELAY_SERVER: ${SHTURMAN_RELAY_SERVER:-}
+      SHTURMAN_RELAY_PORT: ${SHTURMAN_RELAY_PORT:-7000}
+      SHTURMAN_RELAY_NAME: ${SHTURMAN_RELAY_NAME:-}
+      SHTURMAN_RELAY_KEY: ${SHTURMAN_RELAY_KEY:-}
+      SHTURMAN_RELAY_TOKEN: ${SHTURMAN_RELAY_TOKEN:-}
+      SHTURMAN_RELAY_ADMIN_PASSWORD: ${SHTURMAN_RELAY_ADMIN_PASSWORD:-}
+    volumes:
+      - ./data/relay:/etc/frpc/relay:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     logging: *logging
 
 networks:

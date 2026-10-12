@@ -1,0 +1,33 @@
+# Служба посредника «Штурмана» (relay/relayd.py): серверный плагин frps и выдача имён по коду
+# приглашения. Ставит relay/install.sh. Слушает только 127.0.0.1 (7400 — плагин, 7401 — /api/*).
+# Общий токен frps ей нужен, чтобы отдать его подключившемуся экземпляру.
+[Unit]
+Description=relayd — плагин frps и выдача имён посредника «Штурмана»
+After=network.target
+
+[Service]
+Type=simple
+User=shturman-relay
+Group=shturman-relay
+StateDirectory=shturman-relay
+StateDirectoryMode=0700
+EnvironmentFile=/etc/frp/token.env
+ExecStart=/usr/bin/python3 -I /opt/shturman-relay/relayd.py --db /var/lib/shturman-relay/relay.db serve --domain @DOMAIN@ --ca /etc/frp/frps.crt
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

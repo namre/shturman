@@ -9,6 +9,9 @@
 # адресе — сколько ему осталось (строка proxy-cert) — и версия Caddy (proxy-version).
 # Ещё читается local/plugin.sha256 — отпечаток кода плагина, с которым запущен Hermes (его пишет
 # ./ops/up.sh; секретов в нём нет).
+# Если экземпляр подключён к посреднику (./ops/relay.sh, docs/relay.md) — строки relay, relay-proxies,
+# relay-reach, relay-addresses: читаются несекретные строки SHTURMAN_RELAY_NAME, _DOMAIN, _SERVER,
+# _PORT; о ключе и токене — только «записаны ли»; состояние пересылок — frpc status в контейнере.
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -112,6 +115,61 @@ case "$MODE" in
   hermes)     pass mode "с Hermes" ;;
   standalone) pass mode "без Hermes: только архив и согласования" ;;
 esac
+
+# --- посредник (./ops/relay.sh, docs/relay.md) ---
+# Только если экземпляр подключён: имя, зона и адрес посредника — несекретные строки .env; о ключе
+# и токене — только «записаны ли». Состояние пересылок — frpc status внутри контейнера (локальная
+# панель frpc с паролем из окружения контейнера); секретов в его выводе нет. Проверка идёт до строк
+# Hermes: адреса через посредника проверяются и тогда, когда Hermes не работает.
+relay_name="$(env_get SHTURMAN_RELAY_NAME)"
+if [ -n "$relay_name" ]; then
+  relay_domain="$(env_get SHTURMAN_RELAY_DOMAIN)"
+  relay_server="$(env_get SHTURMAN_RELAY_SERVER)"; relay_port="$(env_get SHTURMAN_RELAY_PORT)"
+  relay_dash="https://$relay_name.$relay_domain"; relay_setup="https://setup-$relay_name.$relay_domain"
+  if [ "$MODE" != hermes ]; then
+    warn relay "экземпляр записан подключённым к посреднику ($relay_name), но режим без Hermes — подключение не запускается, наружу ничего не публикуется; забыть подключение — ./ops/relay.sh off --forget"
+  elif ! profile_on relay; then
+    warn relay "подключение к посреднику выключено (./ops/relay.sh off): по адресам $relay_dash и $relay_setup страницы не открываются; включить — ./ops/relay.sh on, затем ./ops/up.sh"
+  else
+    rstate="$(container_state shturman-relay)"
+    if [ "$rstate" = running ]; then
+      pass relay "контейнер frpc работает: имя $relay_name, посредник ${relay_server:-?}:${relay_port:-?}"
+    else
+      fail relay "контейнер shturman-relay в состоянии: $rstate — ./ops/up.sh; docker logs --tail 50 shturman-relay"
+    fi
+    if ! grep -Eq '^SHTURMAN_RELAY_KEY=.+' .env || ! grep -Eq '^SHTURMAN_RELAY_TOKEN=.+' .env; then
+      fail relay-key "в .env нет ключа подключения или токена посредника — подключение заново: ./ops/relay.sh off --forget, затем join с новым кодом"
+    fi
+    if [ ! -s data/relay/ca.pem ]; then
+      fail relay-ca "нет сертификата посредника (data/relay/ca.pem): frpc не сможет проверить посредника — ./ops/relay.sh on, затем ./ops/up.sh"
+    fi
+    if [ "$rstate" = running ]; then
+      rstatus="$(docker exec shturman-relay /frpc status -c /etc/frpc/frpc.toml 2>/dev/null || true)"
+      running=0; bad=""
+      for p in dashboard-https dashboard-http setup-https setup-http; do
+        s="$(printf '%s\n' "$rstatus" | awk -v p="$p" '$1 == p {print $2; exit}')"
+        if [ "$s" = running ]; then running=$((running + 1)); else bad="${bad:+$bad, }$p: ${s:-нет}"; fi
+      done
+      if [ "$running" -eq 4 ]; then
+        pass relay-proxies "пересылки дашборда и страницы настройки работают (4 из 4)"
+      elif [ -z "$rstatus" ]; then
+        fail relay-proxies "frpc не отдал состояние пересылок — docker logs --tail 50 shturman-relay"
+      else
+        fail relay-proxies "работают $running из 4 ($bad): посредник не принял подключение или имена — docker logs --tail 50 shturman-relay (там причина отказа посредника)"
+      fi
+    fi
+    if [ -n "$relay_server" ] && timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$relay_server" "${relay_port:-7000}" 2>/dev/null; then
+      pass relay-reach "посредник $relay_server:${relay_port:-7000} принимает соединения"
+    else
+      warn relay-reach "посредник ${relay_server:-?}:${relay_port:-7000} не принимает соединение за 5 секунд: сеть сервера закрывает этот порт или посредник недоступен (docs/relay.md, «Риски»)"
+    fi
+    if [ "$(url_origin "$(env_get SHTURMAN_PUBLIC_URL)")" = "$relay_dash" ] && [ "$(url_origin "$(env_get SHTURMAN_SETUP_URL)")" = "$relay_setup" ]; then
+      pass relay-addresses "адреса экземпляра — имена посредника: $relay_dash и $relay_setup"
+    else
+      warn relay-addresses "адреса экземпляра не совпадают с именами посредника ($relay_dash, $relay_setup) — вернуть: ./ops/relay.sh on; или выключить посредника: ./ops/relay.sh off"
+    fi
+  fi
+fi
 
 c=shturman-hermes
 # Под тем же пользователем, под которым работает Hermes: файлы, созданные от root, он не прочитает.
