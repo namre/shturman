@@ -3,7 +3,8 @@
 # Хранится в local/state (вне git). Секретов сюда не писать.
 #   ./ops/state.sh show            — показать всё
 #   ./ops/state.sh get KEY         — значение ключа (пусто, если нет)
-#   ./ops/state.sh set KEY VALUE   — записать ключ
+#   ./ops/state.sh set KEY VALUE   — записать ключ (например, address domain|ip|relay — способ адреса,
+#                                    который выбрал владелец: docs/address.md)
 #   ./ops/state.sh done STEP       — отметить шаг выполненным (с отметкой времени)
 #   ./ops/state.sh log "текст"     — дописать строку в журнал
 #   ./ops/state.sh -h | --help     — эта справка; каталог local при этом не создаётся
@@ -39,6 +40,17 @@ case "$cmd" in
       hermes)     echo "# режим установки: hermes — с Hermes (runbook: docs/runbooks/deploy.md)" ;;
       *)          echo "# режим установки: неизвестное значение SHTURMAN_MODE в .env — ./ops/mode.sh" ;;
     esac
+    # Способ адреса (docs/address.md) — только в режиме с Hermes: без него адреса у экземпляра нет.
+    if [ "${mode:-hermes}" = hermes ]; then
+      addr="$(grep -E '^address=' "$file" | tail -n 1 | cut -d= -f2-)"
+      case "$addr" in
+        domain) echo "# адрес ассистента: domain — свой домен (docs/address.md)" ;;
+        ip)     echo "# адрес ассистента: ip — по IP-адресу сервера (docs/address.md)" ;;
+        relay)  echo "# адрес ассистента: relay — через посредника sh.namre.app (docs/address.md)" ;;
+        "")     echo "# адрес ассистента: не записан — на новой установке спросите владельца: свой домен, IP-адрес сервера или посредник (docs/runbooks/server-prepare.md, шаг 5)" ;;
+        *)      echo "# адрес ассистента: неизвестное значение — ./ops/state.sh set address domain|ip|relay" ;;
+      esac
+    fi
     echo "# состояние ($file)"; if [ -s "$file" ]; then sort "$file"; else echo "(пусто — развёртывание не начато)"; fi
     echo; echo "# последние записи журнала"; tail -n 10 "$journal" ;;
   get)

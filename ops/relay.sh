@@ -4,6 +4,12 @@
 # соединение по имени сайта (SNI), не расшифровывая, а контейнер frpc этого сервера (shturman-relay)
 # принимает его исходящим соединением и отдаёт обратному прокси Caddy. Сертификат и ключ — только здесь.
 #
+#   ./ops/relay.sh check КОД ИМЯ  — свободно ли имя у посредника, до подключения; если нет — до трёх
+#                                   свободных вариантов от него. Код приглашения нужен действующий, но
+#                                   проверка его не расходует; в .env ничего не пишется. Код выхода:
+#                                   0 — имя свободно, 3 — нет (занято, служебное или не подходит),
+#                                   2 — отказ (неверный код, слишком часто, имя не по правилам),
+#                                   1 — посредник не ответил или не умеет проверять (служба старше 0.3.0)
 #   ./ops/relay.sh join КОД ИМЯ   — подключиться: код приглашения выдаёт держатель посредника (одноразовый),
 #                                   ИМЯ выбирает владелец (3–30 знаков: a–z, 0–9, дефис внутри). Скрипт
 #                                   получает два имени — ИМЯ.<зона> (дашборд) и setup-ИМЯ.<зона> (страница
@@ -12,7 +18,8 @@
 #                                   в .env, и включает профиль relay. Ключ подключения создаёт сам
 #                                   экземпляр (в .env, до обращения к посреднику); посреднику уходит только
 #                                   его sha256. Ответ потерялся — повторите ту же команду: тот же код, имя
-#                                   и ключ дают тот же успешный ответ
+#                                   и ключ дают тот же успешный ответ. Имя занято — код не израсходован,
+#                                   скрипт печатает свободные варианты
 #   ./ops/relay.sh caddyfile      — напечатать готовую настройку Caddy для этих двух имён (вариант
 #                                   «через посредника» из config/Caddyfile.example); сам прокси не меняет
 #   ./ops/relay.sh status         — имя, адреса, контейнер и состояние четырёх пересылок
@@ -49,7 +56,7 @@ ops_help "$@"
 
 cmd="${1:-status}"
 case "$cmd" in
-  join) [ $# -eq 3 ] || { [ $# -gt 3 ] && ops_unknown "$4"; echo "использование: ./ops/relay.sh join КОД ИМЯ" >&2; exit 2; } ;;
+  join|check) [ $# -eq 3 ] || { [ $# -gt 3 ] && ops_unknown "$4"; echo "использование: ./ops/relay.sh $cmd КОД ИМЯ" >&2; exit 2; } ;;
   on|status|caddyfile) [ $# -le 1 ] || ops_unknown "$2" ;;
   off)
     forget=no
@@ -60,7 +67,7 @@ case "$cmd" in
     esac
     [ $# -le 2 ] || ops_unknown "$3" ;;
   -*) ops_unknown "$cmd" ;;
-  *) echo "использование: ./ops/relay.sh join КОД ИМЯ | caddyfile | status | on | off [--forget] — справка: --help" >&2; exit 2 ;;
+  *) echo "использование: ./ops/relay.sh check КОД ИМЯ | join КОД ИМЯ | caddyfile | status | on | off [--forget] — справка: --help" >&2; exit 2 ;;
 esac
 
 API="${SHTURMAN_RELAY_API:-https://relay.sh.namre.app}"
@@ -96,8 +103,14 @@ if code != "200" or not isinstance(d, dict):
     msg = d.get("message") if isinstance(d, dict) else None
     msg = re.sub(r"[^\w\s.,:;«»()/+—–-]", "", str(msg or ""))[:300]
     print("посредник ответил отказом (HTTP " + code + "): " + (msg or "ответ не разобран"), file=sys.stderr)
+    sug = d.get("suggestions") if isinstance(d, dict) else None
+    sug = [x for x in sug[:3] if isinstance(x, str) and re.fullmatch(r"[a-z0-9]([a-z0-9-]{1,28}[a-z0-9])", x)] if isinstance(sug, list) else []
+    if sug:
+        print("Свободные варианты: " + ", ".join(sug) + " — тот же код с одним из них: ./ops/relay.sh join КОД ИМЯ", file=sys.stderr)
+    if isinstance(d, dict) and d.get("error") in ("name_taken", "name_reserved", "bad_name"):
+        print("Проверить другие имена, не расходуя код: ./ops/relay.sh check КОД ИМЯ", file=sys.stderr)
     sys.exit(3 if code in ("400", "403", "409", "429") else 1)
-host = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+"
+host =r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+"
 checks = {
     "name": r"[a-z0-9]([a-z0-9-]{1,28}[a-z0-9])",
     "domain": host,
@@ -132,7 +145,62 @@ print("SHTURMAN_RELAY_PORT=" + str(port))
 print("SHTURMAN_RELAY_TOKEN=" + d["frp_token"])
 '
 
-# Сертификат посредника (не секрет) — заново с https://…/api/ca: соединение проверяется обычным
+# Разбор ответа на проверку имени. Печатает итог; код выхода — как у ./ops/relay.sh check (шапка).
+#   $1 — проверяемое имя; на входе — тело ответа и последней строкой код HTTP.
+PARSE_CHECK='
+import json, re, sys
+raw = sys.stdin.read()
+body, _, code = raw.rpartition("\n")
+try:
+    d = json.loads(body)
+except ValueError:
+    d = None
+name_rx = r"[a-z0-9]([a-z0-9-]{1,28}[a-z0-9])"
+if code == "404":
+    print("Посредник не умеет проверять имя заранее (служба посредника старше 0.3.0). Подключайтесь сразу:", file=sys.stderr)
+    print("./ops/relay.sh join КОД ИМЯ — неподходящее или занятое имя код не тратит.", file=sys.stderr)
+    sys.exit(1)
+if code != "200" or not isinstance(d, dict):
+    msg = d.get("message") if isinstance(d, dict) else None
+    msg = re.sub(r"[^\w\s.,:;«»()/+—–-]", "", str(msg or ""))[:300]
+    print("посредник ответил отказом (HTTP " + code + "): " + (msg or "ответ не разобран"), file=sys.stderr)
+    sys.exit(2 if code in ("400", "403", "429") else 1)
+host = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+"
+name, domain, free = d.get("name"), d.get("domain"), d.get("available")
+if name != sys.argv[1] or not isinstance(free, bool) or not isinstance(domain, str) or not re.fullmatch(host, domain):
+    print("ответ посредника не разобран", file=sys.stderr); sys.exit(1)
+if free:
+    print("Имя «" + name + "» свободно: адреса будут https://" + name + "." + domain + " и https://setup-" + name + "." + domain + ".")
+    print("Код приглашения проверкой не израсходован. Подключиться: ./ops/relay.sh join КОД " + name)
+    print("(до join имя может занять кто-то другой — тогда join скажет об этом, и код останется).")
+    sys.exit(0)
+why = {"taken": "уже занято", "reserved": "служебное, его не выдают", "invalid": "не подходит по правилам"}.get(d.get("reason"), "недоступно")
+print("Имя «" + name + "» " + why + ".")
+sug = d.get("suggestions")
+sug = [x for x in sug[:3] if isinstance(x, str) and re.fullmatch(name_rx, x)] if isinstance(sug, list) else []
+if sug:
+    print("Свободные варианты: " + ", ".join(sug))
+else:
+    print("Свободных вариантов от этого имени посредник не нашёл — нужно другое имя.")
+print("Код приглашения проверкой не израсходован.")
+sys.exit(3)
+'
+
+# Имя и код — до любого обращения к посреднику. [[ =~ ]], а не grep: grep проверяет каждую строку
+# отдельно и пропустил бы значение с переводом строки. После проверки кавычек и обратной черты
+# в них нет — их можно вставлять в JSON как есть.
+check_name_and_code() {
+  if [[ ! "$2" =~ $NAME_RE ]] || [ "${2#setup-}" != "$2" ]; then
+    echo "Имя не подходит: 3–30 знаков, строчные латинские буквы, цифры и дефис внутри, не начинается с setup-." >&2
+    exit 2
+  fi
+  if [[ ! "$1" =~ $CODE_RE ]]; then
+    echo "Код приглашения не похож на код: 20 букв и цифр, обычно группами через дефис (XXXX-XXXX-…)." >&2
+    exit 2
+  fi
+}
+
+# Сертификат посредника (не секрет) — заново с https://…/api/ca:соединение проверяется обычным
 # сертификатом Let's Encrypt, так что подменить его по дороге нельзя.
 fetch_ca() {
   local pem
@@ -215,6 +283,27 @@ relay_name="$(env_get SHTURMAN_RELAY_NAME)"
 relay_domain="$(env_get SHTURMAN_RELAY_DOMAIN)"
 
 case "$cmd" in
+  check)
+    require_hermes "дашборда и внешнего адреса"
+    need_python
+    code="$2"; name="$3"
+    if [ -n "$relay_name" ]; then
+      echo "Экземпляр уже подключён к посреднику (имя $relay_name): проверять имя незачем." >&2
+      exit 2
+    fi
+    check_name_and_code "$code" "$name"
+    echo "Проверяю у посредника $API имя «$name»…"
+    rc=0
+    resp="$(printf '{"code": "%s", "name": "%s"}' "$code" "$name" | curl -sS --proto '=https' --tlsv1.2 -m 30 -X POST \
+            -H 'Content-Type: application/json' --data-binary @- -w '\n%{http_code}' "$API/api/check")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "Посредник не ответил ($API, код curl $rc). Проверка ничего не меняет — её можно повторить." >&2
+      exit 1
+    fi
+    rc=0
+    printf '%s' "$resp" | python3 -I -c "$PARSE_CHECK" "$name" || rc=$?
+    exit "$rc" ;;
+
   join)
     require_hermes "дашборда и внешнего адреса"
     need_python
@@ -224,15 +313,7 @@ case "$cmd" in
       echo "Подключиться заново под другим именем — сначала ./ops/relay.sh off --forget, затем новый код приглашения." >&2
       exit 2
     fi
-    # [[ =~ ]], а не grep: grep проверяет каждую строку отдельно и пропустил бы значение с переводом строки.
-    if [[ ! "$name" =~ $NAME_RE ]] || [ "${name#setup-}" != "$name" ]; then
-      echo "Имя не подходит: 3–30 знаков, строчные латинские буквы, цифры и дефис внутри, не начинается с setup-." >&2
-      exit 2
-    fi
-    if [[ ! "$code" =~ $CODE_RE ]]; then
-      echo "Код приглашения не похож на код: 20 букв и цифр, обычно группами через дефис (XXXX-XXXX-…)." >&2
-      exit 2
-    fi
+    check_name_and_code "$code" "$name"
     umask 077
     mkdir -p data/relay; chmod 700 data/relay
     # Ключ подключения создаёт сам экземпляр и записывает в .env ДО обращения к посреднику; посреднику

@@ -14,6 +14,10 @@
         посредника — только `relay`;
       - новое рабочее соединение (`NewWorkConn`) — только у экземпляра, который не отключён: так
         отключение (`revoke`) останавливает пересылку сразу, не дожидаясь переподключения;
+  * **проверка имени до подключения**: `POST /api/check {code, name}` — свободно ли имя, и если нет,
+    до трёх свободных вариантов от него. Нужен действующий код приглашения (неиспользованный,
+    неистёкший), но проверка его не расходует: без кода посторонний не узнает, какие имена заняты.
+    Неверный код — тот же отказ 403, что у `join`, без слова о самом имени;
   * **выдача имён по коду приглашения**: `POST /api/join {code, name, key_hash}`. Код одноразовый,
     его выпускает держатель посредника (`relayctl invite`); имя выбирает владелец экземпляра; ключ
     экземпляр создаёт сам и присылает только его sha256 — сам ключ посредника не проходит. Ответ —
@@ -53,7 +57,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_DB = "/var/lib/shturman-relay/relay.db"
 DEFAULT_DOMAIN = "sh.namre.app"
 DEFAULT_CA = "/etc/frp/frps.crt"
@@ -303,6 +307,10 @@ class Settings:
     join_window: int = 15 * 60       # секунд
     join_fail_total: int = 60        # неудачных попыток со всех адресов вместе за короткое окно
     join_fail_window: int = 60       # секунд: общий предел не держит удачные подключения дольше минуты
+    # Проверки имени — свой счёт на адрес: агент владельца проверяет несколько имён подряд, и это не
+    # должно съедать попытки подключения. Неверный код в проверке идёт в общий предел неудачных.
+    check_per_ip: int = 30
+    check_window: int = 15 * 60
 
     @property
     def server_name(self) -> str:
@@ -310,9 +318,9 @@ class Settings:
 
 
 class JoinError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str, extra: dict | None = None):
         super().__init__(code)
-        self.status, self.code, self.message = status, code, message
+        self.status, self.code, self.message, self.extra = status, code, message, extra or {}
 
 
 MESSAGES = {
@@ -320,11 +328,80 @@ MESSAGES = {
                 "не начинается с setup-.",
     "name_reserved": "Это имя занято под служебное — выберите другое.",
     "name_taken": "Это имя уже занято — выберите другое. Код приглашения не израсходован.",
+    "taken": "Это имя уже занято — выберите другое.",
     "bad_code": "Код приглашения не подошёл: неверный, уже использован или истёк. Новый код выдаёт держатель посредника.",
     "bad_key_hash": "Нужен key_hash — sha256 ключа экземпляра (64 шестнадцатеричных знака); ./ops/relay.sh делает это сам.",
 }
 
 KEY_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+SUGGEST_MAX = 3
+
+
+def _suggest_base(name: Any) -> str:
+    """Основа для вариантов: имя, приведённое к правилам — строчные буквы, дефис вместо прочих знаков,
+    без приставки setup-; не длиннее 26 знаков (место под «-xx» или цифру)."""
+    if not isinstance(name, str):
+        return ""
+    b = re.sub(r"[^a-z0-9]+", "-", name[:64].strip().lower()).strip("-")
+    while b.startswith("setup-"):
+        b = b[len("setup-"):]
+    if b == "setup":
+        return ""
+    return b[:26].strip("-")
+
+
+def suggest(conn: sqlite3.Connection, name: Any, limit: int = SUGGEST_MAX) -> list[str]:
+    """До limit свободных имён, похожих на name: само имя по правилам (если прислано, например,
+    с заглавными), затем с цифрой 2–9, затем с двумя случайными буквами через дефис. Только имена,
+    которые прошли бы join: неподходящие, служебные и занятые отсеиваются."""
+    base = _suggest_base(name)
+    if not base:
+        return []
+    letters = "abcdefghijkmnpqrstuvwxyz"
+    cands = [base] + [f"{base}{n}" for n in range(2, 10)]
+    cands += [f"{base}-{secrets.choice(letters)}{secrets.choice(letters)}" for _ in range(8)]
+    fit: list[str] = []
+    for c in cands:
+        if c != name and c not in fit and name_problem(c) is None:
+            fit.append(c)
+    if not fit:
+        return []
+    marks = ",".join("?" * len(fit))
+    taken = {r["name"] for r in conn.execute(f"SELECT name FROM instances WHERE name IN ({marks})", fit)}
+    return [c for c in fit if c not in taken][:limit]
+
+
+def _valid_invite(conn: sqlite3.Connection, code: Any, now: int) -> bool:
+    norm = normalize_code(code)
+    if norm is None:
+        return False
+    inv = conn.execute("SELECT expires_at, used_at FROM invites WHERE code_hash = ?", (code_hash(norm),)).fetchone()
+    return inv is not None and inv["used_at"] is None and inv["expires_at"] > now
+
+
+def check(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, now: int | None = None) -> dict:
+    """Свободно ли имя — до join и без расхода кода. Сначала код: неверный, использованный или
+    истёкший — тот же отказ, что у join, и о самом имени ни слова (иначе по этому адресу можно было бы
+    перебирать занятые имена без приглашения). С действующим кодом ответ — available и, если имя
+    не подходит, причина и до трёх свободных вариантов. Свободное сейчас имя может занять другой
+    владелец до join — тогда join ответит name_taken, и код останется."""
+    now = int(time.time()) if now is None else now
+    if not _valid_invite(conn, code, now):
+        raise JoinError(403, "bad_code", MESSAGES["bad_code"])
+    problem = name_problem(name)
+    if problem == "bad_name":
+        reason = "invalid"
+    elif problem == "name_reserved":
+        reason = "reserved"
+    elif conn.execute("SELECT 1 FROM instances WHERE name = ?", (name,)).fetchone():
+        reason = "taken"
+    else:
+        return {"name": name, "domain": s.domain, "available": True, "reason": None,
+                "message": "Имя свободно.", "suggestions": []}
+    message = {"invalid": MESSAGES["bad_name"], "reserved": MESSAGES["name_reserved"], "taken": MESSAGES["taken"]}[reason]
+    return {"name": name if isinstance(name, str) and len(name) <= 64 else None, "domain": s.domain,
+            "available": False, "reason": reason, "message": message, "suggestions": suggest(conn, name)}
 
 
 def join(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, khash: Any, now: int | None = None) -> dict:
@@ -368,7 +445,8 @@ def join(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, khash: Any
             raise JoinError(403, "bad_code", MESSAGES["bad_code"])
         # Имя занято, в том числе отключённым экземпляром: освобождает его только release.
         if conn.execute("SELECT 1 FROM instances WHERE name = ?", (name,)).fetchone():
-            raise JoinError(409, "name_taken", MESSAGES["name_taken"])
+            # Код здесь уже проверен: варианты получает только держатель действующего приглашения.
+            raise JoinError(409, "name_taken", MESSAGES["name_taken"], {"suggestions": suggest(conn, name)})
         cur = conn.execute("UPDATE invites SET used_at = ?, used_by = ? WHERE id = ? AND used_at IS NULL",
                            (now, name, inv["id"]))
         if cur.rowcount != 1:
@@ -495,7 +573,7 @@ class PluginHandler(_Handler):
 
 
 class ApiHandler(_Handler):
-    """/api/health, /api/ca, /api/join — за локальным Caddy посредника."""
+    """/api/health, /api/ca, /api/check, /api/join — за локальным Caddy посредника."""
 
     def client_ip(self) -> str:
         peer = self.client_address[0]
@@ -523,26 +601,33 @@ class ApiHandler(_Handler):
 
     def do_POST(self) -> None:
         raw = self._body(4096)
-        if urlsplit(self.path).path != "/api/join":
+        path = urlsplit(self.path).path
+        if path not in ("/api/join", "/api/check"):
             self._json(404, {"error": "not_found"})
             return
+        what = path.rsplit("/", 1)[1]
         ip = self.client_ip()
         bucket = ip_bucket(ip)
         st = self.server.settings
-        # Сначала — предел на адрес (считаются все попытки), затем — общий предел неудачных попыток
-        # со всех адресов за минуту: он бережёт службу от перебора с многих адресов, а законное
-        # подключение задерживает не дольше чем на минуту после конца такого перебора.
-        if self.server.per_ip.blocked(bucket):
-            log.info("join from=%s: слишком часто с этого адреса", _safe(ip))
+        if what == "join":
+            per_ip, window = self.server.per_ip, st.join_window
+        else:
+            per_ip, window = self.server.check_per_ip, st.check_window
+        # Сначала — предел на адрес (считаются все попытки; у проверок имени свой счёт, чтобы они не
+        # съедали попытки подключения), затем — общий предел неудачных попыток со всех адресов за
+        # минуту, один на join и check: он бережёт службу от перебора кодов с многих адресов, а
+        # законное подключение задерживает не дольше чем на минуту после конца такого перебора.
+        if per_ip.blocked(bucket):
+            log.info("%s from=%s: слишком часто с этого адреса", what, _safe(ip))
             self._json(429, {"error": "rate_limited", "message": "Слишком много попыток с этого адреса. Повторите через 15 минут."},
-                       extra={"Retry-After": str(st.join_window)})
+                       extra={"Retry-After": str(window)})
             return
         if self.server.failures.blocked("*"):
-            log.info("join from=%s: слишком много неудачных попыток со всех адресов", _safe(ip))
+            log.info("%s from=%s: слишком много неудачных попыток со всех адресов", what, _safe(ip))
             self._json(429, {"error": "rate_limited", "message": "Посредник занят. Повторите через минуту."},
                        extra={"Retry-After": str(st.join_fail_window)})
             return
-        self.server.per_ip.add(bucket)
+        per_ip.add(bucket)
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         try:
             req = json.loads(raw) if raw is not None and ctype == "application/json" else None
@@ -550,20 +635,28 @@ class ApiHandler(_Handler):
             req = None
         if not isinstance(req, dict):
             self.server.failures.add("*")
-            self._json(400, {"error": "bad_request", "message": "Нужен JSON вида {\"code\": …, \"name\": …, \"key_hash\": …}."})
+            shape = '{"code": …, "name": …, "key_hash": …}' if what == "join" else '{"code": …, "name": …}'
+            self._json(400, {"error": "bad_request", "message": f"Нужен JSON вида {shape}."})
             return
         name = req.get("name")
         try:
             with self.server.db_lock:
-                answer = join(self.server.conn, st, req.get("code"), name, req.get("key_hash"))
+                if what == "join":
+                    answer = join(self.server.conn, st, req.get("code"), name, req.get("key_hash"))
+                else:
+                    answer = check(self.server.conn, st, req.get("code"), name)
         except JoinError as e:
             self.server.failures.add("*")
-            log.info("join from=%s name=%s: %s", _safe(ip), _safe(name), e.code)
-            self._json(e.status, {"error": e.code, "message": e.message})
+            log.info("%s from=%s name=%s: %s", what, _safe(ip), _safe(name), e.code)
+            self._json(e.status, {"error": e.code, "message": e.message, **e.extra})
             return
         except Exception:
-            log.exception("join: внутренняя ошибка")
+            log.exception("%s: внутренняя ошибка", what)
             self._json(500, {"error": "internal", "message": "Внутренняя ошибка посредника."})
+            return
+        if what == "check":
+            log.info("check from=%s name=%s: %s", _safe(ip), _safe(name), answer["reason"] or "свободно")
+            self._json(200, answer)
             return
         if answer.get("repeated"):
             log.info("join from=%s name=%s: повтор того же подключения", _safe(ip), _safe(name))
@@ -588,6 +681,7 @@ def make_servers(s: Settings, plugin_addr: tuple[str, int], api_addr: tuple[str,
         srv.conn, srv.db_lock, srv.settings = conn, lock, s
     plugin.plugin_path = plugin_path
     api.per_ip = Window(s.join_per_ip, s.join_window)
+    api.check_per_ip = Window(s.check_per_ip, s.check_window)
     api.failures = Window(s.join_fail_total, s.join_fail_window)
     return plugin, api
 

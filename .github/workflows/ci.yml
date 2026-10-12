@@ -280,10 +280,14 @@ jobs:
           [ "$code" -eq 2 ] && grep -q 'Режим без Hermes' out.txt
           printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\n' > .env; before="$(cat .env)"
           for name in setup-ivan Ivan ab -ivan 'iv an'; do
-            code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX "$name" > /dev/null 2>&1 || code=$?
-            [ "$code" -eq 2 ] || { echo "имя $name: код $code вместо 2"; exit 1; }
+            for c in join check; do
+              code=0; ./ops/relay.sh "$c" ABCD-EFGH-JKMN-PQRS-TVWX "$name" > /dev/null 2>&1 || code=$?
+              [ "$code" -eq 2 ] || { echo "$c, имя $name: код $code вместо 2"; exit 1; }
+            done
           done
           code=0; ./ops/relay.sh join 'x"y' ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          code=0; ./ops/relay.sh check 'x"y' ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          code=0; SHTURMAN_RELAY_API=http://relay.example.com ./ops/relay.sh check ABCD-EFGH-JKMN-PQRS-TVWX ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
           # Значение с переводом строки — отказ (проверка целиком, а не построчно).
           nl=$'\n'
           for bad in "ivan${nl}x" "ivan${nl}"; do
@@ -296,6 +300,8 @@ jobs:
           # Уже подключён — повторный join отказывается, не обращаясь к посреднику.
           printf 'SHTURMAN_RELAY_KEY=ci-only-relay-key\nSHTURMAN_RELAY_NAME=ivan\nSHTURMAN_RELAY_DOMAIN=sh.namre.app\n' >> .env
           code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX petr > out.txt 2>&1 || code=$?
+          [ "$code" -eq 2 ] && grep -q 'уже подключён' out.txt && test ! -e called
+          code=0; ./ops/relay.sh check ABCD-EFGH-JKMN-PQRS-TVWX petr > out.txt 2>&1 || code=$?
           [ "$code" -eq 2 ] && grep -q 'уже подключён' out.txt && test ! -e called
           # status и off не печатают секретов; off убирает профиль, --forget — и строки подключения.
           printf 'COMPOSE_PROFILES=hermes,relay\nSHTURMAN_RELAY_TOKEN=ci-only-relay-token\n' >> .env
@@ -321,6 +327,35 @@ jobs:
           grep -Eq '^#[[:space:]]+ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com \{$' "$f"
           grep -Eq '^#[[:space:]]+setup-ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com:8443 \{$' "$f"
           docker run --rm -v "$PWD/relay.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7@sha256:f2a1290d0463aad60660d4ec134943f183ee2a5f6c3eb7bf32dd984f2f020772 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      # Проверка имени у посредника (./ops/relay.sh check) и варианты на занятое имя в join — разбор
+      # ответов посредника; вместо curl — подставной, который отдаёт заготовленный ответ. Настоящая
+      # служба 0.3.0 проверена на стенде (PR) и в relay/tests.
+      - name: ops — посредник, проверка имени
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops config .env.example "$tmp"/; cd "$tmp"
+          mkdir stub; printf '#!/bin/sh\ncat "%s/resp"\n' "$tmp" > stub/curl; chmod +x stub/curl
+          export PATH="$tmp/stub:$PATH"
+          printf 'SHTURMAN_MODE=hermes\n' > .env; before="$(cat .env)"
+          answer() { printf '%s\n%s' "$2" "$1" > resp; }
+          rc() { code=0; ./ops/relay.sh "$@" > out.txt 2>&1 || code=$?; echo "$code"; }
+          answer 200 '{"name": "ivan", "domain": "sh.namre.app", "available": true, "reason": null, "message": "", "suggestions": []}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 0
+          grep -q 'Имя «ivan» свободно: адреса будут https://ivan.sh.namre.app и https://setup-ivan.sh.namre.app' out.txt
+          answer 200 '{"name": "ivan", "domain": "sh.namre.app", "available": false, "reason": "taken", "message": "", "suggestions": ["ivan2", "bad name", "ivan3"]}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 3
+          grep -qx 'Имя «ivan» уже занято.' out.txt && grep -qx 'Свободные варианты: ivan2, ivan3' out.txt
+          answer 200 '{"name": "petr", "domain": "sh.namre.app", "available": true, "reason": null, "message": "", "suggestions": []}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 1 && grep -q 'не разобран' out.txt
+          answer 403 '{"error": "bad_code", "message": "Код приглашения не подошёл"}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 2 && grep -q 'Код приглашения не подошёл' out.txt
+          answer 404 '{"error": "not_found"}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 1 && grep -q 'не умеет проверять имя заранее' out.txt
+          test "$(cat .env)" = "$before"
+          # join на занятое имя: код остался, варианты и подсказка про check.
+          answer 409 '{"error": "name_taken", "message": "Это имя уже занято", "suggestions": ["ivan2"]}'
+          test "$(rc join ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 2
+          grep -q 'Свободные варианты: ivan2' out.txt && grep -q 'relay.sh check КОД ИМЯ' out.txt
+          if grep -q '^SHTURMAN_RELAY_NAME=' .env; then echo "отказ не должен записывать подключение"; exit 1; fi
       # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
       # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
       # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.

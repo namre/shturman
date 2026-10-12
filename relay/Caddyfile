@@ -34,7 +34,7 @@ http://relay.@DOMAIN@ {
 relay.@DOMAIN@ {
 	header Strict-Transport-Security "max-age=31536000"
 
-	@api path /api/join /api/health /api/ca
+	@api path /api/join /api/check /api/health /api/ca
 	handle @api {
 		request_body {
 			max_size 4KB

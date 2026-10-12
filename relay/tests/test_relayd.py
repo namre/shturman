@@ -171,6 +171,74 @@ def test_key_hash_is_required_and_ca_is_read_before_spending_code(env, tmp_path)
     assert J(conn, s, code, "ivan")[0]["name"] == "ivan"          # код не израсходован
 
 
+# --- проверка имени до подключения ---
+
+def test_check_needs_a_live_code_and_does_not_spend_it(env):
+    s, conn = env
+    code = invite(conn)
+    out = relayd.check(conn, s, code, "ivan")
+    assert out == {"name": "ivan", "domain": "sh.example.test", "available": True, "reason": None,
+                   "message": "Имя свободно.", "suggestions": []}
+    assert relayd.check(conn, s, code, "ivan")["available"] is True        # сколько угодно раз
+    used = invite(conn)
+    J(conn, s, used, "olga")
+    old = invite(conn, days=1, now=int(time.time()) - 2 * 86400)
+    for bad in (used, old, relayd.new_code(), "garbage", None, 5, ""):
+        with pytest.raises(relayd.JoinError) as e:
+            relayd.check(conn, s, bad, "ivan")
+        assert (e.value.status, e.value.code, e.value.extra) == (403, "bad_code", {})
+    assert J(conn, s, code, "ivan")[0]["name"] == "ivan"                   # код не израсходован проверкой
+    with pytest.raises(relayd.JoinError):
+        relayd.check(conn, s, code, "petr")                                # а join — израсходовал
+
+
+def test_check_reasons_and_suggestions(env):
+    s, conn = env
+    J(conn, s, invite(conn), "ivan")
+    J(conn, s, invite(conn), "ivan2")
+    code = invite(conn)
+    out = relayd.check(conn, s, code, "ivan")
+    assert out["available"] is False and out["reason"] == "taken" and out["name"] == "ivan"
+    assert 1 <= len(out["suggestions"]) <= 3
+    for sug in out["suggestions"]:
+        assert relayd.name_problem(sug) is None and relayd.get_instance(conn, sug) is None and sug.startswith("ivan")
+    assert "ivan2" not in out["suggestions"] and out["suggestions"][0] == "ivan3"
+    out = relayd.check(conn, s, code, "relay")
+    assert out["reason"] == "reserved" and all(relayd.name_problem(x) is None for x in out["suggestions"])
+    assert out["suggestions"] and not any(x.startswith("relay") and x[5:].isdigit() for x in out["suggestions"])
+    out = relayd.check(conn, s, code, "Petr Ivanov")
+    assert out["reason"] == "invalid" and out["suggestions"][0] == "petr-ivanov"
+    assert relayd.check(conn, s, code, "setup-olga")["suggestions"][0] == "olga"
+    for odd in (None, 42, "", "--", "я"):
+        out = relayd.check(conn, s, code, odd)
+        assert out["reason"] == "invalid" and out["suggestions"] == []
+    assert relayd.check(conn, s, code, "setup") == {**out, "name": "setup", "reason": "reserved",
+                                                    "message": relayd.MESSAGES["name_reserved"]}
+    assert relayd.check(conn, s, code, "x" * 100)["name"] is None          # длинное имя назад не отдаётся
+    long = relayd.check(conn, s, code, "a" * 40)["suggestions"]
+    assert long and all(len(x) <= 30 and relayd.name_problem(x) is None for x in long)
+
+
+def test_join_with_taken_name_offers_free_variants(env):
+    s, conn = env
+    J(conn, s, invite(conn), "ivan")
+    code = invite(conn)
+    with pytest.raises(relayd.JoinError) as e:
+        J(conn, s, code, "ivan")
+    assert e.value.status == 409 and e.value.extra["suggestions"][0] == "ivan2"
+    assert J(conn, s, code, e.value.extra["suggestions"][0])[0]["name"] == "ivan2"
+    # Служебное имя join отклоняет до проверки кода — без вариантов: иначе по ним без кода было бы
+    # видно, какие имена заняты.
+    with pytest.raises(relayd.JoinError) as e:
+        J(conn, s, "garbage", "relay")
+    assert e.value.code == "name_reserved" and e.value.extra == {}
+
+
+def test_caddy_of_the_relay_passes_check_to_relayd():
+    caddyfile = (Path(__file__).resolve().parents[1] / "Caddyfile").read_text(encoding="utf-8")
+    assert "@api path /api/join /api/check /api/health /api/ca" in caddyfile
+
+
 def test_name_with_trailing_newline_is_refused():
     for name in ("ivan\n", "ivan\r", "iv\nan", " ivan", "ivan "):
         assert relayd.name_problem(name) == "bad_name"
@@ -458,6 +526,63 @@ def test_global_cap_counts_failures_and_clears_quickly(env, tmp_path):
         for name in ("olga", "petr", "anna", "boris"):
             ok = {"code": invite(conn), "name": name, "key_hash": new_key_hash()[1]}
             assert call(api, "POST", "/api/join", ok, {"X-Forwarded-For": "198.51.100.98"})[0] == 200
+    finally:
+        api.shutdown()
+        api.server_close()
+        plugin.server_close()
+
+
+def test_http_check(servers):
+    s, _, api = servers
+    conn = relayd.open_db(s.db)
+    J(conn, s, invite(conn), "ivan")
+    code = invite(conn)
+    status, body, hdr = call(api, "POST", "/api/check", {"code": code, "name": "petr"})
+    assert status == 200 and hdr["Cache-Control"] == "no-store"
+    assert json.loads(body) == {"name": "petr", "domain": "sh.example.test", "available": True, "reason": None,
+                                "message": "Имя свободно.", "suggestions": []}
+    out = json.loads(call(api, "POST", "/api/check", {"code": code, "name": "ivan"})[1])
+    assert out["available"] is False and out["reason"] == "taken" and out["suggestions"][0] == "ivan2"
+    # Неверный код: тот же отказ, что у join, и ни слова об имени — занятое оно или свободное.
+    replies = set()
+    for name in ("ivan", "petr", "relay"):
+        status, body, _ = call(api, "POST", "/api/check", {"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": name},
+                               {"X-Forwarded-For": "198.51.100.40"})
+        assert status == 403
+        replies.add(body)
+    join_403 = call(api, "POST", "/api/join", {"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "petr", "key_hash": "0" * 64},
+                    {"X-Forwarded-For": "198.51.100.41"})[1]
+    assert replies == {join_403} and json.loads(join_403)["error"] == "bad_code"
+    # Код проверкой не израсходован; занятое имя в join — 409 с вариантами, код опять цел.
+    status, body, _ = call(api, "POST", "/api/join", {"code": code, "name": "ivan", "key_hash": "1" * 64})
+    assert status == 409 and json.loads(body)["suggestions"][0] == "ivan2"
+    assert call(api, "POST", "/api/join", {"code": code, "name": "petr", "key_hash": "1" * 64})[0] == 200
+    assert call(api, "POST", "/api/check", {"code": code, "name": "olga"})[0] == 403    # теперь израсходован
+    assert call(api, "POST", "/api/check", b"name=x", {"Content-Type": "text/plain"})[0] == 400
+
+
+def test_http_check_has_its_own_budget_but_shares_the_failure_cap(env):
+    s, conn = env
+    s = relayd.Settings(**{**s.__dict__, "join_per_ip": 2, "check_per_ip": 3, "join_fail_total": 4, "join_fail_window": 1})
+    plugin, api = relayd.make_servers(s, ("127.0.0.1", 0), ("127.0.0.1", 0))
+    threading.Thread(target=api.serve_forever, daemon=True).start()
+    try:
+        code = invite(conn)
+        ip = {"X-Forwarded-For": "203.0.113.70"}
+        for name in ("anna", "boris", "vera"):
+            assert call(api, "POST", "/api/check", {"code": code, "name": name}, ip)[0] == 200
+        status, _, hdr = call(api, "POST", "/api/check", {"code": code, "name": "gleb"}, ip)
+        assert status == 429 and hdr.get("Retry-After") == "900"
+        # Проверки не съели попытки подключения с этого адреса.
+        assert call(api, "POST", "/api/join", {"code": code, "name": "anna", "key_hash": "2" * 64}, ip)[0] == 200
+        # Неверные коды в проверке — в общем пределе неудачных: после четырёх join с других адресов ждёт.
+        for i in range(4):
+            assert call(api, "POST", "/api/check", {"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "x1x"},
+                        {"X-Forwarded-For": f"198.51.100.{60 + i}"})[0] == 403
+        good = {"code": invite(conn), "name": "dima", "key_hash": "3" * 64}
+        assert call(api, "POST", "/api/join", good, {"X-Forwarded-For": "198.51.100.99"})[0] == 429
+        time.sleep(1.2)
+        assert call(api, "POST", "/api/join", good, {"X-Forwarded-For": "198.51.100.99"})[0] == 200
     finally:
         api.shutdown()
         api.server_close()
