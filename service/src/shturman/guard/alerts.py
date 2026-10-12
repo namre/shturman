@@ -183,9 +183,7 @@ async def pump(
                 continue
             await bridge.notify_owner(
                 conn, card(head, row["text"] if bridge.owns_bot() else None),
-                buttons=[[bridge.button("Показать ассистенту", CALLBACK_MODULE, f"r:{alert_id}:{nonce}"),
-                          bridge.button("Оставить скрытым", CALLBACK_MODULE, f"c:{alert_id}:{nonce}")]],
-                handler=CARD_HANDLER, context={"alert_id": alert_id})
+                buttons=_card_buttons(alert_id, nonce), handler=CARD_HANDLER, context={"alert_id": alert_id})
             out["sent"] += 1
         out["waiting"] = max(0, len(groups) - out["sent"])
         if out["waiting"] and not extra:
@@ -198,6 +196,30 @@ async def pump(
                 buttons=[[bridge.button(f"Показать следующие {MORE}", CALLBACK_MODULE, "more")]],
                 silent=True, dedup_key=f"guard-digest:{hour}")
             out["digest"] = int(job is not None)
+    return out
+
+
+def _card_buttons(alert_id: int, nonce: str) -> list[list[dict[str, str]]]:
+    return [[bridge.button("Показать ассистенту", CALLBACK_MODULE, f"r:{alert_id}:{nonce}"),
+             bridge.button("Оставить скрытым", CALLBACK_MODULE, f"c:{alert_id}:{nonce}")]]
+
+
+async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """Карточки о скрытых сообщениях, по которым владелец ещё не решил, — для Mini App бота
+    согласований (`setup_page/approvals.py`). Текст — как в карточке своего бота, с обезвреженной
+    цитатой (её владелец видит и в боте: это его собственная переписка, Hermes сюда не дотягивается),
+    кнопки — те же, с той же случайной меткой. Решение приходит обратно в `_pressed`."""
+    rows = await conn.fetch(
+        """SELECT a.id, a.summary, a.nonce, a.card_message_id, m.text, m.deleted_at
+           FROM guard_alerts a JOIN messages m ON m.id = a.message_id
+           WHERE a.status = 'sent' ORDER BY a.id""")
+    out = []
+    for r in rows:
+        text = card(r["summary"], r["text"] or "") if r["deleted_at"] is None else (
+            "Скрыл от ассистента входящее сообщение: оно похоже на попытку им управлять.\n\n"
+            + r["summary"] + "\n\nСообщение уже удалено из архива.")
+        out.append({"id": r["id"], "title": "Скрытое сообщение", "text": text,
+                    "buttons": _card_buttons(r["id"], r["nonce"]), "card_message_id": r["card_message_id"]})
     return out
 
 

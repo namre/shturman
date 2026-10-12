@@ -117,6 +117,12 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
               + ("" if bot.get("owner_bound") else " — выполните `shturman bot-bind`"))
         if bot.get("bind_paused"):
             print("  приём кодов привязки приостановлен: было много неверных кодов. Подождите 10 минут.")
+        menu = {"set": "стоит в чате владельца",
+                "no_address": "нет — у страницы настройки нет внешнего адреса https, а приложение открывается только по нему",
+                "no_owner": "появится после привязки владельца",
+                "failed": "Telegram её не принял, сервис повторит через 10 минут (подробности — в журнале сервиса)",
+                }.get(bot.get("menu_button") or "", "ещё не сверялась")
+        print(f"  кнопка «Штурман» (приложение в Telegram): {menu}")
         if bot.get("business_capable") is False:
             print("  бизнес-режим: у бота он выключен (в @BotFather: Bot Settings → Secretary Mode; "
                   "раньше пункт назывался Business Mode)")

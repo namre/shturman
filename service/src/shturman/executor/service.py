@@ -100,6 +100,9 @@ async def status(request: Request) -> JSONResponse:
             "owner_bound": owner_bound,
             "bind_paused": bot.flood.locked() if bot else False,
             "business_capable": bot.business_capable if bot else None,
+            # Кнопка «Штурман» (Mini App) в чате владельца: set | no_address | no_owner | failed | null —
+            # ещё не сверялась. Только состояние: адреса и чата здесь нет.
+            "menu_button": bot.menu if bot else None,
             "counters": dict(bot.counters) if bot else {},
         },
         "llm": {
@@ -145,6 +148,7 @@ class Control:
         self._clients: list[Any] = []
         self._announced = False      # объявлял ли этот модуль свои виды заданий
         self._token = ""             # токен работающего бота — чтобы узнать «тот же бот» при перезапуске
+        self._booted = False         # первый запуск в этом процессе уже был
         self._known: Any = None      # (токен, кто бот, место опроса, бизнес-режим) остановленного бота
 
     async def start(self) -> None:
@@ -179,7 +183,15 @@ class Control:
             if llm.broken:
                 logger.error("свой доступ к модели не может работать (%s)", llm.broken)
         self._clients = [client for client in (api, llm) if client is not None]
-        self._token = config.bot_token if api is not None else ""
+        token = config.bot_token if api is not None else ""
+        if self._booted and token != self._token:
+            # Токен бота согласований сменился, убран или введён заново: сессии Mini App, выданные
+            # по данным входа прежнего бота, завершаются (setup_page/miniapp.py) и не оживут, если
+            # тот же токен вернут. При первом запуске процесса сессии сверяются с ботом по номеру.
+            async with state.pool.acquire() as conn:
+                await conn.execute("UPDATE miniapp_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
+        self._booted = True
+        self._token = token
         # При перезапуске прежний перечень заранее не снимается, а заменяется здесь: так плагину
         # ни на миг не открываются привязка владельца и нажатия. Модуль, который ничего своего
         # не объявлял, чужого перечня не трогает.

@@ -7,6 +7,9 @@
   * обновления бизнес-режима — подключение, сообщения, правки, удаления — пишутся в архив теми же
     функциями, что и при приёме от плагина (`ingest_api.accept_business_*`), с пометкой `via="service"`.
 
+Что бот делает сам: ставит в чате владельца кнопку меню «Штурман», которая открывает Mini App
+(`menu_button.py`), — при запуске, после привязки владельца и раз в десять минут сверяет её.
+
 Чего бот не делает: не отвечает посторонним (совсем — чтобы не выдавать, что он существует),
 принимает только детерминированные команды текущего владельца в его личном чате.
 
@@ -35,7 +38,7 @@ from ..api_core import BadRequest
 from ..app import AppState
 from ..sanitize import clean_line
 from ..outbox.text import split_text
-from . import binding, owner_chat
+from . import binding, menu_button, owner_chat
 from .botapi import BotApi, BotApiError, NeverLeft, OutcomeUnknown, Refused
 
 logger = logging.getLogger("shturman.executor.bot")
@@ -97,6 +100,9 @@ class Bot:
         self._hint_at: float | None = None
         self._refused: dict[str, float] = {}
         self._retries: dict[int, int] = {}
+        # Кнопка «Штурман» в чате владельца (menu_button.py): состояние последней сверки и когда она была.
+        self.menu: str | None = None
+        self._menu_at: float | None = None
 
     @property
     def bot_id(self) -> int | None:
@@ -129,7 +135,10 @@ class Bot:
             try:
                 if self.identity is None:
                     await self.ensure_identity()
+                    await self.sync_menu()
                 await self.poll_once()
+                if self._menu_at is None or self._clock() - self._menu_at >= menu_button.CHECK_EVERY:
+                    await self.sync_menu()
                 failures = 0
                 continue
             except asyncio.CancelledError:
@@ -191,6 +200,18 @@ class Bot:
             self._retries.pop(update_id, None)
             await self._advance(update_id + 1)
         return len(updates)
+
+    async def sync_menu(self) -> None:
+        """Кнопка «Штурман» в чате владельца — по нынешним владельцу и адресу страницы настройки.
+        Сбой не останавливает опрос: следующая сверка повторит."""
+        self._menu_at = self._clock()
+        try:
+            self.menu = await menu_button.sync(self.state, self.api, self.bot_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — база или Telegram недоступны
+            self.menu = menu_button.FAILED
+            logger.warning("бот согласований: кнопка меню не сверена (%s)", type(exc).__name__)
 
     async def _advance(self, next_id: int) -> None:
         self.offset = next_id
@@ -288,6 +309,7 @@ class Bot:
         self._hint_at = None
         logger.info("бот согласований: владелец привязан")
         await self._say(chat_id, TEXT_BOUND, buttons=owner_chat.menu_buttons())
+        await self.sync_menu()        # кнопка «Штурман» — новому владельцу, прежнему — обычная
         self.wake()                   # карточки, ждавшие владельца, можно отправлять
 
     async def _say(self, chat_id: int, text: str, *, buttons: Any = None) -> None:

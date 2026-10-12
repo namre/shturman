@@ -177,9 +177,16 @@ async def _owner_changed(conn: asyncpg.Connection, new_user_id: int) -> None:
         await fn(conn, new_user_id)
 
 
+async def _end_app_sessions(conn: asyncpg.Connection) -> None:
+    """Привязка или отвязка владельца завершает все сессии Mini App бота согласований
+    (setup_page/miniapp.py): они выданы прежней привязке и не должны ожить при возврате к ней."""
+    await conn.execute("UPDATE miniapp_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
+
+
 async def clear_owner(conn: asyncpg.Connection) -> None:
     """Владелец отвязан (ссылка восстановления): кнопки никто не нажмёт, отправки останавливаются."""
     async with conn.transaction():
+        await _end_app_sessions(conn)
         removed = await conn.fetchval("DELETE FROM settings WHERE key = 'owner' RETURNING key")
         if removed:
             await _owner_changed(conn, 0)
@@ -188,6 +195,7 @@ async def clear_owner(conn: asyncpg.Connection) -> None:
 async def set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
     async with conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.owner.binding'))")
+        await _end_app_sessions(conn)
         previous = await get_owner(conn)
         await _set_owner(conn, user_id, chat_id)
         if previous is not None and int(previous["user_id"]) != int(user_id):

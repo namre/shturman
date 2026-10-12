@@ -185,11 +185,9 @@ def _note(row: Mapping[str, Any]) -> str | None:
     return None
 
 
-def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None, note: str | None = None,
-               reply_excerpt: str | None = None, facts: str | None = None) -> list[str]:
-    """Текст карточки. Весь текст сообщения показывается дословно; длинный — в нескольких
-    карточках подряд, без сокращений. Текст идёт последним: после него в карточке ничего нет."""
-    word = STATUS_WORDS[status or row["status"]]
+def card_head(row: Mapping[str, Any], tgt: Target, *, note: str | None = None,
+              reply_excerpt: str | None = None, facts: str | None = None) -> list[str]:
+    """Шапка карточки: кому, от чьего имени, на что ответ. Одна и та же в боте и в Mini App."""
     sends = len(policy.parts_of(row["channel"], row["text"]))
     head = [f"Кому: {_who(tgt)}"]
     if row.get("prepare_only"):
@@ -203,6 +201,15 @@ def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None
         head.append(f"Текст длинный: уйдёт {sends} сообщениями подряд.")
     if note:
         head.append(textlib.one_line(note, 300))
+    return head
+
+
+def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None, note: str | None = None,
+               reply_excerpt: str | None = None, facts: str | None = None) -> list[str]:
+    """Текст карточки. Весь текст сообщения показывается дословно; длинный — в нескольких
+    карточках подряд, без сокращений. Текст идёт последним: после него в карточке ничего нет."""
+    word = STATUS_WORDS[status or row["status"]]
+    head = card_head(row, tgt, note=note, reply_excerpt=reply_excerpt, facts=facts)
     tail = f"Знаков: {len(row['text'])}. Всё, что ниже этой строки, — текст сообщения дословно."
     budget = CARD_LIMIT - 200 - sum(textlib.utf16_len(line) + 1 for line in head) - textlib.utf16_len(tail)
     chunks = textlib.split_text(row["text"], budget) or [row["text"]]
@@ -234,6 +241,34 @@ def _card_messages(row: Mapping[str, Any]) -> dict[int, int]:
     raw = row["card_messages"]
     data = json.loads(raw) if isinstance(raw, str) else (raw or {})
     return {int(part): int(message_id) for part, message_id in data.items()}
+
+
+async def awaiting_owner(conn: asyncpg.Connection, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Черновики, которые ждут решения владельца, — для Mini App бота согласований
+    (`setup_page/approvals.py`): та же шапка, что в карточке, текст дословно и те же кнопки с той
+    же случайной меткой. Решение приходит обратно данными кнопки в `on_button` — тем же путём,
+    что нажатие в боте. Список — ровно те черновики, нажатие по которым `on_button` не отвергнет
+    сразу: ждущие, с текстом, от агента или для просмотра, не просроченные."""
+    rows = await conn.fetch(
+        """SELECT * FROM outbox_drafts
+           WHERE status = 'pending' AND text <> '' AND (origin = 'agent' OR prepare_only) AND expires_at > now()
+           ORDER BY id LIMIT $1""", limit)
+    out = []
+    for row in rows:
+        tgt = await policy.target(conn, row["chat_id"])
+        if tgt is None:
+            continue
+        context = await card_context(conn, row, tgt)
+        parts = card_parts(row, tgt, **context)
+        out.append({
+            "id": row["id"], "title": f"Черновик № {row['id']}", "head": card_head(row, tgt, **context),
+            "text": row["text"], "prepare_only": row["prepare_only"], "buttons": _buttons(row),
+            # Сообщение в боте, под которым кнопки (последняя часть карточки): после решения в
+            # Mini App его текст меняется так же, как после нажатия в боте.
+            "card_message_id": _card_messages(row).get(len(parts)),
+            "expires_at": row["expires_at"],
+        })
+    return out
 
 
 async def refresh_cards(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Target | None, *,

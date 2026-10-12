@@ -205,6 +205,10 @@ SETUP_PAGE = [
     "/shturman-setup/api/llm/chatgpt/start", "/shturman-setup/api/llm/chatgpt/finish",
     "/shturman-setup/api/llm/chatgpt/cancel", "/shturman-setup/api/llm/chatgpt/model", "/shturman-setup/api/llm/chatgpt",
     "/api/llm/chatgpt/start", "/api/llm/chatgpt/finish", "/api/llm/chatgpt",
+    # Mini App бота согласований: живёт под префиксом страницы, вход — данными Telegram для бота сервиса
+    "/shturman-setup/app/", "/shturman-setup/app", "/shturman-setup/api/app/login", "/shturman-setup/api/app/logout",
+    "/shturman-setup/api/app/approvals", "/shturman-setup/api/app/approvals/decide",
+    "/api/app/login", "/api/app/approvals", "/api/app/approvals/decide", "/api/miniapp", "/app/",
 ]
 
 

@@ -590,6 +590,24 @@ async def on_digest_failed(conn: asyncpg.Connection, job: dict[str, Any], error:
         await unmark_batch(conn, batch)
 
 
+async def awaiting_owner(conn: asyncpg.Connection, *, limit: int = 100) -> dict[str, Any]:
+    """Предложенные проекты из уже отправленного сообщения — для Mini App бота согласований
+    (`setup_page/approvals.py`): тот же пункт и те же данные кнопок, подписи словами. Решение
+    приходит обратно в `on_button`. Ещё не показанные только считаются (`later`)."""
+    rows = await conn.fetch(
+        """SELECT id, title, reason FROM projects WHERE status = 'proposed' AND batch IS NOT NULL
+           ORDER BY notified_at NULLS LAST, id LIMIT $1""", limit)
+    items = [{"id": r["id"], "title": "Предложенный проект",
+              "text": f"{clean_line(r['title'], TITLE_LIMIT) or 'без названия'} — {_reason_text(_loads(r['reason']) or {})}",
+              "buttons": [[bridge.button("Завести проект", CALLBACK_MODULE, f"a:{r['id']}"),
+                           bridge.button("Не нужно", CALLBACK_MODULE, f"r:{r['id']}")]],
+              "card_message_id": None} for r in rows]
+    later = await conn.fetchval(
+        "SELECT count(*) FROM projects WHERE status = 'proposed' AND batch IS NULL AND digest_attempts < $1",
+        DIGEST_MAX_SENDS)
+    return {"items": items, "later": int(later or 0)}
+
+
 @bridge.on_callback(CALLBACK_MODULE)
 async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str, Any]:
     """Нажатие под предложениями: a:<проект> — завести, r:<проект> — не нужно."""

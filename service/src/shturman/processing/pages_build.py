@@ -1338,6 +1338,24 @@ async def _batch_summary(conn: asyncpg.Connection, batch: str) -> tuple[bool, st
     return bool(rows) and all(r["status"] != "pending" for r in rows), "Страницы памяти — решено:\n" + "\n".join(lines)
 
 
+async def awaiting_owner(conn: asyncpg.Connection, *, days: int, limit: int = 100) -> dict[str, Any]:
+    """Предложения завести страницу о человеке из уже отправленного сообщения — для Mini App бота
+    согласований (`setup_page/approvals.py`): тот же пункт и те же данные кнопок, подписи словами.
+    Решение приходит обратно в `on_button`. Ещё не показанные только считаются (`later`)."""
+    rows = await conn.fetch(
+        """SELECT x.person_id, x.reason, p.display_name FROM page_proposals x
+           JOIN people p ON p.id = x.person_id AND p.merged_into IS NULL
+           WHERE x.status = 'pending' AND x.batch IS NOT NULL
+           ORDER BY x.notified_at NULLS LAST, x.person_id LIMIT $1""", limit)
+    items = [{"id": r["person_id"], "title": "Страница памяти о человеке",
+              "text": f"{clean_line(r['display_name'], 80) or 'без имени'} — {_reason_text(_loads(r['reason']) or {}, days)}",
+              "buttons": [[bridge.button("Завести страницу", CALLBACK_MODULE, f"a:{r['person_id']}"),
+                           bridge.button("Не нужно", CALLBACK_MODULE, f"r:{r['person_id']}")]],
+              "card_message_id": None} for r in rows]
+    later = await conn.fetchval("SELECT count(*) FROM page_proposals WHERE status = 'pending' AND batch IS NULL")
+    return {"items": items, "later": int(later or 0)}
+
+
 @bridge.on_callback(CALLBACK_MODULE)
 async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str, Any]:
     """Нажатие под сообщением с предложениями: a:<человек> — завести страницу, r:<человек> — нет."""

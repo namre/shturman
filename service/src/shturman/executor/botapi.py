@@ -301,6 +301,13 @@ class BotApi:
     async def answer_callback_query(self, query_id: str, text: str | None = None) -> None:
         await self.call("answerCallbackQuery", {"callback_query_id": query_id, "text": text or None})
 
+    async def set_chat_menu_button(self, chat_id: int, button: dict[str, Any] | None) -> None:
+        """Кнопка меню в личном чате: {"type": "web_app", "text", "web_app": {"url"}} либо None —
+        вернуть обычную (`MenuButtonDefault`). Bot API 6.0+, сверено по core.telegram.org/bots/api
+        (Bot API 10.3) 2026-10-12."""
+        await self.call("setChatMenuButton", {"chat_id": chat_id,
+                                              "menu_button": button if button is not None else {"type": "default"}})
+
     async def get_business_connection(self, connection_id: str) -> dict[str, Any] | None:
         out = await self.call("getBusinessConnection", {"business_connection_id": connection_id})
         return out if isinstance(out, dict) else None

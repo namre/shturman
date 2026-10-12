@@ -36,6 +36,7 @@
 | Сервис, база, эмбеддинги и защита в `compose.yaml`; скрипты `ops/` | Написаны; под Docker запускались **только на стенде разработки** — для версии 0.0.6 вместе с официальным образом Hermes и настоящим Caddy, включая обновление с 0.0.5; на эталонном сервере — нет (`docs/deployment.md`) |
 | Runbook развёртывания | Черновики; шаги 1–4 режима с Hermes пройдены на живом сервере (`docs/runbooks/deploy.md`, `docs/runbooks/deploy-standalone.md`) |
 | Повседневное управление правилами, задачами и источниками | Меню, команды и карточки в Telegram; экранов архива и памяти в кабинете пока нет (`docs/service.md`) |
+| Приложение «Штурман» в Telegram (Mini App бота согласований): кнопка «Штурман» в чате с ботом, вход подписью Telegram без ссылки и кода, экран «Согласования» — те же карточки и кнопки, что в боте, тем же путём | Первая очередь: написано, покрыто тестами, пройдено в браузере на стенде с данными входа, подписанными так же, как их подписывает Telegram. **В настоящем Telegram не открывалось.** Нужен внешний адрес страницы «Переписка» по https — в режиме без Hermes приложения нет. Отправку не включает. Экраны «Обязательства» и «Статус» — следующие очереди (`docs/miniapp.md`) |
 | Внешние источники для задач ответа | Ограниченный MCP-посредник реализован; конкретная почта/документы требуют настройки и проверки. Универсальных готовых подключений нет (`docs/external-sources.md`) |
 | Необязательный внешний архив по OAuth | Код read-only gateway реализован, по умолчанию выключен; конкретный облачный клиент и отзыв требуют пилота (`docs/remote-mcp.md`) |
 | Вводная для внешней проверки безопасности | Есть: `docs/security-review.md` |
@@ -109,7 +110,7 @@ sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/s
 
 ## Документы
 
-`docs/target-model.md` · `docs/ceo-demo-video.md` · `docs/external-sources.md` · `docs/remote-mcp.md` · `docs/runbooks/validate-pilot.md` · `docs/architecture.md` · `docs/deployment.md` · `docs/service.md` · `docs/setup.md` · `docs/standalone.md` · `docs/security-review.md` · `docs/guard.md` · `docs/search.md` · `docs/voice.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `docs/runbooks/deploy-standalone.md` · `UPGRADING.md` · `service/README.md` · `AGENTS.md`
+`docs/target-model.md` · `docs/ceo-demo-video.md` · `docs/external-sources.md` · `docs/remote-mcp.md` · `docs/runbooks/validate-pilot.md` · `docs/architecture.md` · `docs/deployment.md` · `docs/service.md` · `docs/setup.md` · `docs/miniapp.md` · `docs/standalone.md` · `docs/security-review.md` · `docs/guard.md` · `docs/search.md` · `docs/voice.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `docs/runbooks/deploy-standalone.md` · `UPGRADING.md` · `service/README.md` · `AGENTS.md`
 
 ## Лицензия
 

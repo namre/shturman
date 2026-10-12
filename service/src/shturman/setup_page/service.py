@@ -47,6 +47,11 @@
   DELETE /shturman-setup/api/llm/chatgpt                выйти из подписки (отзыв сессии у OpenAI)
   GET    /shturman-setup/api/memory/…                   экран «Память ассистента» — маршруты в `memory.py`
 
+  Mini App бота согласований — своя узкая роль и свой ключ сессии, маршруты в `miniapp.py`:
+  GET    /shturman-setup/app/                           приложение (единственное, что можно открыть в рамке
+                                                        у web.telegram.org)
+  POST   /shturman-setup/api/app/…                      вход по данным Telegram, «Согласования», решения
+
 Вход — по одноразовой ссылке; ответ на вход один раз отдаёт ключ сессии. Дальше страница
 присылает его в заголовке `X-Shturman-Session`; cookie нет вовсе (почему — `auth.py`).
 
@@ -108,6 +113,8 @@ STATIC_TYPES = {
     "setup.css": "text/css; charset=utf-8",
     "setup.js": "text/javascript; charset=utf-8",
     "qr.js": "text/javascript; charset=utf-8",
+    "app.css": "text/css; charset=utf-8",          # Mini App бота согласований (miniapp.py)
+    "app.js": "text/javascript; charset=utf-8",
 }
 
 # Виды чатов для отбора в списке диалогов.
@@ -126,6 +133,8 @@ class Page:
     key: bytes = field(repr=False)                 # ключ подписи кодов входа
     slow: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(FAIL_SLOTS))
     fail_audit_at: float = 0.0
+    app_fail_audit_at: float = 0.0                 # то же для входа в Mini App (miniapp.py)
+    app_replays: set[str] = field(default_factory=set)   # подписи, о повторе которых владельцу уже сообщено
     logins_done: set[str] = field(default_factory=set)   # входы в Telegram, уже отмеченные в журнале
     # Начатый вход через ChatGPT — один на страницу; в памяти, перезапуск сервиса его снимает.
     chatgpt_attempt: siwc.Attempt | None = None
@@ -1346,7 +1355,7 @@ async def chatgpt_remove(request: Request) -> JSONResponse:
 # --- сборка ------------------------------------------------------------------------------------
 
 def routes() -> list[BaseRoute]:
-    from . import memory
+    from . import memory, miniapp
 
     account = API + "/tg/accounts/{account_id:int}"
     upload = API + "/imports/{import_id}"
@@ -1395,6 +1404,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/llm/chatgpt/model", chatgpt_model, methods=["PUT"]),
         Route(API + "/llm/chatgpt", chatgpt_remove, methods=["DELETE"]),
         *memory.routes(),
+        *miniapp.routes(),
     ]
 
 
@@ -1404,6 +1414,11 @@ def make_shield(app: Any, config: Any) -> shield.Shield:
 
 
 JANITOR_EVERY = 3600      # секунд
+
+
+async def miniapp_cleanup(conn: Any) -> None:
+    from . import miniapp
+    await miniapp.cleanup(conn)
 
 
 @contextlib.asynccontextmanager
@@ -1416,6 +1431,7 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
             try:
                 async with state.pool.acquire() as conn:
                     await auth.cleanup(conn)
+                    await miniapp_cleanup(conn)
                     await audit.trim(conn)
             except asyncio.CancelledError:
                 raise

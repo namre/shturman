@@ -604,13 +604,13 @@ EOF4
   # Бот согласований — первый шаг страницы настройки переписки в обоих режимах: без него запросы
   # ассистента, которые должен подтвердить владелец (принять обязательство, включить чат), отклоняются.
   # Строка model с Hermes появляется, только если своя модель настроена: разбор делает ассистент.
-  bot_configured=unknown; bot_polling=unknown; bot_problem=""; bot_owner=unknown; bot_business=unknown
+  bot_configured=unknown; bot_polling=unknown; bot_problem=""; bot_owner=unknown; bot_business=unknown; bot_menu=""
   llm_configured=unknown; llm_model=""; llm_last=unknown; llm_problem=""; llm_calls=0; llm_failures=0
   llm_way=""; llm_sub=""
   while IFS='=' read -r k v; do
     case "$k" in
       bot_configured) bot_configured="$v" ;; bot_polling) bot_polling="$v" ;; bot_problem) bot_problem="$v" ;;
-      bot_owner) bot_owner="$v" ;; bot_business) bot_business="$v" ;;
+      bot_owner) bot_owner="$v" ;; bot_business) bot_business="$v" ;; bot_menu) bot_menu="$v" ;;
       llm_configured) llm_configured="$v" ;; llm_model) llm_model="$v" ;; llm_last) llm_last="$v" ;;
       llm_problem) llm_problem="$v" ;; llm_calls) llm_calls="$v" ;; llm_failures) llm_failures="$v" ;;
       llm_way) llm_way="$v" ;; llm_sub) llm_sub="$v" ;;
@@ -631,6 +631,7 @@ print("bot_polling=" + yn(b.get("polling")))
 print("bot_problem=" + safe(b.get("problem")))
 print("bot_owner=" + yn(b.get("owner_bound")))
 print("bot_business=" + yn(b.get("business_capable")))
+print("bot_menu=" + safe(b.get("menu_button")))
 print("llm_configured=" + yn(m.get("configured")))
 print("llm_model=" + safe(m.get("model")))
 print("llm_last=" + yn(m.get("last_call_ok")))
@@ -655,6 +656,31 @@ EOF3
     if [ "$bot_business" = no ] && [ "${setup_business:-}" != yes ]; then
       pass approvals-business "бизнес-режим у бота выключен — он нужен для способа «ассистент — отдельный сотрудник» (у @BotFather: Bot Settings → Secretary Mode)"
     fi
+  fi
+
+  # Mini App «Штурман» в боте согласований (docs/miniapp.md): кнопку меню ставит сервис сам, только
+  # в чате привязанного владельца и только при внешнем адресе страницы настройки по https — сам
+  # адрес здесь не спрашивается: он уже в строке setup-origin. Без Hermes наружу ничего не
+  # публикуется, поэтому без внешнего адреса приложения там нет — это норма, а не неполадка.
+  if [ "$bot_configured" = no ]; then
+    warn miniapp "приложение «Штурман» в Telegram откроется после настройки бота согласований — первый шаг страницы настройки переписки"
+  elif [ "$bot_configured" = yes ] && { [ "$bot_problem" = other_poller ] || [ "$bot_problem" = conflict ] || [ "$bot_problem" = webhook ]; }; then
+    # Ботом согласований пользуется ещё кто-то — так выглядит и тот же токен у бота ассистента в
+    # Hermes. Тогда Hermes мог бы сам подписать данные входа в приложение: вход в него закрыт.
+    fail miniapp "вход в приложение «Штурман» закрыт: ботом согласований пользуется другая программа (код: $bot_problem). Если его токен — тот же, что у бота ассистента в Hermes, создайте у @BotFather отдельного бота и введите его токен на странице настройки переписки: с общим токеном ассистент мог бы подтверждать решения за владельца"
+  elif [ "$bot_configured" = yes ]; then
+    case "$bot_menu" in
+      set) pass miniapp "кнопка «Штурман» в боте согласований открывает приложение: ${svc_setup:-адрес страницы настройки}/shturman-setup/app/" ;;
+      no_address)
+        if [ "$MODE" = standalone ]; then
+          pass miniapp "приложения в Telegram нет: без Hermes наружу ничего не публикуется, а приложению нужен внешний адрес страницы настройки по https (docs/miniapp.md). Решения — кнопками в боте согласований"
+        else
+          warn miniapp "у страницы настройки нет внешнего адреса https — приложению «Штурман» в Telegram он нужен: ./ops/set-setup-url.sh (docs/miniapp.md). Решения пока — кнопками в боте согласований"
+        fi ;;
+      no_owner) warn miniapp "кнопка «Штурман» появится в боте согласований после привязки владельца" ;;
+      failed) warn miniapp "Telegram не принял кнопку «Штурман» — сервис повторит через 10 минут; подробности: docker logs --tail 50 $svc" ;;
+      *) warn miniapp "кнопка «Штурман» ещё не сверялась — повторите проверку через минуту" ;;
+    esac
   fi
 
   if [ "$llm_configured" = no ]; then
