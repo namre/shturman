@@ -9,7 +9,8 @@
 #                 не скачивается, а оставшийся от прежнего режима контейнер убирается.
 # В режиме с Hermes, если адрес дашборда задан, а адреса страницы настройки переписки в .env ещё
 # нет, скрипт дописывает адрес по умолчанию: то же имя, порт 8443 (./ops/set-setup-url.sh --help).
-# Прокси и firewall скрипт не трогает.
+# Прокси и firewall скрипт не трогает. Если экземпляр подключён к посреднику (./ops/relay.sh join,
+# профиль relay), скрипт собирает и запускает и контейнер frpc — только в режиме с Hermes.
 # Если адрес дашборда или адрес страницы настройки записан в .env не как адрес (например, без
 # https://) или как https-адрес с IP закрытой сети либо в необычной записи (docs/deployment.md,
 # «Без домена»), скрипт останавливается до перезапуска и называет строку. Из .env читаются только несекретные строки: режим, профили, эти два
@@ -183,6 +184,21 @@ docker compose config --quiet
 docker compose build --quiet shturman
 # Контейнер распознавания речи — тоже из этого репозитория (каталог asr/), если он включён.
 if profile_on asr; then docker compose build --quiet asr; fi
+# Подключение к посреднику (./ops/relay.sh) — тоже образ из этого репозитория (каталог frpc/). Только
+# в режиме с Hermes: без него профиль relay в COMPOSE_PROFILES не попадает (compose_profiles в lib.sh).
+case ",$COMPOSE_PROFILES," in
+  *,relay,*)
+    mkdir -p data/relay; chmod 700 data/relay
+    docker compose build --quiet relay ;;
+  *)
+    if [ "$MODE" != hermes ] && { profile_on relay || docker inspect shturman-relay >/dev/null 2>&1; }; then
+      echo "Режим без Hermes: подключение к посреднику не запускается — наружу в этом режиме ничего не публикуется."
+      if docker inspect shturman-relay >/dev/null 2>&1; then
+        docker compose --profile relay rm --stop --force relay >/dev/null 2>&1 || true
+        if docker inspect shturman-relay >/dev/null 2>&1; then docker rm --force shturman-relay >/dev/null; fi
+      fi
+    fi ;;
+esac
 if [ "$MODE" != hermes ] && docker inspect "$c" >/dev/null 2>&1; then
   # Остался от режима с Hermes. Убирается только контейнер: данные Hermes (data/hermes) не трогаем.
   echo "Режим без Hermes: останавливаю и убираю контейнер $c (его данные остаются в data/hermes)…"

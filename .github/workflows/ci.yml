@@ -91,6 +91,53 @@ jobs:
       - run: node --check plugins/shturman/dashboard/dist/index.js && node --check plugins/shturman/public/app.js
       - run: python -m json.tool plugins/shturman/dashboard/manifest.json > /dev/null && python -m json.tool plugins/shturman/personas.json > /dev/null
 
+  # Посредник (relay/, docs/relay.md): служба только на стандартной библиотеке Python 3.12, её тесты;
+  # установщик — справка, суммы скачанных выпусков frp и Caddy, файлы настройки для зоны, которые
+  # проверяют сами frps, frpc и Caddy; образ frpc экземпляра.
+  relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: pytest -q relay/tests
+      - run: shellcheck -S warning relay/install.sh
+      - name: установщик — справка, суммы, настройки
+        run: |
+          bash relay/install.sh --help | grep -q 'Установка и обновление посредника'
+          code=0; bash relay/install.sh --no-such-key > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          d="$RUNNER_TEMP/dl"; c="$RUNNER_TEMP/conf"; k="$RUNNER_TEMP/cred"
+          bash relay/install.sh --download-only "$d"
+          bash relay/install.sh --render "$c"
+          if grep -rq '@DOMAIN@' "$c"; then echo "зона не подставлена"; exit 1; fi
+          grep -qx 'subDomainHost = "sh.namre.app"' "$c/frps.toml"
+          grep -q -- '--domain sh.namre.app' "$c/systemd/shturman-relayd.service"
+          # Комментарии файлов frp — тоже шаблон: двойных фигурных скобок в них быть не должно.
+          if grep -En '^#.*\{\{' "$c/frps.toml" "$c/frpc.toml" frpc/frpc.toml; then echo "скобки шаблона в комментарии"; exit 1; fi
+          mkdir -p "$k"; bash relay/install.sh --make-cert "$k/frps.crt" "$k/frps.key"
+          test "$(stat -c '%a' "$k/frps.key")" = "600"
+          openssl x509 -in "$k/frps.crt" -noout -ext subjectAltName | grep -q 'DNS:relay.sh.namre.app'
+          FRP_AUTH_TOKEN=ci CREDENTIALS_DIRECTORY="$k" "$d/frps" verify -c "$c/frps.toml"
+          FRP_AUTH_TOKEN=ci FRPC_OPERATOR_KEY=ci "$d/frpc" verify -c "$c/frpc.toml"
+          "$d/caddy" validate --config "$c/Caddyfile" --adapter caddyfile
+          # Подменённая сумма — ничего не скачано в итоговый каталог, код ошибки.
+          sed 's/^FRP_SHA256_amd64=.*/FRP_SHA256_amd64=0000000000000000000000000000000000000000000000000000000000000000/' relay/install.sh > "$RUNNER_TEMP/bad.sh"
+          if bash "$RUNNER_TEMP/bad.sh" --download-only "$RUNNER_TEMP/dl-bad" > /dev/null 2>&1; then echo "неверная сумма должна останавливать"; exit 1; fi
+          test ! -e "$RUNNER_TEMP/dl-bad/frps"
+      - name: образ frpc экземпляра
+        run: |
+          docker build -t shturman-frpc:ci frpc
+          test "$(docker run --rm shturman-frpc:ci -v)" = "0.71.0"
+          docker run --rm -e SHTURMAN_RELAY_SERVER=relay.sh.namre.app -e SHTURMAN_RELAY_PORT=7000 -e SHTURMAN_RELAY_NAME=ivan \
+            -e SHTURMAN_RELAY_KEY=ci -e SHTURMAN_RELAY_TOKEN=ci -e SHTURMAN_RELAY_ADMIN_PASSWORD=ci \
+            shturman-frpc:ci verify -c /etc/frpc/frpc.toml
+          # Подменённая сумма — образ не собирается.
+          if docker build --build-arg FRP_SHA256_AMD64=0000000000000000000000000000000000000000000000000000000000000000 -t shturman-frpc:bad frpc; then
+            echo "образ с неверной суммой собираться не должен"; exit 1
+          fi
+
   ops:
     runs-on: ubuntu-24.04
     steps:
@@ -107,6 +154,11 @@ jobs:
           test "$(docker compose --profile hermes config --services | sort | tr '\n' ' ')" = "hermes postgres shturman "
           docker compose --profile hermes --profile embeddings --profile guard config --quiet
           test "$(docker compose --profile guard config --services | sort | tr '\n' ' ')" = "guard postgres shturman "
+          # Посредник (профиль relay): frpc в сети хоста, без опубликованных портов, сертификат
+          # посредника — только на чтение. Печатаются только эти свойства, не окружение.
+          test "$(docker compose --profile hermes --profile relay config --services | sort | tr '\n' ' ')" = "hermes postgres relay shturman "
+          rel() { docker compose --profile relay config --format json | python3 -c 'import json, sys; r = json.load(sys.stdin)["services"]["relay"]; print(r["network_mode"], len(r.get("ports") or []), r["read_only"], r["cap_drop"], [v["target"] + ":" + str(v.get("read_only")) for v in r["volumes"]])'; }
+          test "$(rel)" = "host 0 True ['ALL'] ['/etc/frpc/relay:True']"
           # Модель поиска по смыслу: без строк в .env — прежняя модель из прежнего каталога (экземпляру,
           # развёрнутому раньше, править .env не нужно); со строками — выбранная. Сервис и контейнер
           # получают одно и то же имя модели. Печатается только команда контейнера эмбеддингов.
@@ -211,6 +263,54 @@ jobs:
           ./ops/init-env.sh --auto > /dev/null
           grep -qx 'COMPOSE_PROFILES=hermes' .env
           test "$(stat -c '%a' .env)" = "600"
+          # Посредник — только с Hermes: при переходе в режим без Hermes профиль relay убирается,
+          # остальные профили остаются.
+          printf 'SHTURMAN_MODE=hermes\nCOMPOSE_PROFILES=hermes,relay,guard\n' > .env
+          ./ops/mode.sh set standalone > /dev/null
+          grep -qx 'COMPOSE_PROFILES=guard' .env
+      # Подключение к посреднику (./ops/relay.sh, docs/relay.md) без сети: отказы до обращения
+      # к посреднику и готовая настройка Caddy. Настоящее подключение проверено на стенде (PR).
+      - name: ops — посредник
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops config .env.example "$tmp"/; cd "$tmp"
+          mkdir stub; printf '#!/bin/sh\necho "$(basename "$0") $*" >> "%s/called"\nexit 1\n' "$tmp" > stub/curl; cp stub/curl stub/docker; chmod +x stub/*
+          export PATH="$tmp/stub:$PATH"
+          printf 'SHTURMAN_MODE=standalone\n' > .env
+          code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX ivan > out.txt 2>&1 || code=$?
+          [ "$code" -eq 2 ] && grep -q 'Режим без Hermes' out.txt
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\n' > .env; before="$(cat .env)"
+          for name in setup-ivan Ivan ab -ivan 'iv an'; do
+            code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX "$name" > /dev/null 2>&1 || code=$?
+            [ "$code" -eq 2 ] || { echo "имя $name: код $code вместо 2"; exit 1; }
+          done
+          code=0; ./ops/relay.sh join 'x"y' ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          code=0; SHTURMAN_RELAY_API=http://relay.example.com ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          test "$(cat .env)" = "$before"
+          test ! -e called
+          # Уже подключён — повторный join отказывается, не обращаясь к посреднику.
+          printf 'SHTURMAN_RELAY_KEY=ci-only-relay-key\nSHTURMAN_RELAY_NAME=ivan\nSHTURMAN_RELAY_DOMAIN=sh.namre.app\n' >> .env
+          code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX petr > out.txt 2>&1 || code=$?
+          [ "$code" -eq 2 ] && grep -q 'уже подключён' out.txt && test ! -e called
+          # status и off не печатают секретов; off убирает профиль, --forget — и строки подключения.
+          printf 'COMPOSE_PROFILES=hermes,relay\nSHTURMAN_RELAY_TOKEN=ci-only-relay-token\n' >> .env
+          ./ops/relay.sh status > out.txt; ./ops/relay.sh off >> out.txt
+          if grep -q 'ci-only' out.txt; then echo "секрет в выводе"; exit 1; fi
+          grep -qx 'COMPOSE_PROFILES=hermes' .env && grep -q '^SHTURMAN_RELAY_KEY=' .env
+          ./ops/relay.sh off --forget > /dev/null
+          if grep -q '^SHTURMAN_RELAY_' .env; then echo "строки подключения должны исчезнуть"; exit 1; fi
+          # Готовая настройка Caddy: тот же образец, отличия — только заголовки двух блоков, путь
+          # к репозиторию и чтение протокола PROXY в глобальном блоке; её проверяет Caddy 2.11.7.
+          export PATH="${PATH#"$tmp/stub:"}"
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_RELAY_NAME=ivan\nSHTURMAN_RELAY_DOMAIN=sh.namre.app\n' > .env
+          ./ops/relay.sh caddyfile > relay.Caddyfile
+          f=config/Caddyfile.example
+          diff <(grep -Ev '^[[:space:]]*#' "$f" | sed -n '/^{$/,$p' | sed '/^$/d') <(grep -Ev '^[[:space:]]*#' relay.Caddyfile | sed '/^$/d') > d.txt || true
+          test "$(grep -c '^>' d.txt)" = "11" && test "$(grep -c '^<' d.txt)" = "3"
+          grep -qx '> ivan.sh.namre.app {' d.txt && grep -qx '> setup-ivan.sh.namre.app {' d.txt
+          grep -qx $'> \t\t\t\tallow 127.0.0.1/32' d.txt
+          grep -Eq '^#[[:space:]]+ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com \{$' "$f"
+          grep -Eq '^#[[:space:]]+setup-ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com:8443 \{$' "$f"
+          docker run --rm -v "$PWD/relay.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
       # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
       # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.

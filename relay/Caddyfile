@@ -1,0 +1,48 @@
+# Caddy посредника: отдаёт https://relay.<зона>/api/* — выдачу имён по коду приглашения (relayd).
+# Проверено с Caddy 2.11.7. relay/install.sh кладёт файл в /etc/shturman-relay/Caddyfile, подставив
+# имя зоны посредника.
+#
+# Порты 80 и 443 посредника занимает frps, поэтому этот Caddy устроен как обычный экземпляр за
+# посредником: слушает только локальный адрес (9080, 9443), а снаружи до него доходят через frps
+# и служебный frpc посредника (имя relay, relay/frpc-operator.toml). Сертификат Let's Encrypt
+# на relay.<зона> Caddy получает сам — проверка идёт через frps так же, как у экземпляров.
+#
+# Протокол PROXY: frpc сообщает Caddy настоящий адрес браузера (иначе все запросы пришли бы
+# с 127.0.0.1). Заголовок принимается только от 127.0.0.1 — от frpc; relayd по нему ограничивает
+# число попыток подключения с одного адреса.
+{
+	admin off
+	default_bind 127.0.0.1
+	http_port 9080
+	https_port 9443
+	servers {
+		listener_wrappers {
+			proxy_protocol {
+				allow 127.0.0.1/32
+			}
+			tls
+		}
+	}
+}
+
+# На порту 80 — только перенаправление (и проверка Let's Encrypt http-01, её Caddy обрабатывает
+# сам). Блок задан явно: перенаправление по умолчанию вело бы на порт 9443.
+http://relay.@DOMAIN@ {
+	redir https://relay.@DOMAIN@{uri} 308
+}
+
+relay.@DOMAIN@ {
+	header Strict-Transport-Security "max-age=31536000"
+
+	@api path /api/join /api/health /api/ca
+	handle @api {
+		request_body {
+			max_size 4KB
+		}
+		reverse_proxy 127.0.0.1:7401
+	}
+
+	handle {
+		respond "Посредник «Штурмана». Подключение экземпляра — ./ops/relay.sh join (docs/relay.md)." 404
+	}
+}

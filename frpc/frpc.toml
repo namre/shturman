@@ -1,0 +1,73 @@
+# frpc экземпляра «Штурмана»: постоянное исходящее соединение к посреднику (docs/relay.md).
+# Проверено с frp 0.71.0. Файл входит в образ (frpc/Dockerfile); секретов в нём нет: значения
+# из окружения контейнера frp подставляет при чтении файла (шаблон Go, .Envs.ИМЯ в двойных фигурных
+# скобках), а compose.yaml берёт их из .env (записывает ./ops/relay.sh join). Весь файл — шаблон,
+# комментарии тоже: двойных фигурных скобок в комментариях быть не должно. Сертификат посредника —
+# data/relay/ca.pem, только чтение.
+#
+# Что пересылается: четыре пересылки, все — на обратный прокси Caddy этого сервера (127.0.0.1):
+#   <имя>.<зона>        https → 443, http → 80   — дашборд (блок сайта дашборда в Caddy);
+#   setup-<имя>.<зона>  https → 443, http → 80   — страница настройки переписки (свой блок сайта).
+# По https посредник передаёт поток как есть: TLS снимает Caddy этого сервера, сертификат и ключ —
+# только здесь. По http идут только перенаправление на https и проверка Let's Encrypt http-01.
+# Протокол PROXY v2 сообщает Caddy настоящий адрес браузера — только в пересылках https; Caddy
+# принимает его только от 127.0.0.1 (вариант «через посредника» в config/Caddyfile.example).
+# В пересылках http его нет: порт 80 Caddy обслуживает отдельным, созданным им самим сервером
+# перенаправлений, к которому настройка протокола PROXY не применяется (Caddy 2.11.7,
+# modules/caddyhttp/autohttps.go) — с заголовком он отвечал бы 400, и проверка http-01 не прошла бы.
+
+serverAddr = "{{ .Envs.SHTURMAN_RELAY_SERVER }}"
+serverPort = {{ .Envs.SHTURMAN_RELAY_PORT }}
+# Посредник недоступен при запуске — пробовать снова, а не выходить.
+loginFailExit = false
+user = "{{ .Envs.SHTURMAN_RELAY_NAME }}"
+# Ключ экземпляра: по нему посредник узнаёт экземпляр и даёт занять только его два имени.
+metadatas.key = "{{ .Envs.SHTURMAN_RELAY_KEY }}"
+auth.method = "token"
+auth.token = "{{ .Envs.SHTURMAN_RELAY_TOKEN }}"
+# TLS до посредника с проверкой его сертификата: без trustedCaFile frpc принял бы любой сертификат,
+# и перехвативший соединение узнал бы ключ экземпляра.
+transport.tls.enable = true
+transport.tls.trustedCaFile = "/etc/frpc/relay/ca.pem"
+transport.tls.serverName = "{{ .Envs.SHTURMAN_RELAY_SERVER }}"
+
+# Состояние пересылок для ./ops/doctor.sh и ./ops/relay.sh status (frpc status внутри контейнера).
+# Только локальный адрес и с паролем: контейнер Hermes тоже в сети хоста, а без пароля через этот
+# адрес можно было бы остановить frpc или подменить его настройку.
+webServer.addr = "127.0.0.1"
+webServer.port = 7402
+webServer.user = "shturman"
+webServer.password = "{{ .Envs.SHTURMAN_RELAY_ADMIN_PASSWORD }}"
+
+log.to = "console"
+log.level = "info"
+
+[[proxies]]
+name = "dashboard-https"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 443
+subdomain = "{{ .Envs.SHTURMAN_RELAY_NAME }}"
+transport.proxyProtocolVersion = "v2"
+
+[[proxies]]
+name = "dashboard-http"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 80
+subdomain = "{{ .Envs.SHTURMAN_RELAY_NAME }}"
+
+[[proxies]]
+name = "setup-https"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 443
+subdomain = "setup-{{ .Envs.SHTURMAN_RELAY_NAME }}"
+transport.proxyProtocolVersion = "v2"
+
+[[proxies]]
+name = "setup-http"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 80
+subdomain = "setup-{{ .Envs.SHTURMAN_RELAY_NAME }}"
