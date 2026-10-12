@@ -284,6 +284,12 @@ jobs:
             [ "$code" -eq 2 ] || { echo "имя $name: код $code вместо 2"; exit 1; }
           done
           code=0; ./ops/relay.sh join 'x"y' ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          # Значение с переводом строки — отказ (проверка целиком, а не построчно).
+          nl=$'\n'
+          for bad in "ivan${nl}x" "ivan${nl}"; do
+            code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX "$bad" > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          done
+          code=0; ./ops/relay.sh join "ABCD-EFGH-JKMN-PQRS-TVWX${nl}x" ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
           code=0; SHTURMAN_RELAY_API=http://relay.example.com ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
           test "$(cat .env)" = "$before"
           test ! -e called
@@ -305,12 +311,16 @@ jobs:
           ./ops/relay.sh caddyfile > relay.Caddyfile
           f=config/Caddyfile.example
           diff <(grep -Ev '^[[:space:]]*#' "$f" | sed -n '/^{$/,$p' | sed '/^$/d') <(grep -Ev '^[[:space:]]*#' relay.Caddyfile | sed '/^$/d') > d.txt || true
-          test "$(grep -c '^>' d.txt)" = "11" && test "$(grep -c '^<' d.txt)" = "3"
+          test "$(grep -c '^>' d.txt)" = "19" && test "$(grep -c '^<' d.txt)" = "3"
           grep -qx '> ivan.sh.namre.app {' d.txt && grep -qx '> setup-ivan.sh.namre.app {' d.txt
           grep -qx $'> \t\t\t\tallow 127.0.0.1/32' d.txt
+          # Отказ изменяющим запросам с чужого адреса — в блоке дашборда (соседние экземпляры — один сайт).
+          grep -qx $'> \t\tnot header Sec-Fetch-Site same-origin' d.txt && grep -qx $'> \t\trespond 403' d.txt
+          awk '$0 == "ivan.sh.namre.app {" {f=1} f {print} f && /^}/ {exit}' relay.Caddyfile | grep -q '@cross_site'
+          grep -Eq '^#[[:space:]]+not header Sec-Fetch-Site same-origin$' "$f"
           grep -Eq '^#[[:space:]]+ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com \{$' "$f"
           grep -Eq '^#[[:space:]]+setup-ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com:8443 \{$' "$f"
-          docker run --rm -v "$PWD/relay.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -v "$PWD/relay.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7@sha256:f2a1290d0463aad60660d4ec134943f183ee2a5f6c3eb7bf32dd984f2f020772 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
       # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
       # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.
@@ -442,8 +452,8 @@ jobs:
           # Заголовок Host не подменяется, журнал запросов не включён — ни в одном блоке.
           if grep -Ev '^[[:space:]]*#' "$f" | grep -Eq 'header_up[[:space:]]+Host|^[[:space:]]*log([[:space:]]|$)'; then echo "Host не подменяется, журнал не включается"; exit 1; fi
           # Настройку проверяет сам Caddy той версии, с которой она проверена.
-          docker run --rm -v "$PWD/$f:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-          docker run --rm -v "$PWD/config/Caddyfile.remote-mcp.example:/etc/caddy/Caddyfile:ro" caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -v "$PWD/$f:/etc/caddy/Caddyfile:ro" caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -v "$PWD/config/Caddyfile.remote-mcp.example:/etc/caddy/Caddyfile:ro" caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           # Вариант без домена (конец образца): те же два блока на IP-адресе, в каждом — профиль
           # сертификата shortlived (Let's Encrypt выдаёт сертификат на IP только с ним), в глобальном
           # блоке — default_sni (сервер за NAT). Вариант собирается ровно по описанию из образца,
@@ -468,7 +478,7 @@ jobs:
           added="$(diff <(grep -Ev '^[[:space:]]*#' "$f") <(grep -Ev '^[[:space:]]*#' ip.Caddyfile) | grep -c '^>' || true)"
           test "$added" = "15"
           grep -qx $'\tdefault_sni 203.0.113.10' ip.Caddyfile
-          docker run --rm -v "$PWD/ip.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -v "$PWD/ip.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7@sha256:f2a1290d0463aad60660d4ec134943f183ee2a5f6c3eb7bf32dd984f2f020772 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       - name: реальные маршруты Caddy и отсутствие TCP admin
         run: python service/tests/proxy_smoke.py
       # Справка и неизвестные ключи. На -h и --help каждый скрипт печатает своё назначение и выходит

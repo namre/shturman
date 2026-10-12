@@ -5,6 +5,8 @@
 #   sudo RELAY_DOMAIN=sh.example.org ./relay/install.sh   — другая зона (по умолчанию sh.namre.app)
 #   ./relay/install.sh --download-only КАТАЛОГ   — только скачать и сверить frp и Caddy в новый каталог
 #   ./relay/install.sh --render КАТАЛОГ          — только собрать файлы настройки для зоны в новый каталог
+#   ./relay/install.sh --make-cert ФАЙЛ.crt ФАЙЛ.key — только создать сертификат frps в эти файлы
+#                                                   (так же, как при установке; для стенда и проверок)
 #   -h, --help                                   — эта справка; ничего не меняется
 #
 # Что ставится (всё — в /opt/shturman-relay, /etc/frp, /etc/shturman-relay, /etc/systemd/system):

@@ -25,9 +25,32 @@ def env(tmp_path):
     ca = tmp_path / "frps.crt"
     ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
     s = relayd.Settings(db=str(tmp_path / "relay.db"), domain="sh.example.test", port=7000,
-                        ca_file=str(ca), frp_token=TOKEN, join_per_ip=3, join_total=100, join_window=900)
+                        ca_file=str(ca), frp_token=TOKEN, join_per_ip=3, join_window=900, join_fail_total=100, join_fail_window=60)
     conn = relayd.open_db(s.db)
     return s, conn
+
+
+REAL_RESTART = relayd.restart_frps
+
+
+@pytest.fixture(autouse=True)
+def frps_restarts(monkeypatch):
+    """relayctl revoke/release перезапускают frps (systemctl) и требуют root: здесь — подмена."""
+    calls = []
+    monkeypatch.setattr(relayd, "restart_frps", lambda: calls.append("restart") or True)
+    monkeypatch.setattr(relayd, "_is_root", lambda: True)
+    return calls
+
+
+def new_key_hash(key=None):
+    key = key or relayd.new_key()
+    return key, relayd.key_hash(key)
+
+
+def J(conn, s, code, name, key=None):
+    """Подключение так, как его делает ./ops/relay.sh: ключ создаёт экземпляр, посреднику — только sha256."""
+    key, kh = new_key_hash(key)
+    return relayd.join(conn, s, code, name, kh), key
 
 
 def invite(conn, days=7, now=None):
@@ -75,29 +98,28 @@ def test_code_has_100_bits_and_is_forgiving():
 def test_join_consumes_code_once(env):
     s, conn = env
     code = invite(conn)
-    out = relayd.join(conn, s, code, "ivan")
-    assert out["name"] == "ivan"
+    out, key = J(conn, s, code, "ivan")
+    assert out["name"] == "ivan" and "key" not in out          # ключ посредник не создаёт и не отдаёт
     assert out["dashboard_url"] == "https://ivan.sh.example.test"
     assert out["setup_url"] == "https://setup-ivan.sh.example.test"
     assert out["server"] == "relay.sh.example.test" and out["port"] == 7000
     assert out["frp_token"] == TOKEN and out["ca"].startswith("-----BEGIN CERTIFICATE-----")
-    assert len(out["key"]) >= 43
     row = conn.execute("SELECT key_hash FROM instances WHERE name='ivan'").fetchone()
-    assert row["key_hash"] == relayd.key_hash(out["key"]) and out["key"] not in row["key_hash"]
+    assert row["key_hash"] == relayd.key_hash(key) and key not in json.dumps(out)
     with pytest.raises(relayd.JoinError) as e:
-        relayd.join(conn, s, code, "petr")
+        J(conn, s, code, "petr")[0]
     assert e.value.code == "bad_code" and e.value.status == 403
     assert relayd.get_instance(conn, "petr") is None
 
 
 def test_name_taken_keeps_code(env):
     s, conn = env
-    relayd.join(conn, s, invite(conn), "ivan")
+    J(conn, s, invite(conn), "ivan")[0]
     code = invite(conn)
     with pytest.raises(relayd.JoinError) as e:
-        relayd.join(conn, s, code, "ivan")
+        J(conn, s, code, "ivan")[0]
     assert e.value.code == "name_taken" and e.value.status == 409
-    assert relayd.join(conn, s, code, "petr")["name"] == "petr"
+    assert J(conn, s, code, "petr")[0]["name"] == "petr"
 
 
 def test_bad_name_keeps_code(env):
@@ -105,9 +127,9 @@ def test_bad_name_keeps_code(env):
     code = invite(conn)
     for name, why in (("setup-ivan", "bad_name"), ("relay", "name_reserved"), ("Ivan", "bad_name")):
         with pytest.raises(relayd.JoinError) as e:
-            relayd.join(conn, s, code, name)
+            J(conn, s, code, name)[0]
         assert e.value.code == why and e.value.status == 400
-    assert relayd.join(conn, s, code, "ivan")["name"] == "ivan"
+    assert J(conn, s, code, "ivan")[0]["name"] == "ivan"
 
 
 def test_expired_and_unknown_codes(env):
@@ -115,24 +137,86 @@ def test_expired_and_unknown_codes(env):
     old = invite(conn, days=1, now=int(time.time()) - 2 * 86400)
     for code in (old, relayd.new_code(), "garbage"):
         with pytest.raises(relayd.JoinError) as e:
-            relayd.join(conn, s, code, "ivan")
+            J(conn, s, code, "ivan")[0]
         assert e.value.code == "bad_code"
+
+
+def test_retry_with_same_code_name_and_key_is_idempotent(env):
+    """Ответ на join потерялся в сети: повтор тем же кодом, именем и ключом — тот же успех; любой
+    другой повтор израсходованным кодом — отказ."""
+    s, conn = env
+    code = invite(conn)
+    first, key = J(conn, s, code, "ivan")
+    again = relayd.join(conn, s, code, "ivan", relayd.key_hash(key))
+    assert again.pop("repeated") is True and again == first
+    for name, k in (("ivan", relayd.new_key()), ("petr", key)):
+        with pytest.raises(relayd.JoinError) as e:
+            relayd.join(conn, s, code, name, relayd.key_hash(k))
+        assert e.value.code == "bad_code"
+    assert relayd.main(["--db", s.db, "revoke", "ivan", "--no-restart"]) == 0
+    with pytest.raises(relayd.JoinError):
+        relayd.join(conn, s, code, "ivan", relayd.key_hash(key))   # отключённому повтор не помогает
+
+
+def test_key_hash_is_required_and_ca_is_read_before_spending_code(env, tmp_path):
+    s, conn = env
+    code = invite(conn)
+    for bad in (None, "", "x" * 64, "A" * 64, relayd.key_hash("k") + "\n", 5):
+        with pytest.raises(relayd.JoinError) as e:
+            relayd.join(conn, s, code, "ivan", bad)
+        assert e.value.code == "bad_key_hash"
+    broken = relayd.Settings(**{**s.__dict__, "ca_file": str(tmp_path / "nope.crt")})
+    with pytest.raises(OSError):
+        J(conn, broken, code, "ivan")
+    assert J(conn, s, code, "ivan")[0]["name"] == "ivan"          # код не израсходован
+
+
+def test_name_with_trailing_newline_is_refused():
+    for name in ("ivan\n", "ivan\r", "iv\nan", " ivan", "ivan "):
+        assert relayd.name_problem(name) == "bad_name"
+    assert relayd.name_problem("relay\n") == "bad_name"
+
+
+def test_revoke_and_release_restart_frps(env, frps_restarts, monkeypatch):
+    s, conn = env
+    J(conn, s, invite(conn), "ivan")
+    assert relayd.main(["--db", s.db, "revoke", "ivan", "--no-restart"]) == 0 and frps_restarts == []
+    assert relayd.main(["--db", s.db, "revoke", "ivan"]) == 0 and frps_restarts == ["restart"]
+    assert relayd.main(["--db", s.db, "release", "ivan"]) == 0 and frps_restarts == ["restart"] * 2
+    monkeypatch.setattr(relayd, "_is_root", lambda: False)
+    J(conn, s, invite(conn), "petr")
+    assert relayd.main(["--db", s.db, "revoke", "petr"]) == 2        # перезапуск без root невозможен
+    assert relayd.get_instance(conn, "petr").revoked is False
+    assert relayd.main(["--db", s.db, "revoke", "petr", "--no-restart"]) == 0
+    assert relayd.main(["--db", s.db, "release", "petr"]) == 2       # release без перезапуска не бывает
+    assert relayd.get_instance(conn, "petr") is not None
+
+
+def test_failed_frps_restart_keeps_name_taken(env, monkeypatch):
+    s, conn = env
+    J(conn, s, invite(conn), "ivan")
+    monkeypatch.setattr(relayd.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("нет systemctl")))
+    monkeypatch.setattr(relayd, "restart_frps", REAL_RESTART)
+    assert relayd.main(["--db", s.db, "revoke", "ivan"]) == 1             # отмечен, но сказано, что frps не перезапущен
+    assert relayd.get_instance(conn, "ivan").revoked is True
+    assert relayd.main(["--db", s.db, "release", "ivan"]) == 1
+    assert relayd.get_instance(conn, "ivan") is not None                  # имя не освобождено
 
 
 def test_revoked_name_stays_taken_until_release(env, tmp_path):
     s, conn = env
-    relayd.join(conn, s, invite(conn), "ivan")
+    J(conn, s, invite(conn), "ivan")[0]
     assert relayd.main(["--db", s.db, "revoke", "ivan"]) == 0
     with pytest.raises(relayd.JoinError) as e:
-        relayd.join(conn, s, invite(conn), "ivan")
+        J(conn, s, invite(conn), "ivan")[0]
     assert e.value.code == "name_taken"
     assert relayd.main(["--db", s.db, "release", "ivan"]) == 0
-    assert relayd.join(conn, s, invite(conn), "ivan")["name"] == "ivan"
+    assert J(conn, s, invite(conn), "ivan")[0]["name"] == "ivan"
 
 
 def test_release_requires_revoke_and_operator_is_not_revoked(env, tmp_path):
     s, conn = env
-    relayd.join(conn, s, invite(conn), "ivan")
+    J(conn, s, invite(conn), "ivan")[0]
     assert relayd.main(["--db", s.db, "release", "ivan"]) == 2
     keyfile = tmp_path / "operator.env"
     assert relayd.main(["--db", s.db, "operator", "--key-file", str(keyfile)]) == 0
@@ -150,7 +234,7 @@ def test_invite_command_prints_code_and_stores_only_hash(env, capsys):
     assert relayd.normalize_code(code)
     dump = "\n".join(conn.iterdump())
     assert code not in dump and relayd.normalize_code(code) not in dump
-    assert relayd.join(conn, s, code, "ivan")["name"] == "ivan"
+    assert J(conn, s, code, "ivan")[0]["name"] == "ivan"
     assert relayd.main(["--db", s.db, "list"]) == 0
     listing = capsys.readouterr().out
     assert "ivan" in listing and "Иван" in listing and code not in listing
@@ -176,9 +260,9 @@ def new_proxy(user, key, ptype="https", sub=None, run_id="r1", **extra):
 @pytest.fixture()
 def ivan(env):
     s, conn = env
-    out = relayd.join(conn, s, invite(conn), "ivan")
-    petr = relayd.join(conn, s, invite(conn), "petr")
-    return conn, out["key"], petr["key"]
+    _, key = J(conn, s, invite(conn), "ivan")
+    _, petr_key = J(conn, s, invite(conn), "petr")
+    return conn, key, petr_key
 
 
 def decide(conn, op, content):
@@ -263,11 +347,15 @@ def test_unknown_ops_are_refused(ivan):
         assert decide(conn, op, {"user": {"user": "ivan", "metas": {"key": key}}})["reject"] is True
 
 
-def test_rate_limit_window():
-    rl = relayd.RateLimit(per_key=2, total=3, window=10)
-    assert rl.allow("a", 0) and rl.allow("a", 1) and not rl.allow("a", 2)
-    assert rl.allow("b", 2) and not rl.allow("c", 3)       # общий предел
-    assert rl.allow("a", 11.5)                              # окно сдвинулось
+def test_rate_limit_window_and_ipv6_buckets():
+    w = relayd.Window(limit=2, window=10)
+    w.add("a", 0); w.add("a", 1)
+    assert w.blocked("a", 2) and not w.blocked("b", 2)
+    assert not w.blocked("a", 11.5)                         # окно сдвинулось
+    assert relayd.ip_bucket("2001:db8:1:2:aaaa::1") == relayd.ip_bucket("2001:db8:1:2:ffff::9") == "2001:db8:1:2::/64"
+    assert relayd.ip_bucket("2001:db8:1:3::1") != relayd.ip_bucket("2001:db8:1:2::1")
+    assert relayd.ip_bucket("203.0.113.5") == "203.0.113.5" != relayd.ip_bucket("203.0.113.6")
+    assert relayd.ip_bucket("::ffff:203.0.113.5") == "203.0.113.5"
 
 
 # --- HTTP ---
@@ -303,13 +391,19 @@ def test_http_join_and_plugin_round_trip(servers):
     assert status == 200 and body.startswith(b"-----BEGIN CERTIFICATE-----")
     conn = relayd.open_db(s.db)
     code = invite(conn)
-    status, body, hdr = call(api, "POST", "/api/join", {"code": code, "name": "ivan"})
+    key, kh = new_key_hash()
+    body_ok = {"code": code, "name": "ivan", "key_hash": kh}
+    status, body, hdr = call(api, "POST", "/api/join", body_ok)
     assert status == 200 and hdr["Cache-Control"] == "no-store"
     out = json.loads(body)
-    status, body, _ = call(api, "POST", "/api/join", {"code": code, "name": "ivan2"}, {"X-Forwarded-For": "203.0.113.9"})
+    assert "key" not in out and key.encode() not in body
+    status, body, _ = call(api, "POST", "/api/join", body_ok)            # повтор — тот же успех
+    assert status == 200 and json.loads(body)["repeated"] is True
+    status, body, _ = call(api, "POST", "/api/join", {"code": code, "name": "ivan2", "key_hash": kh},
+                           {"X-Forwarded-For": "203.0.113.9"})
     assert status == 403 and json.loads(body)["error"] == "bad_code"
     # Ответ frps — в формате doc/server_plugin.md.
-    req = {"version": "0.1.0", "op": "Login", "content": login("ivan", out["key"])}
+    req = {"version": "0.1.0", "op": "Login", "content": login("ivan", key)}
     status, body, _ = call(plugin, "POST", "/frps/handler?version=0.1.0&op=Login", req)
     assert status == 200 and json.loads(body) == {"reject": False, "unchange": True}
     req["content"] = login("ivan", "wrong")
@@ -327,7 +421,7 @@ def test_http_join_rejects_non_json_and_big_bodies(servers):
 
 def test_http_rate_limit_is_per_client_ip_from_local_proxy(servers):
     _, _, api = servers
-    bad = {"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "ivan"}
+    bad = {"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "ivan", "key_hash": "0" * 64}
     for _ in range(3):
         assert call(api, "POST", "/api/join", bad, {"X-Forwarded-For": "203.0.113.1"})[0] == 403
     status, body, hdr = call(api, "POST", "/api/join", bad, {"X-Forwarded-For": "203.0.113.1"})
@@ -337,13 +431,46 @@ def test_http_rate_limit_is_per_client_ip_from_local_proxy(servers):
     assert call(api, "POST", "/api/join", bad, {"X-Forwarded-For": "203.0.113.1, 203.0.113.2"})[0] == 403
 
 
+def test_http_rate_limit_groups_ipv6_by_64(servers):
+    _, _, api = servers
+    bad = {"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "ivan", "key_hash": "0" * 64}
+    for i in range(3):
+        assert call(api, "POST", "/api/join", bad, {"X-Forwarded-For": f"2001:db8:5:6::{i + 1}"})[0] == 403
+    assert call(api, "POST", "/api/join", bad, {"X-Forwarded-For": "2001:db8:5:6:ffff::77"})[0] == 429
+    assert call(api, "POST", "/api/join", bad, {"X-Forwarded-For": "2001:db8:5:7::1"})[0] == 403
+
+
+def test_global_cap_counts_failures_and_clears_quickly(env, tmp_path):
+    s, conn = env
+    s = relayd.Settings(**{**s.__dict__, "join_per_ip": 100, "join_fail_total": 3, "join_fail_window": 1})
+    plugin, api = relayd.make_servers(s, ("127.0.0.1", 0), ("127.0.0.1", 0))
+    threading.Thread(target=api.serve_forever, daemon=True).start()
+    try:
+        bad = {"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "ivan", "key_hash": "0" * 64}
+        for i in range(3):
+            assert call(api, "POST", "/api/join", bad, {"X-Forwarded-For": f"198.51.100.{i + 1}"})[0] == 403
+        good = {"code": invite(conn), "name": "ivan", "key_hash": new_key_hash()[1]}
+        status, _, hdr = call(api, "POST", "/api/join", good, {"X-Forwarded-For": "198.51.100.99"})
+        assert status == 429 and hdr.get("Retry-After") == "1"        # перебор с многих адресов
+        time.sleep(1.2)
+        assert call(api, "POST", "/api/join", good, {"X-Forwarded-For": "198.51.100.99"})[0] == 200
+        # Удачные подключения общий предел не заполняют.
+        for name in ("olga", "petr", "anna", "boris"):
+            ok = {"code": invite(conn), "name": name, "key_hash": new_key_hash()[1]}
+            assert call(api, "POST", "/api/join", ok, {"X-Forwarded-For": "198.51.100.98"})[0] == 200
+    finally:
+        api.shutdown()
+        api.server_close()
+        plugin.server_close()
+
+
 def test_keepalive_connection_survives_refusals(servers):
     """Caddy держит соединение с relayd открытым: тело отклонённого запроса не должно остаться
     в соединении и стать «следующим запросом» (так было: 429 без чтения тела, затем 501)."""
     import http.client
     _, _, api = servers
     conn = http.client.HTTPConnection(*api.server_address[:2], timeout=5)
-    bad = json.dumps({"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "ivan"})
+    bad = json.dumps({"code": "AAAA-AAAA-AAAA-AAAA-AAAA", "name": "ivan", "key_hash": "0" * 64})
     hdr = {"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.50"}
     codes = []
     for path in ("/api/join", "/api/join", "/api/join", "/api/join", "/nope", "/api/join"):

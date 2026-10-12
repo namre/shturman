@@ -8,8 +8,11 @@
 #                                   ИМЯ выбирает владелец (3–30 знаков: a–z, 0–9, дефис внутри). Скрипт
 #                                   получает два имени — ИМЯ.<зона> (дашборд) и setup-ИМЯ.<зона> (страница
 #                                   настройки переписки), — записывает их адресами экземпляра
-#                                   (./ops/set-public-url.sh, ./ops/set-setup-url.sh), а ключ подключения
-#                                   и токен посредника — в .env, и включает профиль relay
+#                                   (./ops/set-public-url.sh, ./ops/set-setup-url.sh), а токен посредника —
+#                                   в .env, и включает профиль relay. Ключ подключения создаёт сам
+#                                   экземпляр (в .env, до обращения к посреднику); посреднику уходит только
+#                                   его sha256. Ответ потерялся — повторите ту же команду: тот же код, имя
+#                                   и ключ дают тот же успешный ответ
 #   ./ops/relay.sh caddyfile      — напечатать готовую настройку Caddy для этих двух имён (вариант
 #                                   «через посредника» из config/Caddyfile.example); сам прокси не меняет
 #   ./ops/relay.sh status         — имя, адреса, контейнер и состояние четырёх пересылок
@@ -68,6 +71,7 @@ case "$API" in
 esac
 CA=data/relay/ca.pem
 NAME_RE='^[a-z0-9]([a-z0-9-]{1,28}[a-z0-9])$'
+CODE_RE='^[A-Za-z0-9 -]{16,40}$'
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 # Записана ли строка секрета — без чтения значения.
@@ -99,7 +103,6 @@ checks = {
     "domain": host,
     "server": host,
     "frp_token": r"[A-Za-z0-9+/=._~-]{8,256}",
-    "key": r"[A-Za-z0-9_-]{32,128}",
 }
 for k, rx in checks.items():
     if not isinstance(d.get(k), str) or not re.fullmatch(rx, d[k]):
@@ -126,7 +129,6 @@ print("SHTURMAN_RELAY_NAME=" + d["name"])
 print("SHTURMAN_RELAY_DOMAIN=" + d["domain"])
 print("SHTURMAN_RELAY_SERVER=" + d["server"])
 print("SHTURMAN_RELAY_PORT=" + str(port))
-print("SHTURMAN_RELAY_KEY=" + d["key"])
 print("SHTURMAN_RELAY_TOKEN=" + d["frp_token"])
 '
 
@@ -192,7 +194,13 @@ body = body.replace(glob, "{\n\tadmin unix//run/caddy-admin/admin.sock\n"
                           "\t# заголовок принимается только от 127.0.0.1.\n"
                           "\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\tallow 127.0.0.1/32\n"
                           "\t\t\t}\n\t\t\ttls\n\t\t}\n\t}\n}\n")
-body = body.replace("\nassistant.example.com {\n", f"\n{dash} {{\n").replace(end_head, f"\n{setup} {{\n")
+dash_head = "\nassistant.example.com {\n\tencode gzip\n"
+assert body.count(dash_head) == 1
+guard = ("\n\t# Посредник: все экземпляры — один сайт (sh.namre.app), cookie SameSite от соседнего экземпляра\n"
+         "\t# не защищают. Изменяющий запрос, который браузер пометил как пришедший не с этого адреса, — отказ.\n"
+         "\t@cross_site {\n\t\tnot method GET HEAD OPTIONS\n\t\theader Sec-Fetch-Site *\n"
+         "\t\tnot header Sec-Fetch-Site same-origin\n\t}\n\thandle @cross_site {\n\t\trespond 403\n\t}\n")
+body = body.replace(dash_head, f"\n{dash} {{\n\tencode gzip\n" + guard).replace(end_head, f"\n{setup} {{\n")
 body = body.replace("/opt/shturman/", repo.rstrip("/") + "/")
 print(f"# Настройка Caddy для экземпляра за посредником: {dash} и {setup}.")
 print("# Создано ./ops/relay.sh caddyfile из config/Caddyfile.example (вариант «через посредника»); пояснения — там.")
@@ -211,29 +219,41 @@ case "$cmd" in
     require_hermes "дашборда и внешнего адреса"
     need_python
     code="$2"; name="$3"
-    if has_secret SHTURMAN_RELAY_KEY; then
-      echo "Экземпляр уже подключён к посреднику${relay_name:+ (имя $relay_name)}. Включить снова — ./ops/relay.sh on." >&2
+    if [ -n "$relay_name" ]; then
+      echo "Экземпляр уже подключён к посреднику (имя $relay_name). Включить снова — ./ops/relay.sh on." >&2
       echo "Подключиться заново под другим именем — сначала ./ops/relay.sh off --forget, затем новый код приглашения." >&2
       exit 2
     fi
-    if ! printf '%s' "$name" | grep -Eq "$NAME_RE" || [ "${name#setup-}" != "$name" ]; then
+    # [[ =~ ]], а не grep: grep проверяет каждую строку отдельно и пропустил бы значение с переводом строки.
+    if [[ ! "$name" =~ $NAME_RE ]] || [ "${name#setup-}" != "$name" ]; then
       echo "Имя не подходит: 3–30 знаков, строчные латинские буквы, цифры и дефис внутри, не начинается с setup-." >&2
       exit 2
     fi
-    if ! printf '%s' "$code" | grep -Eq '^[A-Za-z0-9 -]{16,40}$'; then
+    if [[ ! "$code" =~ $CODE_RE ]]; then
       echo "Код приглашения не похож на код: 20 букв и цифр, обычно группами через дефис (XXXX-XXXX-…)." >&2
       exit 2
     fi
-    echo "Подключаюсь к посреднику $API как «$name»…"
     umask 077
     mkdir -p data/relay; chmod 700 data/relay
-    # Код и имя уже проверены по шаблонам: кавычек и обратной черты в них нет.
-    body="{\"code\": \"$code\", \"name\": \"$name\"}"
+    # Ключ подключения создаёт сам экземпляр и записывает в .env ДО обращения к посреднику; посреднику
+    # уходит только его sha256. Если ответ потеряется в сети, повтор той же команды пошлёт тот же
+    # sha256, и посредник ответит тем же успехом. Ключ из .env скрипт читает сам и нигде не печатает.
+    if ! has_secret SHTURMAN_RELAY_KEY; then
+      env_put SHTURMAN_RELAY_KEY "$(python3 -I -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    fi
+    key_line="$(grep -E '^SHTURMAN_RELAY_KEY=' .env | tail -n 1)"
+    key_hash="$(printf '%s' "shturman-relay-key:${key_line#*=}" | sha256sum | cut -d' ' -f1)"
+    unset key_line
+    echo "Подключаюсь к посреднику $API как «$name»…"
+    # Код, имя и хеш уже проверены по шаблонам: кавычек и обратной черты в них нет.
+    body="{\"code\": \"$code\", \"name\": \"$name\", \"key_hash\": \"$key_hash\"}"
     rc=0
     resp="$(printf '%s' "$body" | curl -sS --proto '=https' --tlsv1.2 -m 30 -X POST -H 'Content-Type: application/json' \
             --data-binary @- -w '\n%{http_code}' "$API/api/join")" || rc=$?
     if [ "$rc" -ne 0 ]; then
-      echo "Посредник не ответил ($API, код curl $rc). Код приглашения не израсходован." >&2
+      echo "Посредник не ответил ($API, код curl $rc): неизвестно, принял ли он код." >&2
+      echo "Повторите ту же команду с тем же кодом и именем: ключ уже сохранён, и если посредник код принял," >&2
+      echo "повтор завершит подключение, а если нет — подключит заново." >&2
       exit 1
     fi
     rc=0
@@ -243,8 +263,10 @@ case "$cmd" in
       [ "$rc" -eq 3 ] && exit 2
       exit 1
     fi
-    while IFS='=' read -r k v; do
-      [ -n "$k" ] && env_put "$k" "$v"
+    # Строки ИМЯ=значение делятся по первому «=»: значение может само содержать «=» (base64).
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      env_put "${line%%=*}" "${line#*=}"
     done <<EOF_LINES
 $lines
 EOF_LINES

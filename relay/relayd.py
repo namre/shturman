@@ -14,10 +14,11 @@
         посредника — только `relay`;
       - новое рабочее соединение (`NewWorkConn`) — только у экземпляра, который не отключён: так
         отключение (`revoke`) останавливает пересылку сразу, не дожидаясь переподключения;
-  * **выдача имён по коду приглашения**: `POST /api/join {code, name}`. Код одноразовый, его
-    выпускает держатель посредника (`relayctl invite`); имя выбирает владелец экземпляра. Ответ —
-    имена, адрес посредника, общий токен frps, ключ экземпляра и сертификат frps для проверки
-    соединения. Ключ отдаётся один раз и хранится здесь только в виде sha256;
+  * **выдача имён по коду приглашения**: `POST /api/join {code, name, key_hash}`. Код одноразовый,
+    его выпускает держатель посредника (`relayctl invite`); имя выбирает владелец экземпляра; ключ
+    экземпляр создаёт сам и присылает только его sha256 — сам ключ посредника не проходит. Ответ —
+    имена, адрес посредника, общий токен frps и сертификат frps для проверки соединения. Повтор того
+    же запроса (ответ потерялся в сети) получает тот же успешный ответ;
   * **команды держателя** (`relayctl`): invite, list, revoke, release, operator, init.
 
 Ни ключи, ни коды, ни токен не пишутся в журнал. Слушает только 127.0.0.1: плагин спрашивает frps
@@ -25,7 +26,7 @@
 
     relayd.py serve [--db …] [--domain sh.namre.app] [--server relay.sh.namre.app] [--port 7000]
                     [--ca /etc/frp/frps.crt] [--plugin 127.0.0.1:7400] [--api 127.0.0.1:7401]
-    relayd.py init | invite [--days 7] [--note …] | list | revoke ИМЯ [--restart-frps]
+    relayd.py init | invite [--days 7] [--note …] | list | revoke ИМЯ [--no-restart]
             | release ИМЯ | operator --key-file ФАЙЛ
 """
 
@@ -35,6 +36,7 @@ import argparse
 import hashlib
 import hmac
 import http.server
+import ipaddress
 import json
 import logging
 import os
@@ -51,7 +53,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_DB = "/var/lib/shturman-relay/relay.db"
 DEFAULT_DOMAIN = "sh.namre.app"
 DEFAULT_CA = "/etc/frp/frps.crt"
@@ -62,7 +64,8 @@ log = logging.getLogger("relayd")
 # --- имена ---------------------------------------------------------------------------------------
 
 # 3–30 знаков: строчные латинские буквы, цифры и дефис внутри.
-NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{1,28}[a-z0-9])$")
+# Сверка — только re.fullmatch: у re.match знак $ допускает перевод строки в конце («ivan\n»).
+NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]{1,28}[a-z0-9])")
 # Имена, которые не выдаются никому: служебные, почтовые, похожие на чужие службы и на сам проект.
 RESERVED = frozenset("""
 relay www api admin administrator mail email smtp imap pop pop3 ftp sftp ssh test tests testing setup sh
@@ -71,16 +74,16 @@ autoconfig autodiscover wpad isatap localhost local dashboard login auth oauth s
 billing pay static assets cdn docs doc blog shop store app apps dev staging stage prod demo example
 git gitlab github frp frps frpc caddy acme cert certs ca shturman namre hermes telegram bot bots
 """.split())
-RESERVED_PATTERNS = (re.compile(r"^(ns|mx|mail|www|smtp|relay|api)[0-9]*$"),)
+RESERVED_PATTERNS = (re.compile(r"(ns|mx|mail|www|smtp|relay|api)[0-9]*"),)
 
 
 def name_problem(name: str) -> str | None:
     """Почему имя нельзя выдать (код ошибки), или None, если можно."""
-    if not isinstance(name, str) or not NAME_RE.match(name):
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         return "bad_name"
     if name.startswith("setup-") or name[2:4] == "--":   # setup-… — имя страницы; xn-- — punycode
         return "bad_name"
-    if name in RESERVED or any(p.match(name) for p in RESERVED_PATTERNS):
+    if name in RESERVED or any(p.fullmatch(name) for p in RESERVED_PATTERNS):
         return "name_reserved"
     return None
 
@@ -152,7 +155,8 @@ CREATE TABLE IF NOT EXISTS instances (
     invite_id  TEXT
 );
 -- Какой экземпляр подключался с каким run_id frpc: frps заменяет прежнее подключение новым с тем же
--- run_id, и чужой run_id в Login здесь отклоняется.
+-- run_id, и чужой run_id в Login здесь отклоняется. Хранится sha256 номера, не сам номер: зная чужой
+-- run_id и общий токен, можно открывать рабочие соединения за чужой экземпляр (docs/relay.md, риск 8).
 CREATE TABLE IF NOT EXISTS runs (
     run_id  TEXT PRIMARY KEY,
     name    TEXT NOT NULL,
@@ -221,10 +225,14 @@ def _auth(conn: sqlite3.Connection, user: Any, metas: Any) -> tuple[Instance | N
     return inst, None
 
 
+def _run_hash(run_id: str) -> str:
+    return hashlib.sha256(("shturman-relay-run:" + run_id).encode()).hexdigest()
+
+
 def _run_owner(conn: sqlite3.Connection, run_id: Any) -> str | None:
     if not isinstance(run_id, str) or not run_id:
         return None
-    row = conn.execute("SELECT name FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    row = conn.execute("SELECT name FROM runs WHERE run_id = ?", (_run_hash(run_id),)).fetchone()
     return row["name"] if row else None
 
 
@@ -232,7 +240,7 @@ def _remember_run(conn: sqlite3.Connection, run_id: Any, name: str) -> None:
     if isinstance(run_id, str) and run_id and len(run_id) <= 128:
         conn.execute("INSERT INTO runs(run_id, name, seen_at) VALUES(?, ?, ?) "
                      "ON CONFLICT(run_id) DO UPDATE SET seen_at = excluded.seen_at WHERE runs.name = excluded.name",
-                     (run_id, name, int(time.time())))
+                     (_run_hash(run_id), name, int(time.time())))
 
 
 def plugin_decide(conn: sqlite3.Connection, op: str, content: Any) -> tuple[dict, str]:
@@ -291,9 +299,10 @@ class Settings:
     port: int = 7000
     ca_file: str = DEFAULT_CA
     frp_token: str = ""
-    join_per_ip: int = 10            # попыток подключения с одного адреса за окно
-    join_total: int = 120            # попыток подключения всего за окно
+    join_per_ip: int = 10            # попыток подключения с одного адреса (IPv6 — с сети /64) за окно
     join_window: int = 15 * 60       # секунд
+    join_fail_total: int = 60        # неудачных попыток со всех адресов вместе за короткое окно
+    join_fail_window: int = 60       # секунд: общий предел не держит удачные подключения дольше минуты
 
     @property
     def server_name(self) -> str:
@@ -312,12 +321,17 @@ MESSAGES = {
     "name_reserved": "Это имя занято под служебное — выберите другое.",
     "name_taken": "Это имя уже занято — выберите другое. Код приглашения не израсходован.",
     "bad_code": "Код приглашения не подошёл: неверный, уже использован или истёк. Новый код выдаёт держатель посредника.",
+    "bad_key_hash": "Нужен key_hash — sha256 ключа экземпляра (64 шестнадцатеричных знака); ./ops/relay.sh делает это сам.",
 }
 
+KEY_HASH_RE = re.compile(r"[0-9a-f]{64}")
 
-def join(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, now: int | None = None) -> dict:
-    """Израсходовать код и завести экземпляр. Всё — одной транзакцией: код тратится, только если
-    экземпляр заведён."""
+
+def join(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, khash: Any, now: int | None = None) -> dict:
+    """Израсходовать код и завести экземпляр с ключом, который экземпляр создал сам: сюда приходит
+    только sha256 ключа (key_hash), сам ключ посредник не видит и не отдаёт. Всё — одной транзакцией:
+    код тратится, только если экземпляр заведён. Повтор того же запроса (тот же код, то же имя, тот же
+    key_hash) — например, ответ потерялся в сети — получает тот же успешный ответ."""
     now = int(time.time()) if now is None else now
     problem = name_problem(name)
     if problem:
@@ -325,12 +339,32 @@ def join(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, now: int |
     norm = normalize_code(code)
     if norm is None:
         raise JoinError(403, "bad_code", MESSAGES["bad_code"])
-    key = new_key()
+    if not isinstance(khash, str) or not KEY_HASH_RE.fullmatch(khash):
+        raise JoinError(400, "bad_key_hash", MESSAGES["bad_key_hash"])
+    with open(s.ca_file, encoding="ascii") as f:      # до транзакции: без сертификата код не тратится
+        ca = f.read()
+    answer = {
+        "name": name,
+        "domain": s.domain,
+        "dashboard_url": f"https://{name}.{s.domain}",
+        "setup_url": f"https://setup-{name}.{s.domain}",
+        "server": s.server_name,
+        "port": s.port,
+        "frp_token": s.frp_token,
+        "ca": ca,
+    }
     conn.execute("BEGIN IMMEDIATE")
     try:
-        inv = conn.execute("SELECT id FROM invites WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?",
-                           (code_hash(norm), now)).fetchone()
-        if inv is None:
+        inv = conn.execute("SELECT id, expires_at, used_at, used_by FROM invites WHERE code_hash = ?",
+                           (code_hash(norm),)).fetchone()
+        if inv is not None and inv["used_at"] is not None:
+            row = conn.execute("SELECT key_hash FROM instances WHERE name = ? AND invite_id = ? AND revoked_at IS NULL",
+                               (name, inv["id"])).fetchone()
+            if inv["used_by"] == name and row is not None and hmac.compare_digest(row["key_hash"], khash):
+                conn.execute("COMMIT")
+                return dict(answer, repeated=True)
+            raise JoinError(403, "bad_code", MESSAGES["bad_code"])
+        if inv is None or inv["expires_at"] <= now:
             raise JoinError(403, "bad_code", MESSAGES["bad_code"])
         # Имя занято, в том числе отключённым экземпляром: освобождает его только release.
         if conn.execute("SELECT 1 FROM instances WHERE name = ?", (name,)).fetchone():
@@ -340,51 +374,54 @@ def join(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, now: int |
         if cur.rowcount != 1:
             raise JoinError(403, "bad_code", MESSAGES["bad_code"])
         conn.execute("INSERT INTO instances(name, key_hash, created_at, invite_id) VALUES(?, ?, ?, ?)",
-                     (name, key_hash(key), now, inv["id"]))
+                     (name, khash, now, inv["id"]))
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
-    with open(s.ca_file, encoding="ascii") as f:
-        ca = f.read()
-    return {
-        "name": name,
-        "domain": s.domain,
-        "dashboard_url": f"https://{name}.{s.domain}",
-        "setup_url": f"https://setup-{name}.{s.domain}",
-        "server": s.server_name,
-        "port": s.port,
-        "frp_token": s.frp_token,
-        "key": key,
-        "ca": ca,
-    }
+    return answer
 
 
-class RateLimit:
-    """Скользящее окно в памяти: на адрес и на всех вместе. После перезапуска счёт начинается заново."""
+def ip_bucket(ip: str) -> str:
+    """Ключ счёта попыток: IPv4 — адрес, IPv6 — сеть /64 (у одного клиента обычно вся /64)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        return str(addr.ipv4_mapped)
+    if addr.version == 6:
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
 
-    def __init__(self, per_key: int, total: int, window: int):
-        self.per_key, self.total, self.window = per_key, total, window
+
+class Window:
+    """Скользящее окно в памяти, счёт по ключу. После перезапуска счёт начинается заново."""
+
+    def __init__(self, limit: int, window: int):
+        self.limit, self.window = limit, window
         self.hits: dict[str, deque] = {}
-        self.all: deque = deque()
         self.lock = threading.Lock()
 
-    def allow(self, key: str, now: float | None = None) -> bool:
-        now = time.monotonic() if now is None else now
+    def _prune(self, now: float) -> None:
         edge = now - self.window
-        with self.lock:
-            while self.all and self.all[0] <= edge:
-                self.all.popleft()
-            q = self.hits.setdefault(key, deque())
+        for k in list(self.hits):
+            q = self.hits[k]
             while q and q[0] <= edge:
                 q.popleft()
-            for k in [k for k, v in self.hits.items() if not v and k != key]:
+            if not q:
                 del self.hits[k]
-            if len(q) >= self.per_key or len(self.all) >= self.total:
-                return False
-            q.append(now)
-            self.all.append(now)
-            return True
+
+    def blocked(self, key: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self._prune(now)
+            return len(self.hits.get(key, ())) >= self.limit
+
+    def add(self, key: str, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self.hits.setdefault(key, deque()).append(now)
 
 
 # --- HTTP -----------------------------------------------------------------------------------------
@@ -490,30 +527,47 @@ class ApiHandler(_Handler):
             self._json(404, {"error": "not_found"})
             return
         ip = self.client_ip()
-        if not self.server.limiter.allow(ip):
-            log.info("join from=%s: слишком часто", _safe(ip))
-            self._json(429, {"error": "rate_limited", "message": "Слишком много попыток. Повторите через 15 минут."},
-                       extra={"Retry-After": str(self.server.settings.join_window)})
+        bucket = ip_bucket(ip)
+        st = self.server.settings
+        # Сначала — предел на адрес (считаются все попытки), затем — общий предел неудачных попыток
+        # со всех адресов за минуту: он бережёт службу от перебора с многих адресов, а законное
+        # подключение задерживает не дольше чем на минуту после конца такого перебора.
+        if self.server.per_ip.blocked(bucket):
+            log.info("join from=%s: слишком часто с этого адреса", _safe(ip))
+            self._json(429, {"error": "rate_limited", "message": "Слишком много попыток с этого адреса. Повторите через 15 минут."},
+                       extra={"Retry-After": str(st.join_window)})
             return
+        if self.server.failures.blocked("*"):
+            log.info("join from=%s: слишком много неудачных попыток со всех адресов", _safe(ip))
+            self._json(429, {"error": "rate_limited", "message": "Посредник занят. Повторите через минуту."},
+                       extra={"Retry-After": str(st.join_fail_window)})
+            return
+        self.server.per_ip.add(bucket)
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         try:
             req = json.loads(raw) if raw is not None and ctype == "application/json" else None
         except ValueError:
             req = None
         if not isinstance(req, dict):
-            self._json(400, {"error": "bad_request", "message": "Нужен JSON вида {\"code\": …, \"name\": …}."})
+            self.server.failures.add("*")
+            self._json(400, {"error": "bad_request", "message": "Нужен JSON вида {\"code\": …, \"name\": …, \"key_hash\": …}."})
             return
         name = req.get("name")
         try:
             with self.server.db_lock:
-                answer = join(self.server.conn, self.server.settings, req.get("code"), name)
+                answer = join(self.server.conn, st, req.get("code"), name, req.get("key_hash"))
         except JoinError as e:
+            self.server.failures.add("*")
             log.info("join from=%s name=%s: %s", _safe(ip), _safe(name), e.code)
             self._json(e.status, {"error": e.code, "message": e.message})
             return
         except Exception:
             log.exception("join: внутренняя ошибка")
             self._json(500, {"error": "internal", "message": "Внутренняя ошибка посредника."})
+            return
+        if answer.get("repeated"):
+            log.info("join from=%s name=%s: повтор того же подключения", _safe(ip), _safe(name))
+            self._json(200, answer)
             return
         log.info("join from=%s name=%s: экземпляр заведён", _safe(ip), _safe(name))
         self._json(200, answer)
@@ -533,7 +587,8 @@ def make_servers(s: Settings, plugin_addr: tuple[str, int], api_addr: tuple[str,
     for srv in (plugin, api):
         srv.conn, srv.db_lock, srv.settings = conn, lock, s
     plugin.plugin_path = plugin_path
-    api.limiter = RateLimit(s.join_per_ip, s.join_total, s.join_window)
+    api.per_ip = Window(s.join_per_ip, s.join_window)
+    api.failures = Window(s.join_fail_total, s.join_fail_window)
     return plugin, api
 
 
@@ -638,6 +693,36 @@ def cmd_list(a: argparse.Namespace) -> int:
     return 0
 
 
+def _is_root() -> bool:
+    return os.geteuid() == 0
+
+
+def restart_frps() -> bool:
+    """Перезапустить frps. Не вышло — сообщение и False (без трассировки)."""
+    try:
+        subprocess.run(["systemctl", "restart", "frps"], check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"frps НЕ перезапущен ({e}). Перезапустите вручную: sudo systemctl restart frps", file=sys.stderr)
+        return False
+
+
+def _as_db_owner(db: str, fn) -> int:
+    """Работа с базой — от имени её владельца. Под root — в отдельном процессе, чтобы сам relayctl
+    остался root и смог перезапустить frps."""
+    if not _is_root():
+        drop_to_db_owner(db)
+        return fn()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            drop_to_db_owner(db)
+            os._exit(fn())
+        except BaseException:
+            os._exit(1)
+    return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+
+
 def _revoke_in_db(db: str, name: str) -> int:
     conn = open_db(db)
     inst = get_instance(conn, name)
@@ -651,48 +736,73 @@ def _revoke_in_db(db: str, name: str) -> int:
     return 0
 
 
+def _release_in_db(db: str, name: str) -> int:
+    conn = open_db(db)
+    inst = get_instance(conn, name)
+    if inst is None:
+        print(f"экземпляра {name} нет", file=sys.stderr)
+        return 1
+    if not inst.revoked:
+        print(f"{name} не отключён — сначала relayctl revoke {name}", file=sys.stderr)
+        return 2
+    conn.execute("DELETE FROM instances WHERE name = ?", (name,))
+    conn.execute("DELETE FROM runs WHERE name = ?", (name,))
+    return 0
+
+
 def cmd_revoke(a: argparse.Namespace) -> int:
-    if a.restart_frps and os.geteuid() == 0:
-        # База — от имени её владельца (в отдельном процессе), перезапуск frps — от root.
-        pid = os.fork()
-        if pid == 0:
-            try:
-                drop_to_db_owner(a.db)
-                os._exit(_revoke_in_db(a.db, a.name))
-            except BaseException:
-                os._exit(1)
-        rc = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
-    else:
-        drop_to_db_owner(a.db)
-        rc = _revoke_in_db(a.db, a.name)
+    """Отключить экземпляр и (по умолчанию) перезапустить frps. Без перезапуска frps держит уже
+    открытое управляющее соединение экземпляра и уже открытые соединения браузеров (keep-alive,
+    HTTP/2) — они работают, пока frps не перезапустится."""
+    if not a.no_restart and not _is_root():
+        print("нужен root, чтобы перезапустить frps: sudo relayctl revoke ИМЯ (или --no-restart — см. relayctl revoke --help)",
+              file=sys.stderr)
+        return 2
+    rc = _as_db_owner(a.db, lambda: _revoke_in_db(a.db, a.name))
     if rc:
         return rc
-    print(f"{a.name} отключён: новые соединения браузеров к нему посредник больше не пересылает (frps спрашивает "
-          "службу о каждом рабочем соединении), а переподключиться с прежним ключом он не сможет.")
-    if a.restart_frps:
-        subprocess.run(["systemctl", "restart", "frps"], check=True)
-        print("frps перезапущен: подключение экземпляра разорвано сразу (остальные экземпляры переподключились сами).")
+    print(f"{a.name} отключён: новых рабочих соединений frps ему не даёт, переподключиться с прежним ключом он не сможет.")
+    if a.no_restart:
+        print("frps не перезапускался: уже открытое управляющее соединение экземпляра и уже открытые соединения "
+              "браузеров (keep-alive, HTTP/2) работают до перезапуска frps. Разорвать — sudo systemctl restart frps "
+              "(на несколько секунд прервёт все экземпляры, они переподключатся сами).")
+    elif restart_frps():
+        print("frps перезапущен: подключения экземпляра разорваны (остальные экземпляры переподключаются сами).")
     else:
-        print("Уже открытое управляющее соединение экземпляра frps держит до его переподключения; разорвать сразу — "
-              "relayctl revoke ИМЯ --restart-frps (на несколько секунд прервёт все экземпляры). Имя остаётся занятым; "
-              "освободить — relayctl release ИМЯ.")
+        print("Экземпляр отмечен отключённым, но его уже открытые соединения работают до перезапуска frps.", file=sys.stderr)
+        return 1
+    print(f"Имя {a.name} остаётся занятым; освободить — sudo relayctl release {a.name}.")
     return 0
 
 
 def cmd_release(a: argparse.Namespace) -> int:
-    drop_to_db_owner(a.db)
-    conn = open_db(a.db)
-    inst = get_instance(conn, a.name)
-    if inst is None:
-        print(f"экземпляра {a.name} нет", file=sys.stderr)
-        return 1
-    if not inst.revoked:
-        print(f"{a.name} не отключён — сначала relayctl revoke {a.name}", file=sys.stderr)
+    """Освободить имя отключённого экземпляра. frps перезапускается всегда: иначе прежнее подключение
+    могло бы держать пересылку на это имя, и новый владелец имени её не занял бы."""
+    if not _is_root():
+        print("нужен root: release перезапускает frps — sudo relayctl release ИМЯ", file=sys.stderr)
         return 2
-    conn.execute("DELETE FROM instances WHERE name = ?", (a.name,))
-    conn.execute("DELETE FROM runs WHERE name = ?", (a.name,))
-    print(f"имя {a.name} освобождено: его можно получить новым кодом приглашения. Сертификаты, выпущенные на это "
-          "имя прежнему владельцу, остаются действительными до конца срока (до 90 дней).")
+    # Сначала проверка и перезапуск, потом удаление из базы: не перезапустился frps — имя не освобождено.
+    def check() -> int:
+        inst = get_instance(open_db(a.db), a.name)
+        if inst is None:
+            print(f"экземпляра {a.name} нет", file=sys.stderr)
+            return 1
+        if not inst.revoked:
+            print(f"{a.name} не отключён — сначала sudo relayctl revoke {a.name}", file=sys.stderr)
+            return 2
+        return 0
+    rc = _as_db_owner(a.db, check)
+    if rc:
+        return rc
+    if not restart_frps():
+        print(f"Имя {a.name} не освобождено.", file=sys.stderr)
+        return 1
+    rc = _as_db_owner(a.db, lambda: _release_in_db(a.db, a.name))
+    if rc:
+        return rc
+    print(f"Имя {a.name} освобождено, frps перезапущен. Выдавать это имя другому владельцу раньше чем через 90 дней "
+          "не стоит: сертификаты, выпущенные на него прежнему владельцу, действуют до конца своего срока, а с ними "
+          "прежний владелец мог бы выдать себя за нового, окажись он на пути его трафика.")
     return 0
 
 
@@ -740,8 +850,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="экземпляры и приглашения")
     r = sub.add_parser("revoke", help="отключить экземпляр")
     r.add_argument("name")
-    r.add_argument("--restart-frps", action="store_true", help="сразу разорвать его подключение (перезапуск frps)")
-    rl = sub.add_parser("release", help="освободить имя отключённого экземпляра")
+    r.add_argument("--no-restart", action="store_true",
+                   help="не перезапускать frps: уже открытые соединения экземпляра работают до перезапуска")
+    rl = sub.add_parser("release", help="освободить имя отключённого экземпляра (перезапускает frps)")
     rl.add_argument("name")
     o = sub.add_parser("operator", help="ключ служебного экземпляра посредника")
     o.add_argument("--key-file", required=True)
