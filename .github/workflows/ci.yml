@@ -89,6 +89,8 @@ jobs:
       # Тест обработчиков Telegram пропускается сам: библиотека приходит только вместе с Hermes.
       - run: pytest -q plugins/shturman/tests
       - run: node --check plugins/shturman/dashboard/dist/index.js && node --check plugins/shturman/public/app.js
+      # Скрипты страницы настройки и Mini App бота согласований (service/src/shturman/setup_page/static).
+      - run: for f in setup.js qr.js app.js; do node --check "service/src/shturman/setup_page/static/$f" || exit 1; done
       - run: python -m json.tool plugins/shturman/dashboard/manifest.json > /dev/null && python -m json.tool plugins/shturman/personas.json > /dev/null
 
   # Посредник (relay/, docs/relay.md): служба только на стандартной библиотеке Python 3.12, её тесты;
@@ -574,8 +576,8 @@ jobs:
           docker run --rm --entrypoint python shturman-service:ci -c '
           from importlib import resources
           root = resources.files("shturman")
-          for name in ("index.html", "setup.js", "setup.css", "qr.js"):
+          for name in ("index.html", "setup.js", "setup.css", "qr.js", "app.html", "app.js", "app.css"):
               assert (root / "setup_page" / "static" / name).read_bytes(), name
           names = sorted(p.name for p in (root / "migrations").iterdir() if p.name.endswith(".sql"))
-          assert names and names[-1] >= "0016_setup_page.sql", names
+          assert names and names[-1] >= "0030_miniapp.sql", names
           print("страница:", "ok", "миграций:", len(names))'

@@ -757,6 +757,49 @@ async def batch_summary(conn: asyncpg.Connection, batch: str) -> tuple[bool, str
     return done, bridge.fit_message("Обязательства из переписки — решено:\n" + "\n".join(lines))
 
 
+async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit: int = 100) -> dict[str, Any]:
+    """Пункты сводок, которые уже ушли владельцу и ждут его решения, — для Mini App бота
+    согласований (`setup_page/approvals.py`). Текст пункта — как в сводке, кнопки — те же данные,
+    что под сводкой (с отпечатком того, что было показано), подписи словами вместо «N ✓».
+    Решение приходит обратно в `handle_callback` — тем же путём, что нажатие в боте.
+
+    Пункт, ещё не ушедший сводкой, кнопки не имеет (у него нет отпечатка показанного): такие
+    пункты только считаются (`later`) и придут со следующей сводкой."""
+    items: list[dict[str, Any]] = []
+    rows = await conn.fetch(
+        _SELECT + """ AND c.status = 'proposed' AND c.digest_batch IS NOT NULL AND c.digest_fingerprint IS NOT NULL
+                      ORDER BY c.notified_at NULLS LAST, c.id LIMIT $1""", limit)
+    for row in rows:
+        target = row["id"]
+        items.append({
+            "id": target, "title": "Обязательство из переписки",
+            "text": _render_commitment(to_dict(row, today), today),
+            "buttons": [[bridge.button("Верно", CALLBACK_MODULE, f"a:{target}:{row['digest_fingerprint'][:24]}"),
+                         bridge.button("Нет", CALLBACK_MODULE, f"r:{target}")]],
+            "card_message_id": None})
+    changes = await conn.fetch(
+        f"""SELECT x.* FROM commitment_changes x JOIN commitments c ON c.id = x.commitment_id
+            JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+            WHERE x.status = 'proposed' AND x.digest_batch IS NOT NULL AND x.digest_fingerprint IS NOT NULL
+              AND c.status = 'open' AND {VISIBLE} ORDER BY x.id LIMIT $1""", limit)
+    for change in changes:
+        item = await get_commitment(conn, change["commitment_id"], today=today)
+        if item is None:
+            continue
+        target = change["id"]
+        items.append({
+            "id": target, "title": "Изменение обязательства", "text": _render_change(change, item, today),
+            "buttons": [[bridge.button("Применить", CALLBACK_MODULE, f"ca:{target}:{change['digest_fingerprint'][:24]}"),
+                         bridge.button("Оставить как есть", CALLBACK_MODULE, f"cr:{target}")]],
+            "card_message_id": None})
+    later = await conn.fetchval(
+        f"""SELECT (SELECT count(*) FROM commitments c JOIN chats ch ON ch.id = c.chat_id
+                    JOIN messages m ON m.id = c.source_message_id
+                    WHERE c.status = 'proposed' AND c.digest_batch IS NULL
+                      AND c.digest_attempts < {DIGEST_MAX_SENDS} AND {VISIBLE})""")
+    return {"items": items, "later": int(later or 0)}
+
+
 async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]:
     """Нажатие кнопки под сводкой. Данные: a:<id> принять, r:<id> отклонить,
     ca:<id> применить изменение, cr:<id> оставить как есть."""

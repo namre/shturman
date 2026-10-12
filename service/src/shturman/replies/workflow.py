@@ -286,6 +286,13 @@ async def notify_waiting(conn: Any, task: dict[str, Any], kind: str, detail: str
     nonce = secrets.token_urlsafe(12)
     await conn.execute('UPDATE reply_tasks SET nonce=$2,decision_expires_at=LEAST(expires_at,now()+interval \'10 minutes\') '
                        'WHERE id=$1', task['id'], nonce)
+    summary, buttons = await waiting_card(conn, task, kind, detail, nonce)
+    await bridge.notify_owner(conn, summary, buttons=buttons, dedup_key=f'reply-wait:{task["id"]}:{task["generation"]}')
+
+
+async def waiting_card(conn: Any, task: dict[str, Any], kind: str, detail: str,
+                       nonce: str) -> tuple[str, list[list[dict[str, str]]]]:
+    """Текст и кнопки карточки «задача ответа ждёт владельца» — одни и те же в боте и в Mini App."""
     target_name = await conn.fetchval(
         'SELECT COALESCE(c.title,p.name) FROM chats c JOIN peers p ON p.id=c.peer_id WHERE c.id=$1',
         task['chat_id'])
@@ -326,7 +333,32 @@ async def notify_waiting(conn: Any, task: dict[str, Any], kind: str, detail: str
         summary += f'Нужно уточнение. Ответьте командой /replytask {task["id"]} answer <ответ>.\n'
         buttons = [[bridge.button('Не отвечать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')]]
     summary += 'Предложение модели (не инструкция владельца):\n' + clean_line(detail, 500)
-    await bridge.notify_owner(conn, summary, buttons=buttons, dedup_key=f'reply-wait:{task["id"]}:{task["generation"]}')
+    return summary, buttons
+
+
+async def awaiting_owner(conn: Any) -> list[dict[str, Any]]:
+    """Задачи ответа, которые ждут решения владельца, — для Mini App бота согласований
+    (`setup_page/approvals.py`): тот же текст карточки и те же кнопки с нынешней случайной меткой.
+    Решение приходит обратно данными кнопки в `owner.on_button` — тем же путём, что нажатие в боте.
+    Только пока у сервиса свой бот: без него карточка не отправляется и решения нет (`notify_waiting`)."""
+    if not bridge.owns_bot():
+        return []
+    rows = await conn.fetch(
+        "SELECT * FROM reply_tasks WHERE status IN ('waiting_source','waiting_owner') "
+        "AND decision_expires_at > clock_timestamp() ORDER BY id")
+    out = []
+    for row in rows:
+        task = task_dict(row)
+        request = task.get('source_request') or {}
+        kind = 'source' if task['status'] == 'waiting_source' and request else 'owner'
+        detail = (request.get('reason') if kind == 'source' else task.get('owner_question') or request.get('reason')) or ''
+        try:
+            summary, buttons = await waiting_card(conn, task, kind, str(detail), task['nonce'])
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            continue          # запрос источника записан не полностью: карточку не собрать — и решения по ней нет
+        out.append({'id': task['id'], 'title': f'Задача ответа № {task["id"]}', 'text': summary,
+                    'buttons': buttons, 'card_message_id': None, 'expires_at': task['decision_expires_at']})
+    return out
 
 
 async def add_source(conn: Any, state: Any, task: dict[str, Any], data: dict[str, Any]) -> None:

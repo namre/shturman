@@ -1,7 +1,7 @@
 """Server-established owner authority, independent of agent text and API tokens.
 
-Only the verified private control-bot path and authenticated setup-page handlers enter
-this context. It is process-local; there is no HTTP method for creating a principal.
+Only the verified private control-bot path, the approvals-bot Mini App after initData
+verification and authenticated setup-page handlers enter this context. It is process-local; there is no HTTP method for creating a principal.
 An actor string or model result never establishes owner authority.
 """
 
@@ -71,6 +71,18 @@ def owner_context(user_id: int, *, chat_id: int | None = None,
         yield principal
     finally:
         _owner.reset(token)
+
+
+@contextmanager
+def miniapp_context(user_id: int, *, chat_id: int) -> Iterator[AuthorityPrincipal]:
+    """Mini App of the approvals bot (setup_page/miniapp.py, approvals.py).
+
+    Enter only after the app session was issued for initData whose HMAC was checked with the
+    approvals bot token and whose user equals the owner bound to that bot. The source stays
+    "telegram": as with a callback query, Telegram itself vouches for who the user is, signing
+    for the service's own bot. The action marks the path for logs and reviewers."""
+    with owner_context(user_id, chat_id=chat_id, action="telegram.miniapp") as principal:
+        yield principal
 
 
 @contextmanager

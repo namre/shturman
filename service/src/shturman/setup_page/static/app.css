@@ -1,0 +1,180 @@
+/* Mini App «Штурмана» в боте согласований. Лёгкая страница под телефон в цветах темы Telegram:
+   цвета приходят от Telegram (переменные --tg-theme-*, их ставит app.js из параметров запуска),
+   а вне Telegram и до их прихода — свои, светлые и тёмные по настройке системы.
+   Без внешних шрифтов и скриптов. */
+
+:root {
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --text: var(--tg-theme-text-color, #12202f);
+  --hint: var(--tg-theme-hint-color, #5d6b78);
+  --section: var(--tg-theme-section-bg-color, var(--tg-theme-secondary-bg-color, #f2f5f7));
+  --sep: var(--tg-theme-section-separator-color, rgba(18, 32, 47, 0.12));
+  --button: var(--tg-theme-button-color, #0b5c7a);
+  --button-text: var(--tg-theme-button-text-color, #ffffff);
+  --accent: var(--tg-theme-accent-text-color, var(--tg-theme-link-color, #0b5c7a));
+  --danger: var(--tg-theme-destructive-text-color, #b3261e);
+  --quote: rgba(127, 140, 153, 0.12);
+  --font: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Roboto, Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --text: var(--tg-theme-text-color, #f1f4f6);
+    --hint: var(--tg-theme-hint-color, #8f9dab);
+    --section: var(--tg-theme-section-bg-color, var(--tg-theme-secondary-bg-color, #1f2c3a));
+    --sep: var(--tg-theme-section-separator-color, rgba(255, 255, 255, 0.1));
+    --button: var(--tg-theme-button-color, #5cc0e0);
+    --button-text: var(--tg-theme-button-text-color, #06202c);
+    --accent: var(--tg-theme-accent-text-color, var(--tg-theme-link-color, #6ec6e6));
+    --danger: var(--tg-theme-destructive-text-color, #ff8a80);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 var(--font);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  padding: 0 16px calc(24px + env(safe-area-inset-bottom, 0px));
+  max-width: 640px;
+  margin: 0 auto;
+  overflow-x: hidden;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0 4px;
+}
+
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+
+h1 { font-size: 22px; line-height: 1.2; margin: 8px 0 12px; }
+
+p { margin: 8px 0; }
+
+.muted { color: var(--hint); }
+
+.title-row { display: flex; align-items: baseline; gap: 10px; }
+.count { color: var(--hint); font-size: 15px; }
+
+.state { padding: 24px 0; }
+
+.banner {
+  background: var(--section);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 14px;
+}
+
+.list { display: flex; flex-direction: column; gap: 12px; margin: 12px 0; }
+
+.card {
+  background: var(--section);
+  border-radius: 14px;
+  padding: 14px;
+  overflow-wrap: anywhere;
+}
+
+.kind {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.card h2 { font-size: 16px; margin: 0 0 6px; }
+
+.lines { margin: 0; padding: 0; list-style: none; color: var(--hint); font-size: 14px; }
+.lines li { margin: 2px 0; }
+
+.body {
+  white-space: pre-wrap;
+  margin: 10px 0 0;
+  font-size: 14px;
+}
+
+.verbatim {
+  white-space: pre-wrap;
+  background: var(--quote);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 10px 0 0;
+  font-size: 15px;
+}
+
+.verbatim-label { font-size: 12px; color: var(--hint); margin-top: 10px; }
+
+.note { font-size: 13px; color: var(--hint); margin-top: 10px; }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+button {
+  font: inherit;
+  border-radius: 10px;
+  border: 0;
+  cursor: pointer;
+  min-height: 40px;
+  padding: 8px 14px;
+}
+
+button:disabled { opacity: 0.55; cursor: default; }
+
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.primary { background: var(--button); color: var(--button-text); font-weight: 600; }
+
+.secondary { background: transparent; color: var(--accent); border: 1px solid var(--sep); }
+
+.ghost { background: transparent; color: var(--accent); padding: 6px 8px; min-height: 32px; }
+
+.actions button { flex: 1 1 auto; }
+
+.empty { padding: 24px 0; text-align: center; color: var(--hint); }
+
+.later { font-size: 14px; }
+
+.foot { font-size: 13px; margin-top: 20px; }
+
+.home {
+  display: block;
+  width: 100%;
+  margin-top: 16px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px dashed var(--sep);
+}
+
+.toast {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  max-width: 608px;
+  margin: 0 auto;
+  background: var(--text);
+  color: var(--bg);
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 14px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+}
+
+[hidden] { display: none !important; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .toast { transition: opacity 0.2s; }
+}

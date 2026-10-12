@@ -82,6 +82,12 @@ ACTIONS = {
     "memory.owner_fact_accept": "Факт о вас принят в профиль",
     "memory.owner_fact_reject": "Факт о вас отклонён",
     "memory.profile_block": "Изменены ваши правила и указания ассистенту",
+    # Mini App бота согласований (miniapp.py): вход по данным Telegram и решения кнопками.
+    # В подробностях — вид и номер пункта и подпись кнопки; ни имён, ни текстов.
+    "app.login": "Вход в приложение «Штурман» в Telegram",
+    "app.login_failed": "Неудачная попытка входа в приложение в Telegram",
+    "app.logout": "Выход из приложения в Telegram",
+    "app.decide": "Решение в приложении в Telegram",
 }
 
 
@@ -95,11 +101,14 @@ IMPORTANT = frozenset({
     "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
     # заметки владельца ассистент читает как его собственные слова: их правку не вытеснить из вида
     "memory.owner_block", "memory.profile_block", "memory.owner_fact_accept",
+    # вход в приложение и решения в нём — то же, что вход на страницу и нажатие в боте
+    "app.login", "app.decide",
 })
 
 
 # Как называется действие, если оно не состоялось (итог не «ok»).
 NOT_DONE = {
+    "app.decide": "Решение в приложении не принято: кнопки уже нет",
     "bot.token": "Токен бота согласований не сохранён",
     "llm.save": "Своя модель сервиса не сохранена",
     "llm.chatgpt": "Подписка ChatGPT не подключена",

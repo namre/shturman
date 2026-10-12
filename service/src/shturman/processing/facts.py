@@ -452,6 +452,24 @@ async def on_digest_failed(conn: asyncpg.Connection, job: dict[str, Any], error:
         await unmark_batch(conn, batch)
 
 
+async def awaiting_owner(conn: asyncpg.Connection, *, limit: int = 100) -> dict[str, Any]:
+    """Факты о владельце из уже отправленного сообщения, которые ждут его «да» или «нет», — для Mini
+    App бота согласований (`setup_page/approvals.py`). Текст — как в сообщении бота, кнопки — те же
+    данные (с отпечатком показанного), подписи словами. Решение приходит обратно в `on_button`.
+    Ещё не показанные только считаются (`later`): у них нет отпечатка показанного."""
+    rows = await conn.fetch(
+        f"""{_SELECT} AND f.subject_type = 'owner' AND f.status = 'proposed' AND f.batch IS NOT NULL
+            AND f.digest_fingerprint IS NOT NULL ORDER BY f.notified_at NULLS LAST, f.id LIMIT $1""", limit)
+    items = [{"id": r["id"], "title": "Факт о вас для профиля", "text": _item_text(r),
+              "buttons": [[bridge.button("Запомнить", CALLBACK_MODULE, f"a:{r['id']}:{r['digest_fingerprint'][:24]}"),
+                           bridge.button("Не запоминать", CALLBACK_MODULE, f"r:{r['id']}")]],
+              "card_message_id": None} for r in rows]
+    later = await conn.fetchval(
+        f"""SELECT count(*) {_FROM} WHERE {VISIBLE} AND f.subject_type = 'owner' AND f.status = 'proposed'
+            AND f.batch IS NULL AND f.digest_attempts < $1""", DIGEST_MAX_SENDS)
+    return {"items": items, "later": int(later or 0)}
+
+
 @bridge.on_callback(CALLBACK_MODULE)
 async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str, Any]:
     """Нажатие под сообщением с фактами о владельце: a:<id>:<отпечаток> — запомнить, r:<id> — нет."""

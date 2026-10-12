@@ -32,6 +32,10 @@ JavaScript (расширения дашборда). На одном origin с н
   * `Service-Worker: script` — так браузер запрашивает файл service worker'а. Своего у страницы
     нет, поэтому такой запрос получает отказ: под префиксом service worker не зарегистрировать.
 
+Одно исключение из строгих заголовков — страница Mini App (`/shturman-setup/app/`, только GET): её
+разрешено открыть в рамке у https://web.telegram.org — так её показывает Telegram Web (`APP_HEADERS`).
+Её скрипты, стили и запросы к API, как и вся остальная страница, в рамке не открываются.
+
 Заголовки `Authorization` и `Cookie` здесь ничего не значат: токены внутреннего API и архива
 входом на страницу не служат, а cookie страница не читает. Заголовков CORS
 (`Access-Control-*`) страница не отдаёт никогда: чужому origin её ответы не читаются.
@@ -44,7 +48,7 @@ from typing import Any
 from starlette.responses import JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import PREFIX
+from . import APP_PATH, PREFIX
 
 METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
 SCOPE_KEY = "shturman.setup"
@@ -65,6 +69,18 @@ HEADERS: tuple[tuple[bytes, bytes], ...] = (
     (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), payment=(), usb=()"),
     (b"x-robots-tag", b"noindex, nofollow"),
 )
+
+# Mini App (`miniapp.py`) — сама страница приложения, и только она. Telegram открывает Mini App на
+# телефоне и компьютере в своём встроенном браузере, а в Telegram Web (web.telegram.org) — в рамке
+# (iframe) своей страницы. Поэтому ей, единственной под префиксом, разрешена рамка — и только у
+# https://web.telegram.org. `X-Frame-Options` у неё нет: ALLOW-FROM браузеры больше не понимают,
+# а DENY запретил бы рамку и там. Остальное то же: свои скрипты и стили, запросы только к себе.
+# Скрипт telegram-web-app.js с telegram.org не подключается (`static/app.js`).
+TELEGRAM_WEB = "https://web.telegram.org"
+APP_CSP = CSP.replace("frame-ancestors 'none'", "frame-ancestors " + TELEGRAM_WEB)
+APP_HEADERS: tuple[tuple[bytes, bytes], ...] = tuple(
+    (name, APP_CSP.encode() if name == b"content-security-policy" else value)
+    for name, value in HEADERS if name != b"x-frame-options")
 _OWN = frozenset(name for name, _ in HEADERS)
 _NEVER = (b"set-cookie", b"access-control-")       # таких заголовков в ответах страницы не бывает
 _BAD_RAW = (b"%2f", b"%5c", b"%2e", b"%00", b"\\")
@@ -87,11 +103,14 @@ class Shield:
         self.origins = origins(config)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Рамку разрешаем только ответу с самой страницей приложения: ровно этот путь, только GET.
+        own = APP_HEADERS if scope.get("path") == APP_PATH and scope.get("method") == "GET" else HEADERS
+
         async def guarded(message: Message) -> None:
             if message["type"] == "http.response.start":
                 kept = [(k, v) for k, v in message.get("headers", ())
                         if k.lower() not in _OWN and not k.lower().startswith(_NEVER)]
-                message = {**message, "headers": kept + list(HEADERS)}
+                message = {**message, "headers": kept + list(own)}
             await send(message)
 
         headers = dict(scope["headers"])

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>Штурман — согласования</title>
+<link rel="stylesheet" href="../static/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 36 36" fill="none" aria-hidden="true"><circle cx="18" cy="18" r="16" stroke="currentColor" stroke-width="2"/><path d="M18 5l4 13-4 13-4-13z" fill="#F2B441"/><circle cx="18" cy="18" r="2.4" fill="currentColor"/></svg>
+    <span>Штурман</span>
+  </div>
+  <button type="button" class="ghost" id="refresh" hidden>Обновить</button>
+</header>
+
+<main id="main">
+  <!-- вход и его неудачи -->
+  <section class="state" id="screen-wait">
+    <p class="muted">Открываю…</p>
+  </section>
+
+  <section class="state" id="screen-outside" hidden>
+    <h1>Откройте в Telegram</h1>
+    <p>Это приложение открывается кнопкой <strong>«Штурман»</strong> внизу чата с вашим ботом согласований.
+       Отдельного входа у него нет: Telegram сам сообщает, что открыли именно вы.</p>
+    <p class="muted">Настройка — первый вход, ключи, вход в аккаунт Telegram и выгрузка — на странице «Переписка» в браузере.</p>
+  </section>
+
+  <section class="state" id="screen-failed" hidden>
+    <h1>Не получилось войти</h1>
+    <p id="failed-text">Закройте приложение и откройте его снова кнопкой «Штурман» в боте согласований.</p>
+    <p class="muted">Данные входа от Telegram действуют несколько минут и годятся один раз.</p>
+  </section>
+
+  <!-- экран «Согласования» -->
+  <section id="screen-approvals" hidden>
+    <div class="title-row">
+      <h1>Согласования</h1>
+      <span class="count" id="count"></span>
+    </div>
+    <p class="banner" id="sending-off" hidden>Отправка на сервере выключена: «Отправить» черновик не отправит —
+      так же, как кнопка в боте. Черновик останется ждать.</p>
+    <div id="list" class="list" aria-live="polite"></div>
+    <p class="empty" id="empty" hidden>Сейчас ничего не ждёт вашего решения.</p>
+    <p class="later muted" id="later" hidden></p>
+    <p class="muted foot">Те же решения приходят карточками в бот согласований — решать можно и там, и здесь.
+      Обязательства и состояние экземпляра появятся в следующих версиях приложения.</p>
+    <button type="button" class="home" id="home-screen" hidden>Добавить «Штурман» на главный экран</button>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="../static/app.js"></script>
+</body>
+</html>

@@ -100,6 +100,9 @@ async def status(request: Request) -> JSONResponse:
             "owner_bound": owner_bound,
             "bind_paused": bot.flood.locked() if bot else False,
             "business_capable": bot.business_capable if bot else None,
+            # Кнопка «Штурман» (Mini App) в чате владельца: set | no_address | no_owner | failed | null —
+            # ещё не сверялась. Только состояние: адреса и чата здесь нет.
+            "menu_button": bot.menu if bot else None,
             "counters": dict(bot.counters) if bot else {},
         },
         "llm": {

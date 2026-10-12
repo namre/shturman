@@ -79,6 +79,21 @@ MUTATIONS = (
              "AND p.class='user' AND ($3::bigint IS NULL OR true)",
              "tests/test_group_replies.py::test_database_session_reply_requires_same_chat_topic_and_visible_actual_sender",
              database=True),
+    # Mini App бота согласований (docs/miniapp.md): подпись Telegram, одна сессия на одни данные
+    # входа, только кнопка, которая сейчас в списке.
+    Mutation("miniapp_signature", "src/shturman/setup_page/initdata.py",
+             "    if not hmac.compare_digest(sign(fields, bot_token), got):", "    if False:",
+             "tests/setup_page/test_miniapp.py::test_init_data_is_checked_exactly_as_telegram_describes"),
+    Mutation("miniapp_replay", "src/shturman/setup_page/miniapp.py",
+             "           ON CONFLICT (init_hash) DO NOTHING RETURNING expires_at\"\"\",\n        auth.token_hash(token), _init_hash(init),",
+             "           ON CONFLICT (init_hash) DO NOTHING RETURNING expires_at\"\"\",\n        auth.token_hash(token), _init_hash(init) + token,",
+             "tests/setup_page/test_miniapp.py::test_every_refusal_looks_the_same_and_tells_nothing",
+             database=True),
+    Mutation("miniapp_listed_button_only", "src/shturman/setup_page/miniapp.py",
+             "        if found is None:\n            # Кнопки нет",
+             "        if found is None:\n            found = ({'kind_title': 'x', 'id': 0, '_card_message_id': None}, {'label': 'x'})\n        if False:\n            # Кнопки нет",
+             "tests/setup_page/test_miniapp.py::test_only_known_buttons_of_the_screen_are_accepted",
+             database=True),
 )
 
 # Capture actual pytest phases and exception types, rather than treating a

@@ -261,12 +261,27 @@ async def request(conn: asyncpg.Connection, kind: str, summary: str, payload: di
             kind, summary, body, nonce, float(TTL),
         )
         await bridge.notify_owner(
-            conn, _card(summary),
-            buttons=[[bridge.button("Да, сделать", CALLBACK_MODULE, f"y:{row['id']}:{nonce}"),
-                      bridge.button("Нет", CALLBACK_MODULE, f"n:{row['id']}:{nonce}")]],
+            conn, _card(summary), buttons=_card_buttons(row["id"], nonce),
             handler=CARD_HANDLER, context={"action_id": row["id"]},
         )
     return _waiting(row, duplicate=False)
+
+
+def _card_buttons(action_id: int, nonce: str) -> list[list[dict[str, str]]]:
+    return [[bridge.button("Да, сделать", CALLBACK_MODULE, f"y:{action_id}:{nonce}"),
+             bridge.button("Нет", CALLBACK_MODULE, f"n:{action_id}:{nonce}")]]
+
+
+async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """Действия, которые ждут нажатия владельца, — для Mini App бота согласований
+    (`setup_page/approvals.py`): тот же текст карточки и те же кнопки с той же случайной меткой.
+    Решение приходит обратно данными кнопки в `_pressed` — тем же путём, что нажатие в боте."""
+    rows = await conn.fetch(
+        """SELECT id, summary, nonce, card_message_id, expires_at FROM pending_actions
+           WHERE status = 'pending' AND expires_at > now() ORDER BY id""")
+    return [{"id": r["id"], "title": f"Действие № {r['id']}", "text": _card(r["summary"]),
+             "buttons": _card_buttons(r["id"], r["nonce"]), "card_message_id": r["card_message_id"],
+             "expires_at": r["expires_at"]} for r in rows]
 
 
 @bridge.on_result(CARD_HANDLER)

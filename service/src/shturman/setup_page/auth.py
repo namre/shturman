@@ -159,10 +159,13 @@ async def revoke_session(conn: asyncpg.Connection, session_id: int) -> None:
 
 
 async def revoke_all(conn: asyncpg.Connection) -> int:
-    """Завершает все сессии и отменяет невостребованную ссылку входа. Возвращает число сессий."""
+    """Завершает все сессии и отменяет невостребованную ссылку входа. Возвращает число сессий
+    страницы. Сессии Mini App бота согласований (`miniapp.py`) завершаются тоже: «выйти везде» —
+    это все входы владельца мимо Hermes."""
     async with conn.transaction():
         done = await conn.execute("UPDATE setup_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
         await conn.execute("DELETE FROM setup_links WHERE used_at IS NULL")
+        await conn.execute("UPDATE miniapp_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
     return int(done.split()[-1])
 
 

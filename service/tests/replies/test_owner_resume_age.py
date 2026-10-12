@@ -219,6 +219,32 @@ async def test_late_unsolicited_model_reply_is_still_cancelled(env, own_bot):
     assert env.tg.sent == []
 
 
+async def test_mini_app_lists_the_source_card_and_its_press_resumes_like_the_bot(env, own_bot):
+    """Mini App бота согласований (setup_page/approvals.py) показывает ту же карточку и те же кнопки,
+    а нажатие из приложения проходит тот же обработчик и возобновляет задачу так же, как в боте."""
+    task, _, _ = await _source_task(env)
+    import json
+    payloads = [json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"] for r in
+                await env.conn.fetch("SELECT payload FROM jobs WHERE kind = $1 ORDER BY id", bridge.NOTIFY_OWNER)]
+    (card,) = [p for p in payloads if "Для подготовки ответа нужно прочитать" in (p.get("text") or "")]
+    (listed,) = await workflow.awaiting_owner(env.conn)
+    assert listed["id"] == task["id"] and listed["text"] == card["text"] and listed["buttons"] == card["buttons"]
+    once = next(b["data"] for row in listed["buttons"] for b in row if b["text"] == "Прочитать один раз")
+    from shturman.setup_page import approvals
+    assert approvals.REF.fullmatch(once)
+    with authority.miniapp_context(OWNER, chat_id=OWNER):
+        out = await bridge.dispatch_callback(env.conn, once, OWNER)
+    assert out["remove_buttons"] and out["answer"] == "Чтение разрешено для этой задачи."
+    resumed = await workflow.get(env.conn, task["id"])
+    assert (resumed["status"], resumed["owner_resume_by"], resumed["owner_resume_via"]) == (
+        "generating", OWNER, "telegram")
+    assert await workflow.awaiting_owner(env.conn) == []
+    # без привязанного владельца-в-Telegram контекст приложения решения не даёт
+    with authority.miniapp_context(IVAN, chat_id=IVAN):
+        refused = await bridge.dispatch_callback(env.conn, once.replace("y:", "n:"), IVAN)
+    assert refused["answer"] == "Кнопка недоступна."
+
+
 async def test_old_initial_incoming_does_not_start_model_work(env):
     await trusted_setup(env)
     chat = await add_chat(env.conn, env.helper_acc)
