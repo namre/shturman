@@ -709,6 +709,7 @@ async def test_changing_actions_need_a_session(stand, conn):
     s = await stand()
     guest = s.browser()
     for method, path in (("POST", "/bot/token"), ("DELETE", "/bot/token"), ("POST", "/bot/bind"), ("POST", "/bot/refresh"),
+                         ("POST", "/bot/managed"), ("DELETE", "/bot/managed"),
                          ("PUT", "/tg/keys"), ("DELETE", "/tg/keys"), ("POST", "/tg/login"), ("POST", "/tg/login/x/password"),
                          ("POST", "/tg/login/x/cancel"), ("POST", "/tg/accounts/1/pause"), ("POST", "/tg/accounts/1/resume"),
                          ("POST", "/tg/accounts/1/logout"), ("PUT", "/tg/accounts/1/options"), ("POST", "/tg/accounts/1/sync"),

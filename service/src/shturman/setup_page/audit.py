@@ -44,6 +44,10 @@ ACTIONS = {
     "bot.token": "Токен бота согласований сохранён",
     "bot.token_removed": "Токен бота согласований убран",
     "bot.bind_link": "Выдана ссылка привязки владельца к боту",
+    # Бот согласований в одно нажатие через бот-менеджер посредника (bot_setup.py, Р-77).
+    "bot.managed_start": "Начато создание бота согласований в одно нажатие",
+    "bot.managed_cancel": "Создание бота в одно нажатие отменено",
+    "bot.managed": "Бот согласований в одно нажатие",
     "tg.keys": "Ключи приложения Telegram сохранены",
     "tg.keys_removed": "Ключи приложения Telegram убраны",
     "tg.login": "Начат вход в аккаунт Telegram",
@@ -96,7 +100,7 @@ ACTIONS = {
 # не входят намеренно: их может слать посторонний, и они не должны вытеснять остальное.
 IMPORTANT = frozenset({
     "login.link", "login.code", "logout.all", "setup.scenario", "setup.media",
-    "bot.token", "bot.token_removed", "bot.bind_link",
+    "bot.token", "bot.token_removed", "bot.bind_link", "bot.managed_start",
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
     # заметки владельца ассистент читает как его собственные слова: их правку не вытеснить из вида
@@ -110,6 +114,7 @@ IMPORTANT = frozenset({
 NOT_DONE = {
     "app.decide": "Решение в приложении не принято: кнопки уже нет",
     "bot.token": "Токен бота согласований не сохранён",
+    "bot.managed": "Бот согласований в одно нажатие не получен",
     "llm.save": "Своя модель сервиса не сохранена",
     "llm.chatgpt": "Подписка ChatGPT не подключена",
 }

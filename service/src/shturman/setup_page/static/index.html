@@ -136,6 +136,19 @@
         <div class="col">
           <p class="note info" id="bot-server" hidden>Токен бота задан в настройках сервера. Изменить его можно только там.</p>
           <p class="note" id="bot-status" role="status" hidden></p>
+          <p class="note info" id="bot-origin" hidden></p>
+
+          <div id="bot-howto" hidden>
+            <h3>Создайте бота у @BotFather — это пара минут</h3>
+            <p class="small">@BotFather — официальный бот Telegram для создания ботов. Бот будет ваш: токен знаете только вы и этот сервер.</p>
+            <ol class="howto">
+              <li>Откройте @BotFather: <a class="btn ghost small-btn" id="open-botfather" href="#" target="_blank" rel="noopener noreferrer">Открыть @BotFather</a> — или найдите его в поиске Telegram (с синей галочкой) и нажмите «Запустить».</li>
+              <li>Отправьте ему команду <code>/newbot</code> <button class="btn ghost small-btn copy" type="button" data-copy="/newbot">Скопировать</button></li>
+              <li>Он спросит название — отправьте <code id="howto-name">Согласования</code> <button class="btn ghost small-btn copy" type="button" data-copy-from="howto-name">Скопировать</button> (так бот будет подписан в списке чатов; можно любое).</li>
+              <li>Он спросит адрес — отправьте <code id="howto-username">soglasovaniya_bot</code> <button class="btn ghost small-btn copy" type="button" data-copy-from="howto-username">Скопировать</button>. Адрес — латиница, цифры и «_», в конце обязательно <code>bot</code>. Если @BotFather ответит, что адрес занят, добавьте пару цифр перед <code>_bot</code>.</li>
+              <li>@BotFather пришлёт сообщение «Done!» со строкой вида <code>1234567890:AAH…</code> — это токен. Скопируйте её целиком и вставьте сюда.</li>
+            </ol>
+          </div>
 
           <form id="bot-form" autocomplete="off" novalidate hidden>
             <div class="field">
@@ -161,6 +174,32 @@
             <p class="small" id="bot-save-wait" hidden>Проверяю, что ботом не пользуется другая программа. Это занимает несколько секунд…</p>
           </div>
 
+          <div id="bot-managed" class="box" hidden>
+            <h3>Или создать бота в одно нажатие</h3>
+            <p>Telegram создаст бота за вас: откроется окно с готовыми названием и адресом, останется нажать «Создать». Бот всё равно будет ваш, но его создаёт бот-менеджер посредника <b id="managed-host">relay.sh.namre.app</b>.</p>
+            <p class="note warn" id="managed-risk"><b>Чем вы за это платите.</b> Держатель посредника (бот-менеджера) технически может в любой момент и незаметно для вас получить токен вашего бота согласований — а с ним подделать ваши нажатия и вход в приложение «Штурман» в Telegram и читать то, что приходит боту. Если подключите этого бота в бизнес-режиме, тот, у кого есть токен, сможет читать и ваши личные переписки. Если не хотите ни от кого зависеть — создайте бота вручную, шаги выше.</p>
+            <div class="field" id="managed-code-field" hidden>
+              <label for="managed-code">Код приглашения от держателя посредника</label>
+              <input id="managed-code" type="text" autocomplete="off" spellcheck="false" autocapitalize="characters">
+            </div>
+            <p class="note warn" id="managed-error" role="alert" hidden></p>
+            <div class="row" id="managed-start-row">
+              <button class="btn ghost" id="managed-start" type="button">Понимаю — создать бота в одно нажатие</button>
+            </div>
+            <div id="managed-wait" hidden>
+              <p><b>Откройте ссылку в Telegram и нажмите «Создать».</b> <b>Не меняйте адрес бота</b> в окне создания: по нему сервис узнает вашего бота. Ссылка действует <span id="managed-minutes">15</span> мин.</p>
+              <div class="qr-row">
+                <div class="qr" id="managed-qr" aria-hidden="true"></div>
+                <div class="col">
+                  <a class="btn" id="managed-open" href="#" target="_blank" rel="noopener noreferrer">Открыть в Telegram</a>
+                  <p class="small">Или наведите камеру телефона на код. Бот будет создан от имени того аккаунта, в котором вы его подтвердите, — и только этот аккаунт сможет стать владельцем.</p>
+                  <p class="small waiting" role="status" id="managed-status">Жду, пока вы подтвердите создание бота…</p>
+                  <button class="btn ghost small-btn" id="managed-cancel" type="button">Отменить</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div class="row" id="bot-actions" hidden>
             <button class="btn ghost small-btn" id="bot-change" type="button">Сменить токен</button>
             <button class="btn ghost danger small-btn" id="bot-remove" type="button">Убрать токен</button>
@@ -169,6 +208,7 @@
           <div id="bind" hidden>
             <h3>Привязка владельца</h3>
             <p id="bind-none">Теперь бот должен узнать, что его владелец — вы: вопросы он будет присылать только вам, и кнопки будут действовать только от вас. Это одно нажатие.</p>
+            <p class="note info" id="bind-creator" hidden></p>
             <p class="note ok" id="bind-done" hidden></p>
             <div id="bind-link-box" class="box" hidden>
               <p><b>Откройте ссылку в Telegram и нажмите «Запустить».</b> Она действует <span id="bind-minutes">15</span> минут и срабатывает один раз.</p>
@@ -236,6 +276,8 @@
           <dd>Пароль бота, который Telegram выдаёт при его создании. Он хранится только на вашем сервере; обратно эта страница его не показывает. Никому его не пересылайте.</dd>
           <dt>Почему бот должен быть новым?</dt>
           <dd>Одним ботом не могут пользоваться две программы: они перехватывали бы сообщения друг у друга. Поэтому не подойдёт ни бот ассистента, ни любой другой, который у вас уже есть.</dd>
+          <dt>Чем «вручную» отличается от «в одно нажатие»?</dt>
+          <dd>Бот, созданный вручную у @BotFather, ни от кого не зависит: его токен есть только у вас и на этом сервере. Бот «в одно нажатие» создаёт бот-менеджер посредника, и его держатель технически может получить токен вашего бота в любой момент — это вопрос доверия ему. Перейти с одного на другой можно когда угодно: создайте бота у @BotFather, нажмите «Сменить токен» и вставьте новый токен; прежнего бота удалите у @BotFather командой <code>/deletebot</code>.</dd>
           <dt>Это бесплатно?</dt>
           <dd>Да. Создание ботов в Telegram бесплатное.</dd>
         </dl>

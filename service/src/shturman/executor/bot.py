@@ -51,6 +51,10 @@ UPDATE_RETRIES = 5                # столько раз обновление �
 TEXT_BOUND = ("Готово: вы привязаны как владелец.\n\n"
               "Управляйте настройками и заданиями здесь: /menu. Решения по источникам приходят карточками с кнопками.")
 TEXT_HINT = "Управление Штурманом: /menu — настройки, задания ответов и источники. /help — команды."
+TEXT_NOT_CREATOR = ("Привязать не получилось: этого бота создал другой аккаунт Telegram. Владельцем бота "
+                    "согласований, созданного в одно нажатие, может стать только тот, кто его создал. Откройте "
+                    "ссылку привязки в том аккаунте, которым создавали бота, или создайте бота заново на странице "
+                    "«Переписка».")
 TEXT_REFUSED = "Кнопка недоступна."
 TEXT_FAILED = "Не получилось. Попробуйте ещё раз."
 
@@ -294,11 +298,22 @@ class Bot:
         if self.flood.locked():
             self.counters["bind_ignored"] += 1
             return
-        bound = False
+        bound = not_creator = False
         if binding.well_formed(code):
             async with self.state.pool.acquire() as conn:
-                bound = await binding.redeem(conn, code, user_id=user_id, chat_id=chat_id, bot_id=self.bot_id,
-                                             name=name)
+                creator = await binding.required_creator(conn, self.bot_id)
+                if creator is not None and creator != user_id and await binding.code_valid(conn, code):
+                    # Бот создан через бот-менеджер другим аккаунтом (Р-77). Код верный, поэтому
+                    # отвечаем — без этого владелец не понял бы, почему привязка не идёт; код не гасится.
+                    not_creator = True
+                else:
+                    bound = await binding.redeem(conn, code, user_id=user_id, chat_id=chat_id, bot_id=self.bot_id,
+                                                 name=name)
+        if not_creator:
+            self.counters["bind_not_creator"] += 1
+            logger.warning("бот согласований: привязку пробовал не создатель бота — отказ")
+            await self._say(chat_id, TEXT_NOT_CREATOR)
+            return
         if not bound:
             self.counters["bind_wrong"] += 1
             self.flood.wrong()

@@ -148,6 +148,10 @@ services:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}
+      # Посредник с ботом-менеджером: «создать бота согласований в одно нажатие» на странице
+      # настройки переписки (docs/approvals-bot.md). Пусто — https://relay.sh.namre.app; off —
+      # выключить. Только здесь: ни страница, ни API адрес не меняют.
+      SHTURMAN_BOT_MANAGER_API: ${SHTURMAN_BOT_MANAGER_API:-}
       # Свой бот согласований и свой доступ к модели (API, совместимый с OpenAI). В режиме
       # standalone это единственные бот и модель экземпляра; значения владелец вводит сам:
       # ./ops/init-env.sh. Контейнеру Hermes эти переменные не передаются никогда.

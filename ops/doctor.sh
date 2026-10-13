@@ -696,13 +696,13 @@ EOF4
   # Бот согласований — первый шаг страницы настройки переписки в обоих режимах: без него запросы
   # ассистента, которые должен подтвердить владелец (принять обязательство, включить чат), отклоняются.
   # Строка model с Hermes появляется, только если своя модель настроена: разбор делает ассистент.
-  bot_configured=unknown; bot_polling=unknown; bot_problem=""; bot_owner=unknown; bot_business=unknown; bot_menu=""
+  bot_configured=unknown; bot_polling=unknown; bot_problem=""; bot_owner=unknown; bot_business=unknown; bot_menu=""; bot_via=""
   llm_configured=unknown; llm_model=""; llm_last=unknown; llm_problem=""; llm_calls=0; llm_failures=0
   llm_way=""; llm_sub=""
   while IFS='=' read -r k v; do
     case "$k" in
       bot_configured) bot_configured="$v" ;; bot_polling) bot_polling="$v" ;; bot_problem) bot_problem="$v" ;;
-      bot_owner) bot_owner="$v" ;; bot_business) bot_business="$v" ;; bot_menu) bot_menu="$v" ;;
+      bot_owner) bot_owner="$v" ;; bot_business) bot_business="$v" ;; bot_menu) bot_menu="$v" ;; bot_via) bot_via="$v" ;;
       llm_configured) llm_configured="$v" ;; llm_model) llm_model="$v" ;; llm_last) llm_last="$v" ;;
       llm_problem) llm_problem="$v" ;; llm_calls) llm_calls="$v" ;; llm_failures) llm_failures="$v" ;;
       llm_way) llm_way="$v" ;; llm_sub) llm_sub="$v" ;;
@@ -724,6 +724,7 @@ print("bot_problem=" + safe(b.get("problem")))
 print("bot_owner=" + yn(b.get("owner_bound")))
 print("bot_business=" + yn(b.get("business_capable")))
 print("bot_menu=" + safe(b.get("menu_button")))
+print("bot_via=" + safe(b.get("created_via")))
 print("llm_configured=" + yn(m.get("configured")))
 print("llm_model=" + safe(m.get("model")))
 print("llm_last=" + yn(m.get("last_call_ok")))
@@ -743,6 +744,12 @@ EOF3
       fail approvals-bot "бот согласований не работает, код неполадки: $bot_problem — расшифровка: docker exec $svc shturman bot-status"
     elif [ "$bot_polling" = yes ]; then pass approvals-bot "бот согласований на связи с Telegram"
     else warn approvals-bot "бот согласований ещё не начал опрос Telegram — повторите проверку через минуту"; fi
+    # Как создан бот (Р-77). В одно нажатие — выбор владельца, но он должен его видеть: держатель
+    # посредника (бот-менеджера) технически может получить токен этого бота.
+    case "$bot_via" in
+      managed) pass approvals-origin "бот согласований создан в одно нажатие через бот-менеджер посредника: его держатель технически может получить токен бота. Перейти на своего бота — docs/approvals-bot.md, «Перейти на своего бота»" ;;
+      manual) pass approvals-origin "бот согласований создан владельцем у @BotFather" ;;
+    esac
     if [ "$bot_owner" = yes ]; then pass approvals-owner "владелец привязан к боту согласований"
     else warn approvals-owner "владелец не привязан к боту согласований — карточки не отправляются, кнопки не действуют: привязка — первый шаг страницы настройки переписки, либо ./ops/bot-bind.sh"; fi
     if [ "$bot_business" = no ] && [ "${setup_business:-}" != yes ]; then

@@ -97,13 +97,57 @@ async def revoke_code(conn: asyncpg.Connection, code: str) -> bool:
     return done.endswith(" 1")
 
 
+async def code_valid(conn: asyncpg.Connection, code: str) -> bool:
+    """Действует ли код привязки (не погашен и не истёк). Код не гасится."""
+    return bool(await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM executor_bind_codes WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now())",
+        code_hash(code)))
+
+
+# --- как создан бот согласований (Р-77) ---
+# Запись в setup_state 'approvals_bot': {bot_id, created_via: manual | managed, creator_user_id?,
+# creator_name?, restricted?, manager?}. Пишет только страница настройки (setup_page/bot_setup.py);
+# внутренний API таблицу setup_state не читает и не пишет. Запись относится к одному боту: после
+# смены токена на другого бота она для него уже ничего не значит.
+
+ORIGIN_KEY = "approvals_bot"
+
+
+async def bot_origin(conn: asyncpg.Connection, bot_id: int | None) -> dict[str, Any] | None:
+    """Как создан бот согласований с этим номером, если это записано."""
+    if bot_id is None:
+        return None
+    raw = await conn.fetchval("SELECT value FROM setup_state WHERE key = $1", ORIGIN_KEY)
+    if raw is None:
+        return None
+    value = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(value, dict) or value.get("bot_id") != bot_id:
+        return None
+    return value
+
+
+async def required_creator(conn: asyncpg.Connection, bot_id: int | None) -> int | None:
+    """Номер аккаунта, создавшего бота, — если бот создан через бот-менеджер посредника. Тогда
+    владельцем может стать только он: иначе бот, созданный по перехваченной ссылке чужим аккаунтом
+    (у которого есть токен этого бота в @BotFather), стал бы ботом согласований владельца."""
+    origin = await bot_origin(conn, bot_id)
+    creator = origin.get("creator_user_id") if origin and origin.get("created_via") == "managed" else None
+    return creator if isinstance(creator, int) and not isinstance(creator, bool) else None
+
+
 async def redeem(conn: asyncpg.Connection, code: str, *, user_id: int, chat_id: int, bot_id: int,
                  name: str | None = None) -> bool:
     """Гасит код и привязывает владельца. Одна транзакция: код срабатывает ровно один раз.
 
     name — как владелец подписан в Telegram: его показывает страница настройки сервиса
-    («владелец привязан: …»). Через внутренний API эта отметка не читается."""
+    («владелец привязан: …»). Через внутренний API эта отметка не читается.
+
+    Бот, созданный через бот-менеджер, привязывает только своего создателя (`required_creator`):
+    другой аккаунт получает отказ, код при этом не гасится."""
     async with conn.transaction():
+        creator = await required_creator(conn, bot_id)
+        if creator is not None and creator != int(user_id):
+            return False
         used = await conn.fetchval(
             """UPDATE executor_bind_codes SET used_at = now()
                WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING id""",

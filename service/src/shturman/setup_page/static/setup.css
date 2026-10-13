@@ -553,3 +553,9 @@ body.sc-staff .only-own, body:not(.sc-staff) .only-staff { display: none !import
   #mem-tabs .tab { min-height: 44px; padding: 6px 12px; font-size: 15px; }
   .mem-add .btn { flex: 1 1 100%; }
 }
+
+/* Бот согласований: шаги у @BotFather и создание в одно нажатие */
+ol.howto { margin: 8px 0 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; }
+ol.howto code { overflow-wrap: anywhere; }
+ol.howto .small-btn { margin-left: 4px; }
+#bot-managed h3, #bot-howto h3 { margin: 0; }
