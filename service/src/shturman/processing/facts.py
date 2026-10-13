@@ -382,7 +382,7 @@ def said(row: Any) -> str:
 
 def _item_text(row: asyncpg.Record) -> str:
     slot = f"{row['slot']}: " if row["slot"] else ""
-    return (f"{slot}{_short(row['text'], 200)} (с {row['valid_from'].isoformat()}; {said(row)})\n"
+    return (f"{slot}{_short(row['text'], 200)} (с {row['valid_from']:%d.%m.%Y}; {said(row)})\n"
             f"«{_short(row['source_quote'], 160)}»")
 
 
@@ -460,7 +460,7 @@ async def awaiting_owner(conn: asyncpg.Connection, *, limit: int = 100) -> dict[
     rows = await conn.fetch(
         f"""{_SELECT} AND f.subject_type = 'owner' AND f.status = 'proposed' AND f.batch IS NOT NULL
             AND f.digest_fingerprint IS NOT NULL ORDER BY f.notified_at NULLS LAST, f.id LIMIT $1""", limit)
-    items = [{"id": r["id"], "title": "Факт о вас для профиля", "text": _item_text(r),
+    items = [{"id": r["id"], "title": "Запомнить это о вас?", "text": _item_text(r),
               "buttons": [[bridge.button("Запомнить", CALLBACK_MODULE, f"a:{r['id']}:{r['digest_fingerprint'][:24]}"),
                            bridge.button("Не запоминать", CALLBACK_MODULE, f"r:{r['id']}")]],
               "card_message_id": None} for r in rows]

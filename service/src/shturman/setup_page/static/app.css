@@ -1,13 +1,16 @@
 /* Mini App «Штурмана» в боте согласований. Лёгкая страница под телефон в цветах темы Telegram:
    цвета приходят от Telegram (переменные --tg-theme-*, их ставит app.js из параметров запуска),
    а вне Telegram и до их прихода — свои, светлые и тёмные по настройке системы.
+   Фон страницы — secondary_bg_color, карточки — section_bg_color, как в настройках самого Telegram:
+   в светлой теме у Telegram фон и разделы оба белые, и карточки на bg_color слились бы с фоном.
+   Рамка карточки — на случай, когда Telegram прислал не все цвета.
    Без внешних шрифтов и скриптов. */
 
 :root {
-  --bg: var(--tg-theme-bg-color, #ffffff);
+  --bg: var(--tg-theme-secondary-bg-color, var(--tg-theme-bg-color, #eef2f5));
   --text: var(--tg-theme-text-color, #12202f);
   --hint: var(--tg-theme-hint-color, #5d6b78);
-  --section: var(--tg-theme-section-bg-color, var(--tg-theme-secondary-bg-color, #f2f5f7));
+  --section: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, #ffffff));
   --sep: var(--tg-theme-section-separator-color, rgba(18, 32, 47, 0.12));
   --button: var(--tg-theme-button-color, #0b5c7a);
   --button-text: var(--tg-theme-button-text-color, #ffffff);
@@ -19,10 +22,10 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: var(--tg-theme-bg-color, #17212b);
+    --bg: var(--tg-theme-secondary-bg-color, var(--tg-theme-bg-color, #17212b));
     --text: var(--tg-theme-text-color, #f1f4f6);
     --hint: var(--tg-theme-hint-color, #8f9dab);
-    --section: var(--tg-theme-section-bg-color, var(--tg-theme-secondary-bg-color, #1f2c3a));
+    --section: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, #1f2c3a));
     --sep: var(--tg-theme-section-separator-color, rgba(255, 255, 255, 0.1));
     --button: var(--tg-theme-button-color, #5cc0e0);
     --button-text: var(--tg-theme-button-text-color, #06202c);
@@ -64,6 +67,8 @@ p { margin: 8px 0; }
 
 .muted { color: var(--hint); }
 
+a { color: var(--accent); }
+
 .title-row { display: flex; align-items: baseline; gap: 10px; }
 .count { color: var(--hint); font-size: 15px; }
 
@@ -81,6 +86,7 @@ p { margin: 8px 0; }
 
 .card {
   background: var(--section);
+  border: 1px solid var(--sep);
   border-radius: 14px;
   padding: 14px;
   overflow-wrap: anywhere;

@@ -36,6 +36,9 @@ JavaScript (расширения дашборда). На одном origin с н
 разрешено открыть в рамке у https://web.telegram.org — так её показывает Telegram Web (`APP_HEADERS`).
 Её скрипты, стили и запросы к API, как и вся остальная страница, в рамке не открываются.
 
+Отказ (ответ JSON с кодом 400 и выше), который получил переход браузера на страницу, а не запрос
+скрипта, человек видит короткой страницей по-русски (`human_page`): код ответа и решение те же.
+
 Заголовки `Authorization` и `Cookie` здесь ничего не значат: токены внутреннего API и архива
 входом на страницу не служат, а cookie страница не читает. Заголовков CORS
 (`Access-Control-*`) страница не отдаёт никогда: чужому origin её ответы не читаются.
@@ -97,6 +100,54 @@ def origins(config: Any) -> dict[str, str]:
     return out
 
 
+# --- отказ, который видит человек ---------------------------------------------------------------
+#
+# Отказы под префиксом — ответы JSON для скриптов страницы и приложения. Но человек тоже может
+# открыть такой адрес в браузере или в окне Telegram: набрать адрес API, пойти по устаревшей или
+# неверной ссылке, открыть страницу под чужим именем узла. Тогда вместо `{"error": "not_found"}`
+# он видит короткую страницу по-русски. Меняется только тело уже отказанного ответа и только для
+# перехода браузера на страницу (`Sec-Fetch-Mode: navigate`; у старых браузеров без этого
+# заголовка — `Accept` с `text/html`): код ответа, заголовки защиты и решения те же, а запросы
+# `fetch` из страницы и приложения получают JSON, как раньше. В странице нет ничего из запроса.
+
+_SWAPPED_TYPES = (b"application/json", b"text/plain")
+_LINK_PAGE = f'<p><a href="{PREFIX}/">Открыть страницу «Переписка»</a></p>'
+_OPEN_APP = "Приложение открывается кнопкой <strong>«Штурман»</strong> внизу чата с вашим ботом согласований."
+
+
+def _navigation(headers: dict[bytes, bytes]) -> bool:
+    mode = headers.get(b"sec-fetch-mode")
+    if mode is not None:
+        return mode == b"navigate"
+    return b"text/html" in headers.get(b"accept", b"")
+
+
+def human_page(path: str, status: int) -> bytes:
+    """Страница вместо отказа JSON для человека, открывшего адрес в браузере. Текст выбирается только
+    по пути и коду ответа; из запроса в неё не попадает ничего."""
+    styled = True
+    if status == 421:
+        # Имя узла чужое: о сервисе ничего не сообщаем, как и прежний ответ JSON.
+        title, body, styled = ("Адрес не подходит", "<p>По этому адресу страница не открывается. Откройте её ровно по "
+                               "тому адресу, который вам выдали, — с тем же именем и портом.</p>", False)
+    elif path.startswith(PREFIX + "/api/app/") or path == PREFIX + "/api/app":
+        title, body = "Это служебный адрес", f"<p>Через него приложение «Штурман» получает данные — страницы здесь нет.</p><p>{_OPEN_APP}</p>"
+    elif path.startswith(APP_PATH):
+        title, body = "Такой страницы нет", f"<p>{_OPEN_APP}</p>"
+    elif path.startswith(PREFIX + "/api/") or path == PREFIX + "/api":
+        title, body = "Это служебный адрес", "<p>Через него страница «Переписка» получает данные — страницы здесь нет.</p>" + _LINK_PAGE
+    else:
+        title, body = "Такой страницы нет", _LINK_PAGE
+    css = f'<link rel="stylesheet" href="{PREFIX}/static/app.css">' if styled else ""
+    return (
+        '<!doctype html>\n<html lang="ru">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<meta name="robots" content="noindex, nofollow">\n<meta name="color-scheme" content="light dark">\n'
+        f"<title>{title}</title>\n{css}\n</head>\n<body>\n<main>\n<section class=\"state\">\n"
+        f"<h1>{title}</h1>\n{body}\n<p class=\"muted\">Код ответа: {status}.</p>\n</section>\n</main>\n</body>\n</html>\n"
+    ).encode("utf-8")
+
+
 class Shield:
     def __init__(self, app: ASGIApp, config: Any) -> None:
         self.app = app
@@ -105,15 +156,30 @@ class Shield:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Рамку разрешаем только ответу с самой страницей приложения: ровно этот путь, только GET.
         own = APP_HEADERS if scope.get("path") == APP_PATH and scope.get("method") == "GET" else HEADERS
+        headers = dict(scope["headers"])
+        for_person = scope.get("method") == "GET" and _navigation(headers)
+        swapped = False
 
         async def guarded(message: Message) -> None:
+            nonlocal swapped
             if message["type"] == "http.response.start":
                 kept = [(k, v) for k, v in message.get("headers", ())
                         if k.lower() not in _OWN and not k.lower().startswith(_NEVER)]
+                kind = dict((k.lower(), v) for k, v in kept).get(b"content-type", b"").lower()
+                if for_person and message["status"] >= 400 and kind.startswith(_SWAPPED_TYPES):
+                    swapped = True
+                    page = human_page(scope.get("path", ""), message["status"])
+                    kept = [(k, v) for k, v in kept if k.lower() not in (b"content-type", b"content-length")]
+                    await send({"type": "http.response.start", "status": message["status"],
+                                "headers": kept + [(b"content-type", b"text/html; charset=utf-8"),
+                                                   (b"content-length", str(len(page)).encode())] + list(HEADERS)})
+                    await send({"type": "http.response.body", "body": page, "more_body": False})
+                    return
                 message = {**message, "headers": kept + list(own)}
+            elif swapped:
+                return                 # тело отказа JSON уже заменено страницей
             await send(message)
 
-        headers = dict(scope["headers"])
         host = headers.get(b"host", b"").decode("latin-1").strip().lower()
         origin = self.origins.get(host)
         if origin is None:
@@ -132,8 +198,12 @@ class Shield:
         if scope.get("method") not in METHODS:
             await JSONResponse({"error": "method_not_allowed"}, status_code=405)(scope, receive, guarded)
             return
-        if path == PREFIX:
-            await RedirectResponse(PREFIX + "/", status_code=308)(scope, receive, guarded)
+        if path in (PREFIX, APP_PATH.rstrip("/")):
+            # Адрес без косой черты на конце. Перенаправление — относительным адресом: собственное
+            # перенаправление маршрутизатора строится из схемы запроса, а за обратным прокси она
+            # http, и браузер ушёл бы на http:// по порту https (а у приложения сломались бы
+            # относительные адреса его файлов).
+            await RedirectResponse(path + "/", status_code=308)(scope, receive, guarded)
             return
         scope[SCOPE_KEY] = {"origin": origin}
         await self.app(scope, receive, guarded)

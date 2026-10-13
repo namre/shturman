@@ -57,8 +57,10 @@ async def test_card_plain_names_exact_scope_and_buttons(monkeypatch, kind, sid, 
     if kind == 'memory':
         assert 'без фильтра по датам' in summary
     else:
-        assert t['source_request']['since'] in summary and t['source_request']['until'] in summary
-        assert 'включительно' in summary and 'не включая эту дату' in summary
+        # даты — по-человечески, с поясом и до минуты, без записи ISO (сервис не запущен — пояс UTC)
+        assert 'с 01.10.2026 00:00 (UTC) (включительно)' in summary
+        assert 'до 08.10.2026 00:00 (UTC) (не включая эту дату)' in summary
+        assert t['source_request']['since'] not in summary and 'T00:00' not in summary
     buttons = [b for row in notify.call_args.kwargs['buttons'] for b in row]
     assert [b['text'] for b in buttons] == ['Прочитать один раз', 'Этот поиск — на 30 дней', 'Отказать']
     assert [b['data'] for b in buttons] == ['sh:rp:y:1:fresh', 'sh:rp:r:1:fresh', 'sh:rp:n:1:fresh']
@@ -154,3 +156,12 @@ async def test_broker_persistent_default_is_30_days_not_task_expiry(monkeypatch)
     assert before + timedelta(days=30) <= expiry <= datetime.now(timezone.utc) + timedelta(days=30)
     assert expiry > t['expires_at']
     assert captured[0][:3] == (None, 7, 42) and captured[0][6] == 'read'
+
+
+def test_period_bounds_are_shown_in_the_owners_time_zone():
+    from zoneinfo import ZoneInfo
+    moscow = ZoneInfo('Europe/Moscow')
+    assert workflow._moment('2026-10-01T00:00:00+00:00', moscow) == '01.10.2026 03:00 (UTC+3)'
+    assert workflow._moment('2026-10-01T00:00:30+00:00', moscow) == '01.10.2026 03:00:30 (UTC+3)'
+    assert workflow._moment('2026-10-01T00:00:00+00:00', ZoneInfo('Asia/Kolkata')) == '01.10.2026 05:30 (UTC+5:30)'
+    assert workflow._moment('2026-10-01T12:00:00+00:00', ZoneInfo('America/New_York')) == '01.10.2026 08:00 (UTC-4)'

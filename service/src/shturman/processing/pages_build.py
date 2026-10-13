@@ -1347,7 +1347,7 @@ async def awaiting_owner(conn: asyncpg.Connection, *, days: int, limit: int = 10
            JOIN people p ON p.id = x.person_id AND p.merged_into IS NULL
            WHERE x.status = 'pending' AND x.batch IS NOT NULL
            ORDER BY x.notified_at NULLS LAST, x.person_id LIMIT $1""", limit)
-    items = [{"id": r["person_id"], "title": "Страница памяти о человеке",
+    items = [{"id": r["person_id"], "title": "Завести страницу о человеке?",
               "text": f"{clean_line(r['display_name'], 80) or 'без имени'} — {_reason_text(_loads(r['reason']) or {}, days)}",
               "buttons": [[bridge.button("Завести страницу", CALLBACK_MODULE, f"a:{r['person_id']}"),
                            bridge.button("Не нужно", CALLBACK_MODULE, f"r:{r['person_id']}")]],

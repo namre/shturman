@@ -597,7 +597,7 @@ async def awaiting_owner(conn: asyncpg.Connection, *, limit: int = 100) -> dict[
     rows = await conn.fetch(
         """SELECT id, title, reason FROM projects WHERE status = 'proposed' AND batch IS NOT NULL
            ORDER BY notified_at NULLS LAST, id LIMIT $1""", limit)
-    items = [{"id": r["id"], "title": "Предложенный проект",
+    items = [{"id": r["id"], "title": "Завести страницу проекта?",
               "text": f"{clean_line(r['title'], TITLE_LIMIT) or 'без названия'} — {_reason_text(_loads(r['reason']) or {})}",
               "buttons": [[bridge.button("Завести проект", CALLBACK_MODULE, f"a:{r['id']}"),
                            bridge.button("Не нужно", CALLBACK_MODULE, f"r:{r['id']}")]],

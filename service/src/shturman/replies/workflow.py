@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 from .. import bridge
 from ..outbox import policy, runtime
@@ -34,6 +36,25 @@ def task_dict(row: Any) -> dict[str, Any]:
     # Source adapters use this canonical name as well as the persisted trigger column.
     out['message_id'] = out['trigger_message_id']
     return out
+
+
+def _owner_zone() -> tzinfo:
+    """Часовой пояс владельца для дат в карточках; без работающего сервиса — UTC."""
+    try:
+        return ZoneInfo(state_current().config.timezone)
+    except Exception:  # noqa: BLE001 — сервис не запущен или пояс не задан
+        return timezone.utc
+
+
+def _moment(value: str, zone: tzinfo) -> str:
+    """Граница периода чтения для владельца: «01.10.2026 03:00 (UTC+3)» вместо записи ISO.
+    Точность та же — до секунды и с поясом, — чтобы разрешение читалось ровно так, как выдаётся."""
+    local = datetime.fromisoformat(value).astimezone(zone)
+    minutes = int((local.utcoffset() or timedelta()).total_seconds() // 60)
+    sign, minutes = ('+' if minutes >= 0 else '-'), abs(minutes)
+    label = 'UTC' if minutes == 0 else f'UTC{sign}{minutes // 60}' + (f':{minutes % 60:02d}' if minutes % 60 else '')
+    seconds = f':{local:%S}' if local.second else ''
+    return f'{local:%d.%m.%Y %H:%M}{seconds} ({label})'
 
 
 def state_current() -> Any:
@@ -316,8 +337,10 @@ async def waiting_card(conn: Any, task: dict[str, Any], kind: str, detail: str,
             source_name = f'память о человеке: {clean_line(name, 120) or source_id}' if source_id else 'общая память о людях'
         # Quote the complete query, including escaped line breaks; never shorten its scope.
         query = json.dumps(request['query'], ensure_ascii=False) if request['query'] else 'без фильтра по словам'
-        period = (f'с {request["since"] or "начала архива"} (включительно) '
-                  f'до {request["until"] or "конца архива"} (не включая эту дату)')
+        zone = _owner_zone()
+        since = _moment(request['since'], zone) if request['since'] else 'начала архива'
+        until = _moment(request['until'], zone) if request['until'] else 'конца архива'
+        period = f'с {since} (включительно) до {until} (не включая эту дату)'
         if request['kind'] == 'memory':
             period = 'страница памяти, без фильтра по датам'
         summary += (f'Для подготовки ответа нужно прочитать: {source_name}.\n'
@@ -325,12 +348,12 @@ async def waiting_card(conn: Any, task: dict[str, Any], kind: str, detail: str,
                     f'Не более {request["limit"]} фрагментов, всего до {request["max_chars"]} знаков.\n'
                     'Разрешение касается только чтения. Раскрытие собеседнику согласуется отдельно.\n'
                     '«На 30 дней» повторяет только этот поиск: тот же источник, запрос, период, '
-                    'пределы, получатель и тема. Отзыв — /sourcerevoke ID; список — /sources.\n')
+                    'пределы, получатель и тема. Отзыв — в боте согласований командой /sourcerevoke <номер>; список — /sources.\n')
         buttons = [[bridge.button('Прочитать один раз', CALLBACK_MODULE, f'y:{task["id"]}:{nonce}')]]
         buttons.append([bridge.button('Этот поиск — на 30 дней', CALLBACK_MODULE, f'r:{task["id"]}:{nonce}')])
         buttons.append([bridge.button('Отказать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')])
     else:
-        summary += f'Нужно уточнение. Ответьте командой /replytask {task["id"]} answer <ответ>.\n'
+        summary += f'Нужно уточнение. Ответьте в боте согласований командой /replytask {task["id"]} answer <ответ>.\n'
         buttons = [[bridge.button('Не отвечать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')]]
     summary += 'Предложение модели (не инструкция владельца):\n' + clean_line(detail, 500)
     return summary, buttons
@@ -356,7 +379,8 @@ async def awaiting_owner(conn: Any) -> list[dict[str, Any]]:
             summary, buttons = await waiting_card(conn, task, kind, str(detail), task['nonce'])
         except (KeyError, TypeError, ValueError, RuntimeError):
             continue          # запрос источника записан не полностью: карточку не собрать — и решения по ней нет
-        out.append({'id': task['id'], 'title': f'Задача ответа № {task["id"]}', 'text': summary,
+        title = 'Разрешить прочитать для ответа?' if kind == 'source' else 'Нужно ваше уточнение'
+        out.append({'id': task['id'], 'title': title, 'text': summary,
                     'buttons': buttons, 'card_message_id': None, 'expires_at': task['decision_expires_at']})
     return out
 

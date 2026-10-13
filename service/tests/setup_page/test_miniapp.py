@@ -442,6 +442,10 @@ async def test_list_shows_what_the_bot_shows_and_a_decision_goes_the_same_way(st
     assert set(by_kind) == {"action", "page"}
     act = by_kind["action"]
     assert "Тестовое действие для приложения" in act["text"] and act["title"] == f"Действие № {action}"
+    # в приложении над карточкой уже есть «Подтверждение действия»: текст — само описание,
+    # предупреждение — отдельной строкой (в боте — одна карточка, как раньше)
+    assert act["text"] == "Тестовое действие для приложения" and act["note"] == confirm.CARD_WARNING
+    assert "Подтвердите действие" in s.telegram.sent()[-1]["text"]
     # те же кнопки, что под карточкой в боте, — с той же меткой
     assert {a["label"]: a["ref"] for a in act["actions"]} == sent_buttons
     assert not any(key.startswith("_") for item in listed["items"] for key in item)
@@ -662,6 +666,13 @@ async def test_digests_and_hidden_messages_are_decided_with_the_buttons_the_bot_
     assert listed["later"]["commitment"] == 1
     assert later not in [i["id"] for i in listed["items"] if i["kind"] == "commitment"]
     refs = {(i["kind"], i["id"], a["label"]): a["ref"] for i in listed["items"] for a in i["actions"]}
+    # что увидит человек: заголовок — вопрос, а не повтор вида карточки; без дат ISO, кодов кнопок,
+    # пустых значений и словарей
+    import re
+    for item in listed["items"]:
+        assert item["title"] != item["kind_title"] and not item["title"].startswith(item["kind_title"]), item
+        shown = "\n".join([item["title"], item["text"], *item["head"], item["note"] or ""])
+        assert not re.search(r"\d{4}-\d{2}-\d{2}|\bsh:|\bNone\b|\bnull\b|[{}]", shown), shown
     hidden = next(i for i in listed["items"] if i["kind"] == "hidden")
     assert "Показать ассистенту" in [a["label"] for a in hidden["actions"]] and "Начало текста" in hidden["text"]
 
@@ -690,3 +701,74 @@ async def test_digests_and_hidden_messages_are_decided_with_the_buttons_the_bot_
     assert [(i["kind"], i["id"]) for i in left] == [("commitment", changed)]
     dumped = json.dumps(await app_audit(conn), ensure_ascii=False)
     assert not any(word in dumped for word in ("Мария", "Иван", "смет", "Береговой", "директор"))
+
+
+# --- что видит человек ------------------------------------------------------------------------------
+
+NAVIGATE = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document", "Sec-Fetch-Site": "none",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+
+
+async def test_a_person_opening_a_service_address_sees_a_page_not_json(stand, conn):
+    """Адрес API, устаревшая ссылка, неверный путь, чужое имя узла — человек в браузере или в окне
+    Telegram видит короткую страницу по-русски, а не `{"error": …}`. Код ответа и решение те же; запрос
+    скрипта получает JSON, как раньше; в странице нет ничего из запроса."""
+    s = await ready(stand, conn)
+    await s.app.sign_in(signed())
+    http = s.app.http
+    cases = [
+        (APP_API + "/approvals", 403, "приложение «Штурман» получает данные"),
+        (APP_API + "/login", 405, "приложение «Штурман» получает данные"),
+        (APP_PATH + "nothing-marker", 404, "кнопкой <strong>«Штурман»</strong>"),
+        (API + "/state", 403, "страница «Переписка» получает данные"),
+        (PREFIX + "/nothing-marker", 404, "Открыть страницу «Переписка»"),
+        (PREFIX + "//app/", 404, "Такой страницы нет"),
+    ]
+    for path, status, words in cases:
+        got = await http.get(path, headers=NAVIGATE)
+        assert got.status_code == status, path
+        assert got.headers["content-type"].startswith("text/html"), path
+        assert words in got.text and f"Код ответа: {status}." in got.text, path
+        assert "{" not in got.text and "marker" not in got.text, path
+        assert got.headers["x-frame-options"] == "DENY" and "frame-ancestors 'none'" in got.headers["content-security-policy"]
+        assert "<script" not in got.text and " style=" not in got.text
+    # браузер без заголовков Sec-Fetch (старый WebView) — по заголовку Accept
+    old = await http.get(APP_API + "/approvals", headers={"Accept": "text/html"})
+    assert old.status_code == 401 and old.headers["content-type"].startswith("text/html")
+    # чужое имя узла: страница, но о сервисе — ни слова
+    other = await http.get(APP_PATH, headers={**NAVIGATE, "Host": "evil.example"})
+    assert other.status_code == 421 and other.headers["content-type"].startswith("text/html")
+    assert "Штурман" not in other.text and "Переписка" not in other.text and "/shturman-setup" not in other.text
+    # запросы скриптов — по-прежнему JSON; сессия приложения работает как раньше
+    for headers in ({"Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin", "Accept": "*/*"}, {}):
+        got = await http.get(APP_API + "/approvals", headers=headers)
+        assert got.status_code == 401 and got.json()["code"] == "unauthenticated"
+    assert (await http.get(PREFIX + "/", headers={"Host": "evil.example"})).json() == {"error": "misdirected"}
+    assert (await s.app.get("/approvals")).status_code == 200
+    # сама страница приложения при переходе — та же страница, а не замена
+    page = await http.get(APP_PATH, headers=NAVIGATE)
+    assert page.status_code == 200 and "Согласования" in page.text and "Код ответа" not in page.text
+
+
+async def test_app_address_without_trailing_slash_redirects_relatively(stand, conn):
+    """За обратным прокси схема запроса у сервиса — http: абсолютное перенаправление увело бы браузер на
+    http:// по порту https. Поэтому — относительный адрес."""
+    s = await ready(stand, conn)
+    got = await s.app.http.get(PREFIX + "/app", headers=NAVIGATE, follow_redirects=False)
+    assert got.status_code == 308 and got.headers["location"] == APP_PATH
+    assert got.headers["x-frame-options"] == "DENY"
+
+
+def test_cards_speak_plain_russian():
+    """Даты в карточках — по-человечески, а не записью ISO."""
+    from datetime import date, datetime, timezone
+
+    from shturman.processing import facts
+    from shturman.replies import workflow
+
+    row = {"slot": "роль", "text": "отвечаю за бюджет фасадов", "valid_from": date(2026, 10, 6),
+           "source_outgoing": True, "source_quote": "Я отвечаю за бюджет фасадов."}
+    assert facts._item_text(row) == ("роль: отвечаю за бюджет фасадов (с 06.10.2026; сказали вы)\n"
+                                     "«Я отвечаю за бюджет фасадов.»")
+    moment = workflow._moment(datetime(2026, 10, 1, tzinfo=timezone.utc).isoformat(), timezone.utc)
+    assert moment == "01.10.2026 00:00 (UTC)"
