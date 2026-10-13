@@ -1,7 +1,7 @@
 """Подставной Bot API Telegram для тестов и стенда посредника: настоящий HTTP-сервер на 127.0.0.1,
-только стандартная библиотека. Умеет то, что нужно боту-менеджеру (Р-77): getMe, getUpdates с offset
+только стандартная библиотека. Умеет то, что нужно боту-менеджеру (Р-77, Р-78): getMe, getUpdates с offset
 и allowed_updates, getManagedBotToken, replaceManagedBotToken, setManagedBotAccessSettings,
-getManagedBotAccessSettings. Поля — как в core.telegram.org/bots/api (сверено 2026-10-13).
+getManagedBotAccessSettings, sendMessage (запоминает, что отправлено) и сообщения пользователей менеджеру. Поля — как в core.telegram.org/bots/api (сверено 2026-10-13).
 
     python3 relay/tests/fake_telegram.py [ПОРТ]   — запустить отдельно (стенд); токены печатаются в вывод
 """
@@ -61,6 +61,19 @@ class FakeTelegram:
             m = self.managed[bot_id]
             m["owner"] = owner
             self._push({"managed_bot": {"user": owner, "bot": m["bot"]}})
+
+    def send_to_manager(self, user: dict, text: str, chat_type: str = "private") -> None:
+        """Пользователь написал боту-менеджеру (или открыл ссылку t.me/<менеджер>?start=… и нажал «Старт»)."""
+        with self.lock:
+            chat = {"id": user["id"] if chat_type == "private" else -100500, "type": chat_type}
+            self._push({"message": {"message_id": self._uid, "date": int(time.time()), "from": user,
+                                    "chat": chat, "text": text}})
+
+    def replies(self, chat_id: int | None = None) -> list[str]:
+        """Что бот-менеджер ответил (sendMessage), по порядку."""
+        with self.lock:
+            return [p.get("text") for m, p in self.calls
+                    if m == "sendMessage" and (chat_id is None or p.get("chat_id") == chat_id)]
 
     def _push(self, update: dict) -> None:
         self._uid += 1
@@ -134,6 +147,11 @@ class FakeTelegram:
                     req = json.loads(body or b"{}")
                     bot_id = fake.create_managed_bot(req["username"], req.get("name") or "Согласования", req["owner"])
                     status, out = 200, {"ok": True, "bot_id": bot_id}
+                elif self.path == "/__message":
+                    # Только стенд: «пользователь написал боту-менеджеру» (код привязки, Р-78).
+                    req = json.loads(body or b"{}")
+                    fake.send_to_manager(req["user"], req["text"])
+                    status, out = 200, {"ok": True}
                 elif len(parts) != 3 or not parts[1].startswith("bot"):
                     status, out = 404, {"ok": False, "error_code": 404, "description": "Not Found"}
                 else:

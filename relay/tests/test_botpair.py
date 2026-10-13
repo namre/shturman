@@ -1,4 +1,4 @@
-"""Бот-менеджер и создание бота согласований в одно нажатие (relayd 0.4.0, Р-77).
+"""Бот-менеджер и создание бота согласований в одно нажатие (relayd 0.4.0+, Р-77). Привязка кодом — test_botclaim.py.
 
 Telegram — подставной HTTP-сервер (fake_telegram.py), запросы к нему идут настоящим tg_call через
 urllib; API посредника — настоящий HTTP-сервер relayd. Только стандартная библиотека и pytest.
@@ -130,7 +130,7 @@ def test_full_lifecycle_token_once_and_access_restricted(manager, tg, caplog):
     assert (status, body["status"], failed) == (202, "waiting", False)
     bot_id = tg.create_managed_bot(out["username"], "Согласования", OWNER)
     manager.poll_once(0)
-    assert tg.allowed == ["managed_bot"]                         # только эти обновления
+    assert tg.allowed == ["managed_bot", "message"]              # только эти обновления (message — коды, Р-78)
     assert ("setManagedBotAccessSettings", {"user_id": bot_id, "is_access_restricted": True}) in tg.calls
     assert tg.managed[bot_id]["restricted"] is True
     # Чужой секрет — тот же ответ, что неизвестная пара.
@@ -179,11 +179,13 @@ def test_access_settings_failure_is_reported(manager, tg):
 
 
 def test_username_edited_in_creation_window_is_not_matched(manager, tg):
+    """По адресу такой бот не узнаётся; с 0.5.0 он запоминается без пары и закрывается (Р-78, test_botclaim.py)."""
     ready(manager)
-    out, _ = lifecycle(manager, tg, username="ivan_my_own_name_bot")
+    out, bot_id = lifecycle(manager, tg, username="ivan_my_own_name_bot")
     assert manager.counters["unmatched"] == 1
     assert manager.fetch(out["pair_id"], out["secret"])[1]["status"] == "waiting"
-    assert not any(m == "setManagedBotAccessSettings" for m, _ in tg.calls)  # чужого бота не трогаем
+    assert set(manager.orphans) == {bot_id} and tg.managed[bot_id]["restricted"] is True
+    assert not any(m == "getManagedBotToken" for m, _ in tg.calls)          # токена без пары не берём
 
 
 def test_username_match_ignores_case(manager, tg):
@@ -260,7 +262,7 @@ def api(settings, manager):
 def test_http_health_tells_whether_pairing_works(api, manager):
     assert json.loads(call(api, "GET", "/api/health")[1])["botpair"] is False
     ready(manager)
-    assert json.loads(call(api, "GET", "/api/health")[1]) == {"ok": True, "version": "0.4.0", "botpair": True}
+    assert json.loads(call(api, "GET", "/api/health")[1]) == {"ok": True, "version": "0.5.0", "botpair": True}
 
 
 def test_http_pair_round_trip(api, manager, tg):

@@ -38,6 +38,15 @@
     {secret}` один раз отдаёт токен (служба берёт его у Telegram в момент выдачи и не хранит),
     номер и имя бота, номер, @имя и имя создателя; до того, как попытка закрыть доступ к боту
     закончилась, — «ждём». После выдачи пара забывается. Пары живут в памяти 15 минут;
+  * **привязка бота кодом** (с 0.5.0, решение Р-78): если владелец изменил адрес бота в окне
+    создания, бот не совпадает ни с одной парой. Служба не выбрасывает его, а запоминает «сиротой»
+    (только номер и адрес бота, номер создателя и время; без токена, в памяти, до суток) и сразу
+    закрывает доступ к нему, как к обычному. У каждой пары есть код привязки (`claim_code` в ответе
+    `start`, ссылка `https://t.me/<менеджер>?start=<код>`). Владелец открывает ссылку и нажимает
+    «Старт»: служба получает `/start <код>` в личном чате с менеджером (`getUpdates` теперь просит
+    `["managed_bot", "message"]`) и привязывает к паре самого свежего бота-сироту, **созданного
+    тем же пользователем Telegram, который прислал код**. Чужой код без создателя бота ничего не
+    даёт. Ответ в чате — короткий, без токенов и чужих данных; код в журнал не пишется;
   * **команды держателя** (`relayctl`): invite, list, revoke, release, operator, init,
     manager-link, manager-token, manager-status.
 
@@ -79,7 +88,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 import urllib.error
 import urllib.request
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_DB = "/var/lib/shturman-relay/relay.db"
 DEFAULT_DOMAIN = "sh.namre.app"
 DEFAULT_CA = "/etc/frp/frps.crt"
@@ -364,6 +373,15 @@ class Settings:
     botpair_poll_per_ip: int = 600
     botpair_poll_window: int = 15 * 60
     botpair_require_invite: bool = False
+    # Боты без пары («сироты», Р-78): сколько помнить, сколько всего и сколько от одного создателя.
+    botpair_orphan_ttl: int = 24 * 60 * 60
+    botpair_max_orphans: int = 1000
+    botpair_orphans_per_creator: int = 5
+    # Сообщения боту-менеджеру (коды привязки): на одного пользователя Telegram и неудачные коды от всех.
+    botpair_claim_per_user: int = 10
+    botpair_claim_window: int = 15 * 60
+    botpair_claim_fail_total: int = 60
+    botpair_claim_fail_window: int = 60
 
     @property
     def server_name(self) -> str:
@@ -688,6 +706,57 @@ class Pair:
     restricted: bool | None = None
     conflict: bool = False
     net: str = ""
+    claim_hash: str = field(default="", repr=False)   # хеш кода привязки (Р-78); сам код не хранится
+    started: float = 0.0
+    claimed: bool = False                             # бот привязан кодом, а не узнан по адресу
+
+
+@dataclass
+class Orphan:
+    """Бот, созданный под менеджером без подходящей пары: адрес изменили в окне создания, пара
+    истекла или служба перезапускалась (Р-78). Только в памяти и только номера, адрес и время —
+    токена нет: его служба берёт у Telegram только при выдаче паре."""
+    bot_id: int
+    bot_username: str
+    bot_name: str
+    creator_id: int
+    seen: float
+    restricted: bool | None = None
+
+
+# Код привязки: 16 знаков без похожих (≈79 бит). Годится в параметр start (A-Z, a-z, 0-9, _ и -, до 64).
+CLAIM_LEN = 16
+CLAIM_RE = re.compile(f"[{PAIR_ALPHABET}]{{{CLAIM_LEN}}}")
+
+CLAIM_TEXTS = {
+    "claimed": "Готово: бот @{bot} привязан. Вернитесь на страницу настройки «Штурмана» и подтвердите, "
+               "что бот создан вашим аккаунтом.",
+    "already": "Бот @{bot} уже привязан. Вернитесь на страницу настройки «Штурмана».",
+    "unknown_code": "Код не подошёл: он неверный или устарел. Начните создание бота на странице настройки "
+                    "«Штурмана» заново и откройте новую ссылку.",
+    "no_bot": "Не вижу ботов, созданных вашим аккаунтом по ссылке со страницы настройки «Штурмана» за последние "
+              "сутки. Создайте бота заново по ссылке со страницы — тогда он привяжется сам.",
+    "help": "Я создаю ботов согласований для «Штурмана». Чтобы создать или привязать бота, откройте ссылку "
+            "со страницы настройки «Штурмана».",
+    "too_many": "Слишком много попыток. Повторите через 15 минут.",
+    "busy": "Сейчас слишком много попыток. Повторите через минуту.",
+}
+
+
+def claim_code_of(text: Any) -> str | None:
+    """Код привязки из сообщения: `/start <код>` (так приходит ссылка t.me/<менеджер>?start=<код>)
+    или просто код. Регистр не важен. Иначе — None."""
+    if not isinstance(text, str) or len(text) > 256:
+        return None
+    parts = text.split()
+    if len(parts) == 2 and parts[0].lower() == "/start":
+        word = parts[1]
+    elif len(parts) == 1 and not parts[0].startswith("/"):
+        word = parts[0]
+    else:
+        return None
+    word = word.lower()
+    return word if CLAIM_RE.fullmatch(word) else None
 
 
 def read_manager_token(path: str) -> str | None:
@@ -731,11 +800,13 @@ def write_manager_token(path: str, token: str | None) -> None:
 
 
 class Manager:
-    """Бот-менеджер: его токен, опрос обновлений `managed_bot` и пары, которые ждут бота.
+    """Бот-менеджер: его токен, опрос обновлений (`managed_bot` и сообщения с кодами привязки), пары,
+    которые ждут бота, и боты без пары («сироты», Р-78).
 
     Токен читается из файла (`Settings.manager_path`) и перечитывается, когда файл меняется: так
-    его подхватывает работающая служба после `relayctl manager-token` или страницы ввода. Пары —
-    только в памяти: после перезапуска службы начатое создание бота нужно начать заново."""
+    его подхватывает работающая служба после `relayctl manager-token` или страницы ввода. Пары и
+    боты без пары — только в памяти: после перезапуска службы начатое создание бота нужно начать
+    заново, а бот, созданный до перезапуска с изменённым адресом, кодом уже не привязать."""
 
     def __init__(self, s: Settings, *, clock: Callable[[], float] = time.time,
                  tg: Callable[..., Any] = tg_call) -> None:
@@ -748,10 +819,15 @@ class Manager:
         self.ready = False
         self.problem: str | None = "no_token"
         self.offset: int | None = None
-        self.counters = {"created": 0, "delivered": 0, "unmatched": 0, "conflicts": 0}
+        self.counters = {"created": 0, "delivered": 0, "unmatched": 0, "conflicts": 0, "claimed": 0}
+        self.orphans: dict[int, Orphan] = {}
+        self.delivered: dict[int, float] = {}      # номер выданного бота → когда выдан (на сутки)
+        self.claim_per_user = Window(s.botpair_claim_per_user, s.botpair_claim_window)
+        self.claim_told = Window(1, s.botpair_claim_window)
+        self.claim_fails = Window(s.botpair_claim_fail_total, s.botpair_claim_fail_window)
 
     def __repr__(self) -> str:
-        return f"<Manager @{self.username or '-'} ready={self.ready} pairs={len(self.pairs)}>"
+        return f"<Manager @{self.username or '-'} ready={self.ready} pairs={len(self.pairs)} orphans={len(self.orphans)}>"
 
     def tg(self, method: str, params: dict | None = None, timeout: float = 15) -> Any:
         if not self._token:
@@ -798,7 +874,8 @@ class Manager:
 
     def poll_once(self, timeout: int | None = None) -> int:
         wait = self.s.manager_poll if timeout is None else timeout
-        params: dict[str, Any] = {"timeout": wait, "allowed_updates": ["managed_bot"]}
+        # message — коды привязки в личном чате с менеджером (Р-78); остальные виды обновлений не нужны.
+        params: dict[str, Any] = {"timeout": wait, "allowed_updates": ["managed_bot", "message"]}
         if self.offset is not None:
             params["offset"] = self.offset
         updates = self.tg("getUpdates", params, timeout=wait + 10)
@@ -819,10 +896,30 @@ class Manager:
         now = self.clock()
         for pid in [pid for pid, p in self.pairs.items() if p.expires <= now]:
             del self.pairs[pid]
+        edge = now - self.s.botpair_orphan_ttl
+        for bid in [bid for bid, o in self.orphans.items() if o.seen <= edge]:
+            del self.orphans[bid]
+        for bid in [bid for bid, at in self.delivered.items() if at <= edge]:
+            del self.delivered[bid]
+
+    def _keep_orphan(self, orphan: Orphan) -> None:
+        """Запомнить бота без пары. Пределы: от одного создателя и всего — вытесняются самые старые."""
+        mine = sorted((o for o in self.orphans.values() if o.creator_id == orphan.creator_id), key=lambda o: o.seen)
+        while len(mine) >= self.s.botpair_orphans_per_creator:
+            del self.orphans[mine.pop(0).bot_id]
+        while len(self.orphans) >= self.s.botpair_max_orphans:
+            del self.orphans[min(self.orphans.values(), key=lambda o: o.seen).bot_id]
+        self.orphans[orphan.bot_id] = orphan
 
     def handle_update(self, upd: dict) -> None:
         """`managed_bot`: создан бот под этим менеджером, сменился его токен или владелец.
-        Сопоставляется с парой по имени бота; чужие и незнакомые боты не трогаются."""
+        Сопоставляется с парой по имени бота; бот без пары запоминается «сиротой» до привязки кодом
+        (Р-78). `message`: код привязки в личном чате с менеджером."""
+        if "message" in upd:
+            msg = upd.get("message")
+            if isinstance(msg, dict):
+                self.handle_message(msg)
+            return
         mb = upd.get("managed_bot")
         if not isinstance(mb, dict):
             return
@@ -832,17 +929,30 @@ class Manager:
         creator = _int(user.get("id")) if isinstance(user, dict) else None
         if bot_id is None or creator is None or not isinstance(uname, str):
             return
-        restrict = None
+        restrict: Pair | Orphan | None = None
         with self.lock:
             self._prune()
             pair = next((p for p in self.pairs.values() if p.bot_id == bot_id), None) or \
                 next((p for p in self.pairs.values() if p.username == uname.lower()), None)
             if pair is None:
+                if bot_id in self.delivered:
+                    # Бот уже выдан экземпляру; обновление — о смене его токена или владельца. Не наше дело.
+                    return
+                known = self.orphans.get(bot_id)
+                if known is not None:
+                    if known.creator_id != creator:
+                        # Владелец бота сменился, пока бот ждал привязки: привязывать его некому.
+                        del self.orphans[bot_id]
+                        self.counters["conflicts"] += 1
+                        log.warning("managed_bot: у бота без пары сменился владелец — бот забыт")
+                    return
                 self.counters["unmatched"] += 1
-                log.info("managed_bot: бот без ожидающей пары (имя изменили при создании, пара истекла "
-                         "или ссылку открыли не с экземпляра) — пропущен")
-                return
-            if pair.bot_id is None and pair.username == uname.lower():
+                orphan = Orphan(bot_id, uname, _display(bot), creator, self.clock())
+                self._keep_orphan(orphan)
+                restrict = orphan
+                log.info("managed_bot: бот без ожидающей пары (адрес изменили при создании, пара истекла или "
+                         "служба перезапускалась) — запомнен для привязки кодом, доступ закрывается")
+            elif pair.bot_id is None and pair.username == uname.lower():
                 pair.bot_id, pair.bot_username, pair.bot_name = bot_id, uname, _display(bot)
                 pair.creator_id, pair.creator_name = creator, _display(user)
                 handle = user.get("username") if isinstance(user, dict) else None
@@ -859,17 +969,98 @@ class Manager:
         if restrict is not None:
             self._restrict(restrict)
 
-    def _restrict(self, pair: Pair) -> None:
-        """Доступ к новому боту — только у его владельца (создателя). Не вышло — бот всё равно
-        выдаётся, экземпляр узнает об этом (`restricted: false`) и скажет владельцу."""
+    def _restrict(self, target: Pair | Orphan) -> None:
+        """Доступ к новому боту — только у его владельца (создателя). Так и для бота пары, и для бота
+        без пары (Р-78). Не вышло — бот всё равно выдаётся, экземпляр узнает об этом
+        (`restricted: false`) и скажет владельцу."""
+        what = f"пары {target.pair_id}" if isinstance(target, Pair) else "без пары"
         try:
-            done = self.tg("setManagedBotAccessSettings", {"user_id": pair.bot_id, "is_access_restricted": True})
+            done = self.tg("setManagedBotAccessSettings", {"user_id": target.bot_id, "is_access_restricted": True})
             ok = done is True
         except TelegramError as e:
-            log.warning("managed_bot: доступ к боту пары %s не закрыт (%s %s)", pair.pair_id, e.code, e.status)
+            log.warning("managed_bot: доступ к боту %s не закрыт (%s %s)", what, e.code, e.status)
             ok = False
         with self.lock:
-            pair.restricted = ok
+            target.restricted = ok
+
+    # --- коды привязки (Р-78) ---
+
+    def handle_message(self, msg: dict) -> None:
+        """Сообщение боту-менеджеру. Принимаются только личные чаты с людьми; в ответ — короткий
+        текст без токенов и чужих данных, или ничего (после предела попыток)."""
+        chat, sender = msg.get("chat"), msg.get("from")
+        if not isinstance(chat, dict) or chat.get("type") != "private" or not isinstance(sender, dict) \
+                or sender.get("is_bot") is not False:
+            return
+        user_id, chat_id = _int(sender.get("id")), _int(chat.get("id"))
+        if user_id is None or chat_id != user_id:
+            return
+        reply = self.claim(user_id, claim_code_of(msg.get("text")), sender)
+        if reply is None:
+            return
+        try:
+            self.tg("sendMessage", {"chat_id": chat_id, "text": reply})
+        except TelegramError as e:
+            log.warning("бот-менеджер: ответ в чат не отправлен (%s %s)", e.code, e.status)
+
+    def claim(self, user_id: int, code: str | None, sender: dict | None = None) -> str | None:
+        """Привязать к паре с этим кодом бота без пары, **созданного тем, кто прислал код** (номер
+        пользователя удостоверяет Telegram). Если таких несколько — самого свежего из созданных после
+        начала пары, иначе самого свежего вообще. Возвращает текст ответа или None — промолчать.
+        Код сверяется с хешами всех пар постоянным по времени сравнением и в журнал не пишется."""
+        now = self.clock()
+        who = str(user_id)
+        if self.claim_per_user.blocked(who, now):
+            if self.claim_told.blocked(who, now):
+                return None
+            self.claim_told.add(who, now)
+            return CLAIM_TEXTS["too_many"]
+        self.claim_per_user.add(who, now)
+        if code is None:
+            return CLAIM_TEXTS["help"]
+        if self.claim_fails.blocked("*", now):
+            return CLAIM_TEXTS["busy"]
+        want = secret_hash(code, "claim")
+        restrict: Pair | None = None
+        with self.lock:
+            self._prune()
+            pair = None
+            for p in self.pairs.values():               # без раннего выхода: время не зависит от того, где совпало
+                if hmac.compare_digest(p.claim_hash or _DUMMY_SECRET, want):
+                    pair = p
+            if pair is None:
+                self.claim_fails.add("*", now)
+                log.info("claim: код привязки не подошёл")
+                return CLAIM_TEXTS["unknown_code"]
+            if pair.bot_id is not None:
+                if pair.creator_id == user_id and not pair.conflict:
+                    return CLAIM_TEXTS["already"].format(bot=pair.bot_username)
+                log.info("claim: пара %s — бот уже есть, код прислал не его создатель", pair.pair_id)
+                return CLAIM_TEXTS["no_bot"]
+            mine = [o for o in self.orphans.values() if o.creator_id == user_id]
+            if not mine:
+                log.info("claim: пара %s — ботов без пары от этого пользователя нет", pair.pair_id)
+                return CLAIM_TEXTS["no_bot"]
+            after = [o for o in mine if o.seen >= pair.started]
+            orphan = max(after or mine, key=lambda o: o.seen)
+            del self.orphans[orphan.bot_id]
+            pair.bot_id, pair.bot_username, pair.bot_name = orphan.bot_id, orphan.bot_username, orphan.bot_name
+            pair.creator_id = user_id
+            pair.creator_name = _display(sender)
+            handle = sender.get("username") if isinstance(sender, dict) else None
+            pair.creator_username = handle if isinstance(handle, str) and re.fullmatch(r"[A-Za-z0-9_]{1,64}", handle) else ""
+            pair.claimed = True
+            pair.expires = max(pair.expires, now + self.s.botpair_grace)
+            if orphan.restricted is None:
+                restrict = pair                          # закрыть доступ не успели — закрываем сейчас
+            else:
+                pair.restricted = orphan.restricted
+            self.counters["claimed"] += 1
+            bot_username = pair.bot_username
+            log.info("claim: бот без пары привязан к паре %s кодом от его создателя", pair.pair_id)
+        if restrict is not None:
+            self._restrict(restrict)
+        return CLAIM_TEXTS["claimed"].format(bot=bot_username)
 
     def run(self, stop: threading.Event) -> None:
         fails = 0
@@ -924,12 +1115,22 @@ class Manager:
                 pair_id = "".join(secrets.choice(PAIR_ALPHABET) for _ in range(PAIR_LEN))
                 if pair_id not in self.pairs:
                     break
+            while True:
+                claim = "".join(secrets.choice(PAIR_ALPHABET) for _ in range(CLAIM_LEN))
+                claim_hash = secret_hash(claim, "claim")
+                if all(p.claim_hash != claim_hash for p in self.pairs.values()):
+                    break
             username = f"{self.s.botpair_prefix}_{pair_id}_bot"
-            expires = self.clock() + self.s.botpair_ttl
-            self.pairs[pair_id] = Pair(pair_id, secret_hash(secret), username, display, expires, net=net)
+            now = self.clock()
+            expires = now + self.s.botpair_ttl
+            self.pairs[pair_id] = Pair(pair_id, secret_hash(secret), username, display, expires, net=net,
+                                       claim_hash=claim_hash, started=now)
         link = f"https://t.me/newbot/{self.username}/{username}?name={quote(display, safe='')}"
+        # Код привязки (Р-78) — на случай, если владелец изменит адрес бота в окне создания. Код сам по себе
+        # ничего не даёт: привязывается только бот того, кто прислал код боту-менеджеру.
         return {"pair_id": pair_id, "secret": secret, "link": link, "username": username, "name": display,
-                "manager": self.username, "expires_at": int(expires), "ttl": self.s.botpair_ttl}
+                "manager": self.username, "expires_at": int(expires), "ttl": self.s.botpair_ttl,
+                "claim_code": claim, "claim_link": f"https://t.me/{self.username}?start={claim}"}
 
     def fetch(self, pair_id: Any, secret: Any) -> tuple[int, dict, bool]:
         """(код ответа, тело, неудача — для общего предела). Токен берётся у Telegram сейчас и
@@ -962,13 +1163,18 @@ class Manager:
             if self.pairs.get(pair_id) is not pair:
                 return not_found
             del self.pairs[pair_id]
+            self.delivered[bot_id] = self.clock()
+            while len(self.delivered) > self.s.botpair_max_orphans:
+                del self.delivered[min(self.delivered, key=self.delivered.__getitem__)]
             self.counters["delivered"] += 1
         log.info("botpair %s: бот выдан экземпляру", pair_id)
+        # claimed — бот привязан кодом (Р-78): его адрес не тот, что в ссылке; экземпляр сверяет с getMe
+        # номер и адрес, о которых сообщено здесь.
         return 200, {"status": "ready", "token": token,
                      "bot": {"id": bot_id, "username": pair.bot_username, "name": pair.bot_name},
                      "creator": {"id": pair.creator_id, "username": pair.creator_username or None,
                                  "name": pair.creator_name},
-                     "restricted": pair.restricted is True}, False
+                     "restricted": pair.restricted is True, "claimed": pair.claimed}, False
 
 
 def manager_setup(conn: sqlite3.Connection, s: Settings, manager: Manager, secret: Any, token: Any,
