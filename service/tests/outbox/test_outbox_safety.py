@@ -289,10 +289,10 @@ async def test_card_identifies_recipient_beyond_display_name(env):
     real = texts(await owner_messages(env.conn))
     await new_draft(env, lookalike, "Ответ двойнику")
     fake = texts(await owner_messages(env.conn))
-    assert f"Кому: Иван Петров (личный чат) · @ivan_petrov · id {IVAN}\n" in real
+    assert f"Кому: Иван Петров (личный чат) · @ivan_petrov · номер в Telegram {IVAN}\n" in real
     assert "В архиве: 3 сообщения, первое " in real
     # двойник: то же имя, но другой номер, нет адреса и почти нет истории
-    assert "Кому: Иван Петров id 2001 (личный чат) · id 7070707\n" in fake
+    assert "Кому: Иван Петров id 2001 (личный чат) · номер в Telegram 7070707\n" in fake
     assert "@" not in fake.split("От кого")[0] and "В архиве: 1 сообщение, первое " in fake
     assert "‮" not in fake
     # чат без единого сообщения (до карточки такой не дойдёт, но строка для него есть)

@@ -37,6 +37,13 @@
     <p class="muted">Данные входа от Telegram действуют несколько минут и годятся один раз.</p>
   </section>
 
+  <section class="state" id="screen-error" hidden>
+    <h1>Список не загрузился</h1>
+    <p id="error-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+    <p class="muted">Решения по-прежнему можно принять кнопками под карточками в боте согласований.</p>
+    <button type="button" class="primary" id="retry">Повторить</button>
+  </section>
+
   <!-- экран «Согласования» -->
   <section id="screen-approvals" hidden>
     <div class="title-row">
@@ -49,7 +56,7 @@
     <p class="empty" id="empty" hidden>Сейчас ничего не ждёт вашего решения.</p>
     <p class="later muted" id="later" hidden></p>
     <p class="muted foot">Те же решения приходят карточками в бот согласований — решать можно и там, и здесь.
-      Обязательства и состояние экземпляра появятся в следующих версиях приложения.</p>
+      Отдельные экраны со списком обязательств и состоянием сервера появятся в следующих версиях приложения.</p>
     <button type="button" class="home" id="home-screen" hidden>Добавить «Штурман» на главный экран</button>
   </section>
 </main>

@@ -31,6 +31,7 @@
   var busy = false;
   var toastTimer = null;
   var listTimer = null;
+  var listShown = false;                         // список уже был на экране хотя бы раз
 
   function $(id) { return document.getElementById(id); }
   function show(id, on) { $(id).hidden = !on; }
@@ -180,7 +181,7 @@
   }
 
   function screen(name) {
-    ["screen-wait", "screen-outside", "screen-failed", "screen-approvals"].forEach(function (id) {
+    ["screen-wait", "screen-outside", "screen-failed", "screen-error", "screen-approvals"].forEach(function (id) {
       show(id, id === name);
     });
     show("refresh", name === "screen-approvals");
@@ -205,6 +206,11 @@
       if (got.status === 200 && got.data.key) {
         saveKey(got.data.key);
         return true;
+      }
+      if (got.status !== 401 && got.status !== 400) {
+        // Не отказ во входе, а сбой по пути: сервер не ответил или ответил не он (прокси, перезапуск).
+        $("failed-text").textContent = "Сервер сейчас не отвечает. Закройте приложение и откройте его снова " +
+          "через минуту кнопкой «Штурман» в боте согласований.";
       }
       screen("screen-failed");
       return false;
@@ -232,10 +238,31 @@
       "решить их сразу можно на странице «Переписка», раздел «Память ассистента».";
   }
 
+  // Срок решения по-человечески, по часам телефона: «сегодня в 14:30», «завтра в 9:05», «15 октября в 9:05».
+  function deadline(value) {
+    if (!value) return "";
+    var at = new Date(value);
+    if (isNaN(at.getTime())) return "";
+    function two(n) { return (n < 10 ? "0" : "") + n; }
+    var time = at.getHours() + ":" + two(at.getMinutes());
+    var today = new Date();
+    var tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+    function sameDay(a, b) {
+      return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+    }
+    if (sameDay(at, today)) return "сегодня в " + time;
+    if (sameDay(at, tomorrow)) return "завтра в " + time;
+    var months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
+                  "октября", "ноября", "декабря"];
+    var date = at.getDate() + " " + months[at.getMonth()];
+    if (at.getFullYear() !== today.getFullYear()) date += " " + at.getFullYear();
+    return date + " в " + time;
+  }
+
   function card(item) {
     var node = el("article", "card");
     node.appendChild(el("div", "kind", item.kind_title));
-    node.appendChild(el("h2", null, item.title));
+    if (item.title && item.title !== item.kind_title) node.appendChild(el("h2", null, item.title));
     if (item.head && item.head.length) {
       var lines = el("ul", "lines");
       item.head.forEach(function (line) { lines.appendChild(el("li", null, line)); });
@@ -248,6 +275,8 @@
       node.appendChild(el("div", "body", item.text));
     }
     if (item.note) node.appendChild(el("div", "note", item.note));
+    var until = deadline(item.expires_at);
+    if (until) node.appendChild(el("div", "note", "Ждёт решения до " + until + "."));
     var actions = el("div", "actions");
     (item.actions || []).forEach(function (action) {
       var button = el("button", action.primary ? "primary" : "secondary", action.label);
@@ -271,7 +300,16 @@
     show("later", Boolean(later));
     var hasDrafts = items.some(function (item) { return item.kind === "draft"; });
     show("sending-off", hasDrafts && data.sending !== "on");
+    listShown = true;
     screen("screen-approvals");
+  }
+
+  // Список не пришёл. Если на экране уже есть список — короткое сообщение внизу; если ещё нет —
+  // отдельный экран с кнопкой «Повторить», а не бесконечное «Открываю…».
+  function loadFailed(message) {
+    if (listShown) { toast(message); return; }
+    $("error-text").textContent = message;
+    screen("screen-error");
   }
 
   function load() {
@@ -284,8 +322,8 @@
         screen("screen-failed");
         return;
       }
-      toast(got.data.error || "Не получилось загрузить список. Попробуйте ещё раз.");
-    }, function () { toast("Нет связи с сервером. Попробуйте ещё раз."); });
+      loadFailed(got.data.error || "Сервер не ответил. Попробуйте ещё раз через минуту.");
+    }, function () { loadFailed("Нет связи с сервером. Проверьте интернет и попробуйте ещё раз."); });
   }
 
   function decide(ref, actions) {
@@ -307,6 +345,10 @@
   /* ------------------------------------------------------------ запуск */
 
   $("refresh").addEventListener("click", function () { load(); });
+  $("retry").addEventListener("click", function () {
+    screen("screen-wait");
+    load();
+  });
   $("home-screen").addEventListener("click", function () { postEvent("web_app_add_to_home_screen"); });
 
   document.addEventListener("visibilitychange", function () {

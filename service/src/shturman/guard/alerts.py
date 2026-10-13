@@ -218,7 +218,7 @@ async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
         text = card(r["summary"], r["text"] or "") if r["deleted_at"] is None else (
             "Скрыл от ассистента входящее сообщение: оно похоже на попытку им управлять.\n\n"
             + r["summary"] + "\n\nСообщение уже удалено из архива.")
-        out.append({"id": r["id"], "title": "Скрытое сообщение", "text": text,
+        out.append({"id": r["id"], "title": "Показать это сообщение ассистенту?", "text": text,
                     "buttons": _card_buttons(r["id"], r["nonce"]), "card_message_id": r["card_message_id"]})
     return out
 

@@ -129,9 +129,11 @@ def required() -> bool:
     return not authority.is_owner()
 
 
+CARD_WARNING = "Запрос пришёл из кабинета или от ассистента. Если вы этого не просили — нажмите «Нет»."
+
+
 def _card(summary: str) -> str:
-    return ("Подтвердите действие\n\n" + summary.strip() + "\n\n"
-            "Запрос пришёл из кабинета или от ассистента. Если вы этого не просили — нажмите «Нет».")
+    return "Подтвердите действие\n\n" + summary.strip() + "\n\n" + CARD_WARNING
 
 
 def _done(value: "str | Done | None") -> Done:
@@ -279,7 +281,9 @@ async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
     rows = await conn.fetch(
         """SELECT id, summary, nonce, card_message_id, expires_at FROM pending_actions
            WHERE status = 'pending' AND expires_at > now() ORDER BY id""")
-    return [{"id": r["id"], "title": f"Действие № {r['id']}", "text": _card(r["summary"]),
+    # В приложении заголовок «Подтверждение действия» уже есть, поэтому текст — само описание, а
+    # предупреждение — отдельной строкой ниже (в боте это одна карточка `_card`).
+    return [{"id": r["id"], "title": f"Действие № {r['id']}", "text": r["summary"].strip(), "note": CARD_WARNING,
              "buttons": _card_buttons(r["id"], r["nonce"]), "card_message_id": r["card_message_id"],
              "expires_at": r["expires_at"]} for r in rows]
 

@@ -29,7 +29,7 @@ async def test_session_draft_is_sent_only_after_owner_tap(env):
     chat = await add_chat(env.conn, env.helper_acc)
     draft_id, cards = await approved(env, chat)
     card = texts(cards)
-    assert f"Кому: Иван Петров (личный чат) · id {IVAN}" in card and "от имени помощника" in card
+    assert f"Кому: Иван Петров (личный чат) · номер в Telegram {IVAN}" in card and "от имени помощника" in card
     assert card.endswith("Добрый день! Смету пришлю в пятницу.")
     await settle(env)
     assert env.tg.sent == [] and (await draft_row(env.conn, draft_id))["status"] == "pending"

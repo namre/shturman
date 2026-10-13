@@ -772,7 +772,7 @@ async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit:
     for row in rows:
         target = row["id"]
         items.append({
-            "id": target, "title": "Обязательство из переписки",
+            "id": target, "title": "Верно ли это обязательство?",
             "text": _render_commitment(to_dict(row, today), today),
             "buttons": [[bridge.button("Верно", CALLBACK_MODULE, f"a:{target}:{row['digest_fingerprint'][:24]}"),
                          bridge.button("Нет", CALLBACK_MODULE, f"r:{target}")]],
@@ -788,7 +788,7 @@ async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit:
             continue
         target = change["id"]
         items.append({
-            "id": target, "title": "Изменение обязательства", "text": _render_change(change, item, today),
+            "id": target, "title": "Применить изменение?", "text": _render_change(change, item, today),
             "buttons": [[bridge.button("Применить", CALLBACK_MODULE, f"ca:{target}:{change['digest_fingerprint'][:24]}"),
                          bridge.button("Оставить как есть", CALLBACK_MODULE, f"cr:{target}")]],
             "card_message_id": None})

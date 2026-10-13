@@ -82,7 +82,7 @@ def _item(kind: str, kind_title: str, entry: dict[str, Any], *, note: str | None
     return {
         "key": f"{kind}:{entry['id']}", "kind": kind, "kind_title": kind_title, "id": entry["id"],
         "title": entry.get("title") or kind_title, "head": list(entry.get("head") or []),
-        "text": entry.get("text") or "", "note": note, "actions": actions,
+        "text": entry.get("text") or "", "note": note or entry.get("note"), "actions": actions,
         "expires_at": _iso(entry.get("expires_at")),
         # Только для сервера: каким сообщением в боте ушла карточка. В ответ приложению не идёт.
         "_card_message_id": entry.get("card_message_id"),

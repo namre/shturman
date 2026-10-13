@@ -158,7 +158,7 @@ def _who(tgt: Target) -> str:
     line = f"{tgt.display_name} ({_chat_kind(tgt)})"
     if tgt.username and _USERNAME.match(tgt.username):
         line += f" · @{tgt.username}"
-    return f"{line} · id {int(tgt.tg_id)}"
+    return f"{line} · номер в Telegram {int(tgt.tg_id)}"
 
 
 async def card_context(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Target) -> dict[str, Any]:
