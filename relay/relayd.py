@@ -36,7 +36,8 @@
     получает `managed_bot`, сопоставляет бота по имени, сразу закрывает его для всех, кроме
     создателя (`setManagedBotAccessSettings`), и ждёт экземпляр. `POST /api/botpair/<pair_id>/token
     {secret}` один раз отдаёт токен (служба берёт его у Telegram в момент выдачи и не хранит),
-    номер бота и номер создателя; после этого пара забывается. Пары живут в памяти 15 минут;
+    номер и имя бота, номер, @имя и имя создателя; до того, как попытка закрыть доступ к боту
+    закончилась, — «ждём». После выдачи пара забывается. Пары живут в памяти 15 минут;
   * **команды держателя** (`relayctl`): invite, list, revoke, release, operator, init,
     manager-link, manager-token, manager-status.
 
@@ -55,6 +56,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import hmac
 import http.server
@@ -354,6 +356,8 @@ class Settings:
     botpair_ttl: int = 15 * 60                 # секунд живёт пара, пока бот не создан
     botpair_grace: int = 3 * 60                # и не меньше стольких — после создания бота
     botpair_max_pending: int = 200
+    # Ожидающих пар с одной широкой сети (IPv4 /24, IPv6 /48): одна сеть не займёт общий предел.
+    botpair_pending_per_net: int = 5
     botpair_start_per_ip: int = 10
     botpair_start_window: int = 15 * 60
     # Экземпляр спрашивает токен раз в 3 секунды: 300 запросов за 15 минут — с запасом.
@@ -513,6 +517,19 @@ def join(conn: sqlite3.Connection, s: Settings, code: Any, name: Any, khash: Any
     return answer
 
 
+def net_bucket(ip: str) -> str:
+    """Широкая сеть адреса — для предела ожидающих пар: IPv4 /24, IPv6 /48. У одного клиента IPv6
+    обычно целая /48 или /56: счёт по /64 он обошёл бы, перебирая подсети."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    prefix = 24 if addr.version == 4 else 48
+    return str(ipaddress.ip_network(f"{addr}/{prefix}", strict=False))
+
+
 def ip_bucket(ip: str) -> str:
     """Ключ счёта попыток: IPv4 — адрес, IPv6 — сеть /64 (у одного клиента обычно вся /64)."""
     try:
@@ -667,8 +684,10 @@ class Pair:
     bot_name: str = ""
     creator_id: int | None = None
     creator_name: str = ""
+    creator_username: str = ""
     restricted: bool | None = None
     conflict: bool = False
+    net: str = ""
 
 
 def read_manager_token(path: str) -> str | None:
@@ -826,6 +845,8 @@ class Manager:
             if pair.bot_id is None and pair.username == uname.lower():
                 pair.bot_id, pair.bot_username, pair.bot_name = bot_id, uname, _display(bot)
                 pair.creator_id, pair.creator_name = creator, _display(user)
+                handle = user.get("username") if isinstance(user, dict) else None
+                pair.creator_username = handle if isinstance(handle, str) and re.fullmatch(r"[A-Za-z0-9_]{1,64}", handle) else ""
                 pair.expires = max(pair.expires, self.clock() + self.s.botpair_grace)
                 self.counters["created"] += 1
                 restrict = pair
@@ -886,7 +907,7 @@ class Manager:
 
     # --- пары ---
 
-    def start(self, name: Any) -> dict:
+    def start(self, name: Any, net: str = "") -> dict:
         display = bot_display_name(name)
         if not self.ready or not self.username:
             raise PairError(503, "manager_unavailable",
@@ -896,13 +917,16 @@ class Manager:
             self._prune()
             if len(self.pairs) >= self.s.botpair_max_pending:
                 raise PairError(503, "busy", "Посредник занят. Повторите через несколько минут.")
+            if net and sum(1 for p in self.pairs.values() if p.net == net) >= self.s.botpair_pending_per_net:
+                raise PairError(429, "rate_limited", "Слишком много начатых созданий бота из этой сети. "
+                                                     "Повторите через 15 минут.")
             while True:
                 pair_id = "".join(secrets.choice(PAIR_ALPHABET) for _ in range(PAIR_LEN))
                 if pair_id not in self.pairs:
                     break
             username = f"{self.s.botpair_prefix}_{pair_id}_bot"
             expires = self.clock() + self.s.botpair_ttl
-            self.pairs[pair_id] = Pair(pair_id, secret_hash(secret), username, display, expires)
+            self.pairs[pair_id] = Pair(pair_id, secret_hash(secret), username, display, expires, net=net)
         link = f"https://t.me/newbot/{self.username}/{username}?name={quote(display, safe='')}"
         return {"pair_id": pair_id, "secret": secret, "link": link, "username": username, "name": display,
                 "manager": self.username, "expires_at": int(expires), "ttl": self.s.botpair_ttl}
@@ -923,7 +947,8 @@ class Manager:
             if pair.conflict:
                 del self.pairs[pair_id]
                 return 409, {"error": "conflict", "message": "Владелец созданного бота сменился. Начните заново."}, False
-            if pair.bot_id is None:
+            if pair.bot_id is None or pair.restricted is None:
+                # Бот ещё не создан — или создан, но закрыть доступ к нему ещё не пробовали до конца.
                 return 202, {"status": "waiting", "expires_at": int(pair.expires)}, False
             bot_id = pair.bot_id
         try:
@@ -941,12 +966,14 @@ class Manager:
         log.info("botpair %s: бот выдан экземпляру", pair_id)
         return 200, {"status": "ready", "token": token,
                      "bot": {"id": bot_id, "username": pair.bot_username, "name": pair.bot_name},
-                     "creator": {"id": pair.creator_id, "name": pair.creator_name},
+                     "creator": {"id": pair.creator_id, "username": pair.creator_username or None,
+                                 "name": pair.creator_name},
                      "restricted": pair.restricted is True}, False
 
 
 def manager_setup(conn: sqlite3.Connection, s: Settings, manager: Manager, secret: Any, token: Any,
-                  now: int | None = None, tg: Callable[..., Any] = tg_call) -> dict:
+                  now: int | None = None, tg: Callable[..., Any] = tg_call,
+                  lock: Any = None) -> dict:
     """Страница ввода токена бота-менеджера: проверить одноразовую ссылку, спросить у Telegram,
     что это за бот и включён ли у него Bot Management Mode, и сохранить токен в файл службы.
     Ссылка тратится только при успехе. Токен в ответ и в журнал не попадает."""
@@ -955,8 +982,10 @@ def manager_setup(conn: sqlite3.Connection, s: Settings, manager: Manager, secre
                                           "Новую выдаёт relayctl manager-link.")
     if not isinstance(secret, str) or not SECRET_RE.fullmatch(secret):
         raise bad_link
-    row = conn.execute("SELECT id FROM manager_links WHERE secret_hash = ? AND used_at IS NULL AND expires_at > ?",
-                       (secret_hash(secret, "manager-link"), now)).fetchone()
+    lock = lock or contextlib.nullcontext()
+    with lock:
+        row = conn.execute("SELECT id FROM manager_links WHERE secret_hash = ? AND used_at IS NULL AND expires_at > ?",
+                           (secret_hash(secret, "manager-link"), now)).fetchone()
     if row is None:
         raise bad_link
     if not isinstance(token, str) or not BOT_TOKEN_RE.fullmatch(token.strip()):
@@ -974,9 +1003,13 @@ def manager_setup(conn: sqlite3.Connection, s: Settings, manager: Manager, secre
         raise JoinError(422, "not_manager", "У этого бота не включён Bot Management Mode. Откройте мини-приложение "
                                             "@BotFather, выберите бота, включите Bot Management Mode и повторите — "
                                             "ссылка ещё действует.")
-    cur = conn.execute("UPDATE manager_links SET used_at = ? WHERE id = ? AND used_at IS NULL", (now, row["id"]))
-    if cur.rowcount != 1:
-        raise bad_link
+    # Запрос к Telegram шёл без блокировки базы; ссылка тратится здесь — только если её не потратил
+    # параллельный запрос.
+    with lock:
+        cur = conn.execute("UPDATE manager_links SET used_at = ? WHERE id = ? AND used_at IS NULL AND expires_at > ?",
+                           (now, row["id"], now))
+        if cur.rowcount != 1:
+            raise bad_link
     write_manager_token(s.manager_path, token)
     manager.reload(force=True)
     return {"ok": True, "username": me.get("username")}
@@ -1143,8 +1176,10 @@ class ApiHandler(_Handler):
         else:
             self._json(404, {"error": "not_found"})
 
-    def _limited(self, what: str, per_ip: Window, window: int) -> str | None:
-        """Предел на адрес и общий предел неудачных попыток. Превышен — ответ 429 уже отправлен, None."""
+    def _limited(self, what: str, per_ip: Window, window: int, global_cap: bool = True) -> str | None:
+        """Предел на адрес и общий предел неудачных попыток. Превышен — ответ 429 уже отправлен, None.
+        global_cap=False — без общего предела (выдача токена пары: секрет 256 бит, перебор бессмыслен,
+        а общий предел дал бы постороннему остановить выдачу всем)."""
         ip = self.client_ip()
         bucket = ip_bucket(ip)
         if per_ip.blocked(bucket):
@@ -1152,7 +1187,7 @@ class ApiHandler(_Handler):
             self._json(429, {"error": "rate_limited", "message": "Слишком много попыток с этого адреса. Повторите через 15 минут."},
                        extra={"Retry-After": str(window)})
             return None
-        if self.server.failures.blocked("*"):
+        if global_cap and self.server.failures.blocked("*"):
             log.info("%s from=%s: слишком много неудачных попыток со всех адресов", what, _safe(ip))
             self._json(429, {"error": "rate_limited", "message": "Посредник занят. Повторите через минуту."},
                        extra={"Retry-After": str(self.server.settings.join_fail_window)})
@@ -1179,12 +1214,13 @@ class ApiHandler(_Handler):
         if start:
             ip = self._limited("botpair start", self.server.botpair_start, st.botpair_start_window)
         else:
-            ip = self._limited("botpair token", self.server.botpair_poll, st.botpair_poll_window)
+            ip = self._limited("botpair token", self.server.botpair_poll, st.botpair_poll_window, global_cap=False)
         if ip is None:
             return
         req = self._json_body(raw)
         if req is None:
-            self.server.failures.add("*")
+            if start:
+                self.server.failures.add("*")
             self._json(400, {"error": "bad_request", "message": "Нужен JSON."})
             return
         if start:
@@ -1198,7 +1234,7 @@ class ApiHandler(_Handler):
                                      "приглашения. Код выдаёт держатель посредника; либо создайте бота у @BotFather вручную."})
                     return
             try:
-                answer = manager.start(req.get("name"))
+                answer = manager.start(req.get("name"), net_bucket(ip))
             except PairError as e:
                 log.info("botpair start from=%s: %s", _safe(ip), e.code)
                 self._json(e.status, {"error": e.code, "message": e.message})
@@ -1206,9 +1242,7 @@ class ApiHandler(_Handler):
             log.info("botpair start from=%s: пара %s", _safe(ip), answer["pair_id"])
             self._json(200, answer)
             return
-        status, body, failed = manager.fetch(m.group(1), req.get("secret"))
-        if failed:
-            self.server.failures.add("*")
+        status, body, _ = manager.fetch(m.group(1), req.get("secret"))
         self._json(status, body)
 
     def _manager_setup(self, raw: bytes | None) -> None:
@@ -1222,8 +1256,8 @@ class ApiHandler(_Handler):
             self._json(400, {"error": "bad_request", "message": "Нужен JSON."})
             return
         try:
-            with self.server.db_lock:
-                answer = manager_setup(self.server.conn, st, self.server.manager, req.get("secret"), req.get("token"))
+            answer = manager_setup(self.server.conn, st, self.server.manager, req.get("secret"), req.get("token"),
+                                   lock=self.server.db_lock)
         except JoinError as e:
             self.server.failures.add("*")
             log.info("manager setup from=%s: %s", _safe(ip), e.code)

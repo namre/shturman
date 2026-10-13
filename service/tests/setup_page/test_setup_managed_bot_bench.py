@@ -54,7 +54,13 @@ async def test_bench_relayd_and_service_end_to_end(stand, conn, tmp_path, caplog
         assert len(api.manager.pairs) == 1
         # Владелец подтвердил создание в Telegram. Подставной Telegram сервиса знает этот же токен.
         s.telegram.me["username"] = username
-        tg.create_managed_bot(username, "Согласования", OWNER_USER, bot_id=BOT_ID, token=TOKEN)
+        tg.create_managed_bot(username, "Согласования", {**OWNER_USER, "username": "evgeny_t"}, bot_id=BOT_ID, token=TOKEN)
+        page = s.state.extras["setup_page"]
+        await until(lambda: page.managed.status == "confirm", timeout=15)
+        assert s.state.config.bot_token == ""                          # без подтверждения владельца — не сохранён
+        creator = (await s.page.get("/state")).json()["bot"]["managed"]["attempt"]["creator"]
+        assert creator == {"id": OWNER, "username": "evgeny_t", "name": "Евгений Тестов"}
+        assert (await s.page.post("/bot/managed/confirm", {"accept": True})).status_code == 200
         await until(lambda: s.state.config.bot_token == TOKEN, timeout=15)
         await until(lambda: s.state.extras["executor"].bot is not None and s.state.extras["executor"].bot.identity)
         assert tg.managed[BOT_ID]["restricted"] is True                 # посредник закрыл бота для посторонних

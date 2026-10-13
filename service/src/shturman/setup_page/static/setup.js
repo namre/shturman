@@ -547,7 +547,9 @@
     }
     show("bind-none", !b.owner_bound);
     note("bind-creator", "info", !b.owner_bound && b.created_via === "managed"
-      ? "Бот создан аккаунтом Telegram" + (b.creator_name ? " «" + b.creator_name + "»" : "") + ". Владельцем можно привязать только этот аккаунт: откройте ссылку в нём." : "");
+      ? "Бот создан аккаунтом Telegram " + (b.creator_username ? "@" + b.creator_username : "") + (b.creator_name ? " «" + b.creator_name + "»" : "") + ". Владельцем можно привязать только этот аккаунт: откройте ссылку в нём." : "");
+    note("bind-refused", "danger", !b.owner_bound && b.bind_refused_at
+      ? "Ссылку привязки открыли в другом аккаунте Telegram, не в том, которым создан бот (" + when(b.bind_refused_at) + "). Все ссылки привязки отменены. Если это были не вы — ссылку могли подсмотреть; получите новую и откройте её только в своём аккаунте." : "");
     note("bind-done", "ok", b.owner_bound ? "Владелец привязан" + (b.owner_name ? ": " + b.owner_name : "") + "." : "");
     show("bind-link-box", !!ui.bind);
     show("shot-start", !!ui.bind);
@@ -560,12 +562,23 @@
    * t.me/newbot/… и состояние; секрет пары и токен остаются в сервисе. */
   function renderManaged(b, editing) {
     var m = b.managed || {}, a = m.attempt;
-    var waiting = !!(a && a.status === "waiting"), applying = !!(a && a.status === "applying");
-    show("bot-managed", !!m.available && ((editing && m.ready !== false) || waiting || applying));
+    var waiting = !!(a && (a.status === "waiting" || a.status === "checking")), applying = !!(a && a.status === "applying");
+    var asking = !!(a && a.status === "confirm"), intercepted = !!(a && a.status === "intercepted");
+    show("bot-managed", !!m.available && ((editing && m.ready !== false) || waiting || applying || asking || intercepted));
     if (!m.available) return;
     text("managed-host", m.host || "посредника");
-    show("managed-start-row", !waiting && !applying);
+    show("managed-start-row", !waiting && !applying && !asking);
     show("managed-wait", waiting || applying);
+    show("managed-confirm", asking);
+    note("managed-intercepted", "danger", intercepted ? a.message : "");
+    if (asking) {
+      var c = a.creator || {};
+      text("managed-bot-name", "@" + (a.bot_username || ""));
+      text("managed-creator", (c.username ? "@" + c.username : "без имени пользователя") + " (номер " + c.id +
+           (c.name ? ", имя «" + c.name + "»" : "") + ")");
+      text("managed-confirm-minutes", String(Math.max(1, Math.ceil((a.confirm_seconds_left || 0) / 60))));
+      fast(10);
+    }
     if (a && (waiting || applying)) {
       if (ui.managedLink !== a.link && a.link) {
         ui.managedLink = a.link;
@@ -630,6 +643,14 @@
         fast(60);
         refresh(); refreshOverview();
       });
+    });
+    $("managed-yes").addEventListener("click", function () {
+      act(this, "managed-error", "POST", "bot/managed/confirm", { accept: true }, function () {
+        toast("Бот подключён. Теперь привяжите себя владельцем."); fast(20);
+      });
+    });
+    $("managed-no").addEventListener("click", function () {
+      act(this, "managed-error", "POST", "bot/managed/confirm", { accept: false });
     });
     $("managed-cancel").addEventListener("click", function () {
       act(this, "managed-error", "DELETE", "bot/managed", {}, function () { toast("Создание бота отменено."); });

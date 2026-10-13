@@ -139,7 +139,7 @@ def test_full_lifecycle_token_once_and_access_restricted(manager, tg, caplog):
     status, body, failed = manager.fetch(out["pair_id"], out["secret"])
     assert status == 200 and not failed
     assert body["token"] == tg.token_of(bot_id) and body["bot"] == {"id": bot_id, "username": out["username"], "name": "Согласования"}
-    assert body["creator"] == {"id": OWNER["id"], "name": "Евгений Тестов"} and body["restricted"] is True
+    assert body["creator"] == {"id": OWNER["id"], "username": None, "name": "Евгений Тестов"} and body["restricted"] is True
     assert manager.fetch(out["pair_id"], out["secret"])[0] == 404           # второй раз — нет
     assert out["pair_id"] not in manager.pairs
     logs = caplog.text
@@ -154,6 +154,21 @@ def test_token_is_taken_from_telegram_at_delivery(manager, tg):
     assert manager.fetch(out["pair_id"], out["secret"])[0] == 502            # Telegram не ответил — пара жива
     status, body, _ = manager.fetch(out["pair_id"], out["secret"])
     assert status == 200 and body["token"] == tg.token_of(bot_id)
+
+
+def test_token_waits_until_access_is_settled(manager, tg, monkeypatch):
+    ready(manager)
+    monkeypatch.setattr(manager, "_restrict", lambda pair: None)          # закрытие доступа ещё не закончилось
+    out, _ = lifecycle(manager, tg)
+    assert manager.fetch(out["pair_id"], out["secret"])[1]["status"] == "waiting"
+    manager.pairs[out["pair_id"]].restricted = True
+    assert manager.fetch(out["pair_id"], out["secret"])[0] == 200
+
+
+def test_creator_username_is_delivered(manager, tg):
+    ready(manager)
+    out, _ = lifecycle(manager, tg, owner={**OWNER, "username": "evgeny_t"})
+    assert manager.fetch(out["pair_id"], out["secret"])[1]["creator"]["username"] == "evgeny_t"
 
 
 def test_access_settings_failure_is_reported(manager, tg):
@@ -273,14 +288,28 @@ def test_http_start_is_rate_limited_per_address(api, manager):
     assert call(api, "POST", "/api/botpair/start", {}, {"X-Forwarded-For": "198.51.100.2"})[0] == 200
 
 
-def test_http_wrong_secrets_count_as_failures(api, manager):
+def test_http_wrong_secrets_do_not_stop_delivery_for_others(api, manager):
+    """Секрет — 256 бит: перебирать его бессмысленно, а общий предел неудачных позволил бы постороннему
+    остановить выдачу всем. Поэтому у выдачи — только предел на адрес."""
     ready(manager)
     api.failures = relayd.Window(3, 60)
     out = json.loads(call(api, "POST", "/api/botpair/start", {})[1])
-    for i in range(3):
+    for i in range(5):
         assert call(api, "POST", f"/api/botpair/{out['pair_id']}/token", {"secret": "B" * 43},
                     {"X-Forwarded-For": f"192.0.2.{i}"})[0] == 404
-    assert call(api, "POST", f"/api/botpair/{out['pair_id']}/token", {"secret": out["secret"]})[0] == 429
+    assert call(api, "POST", f"/api/botpair/{out['pair_id']}/token", {"secret": out["secret"]})[0] == 202
+    assert not api.failures.blocked("*")
+
+
+def test_pending_pairs_are_capped_per_network(api, manager):
+    """Одна сеть (IPv6 /48, IPv4 /24) не займёт общий предел ожидающих пар, перебирая адреса."""
+    ready(manager)
+    for i in range(5):
+        assert call(api, "POST", "/api/botpair/start", {}, {"X-Forwarded-For": f"2001:db8:1:{i}::1"})[0] == 200
+    status, body, _ = call(api, "POST", "/api/botpair/start", {}, {"X-Forwarded-For": "2001:db8:1:99::1"})
+    assert status == 429 and json.loads(body)["error"] == "rate_limited"
+    assert call(api, "POST", "/api/botpair/start", {}, {"X-Forwarded-For": "2001:db8:2::1"})[0] == 200
+    assert relayd.net_bucket("203.0.113.77") == "203.0.113.0/24" == relayd.net_bucket("::ffff:203.0.113.5")
 
 
 def test_http_invite_can_be_required(settings, manager, tg):

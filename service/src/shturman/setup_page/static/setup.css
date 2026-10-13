@@ -164,6 +164,7 @@ input::placeholder { color: var(--muted); opacity: 0.8; }
 .note.ok { background: var(--ok-bg); color: var(--ok-ink); border-color: transparent; font-weight: 600; }
 .note.warn { background: var(--warn-bg); color: var(--warn-ink); border-color: transparent; font-weight: 600; }
 .note.info { background: var(--info-bg); color: var(--info-ink); border-color: transparent; }
+.note.danger { background: var(--danger-bg); color: var(--danger); border-color: transparent; font-weight: 600; }
 
 .box { border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; background: var(--sunken); display: flex; flex-direction: column; gap: 14px; }
 

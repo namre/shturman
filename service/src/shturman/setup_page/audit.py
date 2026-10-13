@@ -48,6 +48,7 @@ ACTIONS = {
     "bot.managed_start": "Начато создание бота согласований в одно нажатие",
     "bot.managed_cancel": "Создание бота в одно нажатие отменено",
     "bot.managed": "Бот согласований в одно нажатие",
+    "bot.bind_refused": "Ссылку привязки открыл не создатель бота — ссылки привязки отменены",
     "tg.keys": "Ключи приложения Telegram сохранены",
     "tg.keys_removed": "Ключи приложения Telegram убраны",
     "tg.login": "Начат вход в аккаунт Telegram",
@@ -100,7 +101,7 @@ ACTIONS = {
 # не входят намеренно: их может слать посторонний, и они не должны вытеснять остальное.
 IMPORTANT = frozenset({
     "login.link", "login.code", "logout.all", "setup.scenario", "setup.media",
-    "bot.token", "bot.token_removed", "bot.bind_link", "bot.managed_start",
+    "bot.token", "bot.token_removed", "bot.bind_link", "bot.managed_start", "bot.bind_refused",
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
     # заметки владельца ассистент читает как его собственные слова: их правку не вытеснить из вида

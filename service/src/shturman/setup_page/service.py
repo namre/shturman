@@ -19,6 +19,7 @@
   POST   /shturman-setup/api/bot/token                  проверить и сохранить токен бота: {token, separate?}
   POST   /shturman-setup/api/bot/managed                создать бота в одно нажатие через бот-менеджер
                                                         посредника: {name?, code?} → ссылка t.me/newbot/…
+  POST   /shturman-setup/api/bot/managed/confirm        бот создан вашим аккаунтом? {accept: true | false}
   DELETE /shturman-setup/api/bot/managed                отменить начатое создание
   DELETE /shturman-setup/api/bot/token                  убрать токен, введённый на странице
   POST   /shturman-setup/api/bot/bind                   ссылка привязки владельца к боту
@@ -144,6 +145,8 @@ class Page:
     chatgpt_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Начатое создание бота согласований в одно нажатие (bot_setup.py) — тоже только в памяти.
     managed: Any = None
+    # Сохранения токена бота согласований — по одному: ручное и «в одно нажатие» не перекрывают друг друга.
+    bot_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def slow_refusal(self) -> None:
         """Отказ во входе отвечает не мгновенно. Верный вход этим не задерживается, а когда
@@ -485,7 +488,9 @@ async def _bot_state(state: AppState, page: Page) -> dict[str, Any]:
         "business_capable": None,
         "business_connections": 0, "business_can_reply": False,
         # Как создан бот: manual | managed | null (не записано — например, токен задан на сервере).
-        "created_via": None, "creator_name": None, "restricted": None, "manager": None,
+        "created_via": None, "creator_name": None, "creator_username": None, "restricted": None, "manager": None,
+        # Ссылку привязки открыл не создатель бота (Р-77): когда — ссылки привязки при этом отменены.
+        "bind_refused_at": None,
         # Создание в одно нажатие через бот-менеджер посредника (bot_setup.py): доступно ли и что сейчас идёт.
         "managed": {"available": bot_setup.available(config) and page.settings.editable(ss.BOT_TOKEN),
                     "host": bot_setup.manager_host(config),
@@ -505,7 +510,10 @@ async def _bot_state(state: AppState, page: Page) -> dict[str, Any]:
         if origin is not None:
             out.update(created_via=origin.get("created_via"), restricted=origin.get("restricted"),
                        creator_name=origin.get("creator_name") if origin.get("created_via") == "managed" else None,
+                       creator_username=origin.get("creator_username") if origin.get("created_via") == "managed" else None,
                        manager=origin.get("manager_api") if origin.get("created_via") == "managed" else None)
+        refused = await binding.bind_refused(conn, bot.bot_id)
+        out["bind_refused_at"] = refused
         if owner is not None:
             out["owner_bound"] = True
             out["owner_name"] = await binding.bound_owner_name(conn, bot.bot_id)
@@ -743,9 +751,11 @@ async def bot_token_save(request: Request) -> JSONResponse:
     if _flag(data, "separate") is not True:
         bot = await apply.check_bot_token(state.config, token)
         return JSONResponse({"status": "confirm", "bot": {"username": bot["username"], "name": bot["name"]}})
-    # Тот же путь, что у бота, созданного в одно нажатие (bot_setup.apply_token).
+    # Токен, введённый вручную, главнее начатого создания в одно нажатие: оно снимается до сохранения
+    # (и не сохранит свой токен поверх). Дальше — тот же путь, что у бота в одно нажатие.
+    if await bot_setup.cancel(page):
+        await _log(request, "bot.managed_cancel", detail="токен введён вручную")
     found = await bot_setup.apply_token(state, page, token, via="manual")
-    await bot_setup.cancel(page)                  # бот введён вручную — начатое создание не нужно
     return JSONResponse({"status": "saved", "bot": found})
 
 
@@ -768,6 +778,17 @@ async def bot_managed_start(request: Request) -> JSONResponse:
 
 
 @endpoint
+async def bot_managed_confirm(request: Request) -> JSONResponse:
+    """«Бот создан аккаунтом @… (номер, имя). Это ваш аккаунт?» Да — токен сохраняется тем же путём,
+    что вставленный вручную; нет — токен выбрасывается, попытка помечается перехваченной."""
+    data = await _body(request)
+    accept = _flag(data, "accept", required=True)
+    pairing = await bot_setup.confirm(state_of(request), _page(request), request.state.setup_session.id,
+                                      accept=bool(accept))
+    return JSONResponse({"ok": True, "attempt": pairing.view()})
+
+
+@endpoint
 async def bot_managed_cancel(request: Request) -> JSONResponse:
     await _body(request)
     if await bot_setup.cancel(_page(request)):
@@ -778,7 +799,10 @@ async def bot_managed_cancel(request: Request) -> JSONResponse:
 @endpoint
 async def bot_token_delete(request: Request) -> JSONResponse:
     await _body(request)
-    await _page(request).settings.save({ss.BOT_TOKEN: None})
+    page = _page(request)
+    await bot_setup.cancel(page)
+    async with page.bot_lock:
+        await page.settings.save({ss.BOT_TOKEN: None})
     await _log(request, "bot.token_removed")
     return JSONResponse({"ok": True})
 
@@ -1413,6 +1437,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/bot/token", bot_token_delete, methods=["DELETE"]),
         Route(API + "/bot/managed", bot_managed_start, methods=["POST"]),
         Route(API + "/bot/managed", bot_managed_cancel, methods=["DELETE"]),
+        Route(API + "/bot/managed/confirm", bot_managed_confirm, methods=["POST"]),
         Route(API + "/bot/bind", bot_bind, methods=["POST"]),
         Route(API + "/bot/refresh", bot_refresh, methods=["POST"]),
         Route(API + "/tg/keys", tg_keys_save, methods=["PUT"]),

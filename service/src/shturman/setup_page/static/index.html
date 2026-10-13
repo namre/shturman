@@ -198,6 +198,15 @@
                 </div>
               </div>
             </div>
+            <div id="managed-confirm" class="box" hidden>
+              <p><b>Бот <span id="managed-bot-name"></span> создан аккаунтом Telegram <span id="managed-creator"></span>.</b></p>
+              <p>Это ваш аккаунт? Если ссылку подсмотрели и бота успел создать кто-то другой, бот — его: у него есть токен, и он сможет нажимать кнопки за вас. Подтвердите, только если узнаёте свой аккаунт. Без подтверждения бот не подключится (осталось <span id="managed-confirm-minutes">10</span> мин.).</p>
+              <div class="row">
+                <button class="btn" id="managed-yes" type="button">Да, это мой аккаунт</button>
+                <button class="btn ghost danger" id="managed-no" type="button">Нет, не мой</button>
+              </div>
+            </div>
+            <p class="note danger" id="managed-intercepted" role="alert" hidden></p>
           </div>
 
           <div class="row" id="bot-actions" hidden>
@@ -209,6 +218,7 @@
             <h3>Привязка владельца</h3>
             <p id="bind-none">Теперь бот должен узнать, что его владелец — вы: вопросы он будет присылать только вам, и кнопки будут действовать только от вас. Это одно нажатие.</p>
             <p class="note info" id="bind-creator" hidden></p>
+            <p class="note danger" id="bind-refused" role="alert" hidden></p>
             <p class="note ok" id="bind-done" hidden></p>
             <div id="bind-link-box" class="box" hidden>
               <p><b>Откройте ссылку в Telegram и нажмите «Запустить».</b> Она действует <span id="bind-minutes">15</span> минут и срабатывает один раз.</p>
