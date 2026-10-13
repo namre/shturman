@@ -105,6 +105,8 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest
       - run: pytest -q relay/tests
+      # Бот-менеджер (0.4.0, docs/approvals-bot.md): команды держателя на месте; справка не трогает базу.
+      - run: python3 relay/relayd.py --help | grep -q 'manager-link,manager-token,manager-status'
       - run: shellcheck -S warning relay/install.sh
       - name: установщик — справка, суммы, настройки
         run: |

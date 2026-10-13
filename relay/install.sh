@@ -12,7 +12,7 @@
 # Что ставится (всё — в /opt/shturman-relay, /etc/frp, /etc/shturman-relay, /etc/systemd/system):
 #   * frp 0.71.0 (frps и frpc) и Caddy 2.11.7 — официальные выпуски с GitHub, суммы sha256 (frp)
 #     и sha512 (Caddy) закреплены ниже и сверяются до установки; не совпали — ничего не ставится;
-#   * relayd.py (служба: плагин frps и выдача имён) и команда relayctl;
+#   * relayd.py (служба: плагин frps, выдача имён и бот-менеджер) и команда relayctl;
 #   * службы systemd: frps, shturman-relayd, shturman-relay-caddy, shturman-relay-frpc.
 # Что создаётся, если ещё нет (существующее не перезаписывается):
 #   * /etc/frp/token.env — общий токен frps (root, 600);
@@ -20,6 +20,8 @@
 #     Экземпляр получает сертификат при подключении и по нему проверяет посредника;
 #   * /etc/shturman-relay/operator.env — ключ служебного экземпляра посредника (root, 600);
 #   * /var/lib/shturman-relay/relay.db — база экземпляров и приглашений (пользователь shturman-relay, 600).
+# Токен бота-менеджера (/var/lib/shturman-relay/manager.token) установщик не создаёт и не трогает:
+# его задаёт держатель — relayctl manager-link или relayctl manager-token (relay/README.md).
 # Файлы настройки frps, Caddy и служебного frpc перезаписываются из репозитория; прежний
 # /etc/frp/frps.toml, если отличался, сохраняется рядом с пометкой .bak-ДАТА.
 #
@@ -218,4 +220,7 @@ if [ "$new_cert" = yes ]; then
   echo "Сертификат frps новый: экземпляры, подключённые раньше, заберут его командой ./ops/relay.sh on."
 fi
 echo "Код приглашения для владельца экземпляра: sudo relayctl invite --note 'кому'. Список: sudo relayctl list."
+if [ ! -s /var/lib/shturman-relay/manager.token ]; then
+  echo "Бот-менеджер (бот согласований в одно нажатие) не задан — по желанию: relay/README.md, «Бот-менеджер»."
+fi
 [ "$ok" = yes ]
