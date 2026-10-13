@@ -54,7 +54,8 @@
   Mini App бота согласований — своя узкая роль и свой ключ сессии, маршруты в `miniapp.py`:
   GET    /shturman-setup/app/                           приложение (единственное, что можно открыть в рамке
                                                         у web.telegram.org)
-  POST   /shturman-setup/api/app/…                      вход по данным Telegram, «Согласования», решения
+  GET|POST /shturman-setup/api/app/…                    вход по данным Telegram, «Согласования», решения,
+                                                        экран «Чаты» (Р-80; общий код со страницей — `chats.py`)
 
 Вход — по одноразовой ссылке; ответ на вход один раз отдаёт ключ сессии. Дальше страница
 присылает его в заголовке `X-Shturman-Session`; cookie нет вовсе (почему — `auth.py`).
@@ -89,7 +90,7 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
 
-from .. import __version__, api_core, bridge, confirm, ingest_api, store
+from .. import __version__, api_core, bridge, confirm, ingest_api
 from ..api_core import BadRequest, error_response
 from ..app import AppState, state_of
 from ..executor import binding, siwc
@@ -100,7 +101,7 @@ from ..executor.botapi import BotApiError
 from ..tg import gateway
 from ..tg import service as tg_service
 from ..tg.manager import KEEP, ROLE_NAMES, TgError, TgManager
-from . import PREFIX, apply, audit, auth, bot_setup, shield, summary
+from . import PREFIX, apply, audit, auth, bot_setup, chats, shield, summary
 from . import secrets_store as ss
 
 logger = logging.getLogger("shturman.setup")
@@ -121,13 +122,9 @@ STATIC_TYPES = {
     "app.js": "text/javascript; charset=utf-8",
 }
 
-# Виды чатов для отбора в списке диалогов.
-KINDS = {
-    "personal": ("personal_chat", "saved_messages", "bot_chat"),
-    "group": ("private_group", "private_supergroup", "public_supergroup"),
-    "channel": ("private_channel", "public_channel"),
-}
-PEER_CLASSES = ("user", "chat", "channel")
+# Виды чатов для отбора в списке диалогов — общие с экраном «Чаты» приложения (`chats.py`).
+KINDS = chats.KINDS
+PEER_CLASSES = chats.PEER_CLASSES
 
 
 @dataclass
@@ -278,13 +275,7 @@ def _flag(data: dict[str, Any], key: str, *, required: bool = False) -> bool | N
     return value
 
 
-def _query_int(request: Request, key: str, default: int, *, low: int, high: int) -> int:
-    raw = request.query_params.get(key) or ""
-    if not raw:
-        return default
-    if not raw.isdigit() or len(raw) > 9:
-        raise BadRequest(f"параметр {key}: нужно целое число")
-    return max(low, min(high, int(raw)))
+_query_int = chats.query_int
 
 
 async def _log(request: Request, action: str, outcome: str = audit.OK, detail: str = "") -> None:
@@ -543,20 +534,7 @@ async def _tg_state(state: AppState, page: Page) -> dict[str, Any]:
                            "owner_known": await _owner_known(state)}
     if not isinstance(manager, TgManager) or not manager.configured:
         return out
-    accounts = await manager.list_accounts()
-    async with state.ro_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT account_id, count(*) FILTER (WHERE enabled) AS enabled,
-                      count(*) FILTER (WHERE enabled AND backfill_done) AS done,
-                      count(*) FILTER (WHERE enabled AND access_lost_at IS NOT NULL) AS lost
-               FROM tg_sync_chats WHERE chat_id IS NOT NULL GROUP BY account_id""")
-    counts = {r["account_id"]: r for r in rows}
-    for account in accounts:
-        row = counts.get(account["account_id"])
-        account["role_name"] = ROLE_NAMES.get(account["role"], account["role"])
-        account["chats_enabled"] = int(row["enabled"]) if row else 0
-        account["chats_loaded"] = int(row["done"]) if row else 0
-        account["chats_lost"] = int(row["lost"]) if row else 0
+    accounts = await chats.accounts(state, manager)
     out["accounts"] = accounts
     async with state.ro_pool.acquire() as conn:
         out["detached"] = await manager.detached_accounts(conn)
@@ -865,12 +843,7 @@ async def tg_keys_delete(request: Request) -> JSONResponse:
 # --- 3. аккаунты Telegram -----------------------------------------------------------------------
 
 def _tg(request: Request) -> TgManager:
-    manager = state_of(request).extras.get("tg")
-    if not isinstance(manager, TgManager):
-        raise BadRequest("Модуль аккаунтов Telegram не запущен.", 503)
-    if not manager.configured:
-        raise BadRequest("Сначала введите ключи приложения Telegram — шаг «Ключи приложения Telegram».", 409, "no_keys")
-    return manager
+    return chats.manager(state_of(request))
 
 
 def _account_id(request: Request) -> int:
@@ -1006,38 +979,8 @@ async def tg_options(request: Request) -> JSONResponse:
 
 @endpoint
 async def tg_dialogs(request: Request) -> JSONResponse:
-    manager = _tg(request)
-    kind = request.query_params.get("kind") or ""
-    if kind and kind not in KINDS:
-        raise BadRequest("параметр kind: personal, group или channel")
-    out = await manager.list_dialogs(
-        _account_id(request),
-        offset=_query_int(request, "offset", 0, low=0, high=10_000_000),
-        limit=_query_int(request, "limit", 50, low=1, high=200),
-        chat_types=KINDS.get(kind), query=(request.query_params.get("q") or "")[:200],
-        only_enabled=request.query_params.get("only") == "enabled",
-        refresh=request.query_params.get("refresh") == "1",
-    )
-    for item in out["items"]:
-        item["kind"] = next((name for name, types in KINDS.items() if item["type"] in types), "personal")
-        # Служебные чаты Telegram (коды входа, @BotFather) исключены всегда: вернуть их нельзя.
-        item["locked"] = store.is_blocked_peer(item["peer_class"], item["tg_id"], item["username"])
-    async with state_of(request).ro_pool.acquire() as conn:
-        out["enabled_total"] = int(await conn.fetchval(
-            "SELECT count(*) FROM tg_sync_chats WHERE account_id = $1 AND enabled", _account_id(request)))
-    return JSONResponse(out)
-
-
-def _peer_keys(raw: Any) -> list[tuple[str, int]]:
-    if not isinstance(raw, list) or len(raw) > 5000:
-        raise BadRequest("поле chats: нужен список чатов")
-    keys = []
-    for item in raw:
-        if not isinstance(item, dict) or item.get("peer_class") not in PEER_CLASSES \
-                or isinstance(item.get("tg_id"), bool) or not isinstance(item.get("tg_id"), int):
-            raise BadRequest("поле chats: у каждого чата нужны peer_class и tg_id")
-        keys.append((item["peer_class"], item["tg_id"]))
-    return keys
+    state = state_of(request)
+    return JSONResponse(await chats.list_dialogs(state, _tg(request), _account_id(request), request))
 
 
 @endpoint
@@ -1045,15 +988,10 @@ async def tg_sync(request: Request) -> JSONResponse:
     manager = _tg(request)
     data = await _body(request)
     enabled = _flag(data, "enabled", required=True)
-    keys = _peer_keys(data["chats"]) if data.get("chats") is not None else []
+    keys = chats.peer_keys(data["chats"]) if data.get("chats") is not None else []
     kind = data.get("kind")
-    if kind is not None and kind not in KINDS:
-        raise BadRequest("поле kind: personal, group или channel")
-    if not keys and kind is None:
-        raise BadRequest("Не выбрано ни одного чата.")
-    result = await manager.set_sync(_account_id(request), enabled=bool(enabled), chats=keys,
-                                    chat_types=list(KINDS[kind]) if kind else None)
-    on = sum(1 for item in result if item.get("enabled"))
+    result, on = await chats.set_sync(state_of(request), manager, _account_id(request), enabled=bool(enabled),
+                                      keys=keys, kind=kind)
     await _log(request, "tg.sync_on" if enabled else "tg.sync_off",
                detail=f"чатов: {on if enabled else len(result)} из {len(result)}"
                       + (f"; все чаты вида «{kind}»" if kind else ""))
@@ -1065,25 +1003,10 @@ async def tg_exclude(request: Request) -> JSONResponse:
     """Исключить чат аккаунта из архива (по желанию — стерев сохранённое) или вернуть его."""
     manager = _tg(request)
     data = await _body(request)
-    (key,) = _peer_keys([data])
+    (key,) = chats.peer_keys([data])
     excluded, purge = _flag(data, "excluded", required=True), _flag(data, "purge") is True
-    if purge and not excluded:
-        raise BadRequest("Стереть сообщения можно только вместе с исключением чата.")
-    account_id = _account_id(request)
-    dialog = next((d for d in await manager.dialogs(account_id) if d.key == key), None)
-    if dialog is None:
-        raise BadRequest("Чат не найден среди диалогов аккаунта.", 404)
-    if store.is_blocked_peer(dialog.chat.peer_class, dialog.chat.tg_id, dialog.chat.username):
-        raise BadRequest("Служебный чат Telegram исключён всегда: в нём коды входа и токены.", 409, "locked")
-    purged = 0
-    async with state_of(request).pool.acquire() as conn:
-        chat_id, _ = await store.ensure_chat(conn, account_id, dialog.chat, refresh=True)
-        if not excluded:
-            await confirm.apply_owner(conn, ingest_api.CHAT_INCLUDE, {"chat_id": chat_id})
-        else:
-            await confirm.apply_owner(conn, ingest_api.CHAT_EXCLUDE, {"chat_id": chat_id})
-            if purge:
-                purged = (await confirm.apply_owner(conn, ingest_api.CHAT_PURGE, {"chat_id": chat_id}))["result"] or 0
+    _, purged = await chats.exclude(state_of(request), manager, _account_id(request), key,
+                                    excluded=bool(excluded), purge=purge)
     if excluded:
         await _log(request, "chat.exclude", detail=f"чат {key[0]}:{key[1]}")
         if purge:

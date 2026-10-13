@@ -80,6 +80,24 @@ def test_telegram_login_accounts_and_import_are_closed_to_every_role(method, pat
     assert allowed(SETUP_PAGE_ONLY, method, path)        # перечень «только страница» знает этот маршрут
 
 
+# Mini App бота согласований, экран «Чаты» (Р-80): выбор чатов живёт на адресе страницы настройки, под
+# своей сессией приложения. Через проход дашборда — никому, как и выбор чатов на странице.
+MINIAPP_CHATS = [
+    ("GET", "/shturman-setup/api/app/chats"),
+    ("GET", "/shturman-setup/api/app/chats/7/dialogs"),
+    ("POST", "/shturman-setup/api/app/chats/7/sync"),
+    ("POST", "/shturman-setup/api/app/chats/7/exclude"),
+    ("GET", "/api/app/chats"),
+    ("POST", "/api/app/chats/7/sync"),
+]
+
+
+@pytest.mark.parametrize("method, path", MINIAPP_CHATS)
+def test_miniapp_chat_choice_is_closed_to_every_role(method, path):
+    for routes in (BRIDGE, TOOLS, UI, SETUP_PAGE_ONLY):
+        assert not allowed(routes, method, path)
+
+
 def test_setup_page_only_list_shares_nothing_with_the_roles():
     samples = OWNER_ONLY + INTERNAL + [("GET", "/api/status"), ("GET", "/api/tg/accounts"), ("GET", "/api/chats"),
                                        ("POST", "/api/outbox/drafts"), ("GET", "/api/commitments")]

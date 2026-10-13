@@ -1,6 +1,8 @@
 // Браузерная проверка Mini App бота согласований: вход по данным Telegram → «Согласования» →
 // решение → пункт ушёл; чужой пользователь, устаревшие и повторённые данные входа не проходят;
-// сессия приложения не открывает страницу настройки; рамка — только у web.telegram.org.
+// сессия приложения не открывает страницу настройки; рамка — только у web.telegram.org;
+// экран «Чаты» (Р-80): список из памяти, поиск, отбор, включение с глубиной, «Не сохранять»,
+// ожидание Telegram с отсчётом, аккаунт не подключён.
 // Запуск и стенд — README.md в этом каталоге. Печатает строки PASS/FAIL, код возврата 1 при FAIL.
 //
 // Настоящего Telegram здесь нет: данные входа подписывает пульт стенда так же, как Telegram, и
@@ -354,6 +356,235 @@ for (const scheme of ["light", "dark"]) {
   check("адрес приложения без «/» на конце: относительное перенаправление на /shturman-setup/app/",
         [301, 307, 308].includes(redirect.status) && redirect.headers.get("location") === "/shturman-setup/app/",
         `${redirect.status} ${redirect.headers.get("location")}`);
+  await ctx.close();
+}
+
+// --- 8. экран «Чаты» (Р-80) ------------------------------------------------------------------------
+// То же, что шаг «Какие чаты читать» на странице: список из памяти сервиса, поиск, вид, «только
+// выбранные», включение с глубиной, «Не сохранять» без стирания, «Обновить список из Telegram» с
+// отсчётом, когда Telegram просит подождать. Каждое изменение — сообщением владельцу в бот.
+// Ждёт, пока условие не станет истинным (сообщения владельцу уходят через очередь заданий).
+async function waitFor(fn, ms = 5000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) { if (await fn()) return true; await new Promise((r) => setTimeout(r, 100)); }
+  return false;
+}
+async function chatsSeen() { return (await fetch(CONTROL + "/chats/seen")).json(); }
+async function chatsControl(pathname) { return (await fetch(CONTROL + pathname, { method: "POST" })).json(); }
+// Отказы, которые браузер сам пишет в консоль («Failed to load resource … 429»), — ожидаемые ответы сервиса.
+const realErrors = (errs) => errs.filter((e) => !e.startsWith("Failed to load resource"));
+
+async function openChats(width, scheme, theme) {
+  const opened = await openApp(width, scheme, theme);
+  await opened.p.click("#tab-chats");
+  await opened.p.waitForSelector("#chats-body:not([hidden]), #chats-none:not([hidden]), #chats-offline:not([hidden])");
+  await opened.p.waitForFunction(() => document.querySelectorAll("#chats-list li").length > 0);
+  return opened;
+}
+
+async function rowsOf(p) {
+  return p.$$eval("#chats-list li.chat", (nodes) => nodes.map((n) => ({
+    title: n.querySelector(".chat-title").textContent,
+    meta: n.querySelector(".chat-meta").textContent,
+    on: n.querySelector("input[type=checkbox]").checked,
+    disabled: n.querySelector("input[type=checkbox]").disabled,
+  })));
+}
+
+async function layoutOk(p) {
+  return p.evaluate(() => {
+    const wide = document.documentElement.scrollWidth <= window.innerWidth + 1;
+    const rows = [...document.querySelectorAll("#chats-list li.chat")];
+    const clipped = rows.filter((row) => {
+      const box = row.getBoundingClientRect();
+      return [...row.querySelectorAll(".switch, .link, .chat-title")].some((x) => {
+        const r = x.getBoundingClientRect();
+        return r.right > box.right + 1 || r.left < box.left - 1;
+      });
+    }).length;
+    const controls = [...document.querySelectorAll("#chats-body button, #chats-body select, #chats-body input[type=search]")]
+      .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+    return { wide, clipped, controls };
+  });
+}
+
+{
+  const before = await chatsSeen();
+  const { ctx, p, errs } = await openChats(390, "light", THEME_LIGHT);
+  let seen = await chatsSeen();
+  check("«Чаты»: список открылся из памяти сервиса, без запроса к Telegram",
+        JSON.stringify(seen.dialog_requests) === JSON.stringify(before.dialog_requests), JSON.stringify(seen.dialog_requests));
+  const tabs = await p.$$eval("#chats-accounts button", (b) => b.map((x) => [x.textContent, x.getAttribute("aria-selected")]));
+  check("«Чаты»: два аккаунта, выбран ваш (способ «как вы»)",
+        tabs.length === 2 && tabs[0][0].startsWith("Ваш") && tabs[0][1] === "true", JSON.stringify(tabs));
+  let rows = await rowsOf(p);
+  const counter = await p.textContent("#chats-counter");
+  check("«Чаты»: первые 20 чатов, счётчик выбранных и «Показать ещё»",
+        rows.length === 20 && counter.includes("Выбрано для чтения: 2 чата") && await p.isVisible("#chats-more"), counter);
+  check("«Чаты»: служебный чат Telegram помечен и не включается",
+        rows.some((r) => r.title === "Telegram" && r.disabled && r.meta.includes("служебный")));
+  const depth = await p.$eval("#chats-depth", (s) => s.value);
+  check("«Чаты»: глубина по умолчанию — как в настройке аккаунта (12 месяцев)", depth === "12", depth);
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-list-390-light.png`), fullPage: false });
+
+  // «Показать ещё»
+  await p.click("#chats-more");
+  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 50);
+  check("«Чаты»: «Показать ещё» догружает следующие", (await rowsOf(p)).length === 50);
+
+  // поиск
+  await p.fill("#chats-q", "иван");
+  await p.waitForFunction(() => [...document.querySelectorAll("#chats-list .chat-title")].every((n) => /иван/i.test(n.textContent))
+    && document.querySelectorAll("#chats-list li.chat").length > 0);
+  rows = await rowsOf(p);
+  check("«Чаты»: поиск по названию", rows.length >= 1 && rows[0].title === "Иван Петров", JSON.stringify(rows.map((r) => r.title)));
+
+  // включение с глубиной
+  await p.selectOption("#chats-depth", "3");
+  await p.click("#chats-list li.chat:has(.chat-title:text-is('Иван Петров')) .switch");
+  await p.waitForSelector("#toast:not([hidden])");
+  const onToast = await p.textContent("#toast");
+  await waitFor(async () => (await chatsSeen()).told.length > 0);
+  seen = await chatsSeen();
+  check("«Чаты»: чат включён с выбранной глубиной", seen.enabled.includes("Иван Петров")
+        && onToast.includes("3 месяца"), onToast);
+  check("«Чаты»: владельцу ушло сообщение в бот о включении",
+        seen.told.some((t) => t.startsWith("Из приложения включено чтение чата «Иван Петров» (глубина: 3 месяца).")),
+        JSON.stringify(seen.told));
+  check("«Чаты»: запись в журнале «из приложения», без названия",
+        seen.audit.some((a) => a.action === "app.sync_on" && a.outcome === "ok" && a.detail.includes("глубина: 3 месяца"))
+        && !JSON.stringify(seen.audit).includes("Иван"), JSON.stringify(seen.audit));
+  check("«Чаты»: счётчик выбранных обновился", (await p.textContent("#chats-counter")).includes("Выбрано для чтения: 3 чата"));
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-enabled-390-light.png`), fullPage: false });
+
+  // вид чатов и «только выбранные»
+  await p.fill("#chats-q", "");
+  await p.selectOption("#chats-kind", "group");
+  await p.waitForFunction(() => [...document.querySelectorAll("#chats-list .chat-meta")].every((n) => n.textContent.startsWith("группа")));
+  rows = await rowsOf(p);
+  check("«Чаты»: отбор по виду — только группы", rows.length > 0 && rows.every((r) => r.meta.startsWith("группа")));
+  await p.selectOption("#chats-kind", "");
+  await p.check("#chats-only");
+  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 3);
+  rows = await rowsOf(p);
+  check("«Чаты»: «только выбранные» — три включённых", rows.length === 3 && rows.every((r) => r.on), JSON.stringify(rows));
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-only-390-light.png`), fullPage: true });
+  await p.uncheck("#chats-only");
+
+  // «Не сохранять» — с подтверждением, без стирания
+  await p.fill("#chats-q", "ivan_p");
+  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 1);
+  const messagesBefore = (await chatsSeen()).messages;
+  await p.click("#chats-list li.chat .link");
+  await p.waitForSelector("#chats-list .confirm");
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-exclude-confirm-390-light.png`), fullPage: false });
+  await p.click("#chats-list .confirm button.danger");
+  await p.waitForSelector("#chats-list li.chat.is-excluded");
+  await waitFor(async () => (await chatsSeen()).told.some((t) => t.includes("исключён из архива")));
+  seen = await chatsSeen();
+  check("«Чаты»: «Не сохранять» исключает чат, сохранённое остаётся",
+        seen.excluded.includes("Иван Петров") && seen.messages === messagesBefore && !seen.enabled.includes("Иван Петров"),
+        `${seen.messages} / ${messagesBefore}`);
+  check("«Чаты»: владельцу ушло сообщение об исключении",
+        seen.told.some((t) => t.startsWith("Из приложения чат «Иван Петров» исключён из архива")));
+  rows = await rowsOf(p);
+  check("«Чаты»: исключённый чат не включить — переключатель недоступен", rows[0].disabled && rows[0].meta.includes("не сохраняется"));
+  await p.click("#chats-list li.chat .link");             // «Вернуть в архив»
+  await p.waitForFunction(() => !document.querySelector("#chats-list li.chat.is-excluded"));
+  await waitFor(async () => (await chatsSeen()).told.some((t) => t.includes("возвращён в архив")));
+  seen = await chatsSeen();
+  check("«Чаты»: «Вернуть в архив» и сообщение об этом", !seen.excluded.includes("Иван Петров")
+        && seen.told.some((t) => t.includes("возвращён в архив")));
+  await p.fill("#chats-q", "");
+  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 20);
+
+  // список не загружен — подсказка нажать «Обновить»
+  await chatsControl("/chats/forget?role=owner");
+  await p.fill("#chats-q", "а");
+  await p.waitForSelector("#chats-status:not([hidden])");
+  const notLoaded = await p.textContent("#chats-status");
+  check("«Чаты»: списка в памяти нет — приложение просит нажать «Обновить список из Telegram»",
+        notLoaded.includes("ещё не загружен") && (await rowsOf(p)).length === 0, notLoaded);
+  await p.fill("#chats-q", "");
+  await p.waitForTimeout(600);                             // поиск перечитывает список через 0,3 с после ввода
+  await p.waitForSelector("#chats-status:not([hidden])");
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-not-loaded-390-light.png`), fullPage: false });
+
+  // Telegram просит подождать: отсчёт и повтор сам
+  const asked = (await chatsSeen()).dialog_requests.owner;
+  await chatsControl("/chats/flood?role=owner&seconds=7");
+  await p.click("#chats-refresh");
+  await p.waitForSelector("#chats-status.wait:not([hidden])");
+  const waiting = await p.textContent("#chats-status");
+  check("«Чаты»: Telegram просит подождать — отсчёт, кнопка «Обновить» недоступна",
+        /Повторю сам через \d+ с/.test(waiting) && await p.isDisabled("#chats-refresh"), waiting);
+  await p.waitForTimeout(1200);
+  const later = await p.textContent("#chats-status");
+  check("«Чаты»: отсчёт идёт", later !== waiting, `${waiting} → ${later}`);
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-wait-390-light.png`), fullPage: false });
+  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 20, null, { timeout: 15000 });
+  seen = await chatsSeen();
+  check("«Чаты»: после ожидания список загружен из Telegram одним повтором",
+        seen.dialog_requests.owner === asked + 1 && await p.isHidden("#chats-status"), JSON.stringify(seen.dialog_requests));
+
+  // аккаунт помощника на паузе — «не подключён»
+  await chatsControl("/chats/pause?role=assistant");
+  await p.click("#chats-accounts button:nth-child(2)");
+  await p.waitForSelector("#chats-offline:not([hidden])").catch(() => {});
+  check("«Чаты»: аккаунт на паузе — «сейчас не подключён»", await p.isVisible("#chats-offline")
+        && (await p.textContent("#chats-offline")).includes("странице «Переписка»"));
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-offline-390-light.png`), fullPage: false });
+  await chatsControl("/chats/resume?role=assistant");
+  await p.click("#chats-offline-retry");
+  await p.waitForSelector("#chats-body:not([hidden])");
+  check("«Чаты»: после «Проверить ещё раз» — список помощника", await p.isVisible("#chats-body"));
+
+  check("«Чаты»: в консоли нет ошибок", realErrors(errs).length === 0, realErrors(errs).join(" | "));
+  const layout = await layoutOk(p);
+  check("«Чаты» 390: страница не шире экрана, ничего не обрезано",
+        layout.wide && layout.clipped === 0 && layout.controls === 0, JSON.stringify(layout));
+  await ctx.close();
+}
+
+// нет аккаунта и сбой сервера — подставным ответом в браузере
+for (const [name, status, body] of [["none", 200, { accounts: [], mine: null }], ["failed", 502, null]]) {
+  const ctx = await browser.newContext({ ...phone, viewport: { width: 360, height: 700 }, colorScheme: "dark" });
+  const p = await ctx.newPage();
+  await p.route("**/api/app/chats", (route) => body
+    ? route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) })
+    : route.fulfill({ status, contentType: "text/html", body: "<html>502 Bad Gateway</html>" }));
+  await p.goto(launchUrl(await control("/init-data?who=owner")));
+  await p.waitForSelector("#screen-approvals:not([hidden])");
+  await p.click("#tab-chats");
+  await p.waitForSelector(`#chats-${name}:not([hidden])`).catch(() => {});
+  const text = await p.textContent(`#chats-${name}`);
+  check(name === "none" ? "«Чаты»: аккаунта нет — «войдите на странице «Переписка»»"
+                        : "«Чаты»: сбой сервера — понятный текст и «Повторить»",
+        await p.isVisible(`#chats-${name}`) && (name === "none" ? text.includes("странице «Переписка»") : text.includes("Повторить")),
+        text.slice(0, 120));
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-${name}-360-dark.png`), fullPage: true });
+  await ctx.close();
+}
+
+// вид на двух размерах телефона в обеих темах
+for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark", THEME], [390, "dark", THEME]]) {
+  const { ctx, p, errs } = await openChats(width, scheme, theme);
+  const tag = `${width}-${scheme}`;
+  const layout = await layoutOk(p);
+  check(`«Чаты» ${tag}: страница не шире экрана, ничего не обрезано`,
+        layout.wide && layout.clipped === 0 && layout.controls === 0, JSON.stringify(layout));
+  check(`«Чаты» ${tag}: в консоли нет ошибок`, realErrors(errs).length === 0, realErrors(errs).join(" | "));
+  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-list-${tag}.png`), fullPage: false });
+  if (width === 360) {
+    await p.fill("#chats-q", "Береговой");
+    await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 1);
+    await p.click("#chats-list li.chat .link");
+    await p.waitForSelector("#chats-list .confirm");
+    const narrow = await layoutOk(p);
+    check(`«Чаты» ${tag}: длинное название и подтверждение помещаются`, narrow.wide && narrow.clipped === 0,
+          JSON.stringify(narrow));
+    await p.screenshot({ path: path.join(OUT, `${SHOT}chats-long-${tag}.png`), fullPage: false });
+  }
   await ctx.close();
 }
 
