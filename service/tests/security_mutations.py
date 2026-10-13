@@ -122,6 +122,11 @@ MUTATIONS = (
              "    pairing.status = CONFIRM\n    await confirm(state, getattr(state.extras.get('setup_page'), 'managed', None) and state.extras['setup_page'], pairing.session_id, accept=True)\n",
              "tests/setup_page/test_setup_managed_bot.py::test_bot_created_by_someone_else_is_never_accepted_silently",
              database=True),
+    Mutation("managed_bot_claim_needs_code", "src/shturman/setup_page/bot_setup.py",
+             "    claimed = data.get(\"claimed\") is True and bool(pairing.claim_link)\n",
+             "    claimed = data.get(\"claimed\") is True\n",
+             "tests/setup_page/test_setup_managed_bot.py::test_bot_with_other_address_needs_both_claim_code_and_claimed_mark",
+             database=True),
 )
 
 # Capture actual pytest phases and exception types, rather than treating a

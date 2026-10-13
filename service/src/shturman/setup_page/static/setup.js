@@ -31,7 +31,7 @@
   }
   var ui = {
     botEditing: false, botToken: "", bind: null, keysEditing: false,
-    managedLink: "", managedDone: "", managedError: false,
+    managedLink: "", managedClaim: "", managedDone: "", managedError: false,
     login: null, loginLink: "", chatAccount: null, chats: [], chatsTotal: 0, chatsEnabled: 0,
     chatsLoading: false, chatsKey: "", chatsWait: null, scans: {}, scanning: {}, exclude: {}, upload: null,
     signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
@@ -587,6 +587,14 @@
         try { qr.appendChild(window.ShturmanQR.svg(a.link, { label: "QR-код со ссылкой создания бота" })); } catch (e) { /* останется кнопка */ }
         $("managed-open").setAttribute("href", a.link);
       }
+      // Подсказка для изменённого адреса бота (Р-78): только если посредник дал код привязки (0.5.0+).
+      var claim = waiting && a.claim_link ? a.claim_link : "";
+      show("managed-claim", !!claim);
+      if (claim && ui.managedClaim !== claim) {
+        ui.managedClaim = claim;
+        $("managed-claim-open").setAttribute("href", claim);
+        text("managed-claim-manager", a.manager || "");
+      }
       text("managed-minutes", String(Math.max(1, Math.ceil(a.seconds_left / 60))));
       text("managed-status", applying ? "Бот создан, подключаю его…" : "Жду, пока вы подтвердите создание бота…");
       fast(10);
@@ -594,6 +602,11 @@
       ui.managedLink = "";
       $("managed-qr").textContent = "";
       $("managed-open").setAttribute("href", "#");
+    }
+    if (!(a && (waiting || applying)) && ui.managedClaim) {
+      ui.managedClaim = "";
+      show("managed-claim", false);
+      $("managed-claim-open").setAttribute("href", "#");
     }
     if (a && a.status === "failed") note("managed-error", "warn", a.message || "Не получилось.");
     else if (!ui.managedError) note("managed-error", "warn", "");

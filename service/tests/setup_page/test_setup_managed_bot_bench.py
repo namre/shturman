@@ -1,4 +1,4 @@
-"""Стенд «бот в одно нажатие» целиком: настоящая служба посредника (relay/relayd.py 0.4.0, HTTP на
+"""Стенд «бот в одно нажатие» целиком: настоящая служба посредника (relay/relayd.py 0.5.0, HTTP на
 127.0.0.1, поток опроса бота-менеджера), подставной Bot API Telegram посредника (настоящий HTTP-сервер,
 relay/tests/fake_telegram.py) и сервис со страницей настройки. Сервис ходит к посреднику настоящим
 httpx по сети; браузер владельца — только к странице.
@@ -29,7 +29,7 @@ import relayd  # noqa: E402
 from fake_telegram import MANAGER_TOKEN, FakeTelegram  # noqa: E402
 
 
-async def test_bench_relayd_and_service_end_to_end(stand, conn, tmp_path, caplog):
+def _relay(tmp_path):
     tg = FakeTelegram()
     base = tg.start()
     ca = tmp_path / "frps.crt"
@@ -41,6 +41,11 @@ async def test_bench_relayd_and_service_end_to_end(stand, conn, tmp_path, caplog
     stop = threading.Event()
     threading.Thread(target=api.serve_forever, daemon=True).start()
     threading.Thread(target=api.manager.run, args=(stop,), daemon=True).start()
+    return tg, api, stop
+
+
+async def test_bench_relayd_and_service_end_to_end(stand, conn, tmp_path, caplog):
+    tg, api, stop = _relay(tmp_path)
     try:
         await until(lambda: api.manager.ready, timeout=10)
         s = await stand(bot_manager_api=f"http://127.0.0.1:{api.server_address[1]}")
@@ -73,6 +78,47 @@ async def test_bench_relayd_and_service_end_to_end(stand, conn, tmp_path, caplog
         assert (await s.page.get("/state")).json()["bot"]["owner_bound"] is True
         assert TOKEN not in caplog.text and MANAGER_TOKEN not in caplog.text
         assert TOKEN not in json.dumps(state)
+    finally:
+        stop.set()
+        api.shutdown()
+        api.server_close()
+        tg.stop()
+
+
+async def test_bench_bot_with_changed_address_is_claimed_by_code(stand, conn, tmp_path, caplog):
+    """Владелец изменил адрес бота в окне создания (Р-78): страница показывает ссылку на бот-менеджер
+    с кодом, владелец нажимает «Старт» — посредник привязывает бота, созданного этим же аккаунтом."""
+    tg, api, stop = _relay(tmp_path)
+    renamed = "evgeny_own_name_bot"
+    owner_tg = {**OWNER_USER, "username": "evgeny_t"}
+    try:
+        await until(lambda: api.manager.ready, timeout=10)
+        s = await stand(bot_manager_api=f"http://127.0.0.1:{api.server_address[1]}")
+        executor_service.TEST_OVERRIDES.update(botpair_poll=0.05)
+        await s.page.login(conn)
+        view = (await s.page.post("/bot/managed")).json()["attempt"]
+        claim_link = view["claim_link"]
+        assert claim_link.startswith("https://t.me/shturman_manager_bot?start=")
+        code = claim_link.split("start=")[1]
+        s.telegram.me["username"] = renamed
+        tg.create_managed_bot(renamed, "Согласования", owner_tg, bot_id=BOT_ID, token=TOKEN)
+        await until(lambda: BOT_ID in api.manager.orphans, timeout=10)
+        # Посторонний с подсмотренным кодом ничего не получает.
+        tg.send_to_manager({"id": 6666, "is_bot": False, "first_name": "Некто"}, f"/start {code}")
+        await until(lambda: len(tg.replies(6666)) == 1, timeout=10)
+        assert BOT_ID in api.manager.orphans
+        tg.send_to_manager(owner_tg, f"/start {code}")
+        page = s.state.extras["setup_page"]
+        await until(lambda: page.managed.status == "confirm", timeout=15)
+        assert tg.replies(OWNER)[-1].startswith(f"Готово: бот @{renamed} привязан")
+        assert (await s.page.get("/state")).json()["bot"]["managed"]["attempt"]["bot_username"] == renamed
+        assert (await s.page.post("/bot/managed/confirm", {"accept": True})).status_code == 200
+        await until(lambda: s.state.config.bot_token == TOKEN, timeout=15)
+        assert tg.managed[BOT_ID]["restricted"] is True
+        assert await binding.required_creator(conn, BOT_ID) == OWNER
+        await bind_owner(s)
+        assert (await s.page.get("/state")).json()["bot"]["owner_bound"] is True
+        assert code not in caplog.text and TOKEN not in caplog.text and MANAGER_TOKEN not in caplog.text
     finally:
         stop.set()
         api.shutdown()

@@ -1,7 +1,7 @@
 """Бот согласований в одно нажатие через бот-менеджер посредника (Р-77, setup_page/bot_setup.py).
 
 Посредник здесь подставной (httpx.MockTransport с API relayd 0.4.0: /api/health, /api/botpair/start и
-/api/botpair/<pair_id>/token); Telegram сервиса — подставной из tests/executor. Стенд с настоящей
+/api/botpair/<pair_id>/token; с `claim=…` — как relayd 0.5.0, с кодом привязки, Р-78); Telegram сервиса — подставной из tests/executor. Стенд с настоящей
 службой посредника — test_setup_managed_bot_bench.py.
 """
 
@@ -34,7 +34,8 @@ OWNER_TG = {**OWNER_USER, "username": "evgeny_t"}
 class FakeRelay:
     """Подставной посредник: пара, ожидание и одна выдача токена — как у relayd 0.4.0."""
 
-    def __init__(self) -> None:
+    def __init__(self, claim: str | None = None) -> None:
+        self.claim = claim                                # код привязки — как у relayd 0.5.0; None — как 0.4.0
         self.requests: list[tuple[str, dict]] = []
         self.created: dict | None = None
         self.start_answer: httpx.Response | None = None
@@ -47,13 +48,16 @@ class FakeRelay:
         return httpx.MockTransport(self._handle)
 
     def create(self, *, token: str = TOKEN, bot_id: int = BOT_ID, username: str = USERNAME,
-               creator: dict = OWNER_TG, restricted: bool = True) -> None:
-        """Аккаунт `creator` подтвердил создание в Telegram: посредник получил managed_bot."""
+               creator: dict = OWNER_TG, restricted: bool = True, claimed: bool | None = None) -> None:
+        """Аккаунт `creator` подтвердил создание в Telegram: посредник получил managed_bot.
+        claimed=True — адрес изменили при создании, и бот привязан кодом от создателя (relayd 0.5.0)."""
         self.created = {"status": "ready", "token": token,
                         "bot": {"id": bot_id, "username": username, "name": "Согласования"},
                         "creator": {"id": creator["id"], "username": creator.get("username"),
                                     "name": creator.get("first_name", "")},
                         "restricted": restricted}
+        if claimed is not None:
+            self.created["claimed"] = claimed
 
     async def _handle(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/health":
@@ -65,9 +69,12 @@ class FakeRelay:
         if request.url.path == "/api/botpair/start":
             if self.start_answer is not None:
                 return self.start_answer
-            return httpx.Response(200, json={"pair_id": PAIR, "secret": SECRET, "username": USERNAME,
-                                             "name": body.get("name"), "manager": "shturman_manager_bot",
-                                             "link": "https://evil.example/not-used", "expires_at": 0, "ttl": 900})
+            answer = {"pair_id": PAIR, "secret": SECRET, "username": USERNAME,
+                      "name": body.get("name"), "manager": "shturman_manager_bot",
+                      "link": "https://evil.example/not-used", "expires_at": 0, "ttl": 900}
+            if self.claim is not None:
+                answer.update(claim_code=self.claim, claim_link="https://evil.example/claim-not-used")
+            return httpx.Response(200, json=answer)
         assert request.url.path == f"/api/botpair/{PAIR}/token"
         if body.get("secret") != SECRET:
             return httpx.Response(404, json={"error": "not_found"})
@@ -81,8 +88,8 @@ class FakeRelay:
         return httpx.Response(200, json=self.created)
 
 
-async def managed_stand(stand, conn, **changes):
-    relay = FakeRelay()
+async def managed_stand(stand, conn, claim: str | None = None, **changes):
+    relay = FakeRelay(claim)
     s = await stand(bot_manager_api=RELAY, **changes)
     executor_service.TEST_OVERRIDES.update(botpair_transport=relay.transport(), botpair_poll=0.01)
     bot_setup._health.clear()
@@ -124,6 +131,7 @@ async def test_one_tap_bot_waits_for_the_owner_and_then_takes_the_manual_path(st
     # Ссылку сервис собирает сам из имён — ссылке посредника не верит.
     assert view["link"] == f"https://t.me/newbot/shturman_manager_bot/{USERNAME}?name=%D0%9C%D0%BE%D0%B9%20%D0%BF%D1%83%D0%BB%D1%8C%D1%82"
     assert view["status"] == "waiting" and view["seconds_left"] > 800
+    assert view["claim_link"] is None                                 # посредник 0.4.0 кода не даёт — подсказки нет
     assert s.relay.requests[0] == ("/api/botpair/start", {"name": "Мой пульт"})
     await until(lambda: len(s.relay.requests) >= 3)                   # сервис сам спрашивает посредника
     s.relay.create()
@@ -478,3 +486,80 @@ def test_bot_manager_address_comes_only_from_the_environment(monkeypatch):
         except ConfigError:
             continue
         raise AssertionError(bad)
+
+
+# --- адрес бота изменён в окне создания: привязка кодом (Р-78, relayd 0.5.0) -------------------------
+
+CLAIM = "k3x9p2abcdefghjk"
+RENAMED = "evgeny_own_name_bot"
+
+
+async def test_claim_hint_and_bot_with_changed_address(stand, conn, caplog):
+    caplog.set_level(logging.DEBUG)
+    s = await managed_stand(stand, conn, claim=CLAIM)
+    started = await s.page.post("/bot/managed")
+    view = started.json()["attempt"]
+    # Ссылку с кодом сервис собирает сам; ссылке посредника не верит.
+    assert view["claim_link"] == f"https://t.me/shturman_manager_bot?start={CLAIM}"
+    assert view["link"].startswith("https://t.me/newbot/shturman_manager_bot/")
+    # Владелец изменил адрес, затем нажал «Старт» по ссылке с кодом — посредник привязал бота.
+    s.telegram.me["username"] = RENAMED
+    s.relay.create(username=RENAMED, claimed=True)
+    await until_status(s, "confirm")
+    a = await attempt(s)
+    assert a["bot_username"] == RENAMED and a["claim_link"] is None and a["link"] is None
+    assert a["creator"] == {"id": OWNER, "username": "evgeny_t", "name": "Евгений"}
+    assert s.state.config.bot_token == ""                              # без «Да, это мой аккаунт» — не сохранён
+    done = await s.page.post("/bot/managed/confirm", {"accept": True})
+    assert done.status_code == 200 and done.json()["attempt"]["status"] == "done", done.text
+    await until(lambda: s.state.extras["executor"].bot is not None and s.state.extras["executor"].bot.polling)
+    assert ss.SecretStore(s.config.data_dir).load()[ss.BOT_TOKEN] == TOKEN
+    origin = await binding.bot_origin(conn, BOT_ID)
+    assert origin["created_via"] == "managed" and origin["creator_user_id"] == OWNER
+    rows = await audit_rows(conn)
+    assert ("bot.managed", "ok", "бот с изменённым адресом привязан кодом в чате с бот-менеджером; "
+            "ждёт подтверждения, что создан вашим аккаунтом") in rows
+    assert any(a == "bot.token" and o == "ok" and "привязан кодом" in d and f"@{RENAMED}" in d for a, o, d in rows)
+    assert TOKEN not in caplog.text and SECRET not in caplog.text
+
+
+async def test_bot_with_other_address_needs_both_claim_code_and_claimed_mark(stand, conn):
+    # Посредник 0.4.0 (кода не давал) вдруг говорит «привязан кодом» — не принимается.
+    s = await managed_stand(stand, conn)
+    s.telegram.me["username"] = RENAMED
+    await s.page.post("/bot/managed")
+    s.relay.create(username=RENAMED, claimed=True)
+    await until_status(s, "failed")
+    assert pairing(s).code == "wrong_bot" and s.state.config.bot_token == ""
+    # Код давал, но о привязке кодом не сказал — тоже нет.
+    s.relay = FakeRelay(CLAIM)
+    executor_service.TEST_OVERRIDES["botpair_transport"] = s.relay.transport()
+    await s.page.post("/bot/managed")
+    s.relay.create(username=RENAMED)
+    await until_status(s, "failed")
+    assert pairing(s).code == "wrong_bot"
+    # Привязан кодом, но getMe говорит о боте с другим адресом, чем сообщил посредник, — нет.
+    s.relay = FakeRelay(CLAIM)
+    executor_service.TEST_OVERRIDES["botpair_transport"] = s.relay.transport()
+    s.telegram.me["username"] = "someone_else_bot"
+    await s.page.post("/bot/managed")
+    s.relay.create(username=RENAMED, claimed=True)
+    await until_status(s, "failed")
+    assert pairing(s).code == "wrong_bot"
+    # Привязан кодом, адрес сходится, но номер другой — нет.
+    s.relay = FakeRelay(CLAIM)
+    executor_service.TEST_OVERRIDES["botpair_transport"] = s.relay.transport()
+    s.telegram.me["username"] = RENAMED
+    await s.page.post("/bot/managed")
+    s.relay.create(username=RENAMED, claimed=True, bot_id=BOT_ID + 7)
+    await until_status(s, "failed")
+    assert pairing(s).code == "wrong_bot" and s.state.config.bot_token == ""
+    assert await binding.bot_origin(conn, BOT_ID) is None
+
+
+async def test_strange_claim_code_gives_no_hint(stand, conn):
+    s = await managed_stand(stand, conn)
+    for bad in ("short", "x" * 65, "bad code!", 12345678901, "../../evil"):
+        s.relay.claim = bad
+        view = (await s.page.post("/bot/managed")).json()["attempt"]
+        assert view["status"] == "waiting" and view["claim_link"] is None, bad

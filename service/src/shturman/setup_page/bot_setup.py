@@ -19,10 +19,19 @@
 страница показывает, каким аккаунтом создан бот (@имя, номер, имя), и просит «Да, это мой
 аккаунт». «Нет, не мой» — токен выбрасывается, попытка помечается как перехваченная.
 
+**Если владелец изменил адрес бота в окне создания** (Р-78), посредник с 0.5.0 запоминает такого бота
+без пары и отдаёт вместе с парой код привязки. Страница, пока ждёт бота, показывает ссылку
+`https://t.me/<менеджер>?start=<код>` (её сервис тоже собирает сам): владелец нажимает «Старт» в
+чате с бот-менеджером, и посредник привязывает к паре бота, созданного **тем же аккаунтом, который
+прислал код**. Такой бот приходит с пометкой `claimed: true` и со своим адресом — тогда адрес
+из ссылки не сверяется, а номер и адрес, о которых сообщил посредник, сверяются с `getMe`, как всегда. Посредник 0.4.0 кода не
+отдаёт — подсказки нет, а бот с другим адресом не принимается, как раньше.
+
 Токен из обоих способов применяется **одним и тем же путём** — `apply_token`: проверка `getMe`,
 проверка, что ботом не пользуется другая программа (409 или webhook), запись в файл значений
 страницы и перезапуск исполнителя. Для бота из одного нажатия сверх этого: `getMe` должен вернуть
-бота с тем именем, которое сервис сам вписал в ссылку, и с номером, о котором сообщил посредник;
+бота с тем именем, которое сервис сам вписал в ссылку (или, для бота, привязанного кодом, — с
+именем, о котором сообщил посредник), и с номером, о котором сообщил посредник;
 привязать себя владельцем может только аккаунт-создатель (`executor/binding.required_creator`).
 
 Чем владелец платит за одно нажатие: держатель посредника (бот-менеджера) технически может в любой
@@ -67,6 +76,7 @@ _PAIR = re.compile(r"^[a-z0-9]{6,32}$")
 _SECRET = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 _USERNAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,30}[Bb][Oo][Tt]$")
 _MANAGER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+_CLAIM = re.compile(r"^[A-Za-z0-9_-]{10,64}$")        # параметр start ссылки t.me: эти знаки, до 64
 _HANDLE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 _TOKEN = re.compile(r"^[0-9]{5,16}:[A-Za-z0-9_-]{30,80}$")
 
@@ -87,7 +97,8 @@ TEXTS = {
                        "посредника, или создайте бота вручную.",
     "bad_answer": "Посредник ответил непонятно. Создайте бота у @BotFather вручную.",
     "expired": "Время ожидания вышло, а бот так и не появился. Если вы меняли адрес бота (@имя) в окне "
-               "создания, посредник не узнает бота: удалите его у @BotFather (/deletebot) и начните заново, "
+               "создания, начните заново и, когда бот будет создан, откройте ссылку «Поменяли адрес бота?» "
+               "и нажмите «Старт» — либо удалите бота у @BotFather (/deletebot) и создайте его заново, "
                "не меняя адрес, — или создайте бота вручную.",
     "conflict": "Пока бот создавался, у него сменился владелец. Удалите этого бота у @BotFather и начните заново.",
     "session_ended": "Бот создан, но ваш вход на эту страницу завершился раньше, и токен не применён. "
@@ -274,6 +285,8 @@ class Pairing:
     creator_username: str | None = None
     creator_name: str | None = None
     restricted: bool | None = None
+    claim_link: str = ""                            # t.me/<менеджер>?start=<код> — посредник 0.5.0+ (Р-78)
+    claimed: bool = False                           # бот привязан кодом, а не узнан по адресу
     token: str = field(default="", repr=False)     # ждёт подтверждения «это мой аккаунт»
     confirm_until: float = 0.0
     task: asyncio.Task | None = field(default=None, repr=False)
@@ -289,6 +302,7 @@ class Pairing:
         if self.creator_id is not None:
             creator = {"id": self.creator_id, "username": self.creator_username, "name": self.creator_name}
         return {"status": self.status, "link": self.link if self.status == WAITING else None,
+                "claim_link": (self.claim_link or None) if self.status == WAITING else None,
                 "username": self.username, "manager": self.manager,
                 "expires_at": self.expires_at, "seconds_left": max(0, int(self.expires_at - time.time())),
                 "confirm_seconds_left": max(0, int(self.confirm_until - time.time())) if self.status == CONFIRM else None,
@@ -330,10 +344,13 @@ async def start(state: Any, page: Any, session_id: int, *, name: Any = None, cod
             and isinstance(manager, str) and _MANAGER.match(manager)
             and isinstance(ttl, int) and not isinstance(ttl, bool) and 60 <= ttl <= 3600):
         raise apply.Invalid(TEXTS["bad_answer"], "bad_answer")
-    # Ссылку собираем сами из имён: посредник не может подсунуть странице владельца чужую ссылку.
+    # Ссылки собираем сами из имён: посредник не может подсунуть странице владельца чужую ссылку.
     link = f"https://t.me/newbot/{manager}/{username}?name={quote(display, safe='')}"
+    # Код привязки (Р-78) — только у посредника 0.5.0+; нет кода или он странный — подсказки нет.
+    claim = data.get("claim_code")
+    claim_link = f"https://t.me/{manager}?start={claim}" if isinstance(claim, str) and _CLAIM.match(claim) else ""
     _remember(config.bot_manager_api, True)
-    pairing = Pairing(pair_id, secret, link, username, manager, time.time() + ttl, session_id)
+    pairing = Pairing(pair_id, secret, link, username, manager, time.time() + ttl, session_id, claim_link=claim_link)
     page.managed = pairing
     pairing.task = state.spawn(_wait(state, page, pairing), name="setup-managed-bot")
     return pairing
@@ -433,8 +450,12 @@ async def _received(state: Any, pairing: Pairing, data: dict[str, Any]) -> None:
         return
     pairing.status = CHECKING
     # Имя бота — то, что сервис сам вписал в ссылку; номер — тот, о котором сообщил посредник.
-    expect = {"id": bot_id, "username": pairing.username}
-    if username.lower() != pairing.username.lower():
+    # Исключение — бот, привязанный кодом (Р-78): адрес владелец изменил при создании, посредник
+    # привязал его по коду от создателя и говорит об этом (`claimed`). Тогда имя — сообщённое
+    # посредником; принимается, только если эта попытка вообще получала код привязки.
+    claimed = data.get("claimed") is True and bool(pairing.claim_link)
+    expect = {"id": bot_id, "username": username if claimed else pairing.username}
+    if (not claimed and username.lower() != pairing.username.lower()) or not _USERNAME.match(username):
         _fail(pairing, "wrong_bot")
         await audit.write(state.pool, "bot.managed", audit.REFUSED, "посредник сообщил о боте с другим именем")
         return
@@ -451,6 +472,7 @@ async def _received(state: Any, pairing: Pairing, data: dict[str, Any]) -> None:
         await audit.write(state.pool, "bot.managed", audit.REFUSED, "вход на страницу завершился до создания бота")
         return
     pairing.bot_id, pairing.bot_username = bot_id, found["username"]
+    pairing.claimed = claimed
     pairing.creator_id = creator_id
     pairing.creator_username = handle if isinstance(handle, str) and _HANDLE.match(handle) else None
     pairing.creator_name = name.strip()[:64] or None
@@ -458,7 +480,9 @@ async def _received(state: Any, pairing: Pairing, data: dict[str, Any]) -> None:
     pairing.token = token
     pairing.confirm_until = time.time() + CONFIRM_TTL
     pairing.status = CONFIRM
-    await audit.write(state.pool, "bot.managed", audit.OK, "бот создан; ждёт подтверждения, что создан вашим аккаунтом")
+    await audit.write(state.pool, "bot.managed", audit.OK,
+                      ("бот с изменённым адресом привязан кодом в чате с бот-менеджером" if claimed else "бот создан")
+                      + "; ждёт подтверждения, что создан вашим аккаунтом")
 
 
 async def confirm(state: Any, page: Any, session_id: int, *, accept: bool) -> Pairing:
@@ -479,7 +503,8 @@ async def confirm(state: Any, page: Any, session_id: int, *, accept: bool) -> Pa
     pairing.status = APPLYING
     creator = f"@{pairing.creator_username}" if pairing.creator_username else "без имени пользователя"
     detail = (f"бот @{pairing.bot_username} создан в одно нажатие через бот-менеджер @{pairing.manager} посредника "
-              f"{manager_host(state.config)}; создатель {creator}, номер {pairing.creator_id} — подтверждён владельцем; "
+              f"{manager_host(state.config)}" + ("; адрес изменён при создании, привязан кодом" if pairing.claimed else "")
+              + f"; создатель {creator}, номер {pairing.creator_id} — подтверждён владельцем; "
               "проверен запросом к Telegram"
               + ("" if pairing.restricted else "; доступ к боту для посторонних посредник не закрыл"))
 
@@ -494,7 +519,7 @@ async def confirm(state: Any, page: Any, session_id: int, *, accept: bool) -> Pa
     try:
         with authority.setup_context(session_id, action="/shturman-setup/api/bot/managed/confirm"):
             await apply_token(state, page, token, via="managed",
-                              expect={"id": pairing.bot_id, "username": pairing.username},
+                              expect={"id": pairing.bot_id, "username": pairing.bot_username or pairing.username},
                               origin={"creator_user_id": pairing.creator_id, "creator_username": pairing.creator_username,
                                       "creator_name": pairing.creator_name, "restricted": pairing.restricted,
                                       "manager": pairing.manager, "manager_api": manager_host(state.config)},
