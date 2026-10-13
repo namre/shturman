@@ -1,4 +1,4 @@
-# Caddy посредника: отдаёт https://relay.<зона>/api/* — выдачу имён по коду приглашения (relayd).
+# Caddy посредника: отдаёт https://relay.<зона>/api/* — выдачу имён по коду приглашения и бота-менеджера (relayd).
 # Проверено с Caddy 2.11.7. relay/install.sh кладёт файл в /etc/shturman-relay/Caddyfile, подставив
 # имя зоны посредника.
 #
@@ -34,7 +34,9 @@ http://relay.@DOMAIN@ {
 relay.@DOMAIN@ {
 	header Strict-Transport-Security "max-age=31536000"
 
-	@api path /api/join /api/check /api/health /api/ca
+	# /api/botpair/* — создание бота согласований в одно нажатие, /api/manager/setup* — страница ввода
+	# токена бота-менеджера (relayd 0.4.0, Р-77).
+	@api path /api/join /api/check /api/health /api/ca /api/botpair/* /api/manager/setup /api/manager/setup.js
 	handle @api {
 		request_body {
 			max_size 4KB

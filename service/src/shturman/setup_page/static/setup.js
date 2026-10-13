@@ -31,6 +31,7 @@
   }
   var ui = {
     botEditing: false, botToken: "", bind: null, keysEditing: false,
+    managedLink: "", managedDone: "", managedError: false,
     login: null, loginLink: "", chatAccount: null, chats: [], chatsTotal: 0, chatsEnabled: 0,
     chatsLoading: false, chatsKey: "", scans: {}, scanning: {}, exclude: {}, upload: null,
     signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
@@ -525,10 +526,17 @@
     else if (b.username && b.polling) note("bot-status", "ok", "Бот @" + b.username + " на связи с Telegram.");
     else note("bot-status", "info", b.username ? "Бот @" + b.username + " сохранён, выхожу на связь с Telegram…" : "Токен сохранён, выхожу на связь с Telegram…");
     show("bot-form", editing && !ui.botToken);
+    show("bot-howto", editing && !ui.botToken);
     show("bot-form-cancel", ui.botEditing);
     show("bot-confirm", !!ui.botToken);
     show("bot-actions", b.configured && b.source === "page" && !ui.botEditing);
     show("shot-newbot", !b.configured || ui.botEditing);
+    renderManaged(b, editing && !ui.botToken);
+    if (b.configured && b.created_via === "managed") {
+      note("bot-origin", "info", "Бот создан в одно нажатие через бот-менеджер посредника" + (b.manager ? " " + b.manager : "") +
+           ". Его держатель технически может получить токен этого бота. Чтобы ни от кого не зависеть, создайте бота у @BotFather и нажмите «Сменить токен»." +
+           (b.restricted === false ? " Посредник не закрыл бота для посторонних: написать ему может любой, но отвечает он только вам." : ""));
+    } else note("bot-origin", "", "");
 
     var canBind = b.configured && !!b.username && !ui.botEditing;
     show("bind", canBind);
@@ -538,6 +546,10 @@
       toast("Владелец привязан" + (b.owner_name ? ": " + b.owner_name : "") + ".");
     }
     show("bind-none", !b.owner_bound);
+    note("bind-creator", "info", !b.owner_bound && b.created_via === "managed"
+      ? "Бот создан аккаунтом Telegram " + (b.creator_username ? "@" + b.creator_username : "") + (b.creator_name ? " «" + b.creator_name + "»" : "") + ". Владельцем можно привязать только этот аккаунт: откройте ссылку в нём." : "");
+    note("bind-refused", "danger", !b.owner_bound && b.bind_refused_at
+      ? "Ссылку привязки открыли в другом аккаунте Telegram, не в том, которым создан бот (" + when(b.bind_refused_at) + "). Все ссылки привязки отменены. Если это были не вы — ссылку могли подсмотреть; получите новую и откройте её только в своём аккаунте." : "");
     note("bind-done", "ok", b.owner_bound ? "Владелец привязан" + (b.owner_name ? ": " + b.owner_name : "") + "." : "");
     show("bind-link-box", !!ui.bind);
     show("shot-start", !!ui.bind);
@@ -546,7 +558,107 @@
     if (b.bind_paused) note("bind-error", "warn", "Бот получил много неверных кодов привязки и на 10 минут перестал их принимать. Подождите и выдайте ссылку заново.");
   }
 
+  /* Бот в одно нажатие через бот-менеджер посредника (bot_setup.py). Страница видит только ссылку
+   * t.me/newbot/… и состояние; секрет пары и токен остаются в сервисе. */
+  function renderManaged(b, editing) {
+    var m = b.managed || {}, a = m.attempt;
+    var waiting = !!(a && (a.status === "waiting" || a.status === "checking")), applying = !!(a && a.status === "applying");
+    var asking = !!(a && a.status === "confirm"), intercepted = !!(a && a.status === "intercepted");
+    show("bot-managed", !!m.available && ((editing && m.ready !== false) || waiting || applying || asking || intercepted));
+    if (!m.available) return;
+    text("managed-host", m.host || "посредника");
+    show("managed-start-row", !waiting && !applying && !asking);
+    show("managed-wait", waiting || applying);
+    show("managed-confirm", asking);
+    note("managed-intercepted", "danger", intercepted ? a.message : "");
+    if (asking) {
+      var c = a.creator || {};
+      text("managed-bot-name", "@" + (a.bot_username || ""));
+      text("managed-creator", (c.username ? "@" + c.username : "без имени пользователя") + " (номер " + c.id +
+           (c.name ? ", имя «" + c.name + "»" : "") + ")");
+      text("managed-confirm-minutes", String(Math.max(1, Math.ceil((a.confirm_seconds_left || 0) / 60))));
+      fast(10);
+    }
+    if (a && (waiting || applying)) {
+      if (ui.managedLink !== a.link && a.link) {
+        ui.managedLink = a.link;
+        var qr = $("managed-qr");
+        qr.textContent = "";
+        try { qr.appendChild(window.ShturmanQR.svg(a.link, { label: "QR-код со ссылкой создания бота" })); } catch (e) { /* останется кнопка */ }
+        $("managed-open").setAttribute("href", a.link);
+      }
+      text("managed-minutes", String(Math.max(1, Math.ceil(a.seconds_left / 60))));
+      text("managed-status", applying ? "Бот создан, подключаю его…" : "Жду, пока вы подтвердите создание бота…");
+      fast(10);
+    } else if (ui.managedLink) {
+      ui.managedLink = "";
+      $("managed-qr").textContent = "";
+      $("managed-open").setAttribute("href", "#");
+    }
+    if (a && a.status === "failed") note("managed-error", "warn", a.message || "Не получилось.");
+    else if (!ui.managedError) note("managed-error", "warn", "");
+    if (a && a.status === "done" && ui.managedDone !== a.bot_username) {
+      ui.managedDone = a.bot_username;
+      toast("Бот @" + a.bot_username + " создан и подключён. Теперь привяжите себя владельцем.");
+    }
+  }
+
+  function copyText(value, button) {
+    function done() { var t = button.textContent; button.textContent = "Скопировано"; setTimeout(function () { button.textContent = t; }, 1500); }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(value).then(done, function () {});
+  }
+
+  function suggestUsername() {
+    var abc = "abcdefghijkmnpqrstuvwxyz23456789", out = "", rnd = new Uint8Array(6);
+    try { crypto.getRandomValues(rnd); } catch (e) { for (var i = 0; i < 6; i++) rnd[i] = Math.floor(Math.random() * 256); }
+    for (var j = 0; j < 6; j++) out += abc.charAt(rnd[j] % abc.length);
+    return "soglasovaniya_" + out + "_bot";
+  }
+
+  function wireManaged() {
+    text("howto-username", suggestUsername());
+    // Адрес @BotFather ставит скрипт: в разметке страницы чужих адресов нет.
+    $("open-botfather").setAttribute("href", "https://t.me/BotFather");
+    Array.prototype.forEach.call(document.querySelectorAll("button.copy"), function (button) {
+      button.addEventListener("click", function () {
+        var from = button.getAttribute("data-copy-from");
+        copyText(from ? $(from).textContent : button.getAttribute("data-copy"), button);
+      });
+    });
+    $("managed-start").addEventListener("click", function () {
+      var button = this, code = $("managed-code").value.trim(), body = {};
+      if (code) body.code = code;
+      busy(button, true);
+      ui.managedError = false;
+      note("managed-error", "warn", "");
+      call("POST", "bot/managed", body).then(function (r) {
+        busy(button, false);
+        if (!r.ok) {
+          ui.managedError = true;
+          note("managed-error", "warn", r.error);
+          if (r.data && r.data.code === "invite_required") { show("managed-code-field", true); $("managed-code").focus(); }
+          return;
+        }
+        $("managed-code").value = "";
+        fast(60);
+        refresh(); refreshOverview();
+      });
+    });
+    $("managed-yes").addEventListener("click", function () {
+      act(this, "managed-error", "POST", "bot/managed/confirm", { accept: true }, function () {
+        toast("Бот подключён. Теперь привяжите себя владельцем."); fast(20);
+      });
+    });
+    $("managed-no").addEventListener("click", function () {
+      act(this, "managed-error", "POST", "bot/managed/confirm", { accept: false });
+    });
+    $("managed-cancel").addEventListener("click", function () {
+      act(this, "managed-error", "DELETE", "bot/managed", {}, function () { toast("Создание бота отменено."); });
+    });
+  }
+
   function wireBot() {
+    wireManaged();
     var input = $("bot-token");
     $("bot-form").addEventListener("submit", function (event) {
       event.preventDefault();

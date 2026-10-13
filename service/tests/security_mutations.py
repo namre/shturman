@@ -99,6 +99,29 @@ MUTATIONS = (
              "        if found is None:\n            found = ({'kind_title': 'x', 'id': 0, '_card_message_id': None}, {'label': 'x'})\n        if False:\n            # Кнопки нет",
              "tests/setup_page/test_miniapp.py::test_only_known_buttons_of_the_screen_are_accepted",
              database=True),
+    # Бот согласований в одно нажатие (Р-77): только создатель становится владельцем; токен — именно
+    # того бота, что создавался по ссылке; без живой сессии страницы токен не ждёт подтверждения;
+    # без «Да, это мой аккаунт» токен не сохраняется.
+    Mutation("managed_bot_creator_only", "src/shturman/executor/binding.py",
+             "return creator if isinstance(creator, int) and not isinstance(creator, bool) else None",
+             "return None",
+             "tests/setup_page/test_setup_managed_bot.py::test_only_the_creator_can_become_the_owner",
+             database=True),
+    Mutation("managed_bot_same_bot", "src/shturman/setup_page/bot_setup.py",
+             "    return expect is None or (bot[\"id\"] == expect.get(\"id\")",
+             "    return True or (bot[\"id\"] == expect.get(\"id\")",
+             "tests/setup_page/test_setup_managed_bot.py::test_token_of_another_bot_is_refused",
+             database=True),
+    Mutation("managed_bot_live_session", "src/shturman/setup_page/bot_setup.py",
+             "    if not await _session_alive(state, pairing.session_id):",
+             "    if False:",
+             "tests/setup_page/test_setup_managed_bot.py::test_token_is_not_applied_after_the_session_ended",
+             database=True),
+    Mutation("managed_bot_owner_confirms", "src/shturman/setup_page/bot_setup.py",
+             "    pairing.status = CONFIRM\n",
+             "    pairing.status = CONFIRM\n    await confirm(state, getattr(state.extras.get('setup_page'), 'managed', None) and state.extras['setup_page'], pairing.session_id, accept=True)\n",
+             "tests/setup_page/test_setup_managed_bot.py::test_bot_created_by_someone_else_is_never_accepted_silently",
+             database=True),
 )
 
 # Capture actual pytest phases and exception types, rather than treating a
@@ -235,7 +258,7 @@ def main() -> int:
     status = git(repo, "status", "--porcelain")
     report = {
         "schema_version": 1,
-        "scope": "11 targeted security mutations, not whole-project mutation coverage",
+        "scope": f"{len(MUTATIONS)} targeted security mutations, not whole-project mutation coverage",
         "started_at": datetime.now(timezone.utc).isoformat(),
         "provenance": {
             "git_head": git(repo, "rev-parse", "HEAD"),

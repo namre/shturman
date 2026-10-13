@@ -123,6 +123,11 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
                 "failed": "Telegram её не принял, сервис повторит через 10 минут (подробности — в журнале сервиса)",
                 }.get(bot.get("menu_button") or "", "ещё не сверялась")
         print(f"  кнопка «Штурман» (приложение в Telegram): {menu}")
+        via = {"managed": "в одно нажатие через бот-менеджер посредника — его держатель технически может "
+                          "получить токен бота; перейти на своего бота: docs/approvals-bot.md",
+               "manual": "вручную у @BotFather, токен введён на странице настройки"}.get(bot.get("created_via") or "")
+        if via:
+            print(f"  как создан: {via}")
         if bot.get("business_capable") is False:
             print("  бизнес-режим: у бота он выключен (в @BotFather: Bot Settings → Secretary Mode; "
                   "раньше пункт назывался Business Mode)")

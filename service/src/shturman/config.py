@@ -16,6 +16,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+DEFAULT_BOT_MANAGER_API = "https://relay.sh.namre.app"
+
 
 class ConfigError(RuntimeError):
     pass
@@ -121,6 +123,10 @@ class Config:
     remote_mcp_origin: str = ""
     remote_mcp_allow_loopback: bool = False
     remote_mcp_clients: tuple[dict, ...] = ()
+    # Бот-менеджер посредника: создание бота согласований в одно нажатие (Р-77,
+    # docs/approvals-bot.md). Только из окружения — ни страница, ни внутренний API его не меняют:
+    # подменённый адрес отдал бы сервису бота, токен которого есть у подменившего. Пусто — выключено.
+    bot_manager_api: str = DEFAULT_BOT_MANAGER_API
 
     @property
     def own_bot(self) -> bool:
@@ -230,6 +236,7 @@ class Config:
             asr_max_seconds=min(3600, max(10, _int("SHTURMAN_ASR_MAX_SECONDS", 600))),
             media_days=min(3650, max(0, _int("SHTURMAN_MEDIA_DAYS", 30))),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
+            bot_manager_api=bot_manager_api(_env("SHTURMAN_BOT_MANAGER_API")),
         )
         return with_page_values(config, os.environ)
 
@@ -316,6 +323,20 @@ def _dotted_quad(host: str) -> bool:
     parts = host.split(".")
     return len(parts) == 4 and all(p.isascii() and p.isdigit() and (p == "0" or p[0] != "0") and int(p) <= 255
                                    for p in parts)
+
+
+def bot_manager_api(raw: str) -> str:
+    """Адрес посредника с ботом-менеджером. Пусто — по умолчанию (посредник sh.namre.app);
+    off — создание бота в одно нажатие выключено. Только https; http — только к самому серверу
+    (стенд разработки)."""
+    if not raw:
+        return DEFAULT_BOT_MANAGER_API
+    if raw.lower() in ("off", "0", "no", "false"):
+        return ""
+    origin = normalize_origin(raw, "SHTURMAN_BOT_MANAGER_API")
+    if origin.startswith("http://") and origin.split("://", 1)[1].split(":")[0] not in ("127.0.0.1", "localhost", "[::1]"):
+        raise ConfigError("SHTURMAN_BOT_MANAGER_API: нужен адрес https://…, например " + DEFAULT_BOT_MANAGER_API)
+    return origin
 
 
 def _setup_origin(raw: str) -> str:

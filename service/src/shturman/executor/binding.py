@@ -97,13 +97,65 @@ async def revoke_code(conn: asyncpg.Connection, code: str) -> bool:
     return done.endswith(" 1")
 
 
+async def code_valid(conn: asyncpg.Connection, code: str) -> bool:
+    """Действует ли код привязки (не погашен и не истёк). Код не гасится."""
+    return bool(await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM executor_bind_codes WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now())",
+        code_hash(code)))
+
+
+# --- как создан бот согласований (Р-77) ---
+# Запись в setup_state 'approvals_bot': {bot_id, created_via: manual | managed, creator_user_id?,
+# creator_username?, creator_name?, restricted?, manager?}. Пишет только страница настройки
+# (setup_page/bot_setup.py); маршрута во внутреннем API, который бы эту запись читал или менял, нет
+# (через внутренний API видны лишь отдельные признаки из setup_state — например, включён ли разбор
+# вложений — и `created_via` в /api/executor/status). Запись относится к одному боту: после смены
+# токена на другого бота она для него уже ничего не значит.
+#
+# Что даёт правило «привязать только создателя» и чего не даёт. Даёт: ссылка привязки, попавшая
+# к другому аккаунту, владельцем его не сделает. НЕ даёт защиты от бота, который создал посторонний
+# (подсмотрел ссылку создания): создатель тогда он, токен у него есть в @BotFather, а с токеном он
+# подпишет данные входа Mini App за любой аккаунт. От этого защищает только подтверждение владельцем
+# аккаунта-создателя на странице до сохранения токена (bot_setup.confirm).
+
+ORIGIN_KEY = "approvals_bot"
+
+
+async def bot_origin(conn: asyncpg.Connection, bot_id: int | None) -> dict[str, Any] | None:
+    """Как создан бот согласований с этим номером, если это записано."""
+    if bot_id is None:
+        return None
+    raw = await conn.fetchval("SELECT value FROM setup_state WHERE key = $1", ORIGIN_KEY)
+    if raw is None:
+        return None
+    value = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(value, dict) or value.get("bot_id") != bot_id:
+        return None
+    return value
+
+
+async def required_creator(conn: asyncpg.Connection, bot_id: int | None) -> int | None:
+    """Номер аккаунта, создавшего бота, — если бот создан через бот-менеджер посредника. Тогда
+    владельцем может стать только он: иначе бот, созданный по перехваченной ссылке чужим аккаунтом
+    (у которого есть токен этого бота в @BotFather), стал бы ботом согласований владельца."""
+    origin = await bot_origin(conn, bot_id)
+    creator = origin.get("creator_user_id") if origin and origin.get("created_via") == "managed" else None
+    return creator if isinstance(creator, int) and not isinstance(creator, bool) else None
+
+
 async def redeem(conn: asyncpg.Connection, code: str, *, user_id: int, chat_id: int, bot_id: int,
                  name: str | None = None) -> bool:
     """Гасит код и привязывает владельца. Одна транзакция: код срабатывает ровно один раз.
 
     name — как владелец подписан в Telegram: его показывает страница настройки сервиса
-    («владелец привязан: …»). Через внутренний API эта отметка не читается."""
+    («владелец привязан: …»). Через внутренний API эта отметка не читается.
+
+    Бот, созданный через бот-менеджер, привязывает только своего создателя (`required_creator`):
+    другой аккаунт получает отказ (коды отменяет `refuse_not_creator`, его зовёт бот)."""
     async with conn.transaction():
+        creator = await required_creator(conn, bot_id)
+        if creator is not None and creator != int(user_id):
+            return False
         used = await conn.fetchval(
             """UPDATE executor_bind_codes SET used_at = now()
                WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING id""",
@@ -111,11 +163,33 @@ async def redeem(conn: asyncpg.Connection, code: str, *, user_id: int, chat_id: 
         if used is None:
             return False
         await bridge.set_owner(conn, int(user_id), int(chat_id))
+        await conn.execute("DELETE FROM executor_state WHERE key = $1", REFUSED_KEY)
         mark: dict[str, Any] = {"user_id": int(user_id), "bot_id": int(bot_id)}
         if name:
             mark["name"] = name
         await put_state(conn, "owner", mark)
     return True
+
+
+REFUSED_KEY = "bind_refused"
+
+
+async def refuse_not_creator(conn: asyncpg.Connection, bot_id: int) -> int:
+    """Ссылку привязки открыл не создатель бота: все неиспользованные коды привязки отменяются, а
+    отметка видна на странице настройки. Возвращает число отменённых кодов."""
+    async with conn.transaction():
+        done = await conn.execute("UPDATE executor_bind_codes SET used_at = now() WHERE used_at IS NULL")
+        await put_state(conn, REFUSED_KEY, {"bot_id": int(bot_id), "at": int(time.time())})
+    return int(done.split()[-1])
+
+
+async def bind_refused(conn: asyncpg.Connection, bot_id: int | None) -> str | None:
+    """Когда ссылку привязки этого бота открыл не создатель (ISO-время), если это было."""
+    mark = await get_state(conn, REFUSED_KEY)
+    if not mark or bot_id is None or mark.get("bot_id") != bot_id or not isinstance(mark.get("at"), int):
+        return None
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(mark["at"], timezone.utc).isoformat()
 
 
 async def bound_owner_name(conn: asyncpg.Connection, bot_id: int | None) -> str | None:

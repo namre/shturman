@@ -86,9 +86,12 @@ async def status(request: Request) -> JSONResponse:
     runtime: Executor = state.extras.get("executor") or Executor()
     bot, llm, worker = runtime.bot, runtime.llm, runtime.worker
     owner_bound = False
+    created_via = None
     if bot is not None:
         async with state.ro_pool.acquire() as conn:
             owner_bound = await binding.bound_owner(conn, bot.bot_id) is not None
+            origin = await binding.bot_origin(conn, bot.bot_id)
+            created_via = origin.get("created_via") if origin else None
     out = {
         "bot": {
             "configured": bot is not None,
@@ -103,6 +106,9 @@ async def status(request: Request) -> JSONResponse:
             # Кнопка «Штурман» (Mini App) в чате владельца: set | no_address | no_owner | failed | null —
             # ещё не сверялась. Только состояние: адреса и чата здесь нет.
             "menu_button": bot.menu if bot else None,
+            # Как создан бот: manual — владелец вставил токен; managed — в одно нажатие через бот-менеджер
+            # посредника (его держатель может получить токен, Р-77); null — не записано (токен на сервере).
+            "created_via": created_via if created_via in ("manual", "managed") else None,
             "counters": dict(bot.counters) if bot else {},
         },
         "llm": {
