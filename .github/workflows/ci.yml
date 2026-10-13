@@ -161,6 +161,13 @@ jobs:
           test "$(docker compose --profile hermes --profile relay config --services | sort | tr '\n' ' ')" = "hermes postgres relay shturman "
           rel() { docker compose --profile relay config --format json | python3 -c 'import json, sys; r = json.load(sys.stdin)["services"]["relay"]; print(r["network_mode"], len(r.get("ports") or []), r["read_only"], r["cap_drop"], [v["target"] + ":" + str(v.get("read_only")) for v in r["volumes"]])'; }
           test "$(rel)" = "host 0 True ['ALL'] ['/etc/frpc/relay:True']"
+          # Р-76: у Hermes нет CAP_NET_RAW (в сети хоста с ним читается трафик сервера на 127.0.0.1),
+          # а каталог сокета сервиса для прокси подключён только сервису — у Hermes его нет, как и
+          # ничего из /run. Печатаются только эти свойства, не окружение.
+          iso() { docker compose --profile hermes config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; h, s = c["hermes"], c["shturman"]; print(h.get("cap_drop"), [v["source"] for v in h["volumes"] if v["source"].startswith(("/run", "/var/run", "/proc"))], [v["source"] + ":" + v["target"] for v in s["volumes"] if v["target"].startswith("/run")], s["environment"]["SHTURMAN_PROXY_SOCKET"])'; }
+          test "$(iso)" = "['NET_RAW'] [] ['/run/shturman-service:/run/shturman-service'] /run/shturman-service/proxy.sock"
+          others() { docker compose --profile hermes --profile relay --profile embeddings --profile guard --profile asr config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; print(sorted(n for n, s in c.items() if n != "shturman" and any("shturman-service" in str(v) for v in s.get("volumes") or [])))'; }
+          test "$(others)" = "[]"
           # Модель поиска по смыслу: без строк в .env — прежняя модель из прежнего каталога (экземпляру,
           # развёрнутому раньше, править .env не нужно); со строками — выбранная. Сервис и контейнер
           # получают одно и то же имя модели. Печатается только команда контейнера эмбеддингов.
@@ -325,6 +332,7 @@ jobs:
           # Отказ изменяющим запросам с чужого адреса — в блоке дашборда (соседние экземпляры — один сайт).
           grep -qx $'> \t\tnot header Sec-Fetch-Site same-origin' d.txt && grep -qx $'> \t\trespond 403' d.txt
           awk '$0 == "ivan.sh.namre.app {" {f=1} f {print} f && /^}/ {exit}' relay.Caddyfile | grep -q '@cross_site'
+          awk '$0 == "setup-ivan.sh.namre.app {" {f=1} f {print} f && /^}/ {exit}' relay.Caddyfile | grep -Eq '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$'
           grep -Eq '^#[[:space:]]+not header Sec-Fetch-Site same-origin$' "$f"
           grep -Eq '^#[[:space:]]+ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com \{$' "$f"
           grep -Eq '^#[[:space:]]+setup-ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com:8443 \{$' "$f"
@@ -479,10 +487,20 @@ jobs:
           grep -Eq '^[[:space:]]*@no_setup_page path /shturman-setup\*$' <<< "$dash"
           grep -A1 -E '^[[:space:]]*handle @no_setup_page \{$' <<< "$dash" | grep -Eq '^[[:space:]]*respond 404$'
           test "$(grep -c 'reverse_proxy' <<< "$dash")" = "1" && grep -Eq '^[[:space:]]*reverse_proxy 127\.0\.0\.1:9119$' <<< "$dash"
-          # Блок страницы: один выход на порт сервиса, только под префиксом; дашборда нет; остальное — отказ.
-          test "$(grep -c 'reverse_proxy' <<< "$setup")" = "1" && grep -Eq '^[[:space:]]*reverse_proxy 127\.0\.0\.1:8765$' <<< "$setup"
+          # Блок страницы: один выход к сервису — через его Unix-сокет (Р-76), только под префиксом;
+          # дашборда нет; остальное — отказ. На порт сервиса 8765 прокси не ходит нигде.
+          test "$(grep -c 'reverse_proxy' <<< "$setup")" = "1" && grep -Eq '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$' <<< "$setup"
           if grep -q '9119' <<< "$setup"; then echo "в блоке страницы настройки не должно быть дашборда"; exit 1; fi
-          grep -B1 -E '^[[:space:]]*reverse_proxy 127\.0\.0\.1:8765$' <<< "$setup" | grep -Eq '^[[:space:]]*handle @setup_page \{$'
+          grep -B1 -E '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$' <<< "$setup" | grep -Eq '^[[:space:]]*handle @setup_page \{$'
+          if grep -q 'shturman-service' <<< "$dash"; then echo "блок дашборда не должен вести к сервису"; exit 1; fi
+          for g in "$f" config/Caddyfile.remote-mcp.example; do
+            if grep -Ev '^[[:space:]]*#' "$g" | grep -q '8765'; then echo "$g: прокси не должен ходить на порт сервиса 8765"; exit 1; fi
+          done
+          grep -Eq '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$' config/Caddyfile.remote-mcp.example
+          # Каталог сокета: строка systemd-tmpfiles — владелец пользователь стека, группа caddy, 2710;
+          # команда из шапки файла подставляет имя пользователя только в эту строку.
+          test "$(grep -Ev '^[[:space:]]*(#|$)' config/shturman-service-socket.conf | tr -s ' ')" = "d /run/shturman-service 2710 shturman caddy -"
+          test "$(sed 's/ shturman caddy / ivan caddy /' config/shturman-service-socket.conf | grep -Ev '^[[:space:]]*(#|$)' | tr -s ' ')" = "d /run/shturman-service 2710 ivan caddy -"
           grep -q '@setup_page expression' <<< "$setup" && grep -q '\^/shturman-setup/' <<< "$setup"
           grep -Eq '^[[:space:]]*respond 404$' <<< "$setup"
           grep -q 'Strict-Transport-Security' <<< "$setup"

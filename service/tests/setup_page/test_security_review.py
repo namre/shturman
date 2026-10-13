@@ -379,7 +379,7 @@ async def test_status_tells_the_wizard_where_the_page_is_and_why_not(stand):
     status = (await s.api.get("/api/status")).json()["setup"]
     assert (status["enabled"], status["reason"], status["origin"], status["origin_set"]) == (True, "no_origin", None, False)
     assert set(status) == {"enabled", "origin_set", "origin", "reason", "tg_keys", "accounts", "own_bot", "owner_bound",
-                           "business_connected", "own_model"}
+                           "business_connected", "own_model", "socket"}
 
 
 # =================================================================================================

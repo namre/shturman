@@ -4,6 +4,8 @@
 # При добавлении к основному Caddyfile переносите только блок сайта: глобальный admin там уже есть.
 # Каталог /run/caddy-admin: отдельный владелец Caddy, режим 0700, вне mounts Hermes;
 # создание через systemd RuntimeDirectory описано в основном config/Caddyfile.example.
+# К сервису — через его Unix-сокет /run/shturman-service/proxy.sock, не через порт 8765 (Р-76):
+# каталог сокета создаёт config/shturman-service-socket.conf, пояснение — в config/Caddyfile.example.
 {
 	admin unix//run/caddy-admin/admin.sock
 }
@@ -22,7 +24,7 @@ mcp.example.com {
 	# /api, setup page или внутренний порт целиком. Host передаётся без подмены.
 	@remote_mcp expression `{http.request.orig_uri}.matches("^(/mcp|/oauth/(authorize|continue|register|token|revoke)|/[.]well-known/oauth-protected-resource(/mcp)?|/[.]well-known/oauth-authorization-server)([?].*)?$")`
 	handle @remote_mcp {
-		reverse_proxy 127.0.0.1:8765
+		reverse_proxy unix//run/shturman-service/proxy.sock
 	}
 	handle {
 		respond 404

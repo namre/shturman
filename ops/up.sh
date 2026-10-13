@@ -9,7 +9,10 @@
 #                 не скачивается, а оставшийся от прежнего режима контейнер убирается.
 # В режиме с Hermes, если адрес дашборда задан, а адреса страницы настройки переписки в .env ещё
 # нет, скрипт дописывает адрес по умолчанию: то же имя, порт 8443 (./ops/set-setup-url.sh --help).
-# Прокси и firewall скрипт не трогает. Если экземпляр подключён к посреднику (./ops/relay.sh join,
+# Прокси, firewall и каталог сокета сервиса для прокси (/run/shturman-service, Р-76; его создаёт
+# systemd-tmpfiles по config/shturman-service-socket.conf под sudo) скрипт не трогает; если каталог
+# готов, а сервис переписки запущен до его появления, скрипт перезапускает сервис, чтобы тот открыл
+# сокет. Если экземпляр подключён к посреднику (./ops/relay.sh join,
 # профиль relay), скрипт собирает и запускает и контейнер frpc — только в режиме с Hermes.
 # Если адрес дашборда или адрес страницы настройки записан в .env не как адрес (например, без
 # https://) или как https-адрес с IP закрытой сети либо в необычной записи (docs/deployment.md,
@@ -217,6 +220,30 @@ if ! wait_service; then
   echo "Сервис переписки не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-service" >&2
   exit 1
 fi
+
+# Сокет для обратного прокси (Р-76). Сервис проверяет каталог /run/shturman-service только при
+# запуске: если каталог создали или исправили позже (config/shturman-service-socket.conf), а сервис
+# с тех пор не перезапускался, он так и слушает только порт. Тогда перезапускаем его один раз.
+# Из состояния сервиса берётся только код состояния сокета.
+sock_dir=/run/shturman-service
+case "$(stat -c '%u %a' "$sock_dir" 2>/dev/null || true)" in
+  "$(id -u) 2710"|"$(id -u) 2750")
+    sock_state="$(docker exec shturman-service shturman call GET /api/status 2>/dev/null | docker exec -i shturman-service python -c '
+import json, sys
+try:
+    print((json.load(sys.stdin).get("setup") or {}).get("socket") or "")
+except Exception:
+    pass' 2>/dev/null || true)"
+    case "$sock_state" in
+      dir_missing|dir_owner|dir_mode)
+        echo "Каталог сокета для прокси готов, а сервис переписки запущен раньше — перезапускаю его, чтобы он открыл сокет…"
+        docker compose restart shturman
+        if ! wait_service; then
+          echo "Сервис переписки не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-service" >&2
+          exit 1
+        fi ;;
+    esac ;;
+esac
 
 if [ "$MODE" != hermes ]; then
   echo "пропущено: режим без Hermes — включение плагина shturman в Hermes"

@@ -353,8 +353,7 @@ async def _setup_logout_all() -> None:
 def _serve() -> None:
     import logging
 
-    import uvicorn
-
+    from . import listen
     from .app import build_app
     from .config import Config, ConfigError
 
@@ -368,8 +367,14 @@ def _serve() -> None:
     # стоит за обратным прокси, но заголовкам X-Forwarded-* не верит и ими не пользуется
     # (setup_page/shield.py) — адрес клиента и схема из них не подставляются. server_header выключен:
     # страница настройки видна снаружи, и версию сервера ей сообщать незачем.
-    uvicorn.run(build_app(config), host=config.host, port=config.port, log_level="warning", access_log=False,
-                proxy_headers=False, server_header=False)
+    # Адресов два: TCP-порт (Hermes, оператор, туннель SSH) и Unix-сокет для обратного прокси
+    # (listen.py, Р-76); приложение и его фоновая работа — одни на оба.
+    server, sockets = listen.make_server(
+        build_app(config), host=config.host, port=config.port, proxy_socket=config.proxy_socket,
+        log_level="warning", access_log=False, proxy_headers=False, server_header=False)
+    server.run(sockets=sockets)
+    if not server.started:      # как uvicorn.run: запуск не удался — ненулевой код выхода
+        sys.exit(3)
 
 
 def main() -> None:
