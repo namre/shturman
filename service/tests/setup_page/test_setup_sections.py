@@ -400,6 +400,20 @@ async def test_dialogs_are_paged_searched_and_filtered(stand, conn):
     assert telegram["locked"] is True and telegram["excluded"] is True
 
 
+async def test_dialogs_flood_wait_tells_page_how_long(stand, conn):
+    """«Telegram просит подождать» в списке чатов: ответ 429 несёт retry_after — страница
+    показывает отсчёт и повторяет сама."""
+    s = await ready(stand, conn, world=crowded())
+    account_id = await connect(s)
+    rt = next(r for r in s.manager.runtimes.values() if r.account_id == account_id)
+    rt.dialogs = None
+    rt.pacer.flood(40)
+    out = await s.page.get(f"/tg/accounts/{account_id}/dialogs", params={"refresh": "1"})
+    assert out.status_code == 429
+    body = out.json()
+    assert "подождать" in body["error"] and 40 <= body["retry_after"] <= 43
+
+
 async def test_chats_are_enabled_at_once_and_counted(stand, conn):
     s = await ready(stand, conn, world=crowded())
     account_id = await connect(s)

@@ -70,6 +70,12 @@ class LiveIngest:
         self.auto_personal = bool(row and row["auto_personal"])
         self.auto_groups = bool(row and row["auto_groups"])
 
+    def wants_channel(self, channel_id: int) -> bool:
+        """Выбран ли канал или супергруппа: только по ним Telethon запрашивает пропущенное
+        (tg/client.py, ChannelUpdatesThrottle)."""
+        state = self.index.get(("channel", int(channel_id)))
+        return bool(state is not None and state.enabled)
+
     def register(self, client: Any) -> None:
         client.add_event_handler(
             self.on_update, tl_events.Raw(types=[*NEW_UPDATES, *EDIT_UPDATES, *DELETE_UPDATES]))

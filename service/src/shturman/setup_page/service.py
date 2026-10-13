@@ -232,7 +232,8 @@ def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
             except apply.Invalid as exc:
                 return JSONResponse({"error": exc.message, "code": exc.code}, status_code=422)
             except TgError as exc:
-                return JSONResponse({"error": exc.message}, status_code=exc.status)
+                extra = {"retry_after": exc.retry_after} if exc.retry_after else {}
+                return JSONResponse({"error": exc.message, **extra}, status_code=exc.status)
             except confirm.Refused as exc:
                 return JSONResponse({**exc.extra, "error": exc.message, **({"code": exc.code} if exc.code else {})},
                                     status_code=exc.status)

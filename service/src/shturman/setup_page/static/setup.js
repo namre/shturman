@@ -33,7 +33,7 @@
     botEditing: false, botToken: "", bind: null, keysEditing: false,
     managedLink: "", managedDone: "", managedError: false,
     login: null, loginLink: "", chatAccount: null, chats: [], chatsTotal: 0, chatsEnabled: 0,
-    chatsLoading: false, chatsKey: "", scans: {}, scanning: {}, exclude: {}, upload: null,
+    chatsLoading: false, chatsKey: "", chatsWait: null, scans: {}, scanning: {}, exclude: {}, upload: null,
     signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
     messages: null, importOpened: false,
     subUrl: ""                  // адрес входа в ChatGPT текущей попытки — только в памяти страницы
@@ -1011,8 +1011,40 @@
     return [ui.chatAccount, $("chats-q").value.trim(), $("chats-kind").value, $("chats-only").checked].join("|");
   }
 
-  function loadChats(reset, refreshList) {
+  /* Telegram велел подождать: отсчёт на странице и один повтор сам, без новых нажатий.
+     Дольше двух минут не ждём — пишем, через сколько попробовать. */
+  var WAIT_AUTO_MAX = 120;
+
+  function waitAndRetry(seconds, again) {
+    stopChatsWait();
+    var left = Math.max(1, Math.ceil(seconds));
+    if (left > WAIT_AUTO_MAX) {
+      note("chats-error", "warn", "Telegram просит подождать " + Math.ceil(left / 60) + " мин. Список чатов можно обновить позже, а выбирать чаты из уже загруженного — сейчас.");
+      return;
+    }
+    $("chats-refresh").disabled = true;
+    function tick() {
+      if (left <= 0) {
+        stopChatsWait();
+        note("chats-error", "info", "Обновляю список…");
+        again();
+        return;
+      }
+      note("chats-error", "info", "Telegram просит подождать. Повторю сам через " + left + " с — нажимать ничего не нужно.");
+      left -= 1;
+    }
+    tick();
+    ui.chatsWait = setInterval(tick, 1000);
+  }
+
+  function stopChatsWait() {
+    if (ui.chatsWait) { clearInterval(ui.chatsWait); ui.chatsWait = null; }
+    $("chats-refresh").disabled = false;
+  }
+
+  function loadChats(reset, refreshList, retried) {
     if (ui.chatAccount === null || ui.chatsLoading) return;
+    if (!retried) stopChatsWait();
     var key = chatsQueryKey(), offset = reset ? 0 : ui.chats.length;
     ui.chatsLoading = true;
     ui.chatsKey = key;
@@ -1022,6 +1054,14 @@
     call("GET", "tg/accounts/" + ui.chatAccount + "/dialogs" + query).then(function (r) {
       ui.chatsLoading = false;
       if (key !== chatsQueryKey()) { loadChats(true); return; }       // пока шёл запрос, условие поменяли
+      if (!r.ok && r.status === 429 && r.data && r.data.retry_after && !retried) {
+        var account = ui.chatAccount;
+        waitAndRetry(r.data.retry_after, function () {
+          if (ui.chatAccount === account && key === chatsQueryKey()) loadChats(reset, refreshList, true);
+          else note("chats-error", "warn", "");
+        });
+        return;
+      }
       if (!r.ok) { note("chats-error", "warn", r.error); return; }
       note("chats-error", "warn", "");
       ui.chats = reset ? r.data.items : ui.chats.concat(r.data.items);
