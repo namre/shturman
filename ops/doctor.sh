@@ -9,6 +9,10 @@
 # адресе — сколько ему осталось (строка proxy-cert) — и версия Caddy (proxy-version).
 # Ещё читается local/plugin.sha256 — отпечаток кода плагина, с которым запущен Hermes (его пишет
 # ./ops/up.sh; секретов в нём нет).
+# В режиме с Hermes (Р-76): права контейнера Hermes (строка hermes-net-raw — /proc/1/status в нём)
+# и путь прокси к сервису (setup-socket): каталог /run/shturman-service, один GET страницы настройки
+# через сокет сервиса (код ответа и метка) и в /etc/caddy/Caddyfile — ходит ли прокси к сервису
+# через сокет или через порт 8765. Файл настройки прокси не печатается.
 # Если экземпляр подключён к посреднику (./ops/relay.sh, docs/relay.md) — строки relay, relay-proxies,
 # relay-reach, relay-addresses: читаются несекретные строки SHTURMAN_RELAY_NAME, _DOMAIN, _SERVER,
 # _PORT; о ключе и токене — только «записаны ли»; состояние пересылок — frpc status в контейнере.
@@ -191,6 +195,24 @@ fi
 
 case "$(docker inspect -f '{{.Config.Image}}' "$c")" in
   *:latest|*:main|*:stable) warn hermes-version "образ без явной версии — укажите HERMES_VERSION" ;;
+esac
+
+# --- права контейнера Hermes (Р-76) ---
+# Контейнер работает в сети хоста. С правом CAP_NET_RAW процесс root в нём открывает сырой сокет
+# и читает весь трафик сервера на 127.0.0.1 — в том числе то, что владелец вводит на странице
+# настройки. compose.yaml это право убирает (cap_drop: [NET_RAW]). Смотрим ограничивающий набор
+# прав (CapBnd) процесса 1 в контейнере: его наследуют все процессы, и вернуть право оттуда нельзя
+# ни сменой пользователя, ни программой с file capabilities. Бит 13 — CAP_NET_RAW.
+capbnd="$(docker exec -u "$(id -u):$(id -g)" "$c" cat /proc/1/status 2>/dev/null | awk '$1 == "CapBnd:" {print $2}')"
+case "$capbnd" in
+  ""|*[!0-9a-fA-F]*)
+    warn hermes-net-raw "права контейнера Hermes прочитать не удалось — не проверено, убрано ли право CAP_NET_RAW" ;;
+  *)
+    if [ $(( (0x$capbnd >> 13) & 1 )) -eq 1 ]; then
+      fail hermes-net-raw "у контейнера Hermes есть право CAP_NET_RAW: процесс в нём может читать трафик сервера на 127.0.0.1, в том числе ввод на странице настройки переписки. В compose.yaml у hermes — cap_drop: [NET_RAW] (Р-76): проверьте, не возвращает ли его compose.override.yaml, и запустите ./ops/up.sh"
+    else
+      pass hermes-net-raw "у контейнера Hermes нет права CAP_NET_RAW: сырые сокеты ему недоступны, трафик сервера он не читает"
+    fi ;;
 esac
 
 # --- управление прокси ---
@@ -407,12 +429,12 @@ print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n
   # ходит. Кто ответил, узнаётся по заголовку-метке X-Shturman-Setup-Page, а не по телу ответа.
   # Из .env читаются два несекретных адреса: SHTURMAN_SETUP_URL и SHTURMAN_PUBLIC_URL.
   setup_known=no; setup_enabled=unknown; setup_fields=no; setup_reason=unknown; setup_keys=unknown
-  setup_accounts=0; setup_business=unknown
+  setup_accounts=0; setup_business=unknown; setup_socket=absent
   while IFS='=' read -r k v; do
     case "$k" in
       setup_known) setup_known="$v" ;; setup_enabled) setup_enabled="$v" ;; setup_fields) setup_fields="$v" ;;
       setup_reason) setup_reason="$v" ;; setup_keys) setup_keys="$v" ;; setup_accounts) setup_accounts="$v" ;;
-      setup_business) setup_business="$v" ;;
+      setup_business) setup_business="$v" ;; setup_socket) setup_socket="$v" ;;
     esac
   done <<EOF4
 $(printf '%s' "$st" | docker exec -i "$svc" python -c '
@@ -435,7 +457,11 @@ print("setup_fields=" + ("yes" if "origin" in s or "reason" in s else "no"))
 print("setup_reason=" + (reason if reason in ("same_origin", "no_origin") else "none" if reason is None else "unknown"))
 print("setup_keys=" + yn(s.get("tg_keys")))
 print("setup_accounts=" + num(s.get("accounts")))
-print("setup_business=" + yn(s.get("business_connected")))' 2>/dev/null)
+print("setup_business=" + yn(s.get("business_connected")))
+# Сокет для обратного прокси (Р-76); сервис прежней сборки этого поля не отдаёт.
+sock = s.get("socket")
+codes = ("listening", "off", "dir_missing", "dir_owner", "dir_mode", "not_socket", "error")
+print("setup_socket=" + (sock if sock in codes else "unknown" if "socket" in s else "absent"))' 2>/dev/null)
 EOF4
   word() { case "$1" in yes) printf '%s' "$2" ;; no) printf '%s' "$3" ;; *) printf 'неизвестно' ;; esac; }
   # Один запрос GET <адрес>/shturman-setup/. После вызова: probe_code — код ответа, probe_mark —
@@ -520,11 +546,11 @@ EOF4
               if [ "$probe_mark" = yes ]; then
                 pass setup-page-public "страница настройки переписки открывается по своему адресу"
               else
-                warn setup-page-public "по адресу страницы настройки отвечает не сервис переписки (HTTP 200 без метки): блок сайта в прокси ведёт не на 127.0.0.1:8765 или перед адресом стоит внешняя защита со своей страницей — $fix_proxy"
+                warn setup-page-public "по адресу страницы настройки отвечает не сервис переписки (HTTP 200 без метки): блок сайта в прокси ведёт не к сервису (сокет /run/shturman-service/proxy.sock) или перед адресом стоит внешняя защита со своей страницей — $fix_proxy"
               fi ;;
             404) warn setup-page-public "по адресу страницы настройки прокси отвечает «не найдено» (HTTP 404): в его блоке нет пути /shturman-setup/* — $fix_proxy" ;;
             421) warn setup-page-public "сервис переписки не узнаёт этот адрес (HTTP 421): он запущен с другим адресом — ./ops/up.sh; если не помогло, прокси подменяет заголовок Host (он должен доходить как есть, вместе с портом)" ;;
-            502|503|504) warn setup-page-public "блок сайта для страницы настройки есть, но сервис переписки прокси не отвечает (HTTP $probe_code) — смотрите строку service и адрес 127.0.0.1:8765 в блоке прокси" ;;
+            502|503|504) warn setup-page-public "блок сайта для страницы настройки есть, но сервис переписки прокси не отвечает (HTTP $probe_code) — смотрите строки service и setup-socket и путь к сервису в блоке прокси" ;;
             52[0-9]|530) warn setup-page-public "внешняя защита перед адресом (Cloudflare или подобная) не достучалась до сервера (HTTP $probe_code): $fix_port" ;;
             30[1-8]|401|403) warn setup-page-public "перед адресом страницы настройки стоит внешняя защита или перенаправление (HTTP $probe_code) — проверьте страницу из браузера; защита должна пропускать HTTPS на порт $setup_port" ;;
             *) warn setup-page-public "страница настройки переписки по своему адресу не открывается (HTTP ${probe_code:-000}) — $fix_proxy" ;;
@@ -558,7 +584,73 @@ EOF4
       fi
     fi
 
-    # 5. Что уже настроено: ключи, аккаунты, бизнес-режим, архив.
+    # 5. Прокси ходит к сервису через Unix-сокет, а не через порт 8765 (Р-76). Порт, пока сервис
+    # перезапускается, может занять процесс из Hermes (сеть хоста); каталога сокета в файловой
+    # системе Hermes нет. Проверяется: каталог (владелец, группа caddy, режим 2710), сокет сервиса
+    # (один GET страницы через сокет — код ответа и метка, как в setup-page) и путь к сервису
+    # в файле настройки прокси /etc/caddy/Caddyfile (он читается всеми; комментарии пропускаются,
+    # значения не печатаются). Только в режиме с Hermes: без него прокси нет.
+    if [ "$MODE" = hermes ]; then
+      sock_dir=/run/shturman-service; sock="$sock_dir/proxy.sock"; caddyfile=/etc/caddy/Caddyfile
+      sock_want="$(id -un):caddy 2710"
+      fix_dir="каталог создаёт systemd-tmpfiles по config/shturman-service-socket.conf (стоп-точка, sudo: docs/runbooks/deploy.md, шаг 5б; на работающем экземпляре — UPGRADING.md), затем ./ops/up.sh"
+      fix_caddy="в блоке страницы настройки обратного прокси — reverse_proxy unix/$sock вместо 127.0.0.1:8765, как в config/Caddyfile.example (правка прокси — стоп-точка)"
+      caddy_way=unknown
+      if [ -r "$caddyfile" ]; then
+        caddy_text="$(grep -Ev '^[[:space:]]*#' "$caddyfile" 2>/dev/null || true)"
+        caddy_way=none
+        if grep -Eq ':8765([^0-9]|$)' <<< "$caddy_text"; then caddy_way=tcp
+        elif grep -Eq "reverse_proxy[[:space:]]+unix/$sock([[:space:]]|$)" <<< "$caddy_text"; then caddy_way=socket; fi
+        caddy_text=""
+      fi
+      # Неполадка сокета — FAIL, если прокси уже настроен на сокет (страница не откроется), иначе WARN.
+      sock_bad() { if [ "$caddy_way" = socket ]; then fail setup-socket "$1"; else warn setup-socket "$1"; fi; }
+      sock_got="$(stat -c '%U:%G %a' "$sock_dir" 2>/dev/null || true)"
+      if [ ! -d "$sock_dir" ] && [ "$caddy_way" = socket ]; then
+        fail setup-socket "прокси настроен ходить к сервису через сокет, а каталога сокета $sock_dir нет — страница настройки не откроется: $fix_dir"
+      elif [ ! -d "$sock_dir" ]; then
+        warn setup-socket "каталога сокета $sock_dir нет: прокси ходит к сервису по порту 127.0.0.1:8765, а его, пока сервис перезапускается, может занять процесс из Hermes (Р-76). Сначала $fix_dir; затем $fix_caddy"
+      elif [ "${sock_got%%:*}" != "$(id -un)" ]; then
+        # Обычно это пустой каталог, который Docker создал от root, пока systemd-tmpfiles его не создавал:
+        # сервис им не пользуется и остаётся на порту.
+        sock_bad "каталог сокета $sock_dir не такой, как нужно ($sock_got вместо $sock_want; так бывает, если его создал Docker от root, — сервис им не пользуется): $fix_dir"
+      elif case "$sock_got" in *[1-7]) true ;; *) false ;; esac; then
+        fail setup-socket "каталог сокета $sock_dir открыт другим пользователям ($sock_got вместо $sock_want): $fix_dir"
+      elif [ "$sock_got" != "$sock_want" ]; then
+        sock_bad "каталог сокета $sock_dir не такой, как нужно ($sock_got вместо $sock_want): $fix_dir"
+      else
+        case "$setup_socket" in
+          listening)
+            sock_host="127.0.0.1:8765"
+            # Имя узла — как его передаёт прокси: внешний адрес страницы без схемы (обычный порт не пишется).
+            if [ "$setup_public" = yes ]; then sock_host="${svc_setup#*://}"; fi
+            hdr="$(mktemp)"
+            sock_code="$(curl -s -o /dev/null -D "$hdr" -m 8 -w '%{http_code}' --unix-socket "$sock" -H "Host: $sock_host" http://localhost/shturman-setup/ 2>/dev/null)" || true
+            if tr -d '\r' < "$hdr" | grep -Eqi '^x-shturman-setup-page:[[:space:]]*1[[:space:]]*$'; then sock_mark=yes; else sock_mark=no; fi
+            rm -f "$hdr"
+            sock_perm="$(stat -c '%G %a' "$sock" 2>/dev/null || true)"
+            if [ "${sock_code:-000}" != 200 ] || [ "$sock_mark" != yes ]; then
+              sock_bad "сервис открыл сокет, но страница настройки через него не отвечает (HTTP ${sock_code:-000}) — docker logs --tail 50 $svc"
+            elif [ "$sock_perm" != "caddy 660" ]; then
+              sock_bad "сокет $sock с правами «${sock_perm:-нет}» вместо «caddy 660» — прокси не сможет к нему подключиться: $fix_dir"
+            else
+              case "$caddy_way" in
+                socket) pass setup-socket "обратный прокси ходит к сервису через сокет $sock (каталог $sock_got); каталога нет в контейнере Hermes, порт 8765 прокси не нужен" ;;
+                tcp) warn setup-socket "сокет сервиса готов, а обратный прокси ещё ходит к сервису по порту 8765 — его, пока сервис перезапускается, может занять процесс из Hermes: $fix_caddy; затем перечитать настройку прокси" ;;
+                none) warn setup-socket "сокет сервиса готов, но в $caddyfile нет пути к сервису ни через сокет, ни через порт 8765 — проверьте блок страницы настройки (config/Caddyfile.example)" ;;
+                *) warn setup-socket "сокет сервиса готов; файл настройки прокси $caddyfile прочитать не удалось — проверьте, что в блоке страницы настройки reverse_proxy unix/$sock" ;;
+              esac
+            fi ;;
+          absent) sock_bad "сервис переписки прежней сборки не открывает сокет для прокси — ./ops/up.sh" ;;
+          off) sock_bad "сервис переписки запущен без SHTURMAN_PROXY_SOCKET — ./ops/up.sh (compose.yaml задаёт его сам); если не помогло, проверьте compose.override.yaml" ;;
+          dir_missing|dir_owner|dir_mode)
+            sock_bad "каталог сокета теперь в порядке, но сервис переписки запущен, когда он ещё не был готов ($setup_socket) — ./ops/up.sh перезапустит сервис, и он откроет сокет" ;;
+          *) sock_bad "сервис переписки не открыл сокет ($setup_socket) — docker logs --tail 50 $svc" ;;
+        esac
+      fi
+    fi
+
+    # 6. Что уже настроено: ключи, аккаунты, бизнес-режим, архив.
     setup_line="ключи приложения Telegram: $(word "$setup_keys" "заданы" "не заданы"), аккаунтов Telegram: ${setup_accounts:-0}, сообщений в архиве: $(num messages)"
     setup_messages="$(num messages)"
     if [ "${setup_accounts:-0}" -gt 0 ] || [ "${setup_messages:-0}" -gt 0 ] || [ "$setup_business" = "yes" ]; then

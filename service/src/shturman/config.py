@@ -44,6 +44,10 @@ class Config:
     mcp_token: str = field(repr=False)
     host: str = "127.0.0.1"
     port: int = 8765
+    # Unix-сокет для обратного прокси на хосте (listen.py, Р-76): страница настройки, Mini App и
+    # внешний шлюз архива идут от Caddy через него, а не через TCP-порт, который может занять
+    # процесс из Hermes. Пусто — сокета нет, сервис слушает только TCP-порт.
+    proxy_socket: str = ""
     # Каталог данных сервиса: сессии Telegram, загруженные выгрузки. Hermes его не видит.
     data_dir: Path = Path("/data")
     # Имена, под которыми к сервису обращаются (защита от подмены адреса в MCP).
@@ -190,6 +194,7 @@ class Config:
         config = cls(
             dsn=dsn, api_token=api_token, mcp_token=mcp_token,
             host=_env("SHTURMAN_HOST", "127.0.0.1"), port=port,
+            proxy_socket=_env("SHTURMAN_PROXY_SOCKET"),
             data_dir=data_dir,
             sources_file=_env("SHTURMAN_SOURCES_FILE"),
             prepare_only=_env("SHTURMAN_PREPARE_ONLY", "off").lower() in ("on", "1", "true", "yes"),

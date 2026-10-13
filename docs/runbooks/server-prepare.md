@@ -127,7 +127,7 @@
 ### 6. Docker и Caddy — стоп-точка (`sudo`, установка пакетов)
 По официальным инструкциям, **не по памяти**: Docker Engine для Ubuntu — https://docs.docker.com/engine/install/ubuntu/ (способ через репозиторий apt), Caddy — https://caddyserver.com/docs/install (раздел для Debian/Ubuntu, официальный репозиторий). Перед выполнением показать владельцу список команд.
 - `sudo usermod -aG docker shturman`; затем переподключиться.
-- Проверка: `ssh shturman-app 'docker version --format {{.Server.Version}}; docker compose version; caddy version; systemctl is-active caddy'`.
+- Проверка: `ssh shturman-app 'docker version --format {{.Server.Version}}; docker compose version; caddy version; systemctl is-active caddy; id -nG caddy'`. Последняя строка — группы пользователя службы Caddy: в ней должна быть `caddy` (так у пакета из официального репозитория). Через эту группу Caddy получит доступ к сокету сервиса переписки (`deploy.md`, шаг 5б; Р-76); пользователь `shturman` в группу `caddy` не добавляется.
 - Адрес по IP (шаг 5): `caddy version` — 2.11 или новее (сертификат на IP-адрес проверен с 2.11.7). Ниже — стоп: сказать владельцу и обновить Caddy из того же официального репозитория (стоп-точка, `sudo`); версия из репозитория Ubuntu для этого не годится.
 - Через посредника: Caddy ставится так же; проверено с 2.11.7 — ниже обновить из официального репозитория (стоп-точка).
 - Режим без Hermes: Caddy не нужен — только Docker.

@@ -11,6 +11,7 @@ from typing import Any
 
 import asyncpg
 
+from .. import listen
 from ..executor import binding
 
 EXTRAS_KEY = "setup_page"     # под этим ключом работающий модуль страницы лежит в state.extras
@@ -43,4 +44,7 @@ async def overview(conn: asyncpg.Connection, state: Any) -> dict[str, Any]:
         "owner_bound": bool(owner_bound),
         "business_connected": bool(row["business"]),
         "own_model": bool(config.own_llm),
+        # Unix-сокет для обратного прокси (listen.py, Р-76): код состояния — listening, off,
+        # dir_missing, dir_owner, dir_mode, not_socket, error. Пути и имён здесь нет.
+        "socket": listen.state(),
     }
