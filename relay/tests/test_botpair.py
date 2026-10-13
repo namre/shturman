@@ -260,7 +260,7 @@ def api(settings, manager):
 def test_http_health_tells_whether_pairing_works(api, manager):
     assert json.loads(call(api, "GET", "/api/health")[1])["botpair"] is False
     ready(manager)
-    assert json.loads(call(api, "GET", "/api/health")[1]) == {"ok": True, "version": "0.4.0", "botpair": True}
+    assert json.loads(call(api, "GET", "/api/health")[1]) == {"ok": True, "version": "0.4.1", "botpair": True}
 
 
 def test_http_pair_round_trip(api, manager, tg):

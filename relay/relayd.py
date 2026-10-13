@@ -38,6 +38,12 @@
     {secret}` один раз отдаёт токен (служба берёт его у Telegram в момент выдачи и не хранит),
     номер и имя бота, номер, @имя и имя создателя; до того, как попытка закрыть доступ к боту
     закончилась, — «ждём». После выдачи пара забывается. Пары живут в памяти 15 минут;
+  * **бот с изменённым именем** (0.4.1): если владелец поменял имя бота в окне создания, бот
+    приходит без пары. Служба держит такие боты в памяти (не больше 50, 20 минут) и, пока есть
+    ожидающие пары, коротко опрашивает их собственные обновления. У каждой пары есть код
+    подтверждения (`claim`, около 59 бит); бот присоединяется к паре, только если **его создатель**
+    отправил ему `/start <код>` и бот создан после начала этой пары и в пределах её срока. Дальше —
+    как при совпадении имени. `POST /api/botpair/<pair_id>/cancel {secret}` — снять пару;
   * **команды держателя** (`relayctl`): invite, list, revoke, release, operator, init,
     manager-link, manager-token, manager-status.
 
@@ -79,7 +85,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 import urllib.error
 import urllib.request
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DEFAULT_DB = "/var/lib/shturman-relay/relay.db"
 DEFAULT_DOMAIN = "sh.namre.app"
 DEFAULT_CA = "/etc/frp/frps.crt"
@@ -364,6 +370,13 @@ class Settings:
     botpair_poll_per_ip: int = 600
     botpair_poll_window: int = 15 * 60
     botpair_require_invite: bool = False
+    # Боты без пары (имя изменили): сколько держать и сколько слушать их обновления (0.4.1).
+    unmatched_max: int = 50
+    unmatched_ttl: int = 20 * 60
+    claim_poll_every: float = 3.0    # секунд между вопросами одному боту
+    claim_bots_per_round: int = 20
+    claim_wrong_max: int = 10        # столько лишних сообщений боту — и он больше не слушается
+    claim_pair_fail_max: int = 5     # столько отказов по коду одной пары — и код пары больше не принимается
 
     @property
     def server_name(self) -> str:
@@ -612,8 +625,8 @@ def tg_call(base: str, token: str, method: str, params: dict | None = None, time
         params_ = body.get("parameters") if isinstance(body, dict) else None
         retry = params_.get("retry_after") if isinstance(params_, dict) else None
         raise TelegramError("refused", e.code, retry if isinstance(retry, int) else None) from None
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
-        raise TelegramError("no_connection") from None
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
+        raise TelegramError(_net_problem(e)) from None
     try:
         body = json.loads(raw)
     except ValueError:
@@ -621,6 +634,28 @@ def tg_call(base: str, token: str, method: str, params: dict | None = None, time
     if not isinstance(body, dict) or body.get("ok") is not True:
         raise TelegramError("refused", int(body.get("error_code") or 0) if isinstance(body, dict) else 0)
     return body.get("result")
+
+
+def _net_problem(e: BaseException) -> str:
+    """Что случилось со связью — для журнала: timeout (не дождались ответа), reset (соединение
+    оборвалось — у долгого опроса getUpdates это бывает, Telegram или сеть закрывают его), dns,
+    connect (не удалось соединиться) — или no_connection, если не ясно."""
+    import http.client
+    import socket
+    reason = getattr(e, "reason", e)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(reason, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                           http.client.RemoteDisconnected, http.client.IncompleteRead)):
+        return "reset"
+    if isinstance(reason, socket.gaierror):
+        return "dns"
+    if isinstance(reason, (ConnectionRefusedError, OSError)):
+        return "connect"
+    return "no_connection"
+
+
+TRANSIENT = frozenset({"timeout", "reset", "dns", "connect", "no_connection", "bad_answer"})
 
 
 def _int(v: Any) -> int | None:
@@ -644,6 +679,13 @@ PAIR_RE = re.compile(f"[{PAIR_ALPHABET}]{{{PAIR_LEN}}}")
 PREFIX_RE = re.compile(r"[a-z][a-z0-9]{2,15}")
 DEFAULT_BOT_NAME = "Согласования"
 SECRET_RE = re.compile(r"[A-Za-z0-9_-]{40,64}")
+# Код подтверждения пары для бота с изменённым именем: 12 знаков из 31 — около 59 бит. Печатается
+# строчными, сравнивается без учёта регистра; набрать его вручную можно.
+CLAIM_LEN = 12
+CLAIM_RE = re.compile(f"[{PAIR_ALPHABET}]{{{CLAIM_LEN}}}")
+_START_CLAIM = re.compile(r"/start(?:@[A-Za-z0-9_]{1,64})?[ \t]+([A-Za-z0-9]{%d})" % CLAIM_LEN)
+CLAIMED_TEXT = ("Готово: бот найден. Вернитесь на страницу настройки «Штурмана» — там нужно подтвердить, "
+                "что бот создан вашим аккаунтом.")
 
 
 def secret_hash(secret: str, kind: str = "botpair") -> str:
@@ -688,6 +730,26 @@ class Pair:
     restricted: bool | None = None
     conflict: bool = False
     net: str = ""
+    claim_hash: str = field(default="", repr=False)
+    started: float = 0.0
+    claimed: bool = False            # бот присоединён по коду подтверждения, а не по имени
+    claim_failures: int = 0          # верный код, но не от создателя или бот создан не в срок пары
+
+
+@dataclass
+class Unmatched:
+    """Бот, созданный через менеджер без пары (имя изменили в окне создания). Только в памяти."""
+    bot_id: int
+    username: str
+    name: str
+    creator_id: int
+    creator_username: str
+    creator_name: str
+    created: float
+    token: str = field(default="", repr=False)
+    offset: int | None = None
+    wrong: int = 0                   # чужие сообщения и неверные коды — после предела бот не слушаем
+    next_poll: float = 0.0
 
 
 def read_manager_token(path: str) -> str | None:
@@ -748,7 +810,9 @@ class Manager:
         self.ready = False
         self.problem: str | None = "no_token"
         self.offset: int | None = None
-        self.counters = {"created": 0, "delivered": 0, "unmatched": 0, "conflicts": 0}
+        self.unmatched: dict[int, Unmatched] = {}
+        self.counters = {"created": 0, "delivered": 0, "unmatched": 0, "conflicts": 0, "claimed": 0,
+                         "poll_errors": 0}
 
     def __repr__(self) -> str:
         return f"<Manager @{self.username or '-'} ready={self.ready} pairs={len(self.pairs)}>"
@@ -819,6 +883,11 @@ class Manager:
         now = self.clock()
         for pid in [pid for pid, p in self.pairs.items() if p.expires <= now]:
             del self.pairs[pid]
+        for bid in [bid for bid, u in self.unmatched.items() if u.created + self.s.unmatched_ttl <= now]:
+            del self.unmatched[bid]
+
+    def _waiting(self) -> list[Pair]:
+        return [p for p in self.pairs.values() if p.bot_id is None and not p.conflict]
 
     def handle_update(self, upd: dict) -> None:
         """`managed_bot`: создан бот под этим менеджером, сменился его токен или владелец.
@@ -838,9 +907,7 @@ class Manager:
             pair = next((p for p in self.pairs.values() if p.bot_id == bot_id), None) or \
                 next((p for p in self.pairs.values() if p.username == uname.lower()), None)
             if pair is None:
-                self.counters["unmatched"] += 1
-                log.info("managed_bot: бот без ожидающей пары (имя изменили при создании, пара истекла "
-                         "или ссылку открыли не с экземпляра) — пропущен")
+                self._unmatched(bot_id, uname, bot, creator, user)
                 return
             if pair.bot_id is None and pair.username == uname.lower():
                 pair.bot_id, pair.bot_username, pair.bot_name = bot_id, uname, _display(bot)
@@ -858,6 +925,30 @@ class Manager:
                 log.warning("managed_bot: у бота пары %s сменился владелец — пара не будет выдана", pair.pair_id)
         if restrict is not None:
             self._restrict(restrict)
+
+    def _unmatched(self, bot_id: int, uname: str, bot: dict, creator: int, user: Any) -> None:
+        """Бот без пары (под блокировкой). Имя бота — публичное, его можно писать в журнал: по нему
+        держатель видит, что владелец изменил адрес в окне создания."""
+        known = self.unmatched.get(bot_id)
+        if known is not None:
+            if known.creator_id != creator:
+                del self.unmatched[bot_id]             # владелец сменился — по коду его не присоединить
+                log.info("managed_bot: у бота @%s без пары сменился владелец — больше не слушаем", _safe(uname))
+            return
+        self.counters["unmatched"] += 1
+        if not self._waiting():
+            log.info("managed_bot: бот @%s без ожидающей пары, и ожидающих пар нет — пропущен", _safe(uname))
+            return
+        if len(self.unmatched) >= self.s.unmatched_max:
+            oldest = min(self.unmatched.values(), key=lambda u: u.created)
+            del self.unmatched[oldest.bot_id]
+        handle = user.get("username") if isinstance(user, dict) else None
+        self.unmatched[bot_id] = Unmatched(
+            bot_id, uname, _display(bot), creator,
+            handle if isinstance(handle, str) and re.fullmatch(r"[A-Za-z0-9_]{1,64}", handle) else "",
+            _display(user), self.clock())
+        log.info("managed_bot: бот @%s без ожидающей пары (вероятно, имя изменили в окне создания) — "
+                 "ждём от его создателя код подтверждения пары", _safe(uname))
 
     def _restrict(self, pair: Pair) -> None:
         """Доступ к новому боту — только у его владельца (создателя). Не вышло — бот всё равно
@@ -889,21 +980,183 @@ class Manager:
                 continue
             except TelegramError as e:
                 fails += 1
+                self.counters["poll_errors"] += 1
+                transient = not e.status and e.code in TRANSIENT
                 if e.status in (401, 404):
                     self.ready, self.problem = False, "token_rejected"
                 elif e.status == 409:
                     self.problem = "conflict"        # бота опрашивает кто-то ещё или у него webhook
                 else:
                     self.problem = e.code if not e.status else f"refused_{e.status}"
-                if fails == 1 or fails % 20 == 0:
-                    log.warning("бот-менеджер: опрос приостановлен (%s)", self.problem)
-                pause = e.retry_after + 1 if e.retry_after else min(60, 2 ** min(fails, 6))
+                # Обрыв долгого опроса (timeout, reset) — обычное дело и обновлений не теряет: место
+                # опроса (offset) сдвигается только после того, как ответ получен и разобран, и
+                # Telegram отдаст то же обновление следующим запросом. Поэтому первые такие обрывы
+                # подряд — в журнал на уровне info, предупреждение — если связь не вернулась.
+                if transient and fails < 3:
+                    log.info("бот-менеджер: запрос обновлений прервался (%s), повторяю; обновления не "
+                             "теряются", self.problem)
+                elif fails in (1, 3) or fails % 20 == 0:
+                    log.warning("бот-менеджер: опрос приостановлен (%s), попыток подряд: %d", self.problem, fails)
+                if e.retry_after:
+                    pause = e.retry_after + 1
+                elif transient and fails < 3:
+                    pause = 1
+                else:
+                    pause = min(60, 2 ** min(fails, 6))
             except Exception:
                 fails += 1
                 self.problem = "internal"
                 log.exception("бот-менеджер: сбой опроса")
                 pause = 10
             stop.wait(pause)
+
+    # --- боты без пары: код подтверждения от создателя (0.4.1) ---
+
+    def claim_loop(self, stop: threading.Event) -> None:
+        while not stop.is_set():
+            try:
+                self.claim_once()
+            except Exception:
+                log.exception("бот-менеджер: сбой при опросе ботов без пары")
+            stop.wait(self.s.claim_poll_every / 3)
+
+    def claim_once(self) -> int:
+        """Один круг по ботам без пары, чей черёд пришёл. Только пока есть ожидающие пары: иначе
+        присоединять их не к чему, и их обновления не трогаются. Возвращает число опрошенных."""
+        now = self.clock()
+        with self.lock:
+            self._prune()
+            if not self._waiting() or not self.ready:
+                for u in self.unmatched.values():
+                    u.token = ""
+                return 0
+            due = sorted((u for u in self.unmatched.values() if u.next_poll <= now), key=lambda u: u.next_poll)
+            due = due[:self.s.claim_bots_per_round]
+            for u in due:
+                u.next_poll = now + self.s.claim_poll_every
+        for u in due:
+            self._watch(u)
+        return len(due)
+
+    def _drop(self, u: Unmatched, why: str) -> None:
+        with self.lock:
+            if self.unmatched.get(u.bot_id) is u:
+                del self.unmatched[u.bot_id]
+        u.token = ""
+        log.info("бот @%s без пары больше не слушаем: %s", _safe(u.username), why)
+
+    def _watch(self, u: Unmatched) -> None:
+        """Короткий опрос обновлений самого бота без пары (`getUpdates` с timeout 0, без
+        allowed_updates — перечень видов обновлений бота не меняется, webhook не ставится)."""
+        base = self.s.tg_api
+        if not u.token:
+            try:
+                token = self.tg("getManagedBotToken", {"user_id": u.bot_id})
+            except TelegramError as e:
+                log.info("бот @%s без пары: токен не получен (%s %s)", _safe(u.username), e.code, e.status)
+                return
+            if not isinstance(token, str) or not BOT_TOKEN_RE.fullmatch(token):
+                return
+            u.token = token
+        params: dict[str, Any] = {"timeout": 0, "limit": 20}
+        if u.offset is not None:
+            params["offset"] = u.offset
+        try:
+            updates = self._tg(base, u.token, "getUpdates", params, 10)
+        except TelegramError as e:
+            if e.status == 409:
+                # Бота опрашивает кто-то ещё (например, владелец вставил его токен в экземпляр вручную):
+                # отступаем сразу, чтобы не мешать.
+                self._drop(u, "его опрашивает другая программа")
+            elif e.status in (401, 404):
+                u.token = ""                       # токен заменили — возьмём новый в следующий раз
+            return
+        if not isinstance(updates, list):
+            return
+        for upd in updates:
+            uid = _int(upd.get("update_id")) if isinstance(upd, dict) else None
+            if uid is None:
+                continue
+            u.offset = uid + 1
+            pair = self._claim_message(u, upd.get("message"))
+            if pair is not None:
+                self._claimed(u, pair)
+                return
+        with self.lock:
+            too_many = u.wrong >= self.s.claim_wrong_max
+        if too_many:
+            self._drop(u, "слишком много лишних сообщений")
+
+    def _claim_message(self, u: Unmatched, msg: Any) -> Pair | None:
+        """Пара, к которой присоединяется бот по этому сообщению, или None. Условия: личный чат,
+        отправитель — создатель бота, текст — ровно `/start <код>`, код — ожидающей пары, бот создан
+        после начала этой пары и в пределах её срока. Остальное не считается и не обсуждается."""
+        if not isinstance(msg, dict):
+            return None
+        sender, chat, text = msg.get("from"), msg.get("chat"), msg.get("text")
+        if not isinstance(sender, dict) or not isinstance(chat, dict) or not isinstance(text, str):
+            return None
+        m = _START_CLAIM.fullmatch(text.strip())
+        from_creator = _int(sender.get("id")) == u.creator_id and chat.get("type") == "private"
+        with self.lock:
+            if not m:
+                if from_creator and text.strip().startswith("/start"):
+                    u.wrong += 1
+                return None
+            digest = secret_hash(m.group(1).lower(), "claim")
+            pair = next((p for p in self._waiting() if hmac.compare_digest(p.claim_hash, digest)), None)
+            if pair is None:
+                if from_creator:              # чужие сообщения не считаются: посторонний не «выключит» бота
+                    u.wrong += 1
+                return None
+            if pair.claim_failures >= self.s.claim_pair_fail_max:
+                return None
+            if not from_creator or not (pair.started <= u.created <= pair.started + self.s.botpair_ttl):
+                pair.claim_failures += 1
+                log.warning("botpair %s: код подтверждения пришёл боту @%s не от его создателя или бот создан не "
+                            "в срок пары — не принят", pair.pair_id, _safe(u.username))
+                return None
+            # Присоединяем под той же блокировкой: второй бот этот код уже не получит.
+            pair.bot_id, pair.bot_username, pair.bot_name = u.bot_id, u.username, u.name
+            pair.creator_id, pair.creator_name, pair.creator_username = u.creator_id, u.creator_name, u.creator_username
+            pair.claimed = True
+            pair.expires = max(pair.expires, self.clock() + self.s.botpair_grace)
+            self.counters["claimed"] += 1
+            if self.unmatched.get(u.bot_id) is u:
+                del self.unmatched[u.bot_id]
+            return pair
+
+    def _claimed(self, u: Unmatched, pair: Pair) -> None:
+        log.info("managed_bot: бот @%s присоединён к паре %s по коду подтверждения от создателя",
+                 _safe(u.username), pair.pair_id)
+        base, token = self.s.tg_api, u.token
+        u.token = ""
+        try:
+            # Подтверждаем прочитанное (offset после сообщения с кодом): экземпляр, который начнёт
+            # опрашивать этого бота, не получит «/start <код>» как попытку привязки. Дальше бота не
+            # опрашиваем — первый getUpdates экземпляра не встретит ни webhook, ни второго опрашивающего.
+            self._tg(base, token, "getUpdates", {"offset": u.offset, "timeout": 0, "limit": 1}, 10)
+        except TelegramError:
+            pass
+        try:
+            self._tg(base, token, "sendMessage", {"chat_id": u.creator_id, "text": CLAIMED_TEXT}, 10)
+        except TelegramError:
+            pass
+        self._restrict(pair)
+
+    def cancel(self, pair_id: Any, secret: Any) -> bool:
+        """Снять пару по просьбе экземпляра (тот же секрет): создание отменено на странице. Без
+        ожидающих пар служба перестаёт слушать ботов без пары."""
+        if not (isinstance(pair_id, str) and PAIR_RE.fullmatch(pair_id) and isinstance(secret, str)
+                and SECRET_RE.fullmatch(secret)):
+            return False
+        with self.lock:
+            pair = self.pairs.get(pair_id)
+            if pair is None or not hmac.compare_digest(pair.secret_hash, secret_hash(secret)):
+                return False
+            del self.pairs[pair_id]
+        log.info("botpair %s: снята экземпляром", pair_id)
+        return True
 
     # --- пары ---
 
@@ -913,6 +1166,7 @@ class Manager:
             raise PairError(503, "manager_unavailable",
                             "Создание бота в одно нажатие сейчас недоступно. Создайте бота у @BotFather вручную.")
         secret = secrets.token_urlsafe(32)
+        claim = "".join(secrets.choice(PAIR_ALPHABET) for _ in range(CLAIM_LEN))
         with self.lock:
             self._prune()
             if len(self.pairs) >= self.s.botpair_max_pending:
@@ -926,10 +1180,11 @@ class Manager:
                     break
             username = f"{self.s.botpair_prefix}_{pair_id}_bot"
             expires = self.clock() + self.s.botpair_ttl
-            self.pairs[pair_id] = Pair(pair_id, secret_hash(secret), username, display, expires, net=net)
+            self.pairs[pair_id] = Pair(pair_id, secret_hash(secret), username, display, expires, net=net,
+                                       claim_hash=secret_hash(claim, "claim"), started=self.clock())
         link = f"https://t.me/newbot/{self.username}/{username}?name={quote(display, safe='')}"
         return {"pair_id": pair_id, "secret": secret, "link": link, "username": username, "name": display,
-                "manager": self.username, "expires_at": int(expires), "ttl": self.s.botpair_ttl}
+                "manager": self.username, "expires_at": int(expires), "ttl": self.s.botpair_ttl, "claim": claim}
 
     def fetch(self, pair_id: Any, secret: Any) -> tuple[int, dict, bool]:
         """(код ответа, тело, неудача — для общего предела). Токен берётся у Telegram сейчас и
@@ -968,7 +1223,7 @@ class Manager:
                      "bot": {"id": bot_id, "username": pair.bot_username, "name": pair.bot_name},
                      "creator": {"id": pair.creator_id, "username": pair.creator_username or None,
                                  "name": pair.creator_name},
-                     "restricted": pair.restricted is True}, False
+                     "restricted": pair.restricted is True, "claimed": pair.claimed}, False
 
 
 def manager_setup(conn: sqlite3.Connection, s: Settings, manager: Manager, secret: Any, token: Any,
@@ -1207,7 +1462,7 @@ class ApiHandler(_Handler):
         """POST /api/botpair/start и /api/botpair/<pair_id>/token (Р-77)."""
         st, manager = self.server.settings, self.server.manager
         start = path == "/api/botpair/start"
-        m = re.fullmatch(r"/api/botpair/([a-z0-9]{1,32})/token", path)
+        m = re.fullmatch(r"/api/botpair/([a-z0-9]{1,32})/(token|cancel)", path)
         if not start and m is None:
             self._json(404, {"error": "not_found"})
             return
@@ -1241,6 +1496,10 @@ class ApiHandler(_Handler):
                 return
             log.info("botpair start from=%s: пара %s", _safe(ip), answer["pair_id"])
             self._json(200, answer)
+            return
+        if m.group(2) == "cancel":
+            done = manager.cancel(m.group(1), req.get("secret"))
+            self._json(200 if done else 404, {"ok": True} if done else {"error": "not_found"})
             return
         status, body, _ = manager.fetch(m.group(1), req.get("secret"))
         self._json(status, body)
@@ -1384,6 +1643,7 @@ def cmd_serve(a: argparse.Namespace) -> int:
     for srv in (plugin, api):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=api.manager.run, args=(stop,), daemon=True, name="manager").start()
+    threading.Thread(target=api.manager.claim_loop, args=(stop,), daemon=True, name="claims").start()
     log.info("relayd %s: плагин frps на %s:%d, выдача имён на %s:%d, зона %s; бот-менеджер: %s%s",
              VERSION, *a.plugin, *a.api, a.domain, s.manager_path,
              "; пары — только по коду приглашения" if invite else "")

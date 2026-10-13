@@ -31,6 +31,8 @@ class FakeTelegram:
         }
         self.managed: dict[int, dict] = {}          # id бота → {token, owner, username, name, restricted}
         self.updates: list[dict] = []
+        self.bot_updates: dict[int, list[dict]] = {}   # обновления управляемых ботов — у каждого свои
+        self.bot_calls: list[tuple[int, str, dict]] = []
         self.calls: list[tuple[str, dict]] = []
         self.fail: dict[str, list[int]] = {}         # метод → коды ошибок для следующих вызовов
         self.allowed: list | None = None
@@ -55,6 +57,14 @@ class FakeTelegram:
             self.bots[token] = dict(bot)
             self._push({"managed_bot": {"user": owner, "bot": bot}})
         return bot_id
+
+    def send_to_bot(self, bot_id: int, user: dict, text: str, chat_type: str = "private") -> None:
+        """Пользователь написал управляемому боту: обновление в очередь самого бота."""
+        with self.lock:
+            self._uid += 1
+            self.bot_updates.setdefault(bot_id, []).append({"update_id": self._uid, "message": {
+                "message_id": self._uid, "date": int(time.time()), "from": user, "text": text,
+                "chat": {"id": user["id"] if chat_type == "private" else -100, "type": chat_type}}})
 
     def change_owner(self, bot_id: int, owner: dict) -> None:
         with self.lock:
@@ -101,6 +111,21 @@ class FakeTelegram:
                     m["restricted"] = params["is_access_restricted"]
                     return 200, {"ok": True, "result": True}
                 return 200, {"ok": True, "result": {"is_access_restricted": m["restricted"]}}
+            own = next((bid for bid, m in self.managed.items() if m["token"] == token), None)
+            if own is not None:
+                # Запрос от имени самого управляемого бота.
+                self.bot_calls.append((own, method, dict(params)))
+                if method == "sendMessage":
+                    return 200, {"ok": True, "result": {"message_id": 1, "chat": {"id": params.get("chat_id")},
+                                                        "text": params.get("text")}}
+                if method != "getUpdates":
+                    return 200, {"ok": True, "result": True}
+                queue = self.bot_updates.setdefault(own, [])
+                offset = params.get("offset")
+                if isinstance(offset, int):
+                    queue[:] = [u for u in queue if u["update_id"] >= offset]
+                limit = params.get("limit") if isinstance(params.get("limit"), int) else 100
+                return 200, {"ok": True, "result": queue[:limit]}
             if method != "getUpdates":
                 return 200, {"ok": True, "result": True}
             if "allowed_updates" in params:
@@ -134,6 +159,11 @@ class FakeTelegram:
                     req = json.loads(body or b"{}")
                     bot_id = fake.create_managed_bot(req["username"], req.get("name") or "Согласования", req["owner"])
                     status, out = 200, {"ok": True, "bot_id": bot_id}
+                elif self.path == "/__send":
+                    # Только стенд: «пользователь написал управляемому боту».
+                    req = json.loads(body or b"{}")
+                    fake.send_to_bot(int(req["bot_id"]), req["user"], req["text"])
+                    status, out = 200, {"ok": True}
                 elif len(parts) != 3 or not parts[1].startswith("bot"):
                     status, out = 404, {"ok": False, "error_code": 404, "description": "Not Found"}
                 else:
