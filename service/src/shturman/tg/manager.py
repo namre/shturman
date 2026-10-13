@@ -72,9 +72,14 @@ KEEP: Any = object()   # «настройку не трогать»
 class TgError(Exception):
     """Отказ с текстом для владельца и кодом ответа HTTP."""
 
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(self, message: str, status: int = 400, *, retry_after: int | None = None) -> None:
         super().__init__(message)
         self.message, self.status = message, status
+        self.retry_after = retry_after   # Telegram велел ждать столько секунд (для 429)
+
+
+def _wait_error(seconds: int) -> TgError:
+    return TgError(f"Telegram просит подождать {seconds} с. Попробуйте позже.", 429, retry_after=max(1, seconds))
 
 
 class _Unauthorized(Exception):
@@ -432,6 +437,9 @@ class TgManager:
                                  self_id=rt.self_id, wake=rt.wake)
             await rt.live.reload()
             rt.live.register(client)  # до первого чтения истории, чтобы ничего не проскочило
+        set_filter = getattr(client, "set_channel_filter", None)
+        if set_filter is not None:
+            set_filter(rt.live.wants_channel)
         rt.history = sync.HistorySync(
             client=client, pool=self.pool, events=self.events, account_id=rt.account_id,
             self_id=rt.self_id, pacer=rt.pacer, stop=rt.stop)
@@ -842,11 +850,12 @@ class TgManager:
         if rt.dialogs is None or age > DIALOGS_TTL or (refresh and age > DIALOGS_MIN_GAP):
             waiting = rt.pacer.flood_remaining()
             if waiting > 5:   # запрос экрана не должен висеть всё время ожидания
-                raise TgError(f"Telegram просит подождать {int(waiting)} с. Попробуйте позже.", 429)
+                raise _wait_error(int(waiting) + 1)
             try:
                 await self._load_dialogs(rt)
             except gateway.FloodWait as exc:
-                raise TgError(f"Telegram просит подождать {exc.seconds} с. Попробуйте позже.", 429) from None
+                logger.warning("аккаунт %s: список чатов — Telegram просит подождать %s с", account_id, exc.seconds)
+                raise _wait_error(int(exc.seconds) + 1) from None
             except sync.Stopped:
                 raise TgError("Аккаунт останавливается.", 409) from None
         return rt.dialogs or []

@@ -19,15 +19,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import random
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.sessions import SQLiteSession
-from telethon.tl import functions
+from telethon.tl import functions, types
 
 from .. import __version__
 from ..config import Config
@@ -146,6 +149,112 @@ class RequestPolicy:
                 raise RequestNotAllowed(type(inner).__name__, self.role)
 
 
+# --- фоновые запросы Telethon по каналам ---
+#
+# Telethon следит за каждым каналом и супергруппой, о которых узнал (список диалогов сообщает
+# ему их состояние). Если по каналу 15 минут не было обновлений, он запрашивает разницу
+# (`updates.GetChannelDifference`) — по всем таким каналам сразу, подряд, без пауз. У аккаунта
+# с десятками каналов это пачка из десятков запросов за доли секунды, круглые сутки раз в
+# 15 минут; Telegram отвечает на неё FLOOD_WAIT (замечено на пилоте 2026-10-13: 35 отказов за
+# полсекунды). Сервису разница нужна только по выбранным чатам — остальное он не сохраняет.
+#
+# Поэтому запрос разницы по каналу:
+#   * по невыбранному каналу в Telegram не уходит: Telethon получает ответ «разницы нет» с
+#     прежним номером состояния и вернётся к каналу через 15 минут (опять без запроса). Живые
+#     сообщения такого канала по-прежнему приходят — их Telegram присылает сам;
+#   * по выбранному — уходит с паузой не меньше CHANNEL_DIFF_GAP (со случайной добавкой);
+#   * пока Telegram велит ждать, в Telegram не уходит ничего — тот же ответ «разницы нет».
+#     Пропущенное по выбранным чатам дочитывает загрузка истории (sync.HistorySync).
+
+CHANNEL_DIFF_GAP = 2.0
+CHANNEL_DIFF_JITTER = (1.0, 1.8)
+
+
+# Список диалогов Telethon читает страницами по 100 (`messages.GetDialogs`) подряд, без пауз;
+# у большого аккаунта это несколько запросов за секунду. Между страницами — пауза.
+DIALOGS_PAGE_GAP = 1.5
+
+
+class Spacer:
+    """Не чаще одного запроса в `gap` секунд (со случайной добавкой до 80 %)."""
+
+    def __init__(self, gap: float, *, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Any] = asyncio.sleep, rng: random.Random | None = None) -> None:
+        self.gap = gap
+        self._clock, self._sleep = clock, sleep
+        self._rng = rng or random.SystemRandom()
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def run(self, send: Callable[[], Any]) -> Any:
+        async with self._lock:
+            now = self._clock()
+            if now < self._next_at:
+                await self._sleep(self._next_at - now)
+            try:
+                return await send()
+            finally:
+                self._next_at = self._clock() + self.gap * self._rng.uniform(*CHANNEL_DIFF_JITTER)
+
+
+class ChannelUpdatesThrottle:
+    """Решает, уходит ли запрос разницы по каналу в Telegram, и держит паузы между ними.
+
+    `wanted(channel_id)` — выбран ли канал владельцем; не задан — не выбран никакой
+    (так до запуска приёма и во время входа)."""
+
+    def __init__(self, role: str, *, gap: float = CHANNEL_DIFF_GAP,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Any] = asyncio.sleep,
+                 rng: random.Random | None = None) -> None:
+        self.role = role
+        self.gap = gap
+        self.wanted: Callable[[int], bool] | None = None
+        self._clock, self._sleep = clock, sleep
+        self._rng = rng or random.SystemRandom()
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+        self.flood_until = 0.0
+        self.skipped = 0     # сколько запросов не ушло: невыбранный канал или ожидание
+
+    def allowed(self, channel_id: int) -> bool:
+        wanted = self.wanted
+        if wanted is None:
+            return False
+        try:
+            return bool(wanted(int(channel_id)))
+        except Exception:
+            return False
+
+    @staticmethod
+    def empty(request: Any) -> Any:
+        """Ответ «разницы нет» с прежним номером состояния: Telethon ничего не меняет и
+        откладывает канал на обычные 15 минут."""
+        return types.updates.ChannelDifferenceEmpty(pts=int(request.pts), final=True, timeout=None)
+
+    async def run(self, request: Any, send: Callable[[], Any]) -> Any:
+        if not self.allowed(request.channel.channel_id):
+            self.skipped += 1
+            return self.empty(request)
+        async with self._lock:
+            now = self._clock()
+            if now < self.flood_until:
+                self.skipped += 1
+                return self.empty(request)
+            if now < self._next_at:
+                await self._sleep(self._next_at - now)
+            try:
+                return await send()
+            except errors.FloodError as exc:
+                seconds = int(getattr(exc, "seconds", 0) or 0)
+                self.flood_until = self._clock() + max(1, seconds) + 1
+                logger.warning("аккаунт (%s): Telegram просит подождать %s с (обновления каналов); "
+                               "до тех пор запросы по каналам не отправляются", self.role, seconds)
+                raise
+            finally:
+                self._next_at = self._clock() + self.gap * self._rng.uniform(*CHANNEL_DIFF_JITTER)
+
+
 class GuardedClient(TelegramClient):
     """`TelegramClient`, который не отправит запрос вне перечня своей роли."""
 
@@ -153,14 +262,31 @@ class GuardedClient(TelegramClient):
                  on_reconnect: Callable[[], None] | None = None, **kwargs: Any) -> None:
         self._shturman_policy = policy
         self._shturman_on_reconnect = on_reconnect
+        self._shturman_channels = ChannelUpdatesThrottle(policy.role)
+        self._shturman_dialogs = Spacer(DIALOGS_PAGE_GAP)
         super().__init__(session, api_id, api_hash, **kwargs)
 
     @property
     def policy(self) -> RequestPolicy:
         return self._shturman_policy
 
+    @property
+    def channel_updates(self) -> ChannelUpdatesThrottle:
+        return self._shturman_channels
+
+    def set_channel_filter(self, wanted: Callable[[int], bool] | None) -> None:
+        """Какие каналы выбраны: по остальным Telethon разницу в Telegram не запрашивает."""
+        self._shturman_channels.wanted = wanted
+
     async def __call__(self, request: Any, ordered: bool = False, flood_sleep_threshold: int | None = None) -> Any:
         self._shturman_policy.check(request)
+        if isinstance(request, functions.updates.GetChannelDifferenceRequest):
+            # Так запрашивает разницу цикл обновлений Telethon (client/updates.py: `self(get_diff)`).
+            return await self._shturman_channels.run(request, lambda: super(GuardedClient, self).__call__(
+                request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold))
+        if isinstance(request, functions.messages.GetDialogsRequest):
+            return await self._shturman_dialogs.run(lambda: super(GuardedClient, self).__call__(
+                request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold))
         return await super().__call__(request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold)
 
     async def _call(self, sender: Any, request: Any, ordered: bool = False,
