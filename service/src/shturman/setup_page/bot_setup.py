@@ -31,6 +31,12 @@
 в бизнес-режиме, его личные переписки. Это говорится владельцу до кнопки. Перейти на своего бота
 можно в любой момент: создать бота у @BotFather и заменить токен на странице.
 
+**Если владелец изменил адрес бота в окне создания** (посредник 0.4.1), посредник не узнаёт бота по
+имени. Тогда страница просит вписать новый адрес бота (`claim_username`) и отправить этому боту
+`/start <код подтверждения пары>`: посредник присоединит бота, только если код пришёл от его
+создателя и бот создан после начала пары. Посредник сообщает `claimed: true`, и имя бота должно
+совпасть и с тем, что вписал владелец, и с `getMe`. Подтверждение «Это ваш аккаунт?» остаётся.
+
 Адрес посредника — только из окружения (`SHTURMAN_BOT_MANAGER_API`): ни страница, ни внутренний
 API его не меняют. Запустить создание может только сессия страницы настройки.
 """
@@ -68,6 +74,8 @@ _SECRET = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 _USERNAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,30}[Bb][Oo][Tt]$")
 _MANAGER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 _HANDLE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+_CLAIM = re.compile(r"^[a-z0-9]{8,16}$")
+_TYPED = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{1,29}[Bb][Oo][Tt])$")      # адрес бота, как его впишет владелец
 _TOKEN = re.compile(r"^[0-9]{5,16}:[A-Za-z0-9_-]{30,80}$")
 
 # Состояния попытки. Конечные — DONE, FAILED, INTERCEPTED, CANCELLED.
@@ -102,6 +110,13 @@ TEXTS = {
     "replaced": "Пока шло создание, токен бота согласований поменяли на этой странице. Созданный бот не "
                 "подключён.",
     "not_pending": "Подтверждать нечего: создание бота не ждёт подтверждения.",
+    "claim_mismatch": "Посредник нашёл бота по коду подтверждения, но его адрес не совпадает с тем, что вы вписали "
+                      "на странице. Токен не сохранён. Проверьте адрес бота и начните заново — или создайте бота "
+                      "вручную.",
+    "bad_username": "Это не похоже на адрес бота: латинские буквы, цифры и «_», 5–32 знака, в конце — bot. "
+                    "Например, @shturman_ivan_bot.",
+    "no_claim": "Посредник не умеет находить бота с изменённым адресом. Удалите бота у @BotFather (/deletebot) "
+                "и начните заново, не меняя адрес, — или создайте бота вручную.",
 }
 
 
@@ -276,6 +291,10 @@ class Pairing:
     restricted: bool | None = None
     token: str = field(default="", repr=False)     # ждёт подтверждения «это мой аккаунт»
     confirm_until: float = 0.0
+    # Код подтверждения пары (посредник 0.4.1): владелец отправляет `/start <код>` боту, если изменил
+    # его адрес в окне создания. Не секрет пары — его видит владелец на странице.
+    claim: str | None = None
+    claimed_username: str | None = None            # адрес бота, который вписал владелец
     task: asyncio.Task | None = field(default=None, repr=False)
 
     def drop_secrets(self) -> None:
@@ -288,7 +307,12 @@ class Pairing:
         creator = None
         if self.creator_id is not None:
             creator = {"id": self.creator_id, "username": self.creator_username, "name": self.creator_name}
+        claim_link = None
+        if self.claim and self.claimed_username and self.status == WAITING:
+            claim_link = f"https://t.me/{self.claimed_username}?start={self.claim}"
         return {"status": self.status, "link": self.link if self.status == WAITING else None,
+                "claim": self.claim if self.status == WAITING else None,
+                "claimed_username": self.claimed_username, "claim_link": claim_link,
                 "username": self.username, "manager": self.manager,
                 "expires_at": self.expires_at, "seconds_left": max(0, int(self.expires_at - time.time())),
                 "confirm_seconds_left": max(0, int(self.confirm_until - time.time())) if self.status == CONFIRM else None,
@@ -310,7 +334,7 @@ async def start(state: Any, page: Any, session_id: int, *, name: Any = None, cod
         invite = apply.clean(code, limit=64)
         if invite:
             body["code"] = invite
-    await cancel(page)
+    await cancel(page, state)
     try:
         async with _client(config) as http:
             status, data = await _call(http, "POST", "/api/botpair/start", body)
@@ -325,6 +349,9 @@ async def start(state: Any, page: Any, session_id: int, *, name: Any = None, cod
     pair_id, secret = data.get("pair_id"), data.get("secret")
     username, manager = data.get("username"), data.get("manager")
     ttl = data.get("ttl")
+    claim = data.get("claim")
+    if claim is not None and not (isinstance(claim, str) and _CLAIM.match(claim)):
+        raise apply.Invalid(TEXTS["bad_answer"], "bad_answer")
     if not (isinstance(pair_id, str) and _PAIR.match(pair_id) and isinstance(secret, str) and _SECRET.match(secret)
             and isinstance(username, str) and _USERNAME.match(username) and pair_id in username
             and isinstance(manager, str) and _MANAGER.match(manager)
@@ -333,19 +360,44 @@ async def start(state: Any, page: Any, session_id: int, *, name: Any = None, cod
     # Ссылку собираем сами из имён: посредник не может подсунуть странице владельца чужую ссылку.
     link = f"https://t.me/newbot/{manager}/{username}?name={quote(display, safe='')}"
     _remember(config.bot_manager_api, True)
-    pairing = Pairing(pair_id, secret, link, username, manager, time.time() + ttl, session_id)
+    pairing = Pairing(pair_id, secret, link, username, manager, time.time() + ttl, session_id, claim=claim)
     page.managed = pairing
     pairing.task = state.spawn(_wait(state, page, pairing), name="setup-managed-bot")
     return pairing
 
 
-async def cancel(page: Any) -> bool:
+def claim_username(page: Any, raw: Any) -> Pairing:
+    """Владелец изменил адрес бота в окне создания и вписал новый: по нему страница откроет бота
+    с командой `/start <код>`, а сервис потом сверит адрес найденного посредником бота."""
+    pairing = getattr(page, "managed", None)
+    if pairing is None or pairing.status != WAITING:
+        raise apply.Invalid(TEXTS["not_pending"], "not_pending")
+    if not pairing.claim:
+        raise apply.Invalid(TEXTS["no_claim"], "no_claim")
+    m = _TYPED.match(raw.strip()) if isinstance(raw, str) else None
+    if m is None:
+        raise apply.Invalid(TEXTS["bad_username"], "bad_username")
+    pairing.claimed_username = m.group(1)
+    return pairing
+
+
+async def _release(state: Any, pair_id: str, secret: str) -> None:
+    """Сказать посреднику, что пара больше не нужна: без ожидающих пар он не слушает ботов без пары."""
+    with contextlib.suppress(RelayError, apply.Invalid):
+        async with _client(state.config) as http:
+            await _call(http, "POST", f"/api/botpair/{pair_id}/cancel", {"secret": secret})
+
+
+async def cancel(page: Any, state: Any = None) -> bool:
     """Снять попытку в любом незаконченном состоянии: ожидание бота останавливается, полученный
-    и не подтверждённый токен выбрасывается. True — было что снимать."""
+    и не подтверждённый токен выбрасывается. True — было что снимать. С `state` — ещё и посреднику
+    сообщается, что пара снята (в фоне)."""
     pairing = getattr(page, "managed", None)
     page.managed = None
     if pairing is None or pairing.status in FINAL:
         return False
+    if state is not None and pairing.secret and pairing.status == WAITING:
+        state.spawn(_release(state, pairing.pair_id, pairing.secret), name="setup-managed-release")
     pairing.status = CANCELLED
     pairing.drop_secrets()
     if pairing.task is not None and not pairing.task.done() and pairing.task is not asyncio.current_task():
@@ -432,9 +484,19 @@ async def _received(state: Any, pairing: Pairing, data: dict[str, Any]) -> None:
         await audit.write(state.pool, "bot.managed", audit.REFUSED, "посредник ответил непонятно")
         return
     pairing.status = CHECKING
-    # Имя бота — то, что сервис сам вписал в ссылку; номер — тот, о котором сообщил посредник.
-    expect = {"id": bot_id, "username": pairing.username}
-    if username.lower() != pairing.username.lower():
+    # Имя бота — то, что сервис сам вписал в ссылку, а если бот найден по коду подтверждения
+    # (владелец изменил адрес) — то, что вписал владелец; номер — тот, о котором сообщил посредник.
+    if data.get("claimed") is True:
+        if not pairing.claimed_username or username.lower() != pairing.claimed_username.lower():
+            _fail(pairing, "claim_mismatch")
+            await audit.write(state.pool, "bot.managed", audit.REFUSED,
+                              "бот найден по коду, но его адрес не тот, что вписан на странице")
+            return
+        expected_name = pairing.claimed_username
+    else:
+        expected_name = pairing.username
+    expect = {"id": bot_id, "username": expected_name}
+    if username.lower() != expected_name.lower():
         _fail(pairing, "wrong_bot")
         await audit.write(state.pool, "bot.managed", audit.REFUSED, "посредник сообщил о боте с другим именем")
         return
@@ -451,6 +513,7 @@ async def _received(state: Any, pairing: Pairing, data: dict[str, Any]) -> None:
         await audit.write(state.pool, "bot.managed", audit.REFUSED, "вход на страницу завершился до создания бота")
         return
     pairing.bot_id, pairing.bot_username = bot_id, found["username"]
+    pairing.username = expected_name                 # дальше (подтверждение, сохранение) — этот бот
     pairing.creator_id = creator_id
     pairing.creator_username = handle if isinstance(handle, str) and _HANDLE.match(handle) else None
     pairing.creator_name = name.strip()[:64] or None

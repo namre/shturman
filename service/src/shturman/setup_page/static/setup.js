@@ -31,7 +31,7 @@
   }
   var ui = {
     botEditing: false, botToken: "", bind: null, keysEditing: false,
-    managedLink: "", managedDone: "", managedError: false,
+    managedLink: "", managedDone: "", managedError: false, claim: "", claimSent: "",
     login: null, loginLink: "", chatAccount: null, chats: [], chatsTotal: 0, chatsEnabled: 0,
     chatsLoading: false, chatsKey: "", scans: {}, scanning: {}, exclude: {}, upload: null,
     signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
@@ -569,6 +569,10 @@
     text("managed-host", m.host || "посредника");
     show("managed-start-row", !waiting && !applying && !asking);
     show("managed-wait", waiting || applying);
+    // Изменённый адрес бота: код подтверждения пары и ссылка на бота (посредник 0.4.1).
+    show("claim-box", !!(a && a.status === "waiting" && a.claim));
+    if (a && a.claim) text("claim-command", "/start " + a.claim);
+    ui.claim = a && a.claim ? a.claim : "";
     show("managed-confirm", asking);
     note("managed-intercepted", "danger", intercepted ? a.message : "");
     if (asking) {
@@ -601,6 +605,26 @@
       ui.managedDone = a.bot_username;
       toast("Бот @" + a.bot_username + " создан и подключён. Теперь привяжите себя владельцем.");
     }
+  }
+
+  var CLAIM_USERNAME = /^@?([A-Za-z][A-Za-z0-9_]{1,29}[Bb][Oo][Tt])$/;
+
+  /* Адрес бота проверяется здесь же; сервис узнаёт его до того, как бот получит код: потом он сверит
+   * его с ботом, которого найдёт посредник. Ссылка — https://t.me/<адрес>?start=<код>. */
+  function claimTyped() {
+    var m = CLAIM_USERNAME.exec($("claim-username").value.trim());
+    var link = $("claim-open");
+    if (!m || !ui.claim) { link.setAttribute("href", "#"); return null; }
+    link.setAttribute("href", "https://t.me/" + m[1] + "?start=" + ui.claim);
+    return m[1];
+  }
+
+  function sendClaim(username) {
+    if (ui.claimSent === username) return;
+    ui.claimSent = username;
+    call("POST", "bot/managed/claim", { username: username }).then(function (r) {
+      if (!r.ok) { ui.claimSent = ""; note("claim-error", "warn", r.error); }
+    });
   }
 
   function copyText(value, button) {
@@ -643,6 +667,22 @@
         fast(60);
         refresh(); refreshOverview();
       });
+    });
+    $("claim-username").addEventListener("input", function () { note("claim-error", "warn", ""); claimTyped(); });
+    $("claim-open").addEventListener("click", function (event) {
+      var username = claimTyped();
+      if (!username) {
+        event.preventDefault();
+        note("claim-error", "warn", "Это не похоже на адрес бота: латинские буквы, цифры и «_», в конце — bot. Например, @shturman_ivan_bot.");
+        return;
+      }
+      sendClaim(username);                       // ссылка открывается сама (новая вкладка), сервис узнаёт адрес
+    });
+    $("claim-copy").addEventListener("click", function () {
+      var username = claimTyped();
+      if (!username) { note("claim-error", "warn", "Сначала впишите адрес нового бота — сервис сверит с ним найденного бота."); return; }
+      sendClaim(username);
+      copyText($("claim-command").textContent, this);
     });
     $("managed-yes").addEventListener("click", function () {
       act(this, "managed-error", "POST", "bot/managed/confirm", { accept: true }, function () {

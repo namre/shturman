@@ -78,3 +78,45 @@ async def test_bench_relayd_and_service_end_to_end(stand, conn, tmp_path, caplog
         api.shutdown()
         api.server_close()
         tg.stop()
+
+
+async def test_bench_renamed_bot_is_claimed_by_its_creator(stand, conn, tmp_path, caplog):
+    """Владелец изменил адрес бота в окне создания (как на пилоте 2026-10-13): страница — адрес,
+    владелец — «/start <код>» своему боту, служба посредника слушает бота и присоединяет его."""
+    tg = FakeTelegram()
+    base = tg.start()
+    ca = tmp_path / "frps.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+    settings = relayd.Settings(db=str(tmp_path / "relay.db"), domain="sh.example.test", ca_file=str(ca), frp_token="t",
+                               tg_api=base, manager_poll=1, claim_poll_every=0.3)
+    relayd.write_manager_token(settings.manager_path, MANAGER_TOKEN)
+    _, api = relayd.make_servers(settings, ("127.0.0.1", 0), ("127.0.0.1", 0))
+    stop = threading.Event()
+    threading.Thread(target=api.serve_forever, daemon=True).start()
+    threading.Thread(target=api.manager.run, args=(stop,), daemon=True).start()
+    threading.Thread(target=api.manager.claim_loop, args=(stop,), daemon=True).start()
+    try:
+        await until(lambda: api.manager.ready, timeout=10)
+        s = await stand(bot_manager_api=f"http://127.0.0.1:{api.server_address[1]}")
+        executor_service.TEST_OVERRIDES.update(botpair_poll=0.05)
+        await s.page.login(conn)
+        view = (await s.page.post("/bot/managed")).json()["attempt"]
+        claim = view["claim"]
+        s.telegram.me["username"] = "shturman_erman_bot"
+        tg.create_managed_bot("shturman_erman_bot", "Согласования", OWNER_USER, bot_id=BOT_ID, token=TOKEN)
+        await until(lambda: BOT_ID in api.manager.unmatched, timeout=15)
+        view = (await s.page.post("/bot/managed/claim", {"username": "@shturman_erman_bot"})).json()["attempt"]
+        assert view["claim_link"] == f"https://t.me/shturman_erman_bot?start={claim}"
+        tg.send_to_bot(BOT_ID, OWNER_USER, f"/start {claim}")          # «Запустить» по ссылке со страницы
+        page = s.state.extras["setup_page"]
+        await until(lambda: page.managed.status == "confirm", timeout=15)
+        assert (await s.page.post("/bot/managed/confirm", {"accept": True})).status_code == 200
+        await until(lambda: s.state.config.bot_token == TOKEN, timeout=15)
+        assert tg.managed[BOT_ID]["restricted"] is True and api.manager.unmatched == {}
+        assert [p["text"] for b, m, p in tg.bot_calls if m == "sendMessage"] == [relayd.CLAIMED_TEXT]
+        assert TOKEN not in caplog.text and claim not in caplog.text
+    finally:
+        stop.set()
+        api.shutdown()
+        api.server_close()
+        tg.stop()

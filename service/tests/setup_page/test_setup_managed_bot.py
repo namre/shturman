@@ -28,6 +28,7 @@ RELAY = "https://relay.test"
 SECRET = "S" * 20 + "ecret-of-the-pair_" + "x" * 10          # 48 знаков, как token_urlsafe(32) с запасом
 PAIR = "abcdefgh23"
 USERNAME = f"shturman_{PAIR}_bot"
+CLAIM = "k7m2p9q4r8s3"
 OWNER_TG = {**OWNER_USER, "username": "evgeny_t"}
 
 
@@ -47,13 +48,13 @@ class FakeRelay:
         return httpx.MockTransport(self._handle)
 
     def create(self, *, token: str = TOKEN, bot_id: int = BOT_ID, username: str = USERNAME,
-               creator: dict = OWNER_TG, restricted: bool = True) -> None:
+               creator: dict = OWNER_TG, restricted: bool = True, claimed: bool = False) -> None:
         """Аккаунт `creator` подтвердил создание в Telegram: посредник получил managed_bot."""
         self.created = {"status": "ready", "token": token,
                         "bot": {"id": bot_id, "username": username, "name": "Согласования"},
                         "creator": {"id": creator["id"], "username": creator.get("username"),
                                     "name": creator.get("first_name", "")},
-                        "restricted": restricted}
+                        "restricted": restricted, "claimed": claimed}
 
     async def _handle(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/health":
@@ -67,7 +68,10 @@ class FakeRelay:
                 return self.start_answer
             return httpx.Response(200, json={"pair_id": PAIR, "secret": SECRET, "username": USERNAME,
                                              "name": body.get("name"), "manager": "shturman_manager_bot",
-                                             "link": "https://evil.example/not-used", "expires_at": 0, "ttl": 900})
+                                             "link": "https://evil.example/not-used", "expires_at": 0, "ttl": 900,
+                                             "claim": CLAIM})
+        if request.url.path == f"/api/botpair/{PAIR}/cancel":
+            return httpx.Response(200 if body.get("secret") == SECRET else 404, json={})
         assert request.url.path == f"/api/botpair/{PAIR}/token"
         if body.get("secret") != SECRET:
             return httpx.Response(404, json={"error": "not_found"})

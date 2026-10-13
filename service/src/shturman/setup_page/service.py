@@ -20,6 +20,7 @@
   POST   /shturman-setup/api/bot/managed                создать бота в одно нажатие через бот-менеджер
                                                         посредника: {name?, code?} → ссылка t.me/newbot/…
   POST   /shturman-setup/api/bot/managed/confirm        бот создан вашим аккаунтом? {accept: true | false}
+  POST   /shturman-setup/api/bot/managed/claim          адрес бота, изменённый в окне создания: {username}
   DELETE /shturman-setup/api/bot/managed                отменить начатое создание
   DELETE /shturman-setup/api/bot/token                  убрать токен, введённый на странице
   POST   /shturman-setup/api/bot/bind                   ссылка привязки владельца к боту
@@ -443,7 +444,7 @@ async def logout(request: Request) -> JSONResponse:
         await auth.revoke_session(conn, request.state.setup_session.id)
     page = _page(request)
     if page.managed is not None and page.managed.session_id == request.state.setup_session.id:
-        await bot_setup.cancel(page)              # начатое этой сессией создание бота не доводится
+        await bot_setup.cancel(page, state_of(request))  # начатое этой сессией создание бота не доводится
     await _log(request, "logout")
     return JSONResponse({"ok": True})
 
@@ -452,7 +453,7 @@ async def logout(request: Request) -> JSONResponse:
 async def logout_all(request: Request) -> JSONResponse:
     async with state_of(request).pool.acquire() as conn:
         count = await auth.revoke_all(conn)
-    await bot_setup.cancel(_page(request))
+    await bot_setup.cancel(_page(request), state_of(request))
     await _log(request, "logout.all", detail=f"сессий завершено: {count}")
     return JSONResponse({"ok": True, "sessions": count})
 
@@ -753,7 +754,7 @@ async def bot_token_save(request: Request) -> JSONResponse:
         return JSONResponse({"status": "confirm", "bot": {"username": bot["username"], "name": bot["name"]}})
     # Токен, введённый вручную, главнее начатого создания в одно нажатие: оно снимается до сохранения
     # (и не сохранит свой токен поверх). Дальше — тот же путь, что у бота в одно нажатие.
-    if await bot_setup.cancel(page):
+    if await bot_setup.cancel(page, state):
         await _log(request, "bot.managed_cancel", detail="токен введён вручную")
     found = await bot_setup.apply_token(state, page, token, via="manual")
     return JSONResponse({"status": "saved", "bot": found})
@@ -789,9 +790,19 @@ async def bot_managed_confirm(request: Request) -> JSONResponse:
 
 
 @endpoint
+async def bot_managed_claim(request: Request) -> JSONResponse:
+    """Владелец изменил адрес бота в окне создания: страница получает ссылку на бота с командой
+    `/start <код подтверждения>`; посредник присоединит бота, только если код пришлёт его создатель."""
+    data = await _body(request)
+    pairing = bot_setup.claim_username(_page(request), data.get("username"))
+    await _log(request, "bot.managed_claim", detail=f"указан адрес @{pairing.claimed_username}")
+    return JSONResponse({"ok": True, "attempt": pairing.view()})
+
+
+@endpoint
 async def bot_managed_cancel(request: Request) -> JSONResponse:
     await _body(request)
-    if await bot_setup.cancel(_page(request)):
+    if await bot_setup.cancel(_page(request), state_of(request)):
         await _log(request, "bot.managed_cancel")
     return JSONResponse({"ok": True})
 
@@ -800,7 +811,7 @@ async def bot_managed_cancel(request: Request) -> JSONResponse:
 async def bot_token_delete(request: Request) -> JSONResponse:
     await _body(request)
     page = _page(request)
-    await bot_setup.cancel(page)
+    await bot_setup.cancel(page, state_of(request))
     async with page.bot_lock:
         await page.settings.save({ss.BOT_TOKEN: None})
     await _log(request, "bot.token_removed")
@@ -1438,6 +1449,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/bot/managed", bot_managed_start, methods=["POST"]),
         Route(API + "/bot/managed", bot_managed_cancel, methods=["DELETE"]),
         Route(API + "/bot/managed/confirm", bot_managed_confirm, methods=["POST"]),
+        Route(API + "/bot/managed/claim", bot_managed_claim, methods=["POST"]),
         Route(API + "/bot/bind", bot_bind, methods=["POST"]),
         Route(API + "/bot/refresh", bot_refresh, methods=["POST"]),
         Route(API + "/tg/keys", tg_keys_save, methods=["PUT"]),

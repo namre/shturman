@@ -197,6 +197,20 @@
                   <button class="btn ghost small-btn" id="managed-cancel" type="button">Отменить</button>
                 </div>
               </div>
+              <div id="claim-box" class="box" hidden>
+                <h3>Изменили адрес бота в окне создания? Укажите новый адрес</h3>
+                <p>Если в окне создания вы поменяли адрес бота (то, что начинается с @), посредник не узнает его сам. Ничего страшного: впишите сюда адрес, который получился, — мы откроем вашего нового бота, и вы отправите ему код. Бот будет найден, только если код отправите вы — с того же аккаунта, которым создавали бота.</p>
+                <div class="field">
+                  <label for="claim-username">Адрес нового бота</label>
+                  <input id="claim-username" type="text" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="@shturman_ivan_bot" aria-describedby="claim-error">
+                </div>
+                <p class="note warn" id="claim-error" role="alert" hidden></p>
+                <div class="row">
+                  <a class="btn" id="claim-open" href="#" target="_blank" rel="noopener noreferrer">Открыть бота и отправить код</a>
+                </div>
+                <p class="small">Откроется чат с ботом — нажмите «Запустить» (Start): бот получит код сам. На компьютере без Telegram Desktop откройте бота в Telegram и отправьте ему эту строку:</p>
+                <p><code id="claim-command">/start …</code> <button class="btn ghost small-btn" id="claim-copy" type="button">Скопировать</button></p>
+              </div>
             </div>
             <div id="managed-confirm" class="box" hidden>
               <p><b>Бот <span id="managed-bot-name"></span> создан аккаунтом Telegram <span id="managed-creator"></span>.</b></p>
