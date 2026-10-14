@@ -33,7 +33,7 @@ from typing import Any, Awaitable, Callable
 
 import asyncpg
 
-from . import jobs
+from . import jobs, jobstats
 
 logger = logging.getLogger("shturman.bridge")
 
@@ -46,6 +46,7 @@ NOTIFY_OWNER = "notify.owner"
 NOTIFY_EDIT = "notify.edit"
 BUSINESS_SEND = "business.send"
 EXECUTOR_KINDS = (LLM_STRUCTURED, LLM_TEXT, NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND)
+LLM_KINDS = (LLM_STRUCTURED, LLM_TEXT)
 NOT_SENT_PREFIX = "not_sent:"
 
 # Все кнопки сервиса начинаются с этого префикса: он не пересекается с префиксами ядра Hermes
@@ -316,6 +317,8 @@ async def deliver_result(
         fn = _result_handlers.get(job["handler"] or "")
         if fn is not None:
             await fn(conn, job, result)
+    if job["kind"] in LLM_KINDS:
+        jobstats.stats().record(True)
     return True
 
 
@@ -324,11 +327,18 @@ async def deliver_failure(
 ) -> str:
     async with conn.transaction():
         status = await jobs.fail(conn, job_id, error, retry_in=retry_in, executor=executor)
+        kind = None
         if status == "failed":
             job = await jobs.get(conn, job_id)
+            kind = (job or {}).get("kind")
             fn = _failure_handlers.get((job or {}).get("handler") or "")
             if fn is not None and job is not None:
                 await fn(conn, job, error)
+        elif status != "unknown":
+            kind = await conn.fetchval("SELECT kind FROM jobs WHERE id = $1", job_id)
+    # Счётчик попыток за час (строка jobs-failing): только вид ошибки, без её текста.
+    if kind in LLM_KINDS:
+        jobstats.stats().record(False, error)
     return status
 
 

@@ -20,12 +20,22 @@
 
 Процесс дашборда и разовые запуски Hermes фабрику не вызывают — там исполнителя нет.
 
+Задачи исполнителя работают вне хода ассистента. Когда шлюз обслуживает несколько профилей
+(`gateway.multiplex_profiles`, Hermes включает это сам, если профилей больше одного), Hermes
+читает ключи провайдера модели только внутри области секретов профиля, а без неё бросает
+`UnscopedSecretError` (agent/secret_scope.py:200-228). Поэтому вызов модели исполнитель делает
+внутри области профиля запуска — той же, что Hermes ставит своим фоновым делам профиля запуска
+(`tui_gateway.launch_profile_policy.async_launch_profile_scope_if_multiplexed`; её зовут
+gateway/run_turn.py:2296 и gateway/run_notifications.py:1562). Когда шлюз обслуживает один профиль,
+это пустой контекст и ничего не меняется. Решение Р-83.
+
 Библиотека python-telegram-bot (LGPL) импортируется только внутри функций, как и в остальном плагине.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -83,6 +93,30 @@ def refusal(exc: BaseException) -> NotSent | None:
             and type(cause).__module__.split(".")[0] == "httpx":
         return NotSent(f"нет связи с Telegram ({type(cause).__name__})", replied=False)
     return None
+
+
+_scope_factory: Any = None
+
+
+@contextlib.asynccontextmanager
+async def _no_scope():
+    yield
+
+
+def hermes_llm_scope() -> Any:
+    """Асинхронный контекст для вызова модели из фоновой задачи: область секретов профиля запуска
+    Hermes, если шлюз обслуживает несколько профилей, иначе пустой. Если в этой версии Hermes такой
+    функции нет — пустой контекст и одна строка в журнале."""
+    global _scope_factory
+    if _scope_factory is None:
+        try:
+            from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
+            _scope_factory = async_launch_profile_scope_if_multiplexed
+        except Exception as exc:  # noqa: BLE001 — другая версия Hermes: работаем как раньше
+            logger.warning("shturman: области секретов профиля в этой версии Hermes нет (%s) — модель "
+                           "вызывается без неё", type(exc).__name__)
+            _scope_factory = _no_scope
+    return _scope_factory()
 
 
 class PtbBot:
@@ -257,7 +291,8 @@ class Runtime:
             self.store = store
             bot = PtbBot(self)
             self.executor = Executor(self.call, llm=self._llm(), bot=bot, stats=self.stats,
-                                     owner=lambda: store.read("owner"), tasks=tuple(AUX_TASKS))
+                                     owner=lambda: store.read("owner"), tasks=tuple(AUX_TASKS),
+                                     llm_scope=hermes_llm_scope)
             self.ingest = Ingest(
                 self.call,
                 # Строгое чтение: «не удалось прочитать» не должно выглядеть как «владельца нет».

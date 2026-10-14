@@ -291,3 +291,73 @@ def test_cli_status_tells_doctor_when_the_assistant_bot_is_connected_in_business
     assert line() == "hermes_business=no"
     store.write("business", {"connected": "yes"})            # не признак — не «да»
     assert line() == "hermes_business=no"
+
+
+# --- область секретов профиля Hermes для вызова модели (Р-83) ---
+
+def _bridge(monkeypatch):
+    import shturman_bridge
+
+    monkeypatch.setattr(shturman_bridge, "_scope_factory", None)
+    return shturman_bridge
+
+
+def test_llm_scope_is_hermes_launch_profile_scope(monkeypatch):
+    import asyncio
+    import contextlib
+    import sys
+    import types
+
+    entered = []
+
+    @contextlib.asynccontextmanager
+    async def launch():
+        entered.append(True)
+        yield
+
+    fake = types.ModuleType("tui_gateway.launch_profile_policy")
+    fake.async_launch_profile_scope_if_multiplexed = launch
+    monkeypatch.setitem(sys.modules, "tui_gateway", types.ModuleType("tui_gateway"))
+    monkeypatch.setitem(sys.modules, "tui_gateway.launch_profile_policy", fake)
+    bridge = _bridge(monkeypatch)
+
+    async def use():
+        async with bridge.hermes_llm_scope():
+            return "ok"
+    assert asyncio.run(use()) == "ok" and asyncio.run(use()) == "ok"
+    assert entered == [True, True] and bridge._scope_factory is launch
+
+
+def test_llm_scope_without_that_hermes_function_is_empty_and_said_once(monkeypatch, caplog):
+    import asyncio
+    import logging
+    import sys
+
+    monkeypatch.setitem(sys.modules, "tui_gateway.launch_profile_policy", None)   # импорт не удастся
+    bridge = _bridge(monkeypatch)
+
+    async def use():
+        async with bridge.hermes_llm_scope():
+            return "ok"
+    with caplog.at_level(logging.WARNING, logger="shturman.bridge"):
+        assert asyncio.run(use()) == "ok" and asyncio.run(use()) == "ok"
+    assert sum("области секретов профиля" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_runtime_hands_the_scope_to_the_executor(monkeypatch, tmp_path):
+    import asyncio
+
+    bridge = _bridge(monkeypatch)
+    monkeypatch.setenv("SHTURMAN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SHTURMAN_SERVICE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("SHTURMAN_API_TOKEN", "t" * 40)
+    runtime = bridge.Runtime()
+    runtime.application = object()
+    seen = {}
+
+    async def start():
+        assert runtime.ensure_started()
+        seen["scope"] = runtime.executor._llm_scope
+        await runtime.stop()
+    asyncio.run(start())
+    assert seen["scope"] is bridge.hermes_llm_scope

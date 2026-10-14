@@ -257,6 +257,10 @@ async def overview(state: AppState) -> dict[str, Any]:
                own_llm=bridge.LLM_TEXT in bridge.builtin_kinds())
     out["last_message_seen_at"] = out["last_message_seen_at"].isoformat() if out["last_message_seen_at"] else None
     out["owner_known"] = bool(out["owner_known"])
+    # Задания модели за последний час: сколько попыток удалось, сколько нет и виды ошибок
+    # (имя класса или короткий код). Считает сам сервис, в памяти (jobstats.py).
+    from . import jobstats
+    out["llm_jobs"] = jobstats.stats().snapshot()
     # Страница настройки сервиса (/shturman-setup/): что на ней уже сделано. Только признаки.
     out["setup"] = setup
     return out

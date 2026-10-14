@@ -16,6 +16,12 @@
 # Если экземпляр подключён к посреднику (./ops/relay.sh, docs/relay.md) — строки relay, relay-proxies,
 # relay-reach, relay-addresses: читаются несекретные строки SHTURMAN_RELAY_NAME, _DOMAIN, _SERVER,
 # _PORT; о ключе и токене — только «записаны ли»; состояние пересылок — frpc status в контейнере.
+# Подключение архива к Hermes (строка archive-mcp, Р-83) проверяется по-настоящему: в контейнере
+# Hermes запись mcp_servers.shturman разворачивается штатной функцией Hermes так, как её получает
+# шлюз, и с этим заголовком идёт один запрос к 127.0.0.1:8765/mcp — смотрится только код ответа;
+# в журнале ошибок Hermes (logs/errors.log) считаются строки отказа 401 архива за последний час —
+# печатается только число. Строка jobs-failing — задания модели за час по счётчику сервиса
+# (llm_jobs в /api/status: числа и виды ошибок, без текстов).
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -366,12 +372,98 @@ if docker inspect "$svc" >/dev/null 2>&1; then
   else fail database "база архива в состоянии: $pg_state"; fi
 
   if [ "$MODE" = hermes ]; then
-    mcp="$(hpy -c '
-from hermes_cli.config import load_config
-s = ((load_config() or {}).get("mcp_servers") or {}).get("shturman") or {}
-print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n 1)"
-    if [ "$mcp" = "yes" ]; then pass archive-mcp "архив подключён к Hermes"
-    else fail archive-mcp "архив не подключён к Hermes — запустите ./ops/up.sh"; fi
+    # Настоящее подключение, а не только запись в настройках (Р-83). В контейнере Hermes запись
+    # mcp_servers.shturman разворачивается штатной функцией Hermes в самом строгом виде, в каком
+    # её получает шлюз: внутри области секретов профиля и с включённым мультиплексом — тогда
+    # переменная берётся только из .env профиля. С получившимся заголовком идёт один запрос POST
+    # к 127.0.0.1:8765/mcp; смотрится только код ответа (401 — токен не тот). Плюс в журнале ошибок
+    # Hermes (logs/errors.log) считаются строки отказа 401 архива «shturman» за последний час,
+    # но не раньше запуска контейнера, — только число. Значение токена нигде не печатается.
+    mcp_started="$(docker inspect -f '{{.State.StartedAt}}' "$c" 2>/dev/null || true)"
+    mcp_started_s="$(date -d "$mcp_started" +%s 2>/dev/null || echo 0)"
+    mcp_probe=unknown; mcp_code=""; mcp_rejects=0; mcp_served=unknown
+    while IFS='=' read -r k v; do
+      case "$k" in
+        probe) mcp_probe="$v" ;; code) mcp_code="$v" ;; rejects) mcp_rejects="$v" ;; served) mcp_served="$v" ;;
+      esac
+    done <<EOF5
+$(hpy -c '
+import sys, time
+from datetime import datetime
+started = float(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 0.0
+try:
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+except Exception:
+    print("probe=unsupported")
+    sys.exit(0)
+try:
+    from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+    served = recorded_served_profiles()
+    print("served=" + ("unknown" if served is None else str(len(served))))
+except Exception:
+    pass
+since, rejects = max(time.time() - 3600, started), 0
+for name in ("errors.log.1", "errors.log"):
+    try:
+        fh = open(home / "logs" / name, encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    with fh:
+        for line in fh:
+            if "MCP server " not in line or "shturman" not in line or "401" not in line:
+                continue
+            try:
+                at = time.mktime(datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timetuple())
+            except ValueError:
+                continue
+            rejects += at >= since
+print("rejects=%d" % rejects)
+try:
+    from hermes_cli.config import read_raw_config
+    from agent.secret_scope import build_profile_secret_scope, set_multiplex_active, set_secret_scope
+    from tools.mcp_tool_config import _interpolate_env_vars
+except Exception:
+    print("probe=unsupported")
+    sys.exit(0)
+raw = ((read_raw_config() or {}).get("mcp_servers") or {}).get("shturman")
+if not isinstance(raw, dict) or not str(raw.get("url", "")).endswith(":8765/mcp"):
+    print("probe=absent")
+    sys.exit(0)
+set_multiplex_active(True)
+set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+cfg = _interpolate_env_vars(raw)
+headers = {str(k): str(v) for k, v in (cfg.get("headers") or {}).items()}
+if any("${" in v for v in headers.values()):
+    print("probe=unresolved")
+    sys.exit(0)
+import urllib.error, urllib.request
+headers.update({"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(urllib.request.Request(str(cfg["url"]), data=b"{}", headers=headers, method="POST"), timeout=5) as r:
+        code = r.status
+except urllib.error.HTTPError as exc:
+    code = exc.code
+except Exception:
+    code = 0
+print("probe=done")
+print("code=%d" % code)' "$mcp_started_s")
+EOF5
+    case "$mcp_served" in ''|unknown|0|1) mcp_mux="" ;; *) mcp_mux=" (шлюз обслуживает профилей: $mcp_served)" ;; esac
+    case "$mcp_probe:$mcp_code" in
+      absent:*) fail archive-mcp "архив не подключён к Hermes — запустите ./ops/up.sh" ;;
+      unresolved:*) fail archive-mcp "Hermes не видит токен архива: в .env профиля Hermes нет MCP_SHTURMAN_API_KEY, и шлюз шлёт архиву пустую подстановку$mcp_mux — ./ops/up.sh" ;;
+      done:401|done:403) fail archive-mcp "архив отказал Hermes (HTTP $mcp_code): токен в .env профиля Hermes не совпадает с токеном сервиса — ./ops/up.sh" ;;
+      done:0) fail archive-mcp "архив не отвечает на 127.0.0.1:8765/mcp" ;;
+      done:*)
+        if [ "${mcp_rejects:-0}" -gt 0 ] 2>/dev/null; then
+          fail archive-mcp "токен виден, но шлюз Hermes за последний час получил от архива отказ 401 ($mcp_rejects строк в журнале ошибок Hermes)$mcp_mux: шлюз запущен с прежним токеном — ./ops/up.sh (перезапустит Hermes)"
+        else
+          pass archive-mcp "архив подключён к Hermes: токен виден в области профиля, архив его принимает$mcp_mux"
+        fi ;;
+      *) warn archive-mcp "подключение архива к Hermes не проверено: в этой версии Hermes нет нужных функций либо контейнер не ответил — проверьте вручную: docker exec shturman-hermes hermes mcp test shturman" ;;
+    esac
   else
     # Без токена архив обязан отказать: так видно и что он отвечает, и что закрыт. Сам токен не нужен.
     code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
@@ -393,6 +485,43 @@ print("yes" if str(s.get("url", "")).endswith(":8765/mcp") else "no")' | tail -n
     elif [ "${waiting:-0}" -gt 50 ]; then
       warn jobs "в очереди $waiting заданий — их некому выполнять: смотрите строки approvals-bot и model"
     else pass jobs "очередь заданий: ${waiting:-0}, неудачных: ${failed:-0}"; fi
+    # Задания модели за последний час (Р-83): сколько попыток не удалось и чаще всего почему —
+    # объект llm_jobs ответа /api/status (только числа и виды ошибок: имя класса или короткий код).
+    # Не меньше половины попыток (и хотя бы 10) не удались — FAIL; не меньше пятой части (и хотя
+    # бы 5) — WARN. Сервис прежней версии этого объекта не отдаёт — строки нет.
+    lj="$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, re, sys
+try:
+    j = json.load(sys.stdin).get("llm_jobs")
+except Exception:
+    sys.exit(0)
+if not isinstance(j, dict):
+    sys.exit(0)
+num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+top = []
+for item in (j.get("errors") or [])[:3]:
+    if isinstance(item, list) and len(item) == 2 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:.]{0,80}", str(item[0])):
+        top.append("%s ×%d" % (item[0], num(item[1])))
+print("%d %d %d %s" % (num(j.get("done")), num(j.get("failed")), num(j.get("window_s")) // 60, ", ".join(top)))' 2>/dev/null)"
+    if [ -n "$lj" ]; then
+      read -r lj_done lj_failed lj_min lj_top <<EOF6
+$lj
+EOF6
+      lj_total=$((lj_done + lj_failed))
+      lj_where="за последние $lj_min мин"
+      [ "$lj_min" -ge 60 ] && lj_where="за последний час"
+      if [ "$lj_total" -eq 0 ]; then
+        pass jobs-failing "$lj_where заданий модели не было"
+      else
+        lj_pct=$((lj_failed * 100 / lj_total))
+        lj_msg="$lj_where заданий модели: $lj_total, не удалось: $lj_failed ($lj_pct%)${lj_top:+; чаще всего: $lj_top}"
+        if [ "$MODE" = hermes ]; then lj_hint="причина — в журнале Hermes: docker exec $c grep -a 'shturman.executor' /opt/data/logs/errors.log | tail -n 5"
+        else lj_hint="состояние своей модели — строка model ниже и docker exec $svc shturman bot-status"; fi
+        if [ "$lj_failed" -ge 10 ] && [ "$lj_pct" -ge 50 ]; then fail jobs-failing "$lj_msg — $lj_hint"
+        elif [ "$lj_failed" -ge 5 ] && [ "$lj_pct" -ge 20 ]; then warn jobs-failing "$lj_msg — $lj_hint"
+        else pass jobs-failing "$lj_msg"; fi
+      fi
+    fi
     if [ "$MODE" = hermes ]; then
       # Со своим ботом сервиса владельца привязывает он (строка approvals-owner ниже), а плагин
       # в Hermes уходит в спокойный режим: не привязывает владельца, не передаёт нажатия и не

@@ -59,6 +59,7 @@ async def lifespan(state: AppState): ...      # запуск и остановк
 | `records.py` | `MessageRecord`, `ChatRecord` — запись в словаре экспорта Telegram Desktop |
 | `store.py` | единственный путь записи в архив: `ensure_account`, `ensure_chat`, `upsert_messages` (параметр `hold` — записать входящее скрытым до проверки защитой), `mark_deleted`, `mark_deleted_without_chat`; перечень всегда исключённых чатов |
 | `jobs.py` | очередь заданий с арендой и защитой от повторов; у задания — исполнитель (`plugin` или `builtin`); закрытие невостребованных и стирание содержимого выполненных |
+| `jobstats.py` | итоги попыток заданий модели за последний час в памяти сервиса — числа и виды ошибок без текста (`llm_jobs` в `/api/status`, строка `jobs-failing` в `./ops/doctor.sh`, Р-83) |
 | `bridge.py` | постановка заданий (`notify_owner`, `edit_owner_message`, `request_structured`, `request_text`, `request_business_send`), разбор результатов (`on_result`, `on_failure`) и нажатий кнопок (`on_callback`, `button`, `dispatch_callback`); владелец; кто выполняет задания (`set_builtin`, `builtin_kinds`, `owns_bot`) |
 | `events.py` | события внутри процесса: `message.live`, `messages.deleted`, `messages.hidden`, `chat.excluded` |
 | `archive.py` | запросы чтения архива с правилами видимости — из них собираются ответы агенту |
