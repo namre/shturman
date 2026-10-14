@@ -262,11 +262,50 @@ def build_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+async def gather_context(
+    conn: asyncpg.Connection, state: Any, settings: dict[str, Any], chat_id: int, message_id: int, text: str,
+) -> tuple[int | None, list[Mapping[str, Any]], list[dict[str, Any]]]:
+    """Справка для ответа: тема, последние сообщения этого чата и найденное в архиве по словам сообщения.
+
+    Общая для автоответа доверенным и репетиции ответов (rehearsal/, Р-85): правила одни. Только этот
+    чат и эта тема; скрытое защитой от внедрённых инструкций и удалённое не берётся."""
+    from . import scopes
+    topic = await scopes.topic_for_message(conn, message_id, chat_id)
+    recent = await conn.fetch(
+        """SELECT id, sent_at, is_outgoing, text FROM (
+               SELECT id, sent_at, is_outgoing, text FROM messages
+               WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible
+                 AND topic_tg_id IS NOT DISTINCT FROM $4::bigint
+               ORDER BY sent_at DESC, id DESC LIMIT $3) t
+           ORDER BY sent_at, id""",
+        chat_id, message_id, min(settings["context_messages"], 20), topic)
+    hits: list[dict[str, Any]] = []
+    query = _search_query(text)
+    if query and settings["search_hits"]:
+        wide = False  # Additional chats require a bounded broker grant; never implicit RAG.
+        scope = {"chat_id": chat_id}
+        try:
+            async with conn.transaction():   # сбой поиска не должен срывать сам ответ
+                found = await retrieval.find(
+                    state, conn, query, limit=settings["search_hits"] * (6 if wide else 1) + 1, **scope)
+            # Only this exact chat/topic has an implicit baseline read scope.
+            allowed_ids = set(await conn.fetchval("SELECT array_agg(id) FROM messages WHERE chat_id=$1 "
+                "AND topic_tg_id IS NOT DISTINCT FROM $2::bigint AND id=ANY($3::bigint[]) "
+                "AND deleted_at IS NULL AND agent_visible",
+                chat_id, topic, [h["id"] for h in found]) or [])
+            hits = [h for h in found
+                    if h["id"] in allowed_ids
+                    if h["id"] != message_id and (h["chat_id"] == chat_id or h["is_outgoing"] is True)
+                    ][: min(settings["search_hits"], 9)]
+        except asyncpg.PostgresError:
+            logger.warning("ответ в чат %s: поиск по архиву не удался, готовим без него", chat_id)
+    return topic, list(recent), hits
+
+
 async def _prepare_work(mod: runtime.Outbox, chat_id: int, message_id: int) -> None:
     """Собирает справку и просит у модели текст ответа. Ничего не отправляет."""
     state = mod.state
     from ..replies import workflow
-    from . import scopes
     if not workflow.preparing(state):
         return
     prepare_only = getattr(state.config, "prepare_only", False) is True
@@ -300,34 +339,7 @@ async def _prepare_work(mod: runtime.Outbox, chat_id: int, message_id: int) -> N
             if not decision.ok:
                 logger.info("автоответ в чат %s не готовится: %s", chat_id, decision.code)
                 return
-        topic = await scopes.topic_for_message(conn, message_id, chat_id)
-        recent = await conn.fetch(
-            """SELECT id, sent_at, is_outgoing, text FROM (
-                   SELECT id, sent_at, is_outgoing, text FROM messages
-                   WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible
-                     AND topic_tg_id IS NOT DISTINCT FROM $4::bigint
-                   ORDER BY sent_at DESC, id DESC LIMIT $3) t
-               ORDER BY sent_at, id""",
-            chat_id, message_id, min(settings["context_messages"], 20), topic)
-        hits: list[dict[str, Any]] = []
-        query = _search_query(msg["text"])
-        if query and settings["search_hits"]:
-            wide = False  # Additional chats require a bounded broker grant; never implicit RAG.
-            scope = {"account_id": tgt.account_id} if wide else {"chat_id": chat_id}
-            try:
-                async with conn.transaction():   # сбой поиска не должен срывать сам ответ
-                    found = await retrieval.find(
-                        state, conn, query, limit=settings["search_hits"] * (6 if wide else 1) + 1, **scope)
-                # Only this exact chat/topic has an implicit baseline read scope.
-                allowed_ids = set(await conn.fetchval("SELECT array_agg(id) FROM messages WHERE chat_id=$1 "
-                    "AND topic_tg_id IS NOT DISTINCT FROM $2::bigint AND id=ANY($3::bigint[])",
-                    chat_id, topic, [h["id"] for h in found]) or [])
-                hits = [h for h in found
-                        if h["id"] in allowed_ids
-                        if h["id"] != message_id and (h["chat_id"] == chat_id or h["is_outgoing"] is True)
-                        ][: min(settings["search_hits"], 9)]
-            except asyncpg.PostgresError:
-                logger.warning("автоответ в чат %s: поиск по архиву не удался, отвечаем без него", chat_id)
+        topic, recent, hits = await gather_context(conn, state, settings, chat_id, message_id, msg["text"])
         try:
             tz = ZoneInfo(state.config.timezone)
         except Exception:

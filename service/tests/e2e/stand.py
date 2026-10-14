@@ -99,7 +99,15 @@ class StandTelegram(exec_fakes.FakeTelegram):
                                            "make sure that only one bot instance is running")
         if request.url.path.endswith("/getUpdates") and not self.updates:
             await asyncio.sleep(0.2)          # не крутить опрос вхолостую сотни раз в секунду
-        return await super()._handle(request)
+        response = await super()._handle(request)
+        if request.url.path.endswith("/sendMessage") and response.status_code == 200:
+            # номер отправленного сообщения — чтобы пульт нажимал кнопку под нужной карточкой
+            sent = json.loads(response.content)["result"]
+            for method, params in reversed(self.requests):
+                if method == "sendMessage" and params.get("text") == sent.get("text") and "_message_id" not in params:
+                    params["_message_id"] = sent["message_id"]
+                    break
+        return response
 
 
 def dialogs() -> list:
@@ -537,6 +545,87 @@ async def main() -> None:
             "requests": [r["state"] for r in await conn.fetch("SELECT state FROM processing_requests ORDER BY job_id")],
             "audit": [dict(r) for r in rows]})
 
+    # --- репетиция ответов (Р-85) ---
+
+    async def rehearsal_live(request):
+        """Анна Ким (из `/notify/seed`) пишет в личку живое сообщение; подставная модель ответит так, как
+        ответила бы на задачу ответа. Репетиция готовит карточку через бота стенда."""
+        from shturman import events, store
+        from shturman.records import MessageRecord
+
+        app = state["app"]
+        reply = json.dumps({"outcome": "reply", "text": "Добрый вечер! Да, в 10 буду на объекте, смету возьму с собой."},
+                           ensure_ascii=False)
+
+        # Ответ — только на запрос репетиции (в нём есть сообщение Анны); остальные запросы модели стенда
+        # получают обычный ответ. Своя модель стенда к этому месту — подписка ChatGPT или ключ API: заготовка
+        # кладётся обоим.
+        def for_rehearsal(queue, make):
+            def answer(body):
+                if "Завтра в 10 на объекте" in json.dumps(body, ensure_ascii=False):
+                    return make(body)
+                queue.insert(0, answer)          # не тот запрос — ждём своего
+                return None
+            return answer
+
+        llm.script.append(for_rehearsal(llm.script, lambda body: exec_fakes.FakeLlm.completion(reply, body["model"])))
+        openai.responses_script.append(for_rehearsal(openai.responses_script,
+                                                     lambda body: openai_fakes.completed(reply, body["model"])))
+        async with app.pool.acquire() as c:
+            account = await c.fetchval("SELECT id FROM accounts WHERE role = 'owner' ORDER BY id LIMIT 1")
+            owner_tg = await c.fetchval("SELECT tg_user_id FROM accounts WHERE id = $1", account)
+            anna = await c.fetchval(
+                "SELECT c.id FROM chats c JOIN peers p ON p.id = c.peer_id WHERE c.account_id = $1 AND p.tg_id = 5101",
+                account)
+            number = 100 + int(await c.fetchval("SELECT count(*) FROM rehearsal_items"))
+            record = MessageRecord(
+                tg_message_id=number, sent_at=datetime.now(timezone.utc), kind="message", sender_class="user",
+                sender_tg_id=5101, sender_name="Анна Ким", text="Добрый вечер! Завтра в 10 на объекте получится?",
+                entities=None, reply_to_tg_id=None, forwarded_from=None, edited_at=None, media_type=None,
+                media_path=None, service_action=None, telegram_entities=[], is_forwarded=False,
+                telegram_via_bot=False, telegram_sender_bot=False)
+            result = await store.upsert_messages(c, [(anna, record, False)], source="session", owner_tg_id=owner_tg)
+            message_id = (result.new_ids or result.known_ids)[0]
+        app.events.publish(events.MESSAGE_LIVE, {"account_id": account, "chat_id": anna, "message_id": message_id,
+                                                  "source": "session", "outgoing": False, "edited": False,
+                                                  "via_bot": False})
+        await app.events.drain()
+        return JSONResponse({"ok": True, "message_id": message_id})
+
+    def rehearsal_cards() -> list[dict]:
+        return [p for p in telegram.calls("sendMessage") if str(p.get("text", "")).startswith("🎭")]
+
+    async def rehearsal_press(request):
+        """Владелец нажимает оценку под последней карточкой репетиции в Telegram."""
+        label = {"good": "Годится", "almost": "Почти — поправил бы", "bad": "Не годится"}[request.query_params["rating"]]
+        card = rehearsal_cards()[-1]
+        buttons = exec_fakes.buttons_of(card)
+        telegram.press(buttons[label], user=exec_fakes.OWNER_USER, message_id=card["_message_id"],
+                       markup=card["reply_markup"])
+        return JSONResponse({"ok": True})
+
+    async def rehearsal_seen(request):
+        """Карточки, ушедшие владельцу, правки кнопок, настройки, строки репетиции, журнал — для проверок.
+        И главное: ни одной отправки собеседнику."""
+        rows = await conn.fetch(
+            "SELECT action, outcome, detail FROM setup_audit WHERE action LIKE 'rehearsal.%' ORDER BY id")
+        return JSONResponse({
+            "cards": [{"text": p["text"], "buttons": [[b["text"] for b in row] for row in
+                                                      (p.get("reply_markup") or {}).get("inline_keyboard", [])],
+                       "silent": bool(p.get("disable_notification"))} for p in rehearsal_cards()],
+            "marked": [[b["text"] for row in p["reply_markup"]["inline_keyboard"] for b in row]
+                       for p in telegram.calls("editMessageReplyMarkup") if p["reply_markup"].get("inline_keyboard")],
+            "notified": [p.get("text", "") for p in telegram.calls("sendMessage")
+                         if str(p.get("text", "")).startswith(("💬", "🔔"))],
+            "business_sent": len(telegram.sent(business=True)),
+            "drafts": await conn.fetchval("SELECT count(*) FROM outbox_drafts"),
+            "tasks": await conn.fetchval("SELECT count(*) FROM reply_tasks"),
+            "settings": json.loads(await conn.fetchval("SELECT value::text FROM settings WHERE key = 'rehearsal.settings'")
+                                   or "null"),
+            "items": [dict(r) for r in await conn.fetch(
+                "SELECT state, reason, outcome, rating FROM rehearsal_items ORDER BY id")],
+            "audit": [dict(r) for r in rows]})
+
     async def dashboard_page(request):
         return HTMLResponse(DASHBOARD_PAGE)
 
@@ -554,7 +643,9 @@ async def main() -> None:
         Route("/spheres/seed", spheres_seed, methods=["POST"]),
         Route("/spheres/folder-new", spheres_folder_new, methods=["POST"]), Route("/spheres/seen", spheres_seen),
         Route("/notify/seed", notify_seed, methods=["POST"]),
-        Route("/notify/watch-live", notify_watch_live, methods=["POST"]), Route("/notify/seen", notify_seen)])
+        Route("/notify/watch-live", notify_watch_live, methods=["POST"]), Route("/notify/seen", notify_seen),
+        Route("/rehearsal/live", rehearsal_live, methods=["POST"]),
+        Route("/rehearsal/press", rehearsal_press, methods=["POST"]), Route("/rehearsal/seen", rehearsal_seen)])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

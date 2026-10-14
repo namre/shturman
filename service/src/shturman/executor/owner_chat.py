@@ -36,7 +36,8 @@ HELP = """Управление Штурманом в Telegram
 /groupallow CHAT_ID [TOPIC_ID] — разрешить эту группу/тему
 /groupdeny SCOPE_ID — убрать разрешение
 /addressing JSON — точные обращения (например {"aliases":["Штурман"]})
-/prepare on|off — готовить автоответы без отправки
+/prepare on|off — готовить автоответы без отправки (бизнес-бот и помощник)
+/rehearsal — репетиция ответов на основном аккаунте: on|off, add USER_ID, remove USER_ID
 /policy JSON — правила отправки (например {"daily_cap":20})
 /autoconfig JSON — настройки автоответа
 /autoreply ACCOUNT_ID on|off — правило автоответа доверенным
@@ -107,11 +108,17 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         counts = await conn.fetchrow("""SELECT
             (SELECT count(*) FROM outbox_drafts WHERE status = 'pending') AS pending,
             (SELECT count(*) FROM reply_tasks WHERE status IN ('waiting_source','waiting_owner')) AS decisions""")
+        from ..rehearsal import settings as rehearsal_settings
+        rehearsal = await rehearsal_settings.load(conn)
         return {"text": (f"Отправка: {'включена' if state.config.sending else 'выключена'}.\n"
                          f"Подготовка автоответов: {'включена' if getattr(state.config, 'prepare_only', False) else 'по правилам отправки'}.\n"
+                         f"Репетиция ответов: {'включена' if rehearsal['enabled'] else 'выключена'}"
+                         f" (людей в списке: {len(rehearsal['people'])}; ничего не отправляет).\n"
                          f"Черновиков: {counts['pending']}. Заданий с вашим решением: {counts['decisions']}.\n"
                          "Основной аккаунт остаётся только для чтения; группы — от аккаунта помощника."),
                 "buttons": menu_buttons()}
+    if command == "rehearsal":
+        return await _rehearsal(conn, argument)
     if command == "config":
         from ..outbox.service import _policy_view
         view = await _policy_view(conn, state.config)
@@ -215,6 +222,45 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
     else:
         return {"text": "Неизвестная команда. /help — доступные действия.", "buttons": menu_buttons()}
     return {"text": "Сделано. Изменена только указанная настройка/область.", "buttons": menu_buttons()}
+
+
+REHEARSAL_FORMAT = "Формат: /rehearsal, /rehearsal on|off, /rehearsal add USER_ID, /rehearsal remove USER_ID"
+
+
+async def _rehearsal(conn: asyncpg.Connection, argument: str) -> dict[str, Any]:
+    """Репетиция ответов (Р-85): посмотреть, включить, выключить, добавить или убрать человека.
+    Команда владельца из личного чата с ботом — его решение: применяется сразу. Отправки здесь нет."""
+    from ..rehearsal import core as rehearsal
+    from ..rehearsal import service as rehearsal_service
+    from ..rehearsal import settings as rs
+    parts = argument.split()
+    s = await rs.load(conn)
+    if not parts:
+        st = await rehearsal.stats(conn)
+        text = (f"Репетиция ответов: {'включена' if s['enabled'] else 'выключена'}. "
+                f"Людей в списке: {len(s['people'])}. Не больше {s['daily_cap']} карточек в сутки.\n"
+                f"За {st['days']} дней карточек: {st['shown']}; оценки — годится: {st['good']}, "
+                f"почти: {st['almost']}, не годится: {st['bad']}, без оценки: {st['unrated']}.\n"
+                "Ничего не отправляется: предложенный ответ приходит только вам, в карточке.\n" + REHEARSAL_FORMAT)
+        return {"text": text, "buttons": menu_buttons()}
+    if len(parts) == 1 and parts[0] in ("on", "off"):
+        changes: dict[str, Any] = {"enabled": parts[0] == "on"}
+    elif len(parts) == 2 and parts[0] in ("add", "remove"):
+        tg_id = _int(parts[1])
+        people = set(s["people"])
+        if parts[0] == "add":
+            people.add(tg_id)
+        else:
+            people.discard(tg_id)
+        changes = {"people": sorted(people)}
+    else:
+        raise ValueError(REHEARSAL_FORMAT)
+    out = await confirm.apply_owner(conn, rehearsal_service.SETTINGS, {"changes": rs.validate(changes)})
+    after = out["result"]["settings"]
+    text = "Репетиция ответов:\n" + "\n".join(rs.describe(after))
+    if after["enabled"] and not after["people"]:
+        text += "\nВ списке пока никого: добавьте человека — /rehearsal add USER_ID или на странице «Переписка»."
+    return {"text": text, "buttons": menu_buttons()}
 
 
 async def on_menu(conn: asyncpg.Connection, state: Any, rest: str, user_id: int) -> dict[str, Any]:

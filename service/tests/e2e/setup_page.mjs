@@ -1192,6 +1192,106 @@ await shot(page, "27-app-done-desktop-light");
   }
 }
 
+// --- репетиция ответов (Р-85) ---------------------------------------------------------------------
+// Раздел «Репетиция ответов»: включить, выбрать человека из личных чатов, предел. Живое сообщение Анны
+// (пульт `POST /rehearsal/live`) — карточка в боте стенда с предложенным ответом и тремя оценками, без
+// отдельного уведомления; оценка нажатием в Telegram (`POST /rehearsal/press`) отмечает кнопку и видна в
+// статистике раздела. Собеседнику — ничего. Снимки раздела в четырёх видах — в `E2E_REHEARSAL_OUT`.
+{
+  const RH_OUT = process.env.E2E_REHEARSAL_OUT || OUT;
+  mkdirSync(RH_OUT, { recursive: true });
+  const seen = async () => control("GET", "/rehearsal/seen");
+  async function waitFor(test, timeout = 20000) {
+    const until = Date.now() + timeout;
+    while (Date.now() < until) { if (await test()) return true; await page.waitForTimeout(200); }
+    return false;
+  }
+  async function cardShot(p, name) {
+    await p.evaluate(() => { const t = document.getElementById("toast"); if (t) t.hidden = true;
+                             document.querySelector(".top").style.position = "static"; });
+    await p.locator("#s-rehearsal").screenshot({ path: path.join(RH_OUT, name + ".png") });
+    await p.evaluate(() => { document.querySelector(".top").style.position = ""; });
+  }
+
+  await page.goto(URL_PAGE);
+  await page.waitForSelector("#screen-app:not([hidden])");
+  await page.waitForFunction(() => document.getElementById("st-rehearsal").textContent !== "", null, { timeout: 10000 }).catch(() => {});
+  check("репетиция: раздел виден, по умолчанию выключена", await page.isVisible("#s-rehearsal") &&
+        (await page.textContent("#st-rehearsal")) === "выключена", await page.textContent("#st-rehearsal"));
+  await page.click("#rehearsal-details > summary");
+  await page.waitForSelector("#rh-stats .rh-tile");
+  check("репетиция: сказано, что отправить нельзя; основной аккаунт подключён — предупреждения нет",
+        (await page.textContent(".rh-safe")).includes("Отправить отсюда нельзя") && !(await page.isVisible("#rh-noaccount")) &&
+        !(await page.isVisible("#rh-nobot")));
+  check("репетиция: в разделе нет кнопки отправки",
+        !(await page.locator("#s-rehearsal button", { hasText: /Отправ/ }).count()));
+  await cardShot(page, "rehearsal-off-desktop-light");
+
+  await page.check("#rh-enabled");
+  await page.fill("#rh-people-q", "анна");
+  await page.waitForSelector("#rh-people-found button");
+  await page.click("#rh-people-found button");
+  await page.fill("#rh-cap", "20");
+  await page.click("#rehearsal-save");
+  check("репетиция: включена со страницы сразу — Анна по номеру, 20 в сутки", await waitFor(async () => {
+    const s = (await seen()).settings; return s && s.enabled && s.people.length === 1 && s.people[0] === 5101 && s.daily_cap === 20; }),
+        JSON.stringify((await seen()).settings));
+  await page.waitForFunction(() => document.getElementById("st-rehearsal").textContent.startsWith("включена"));
+
+  const notifiedBefore = (await seen()).notified.length;
+  await control("POST", "/rehearsal/live");
+  const shown = await waitFor(async () => (await seen()).cards.length === 1, 30000);
+  const after = await seen();
+  const card = after.cards[0] || { text: "", buttons: [] };
+  check("репетиция: карточка ушла в бот — кто, сообщение, предложенный ответ", shown &&
+        card.text.includes("Вам написали: Анна Ким") && card.text.includes("Завтра в 10 на объекте получится?") &&
+        card.text.includes("Да, в 10 буду на объекте") && card.text.includes("отправить отсюда нельзя"), card.text);
+  check("репетиция: под карточкой только три оценки",
+        JSON.stringify(card.buttons) === JSON.stringify([["Годится"], ["Почти — поправил бы"], ["Не годится"]]),
+        JSON.stringify(card.buttons));
+  check("репетиция: отдельного уведомления об этом сообщении нет",
+        !after.notified.slice(notifiedBefore).some((t) => t.includes("Завтра в 10")), JSON.stringify(after.notified));
+
+  await control("POST", "/rehearsal/press?rating=almost");
+  check("репетиция: оценка «Почти» сохранена и отмечена на кнопке", await waitFor(async () => {
+    const s = await seen();
+    return s.items.some((i) => i.rating === "almost") &&
+           s.marked.some((m) => JSON.stringify(m) === JSON.stringify(["Годится", "✓ Почти — поправил бы", "Не годится"]));
+  }), JSON.stringify((await seen()).marked));
+  const final = await seen();
+  check("репетиция: собеседнику ничего — ни сообщения бота, ни черновика, ни задачи ответа",
+        final.business_sent === 0 && final.drafts === 0 && final.tasks === 0, JSON.stringify(final));
+  check("журнал: репетиция и оценка записаны — без имён, номеров людей и текста",
+        final.audit.some((r) => r.action === "rehearsal.settings") && final.audit.some((r) => r.action === "rehearsal.rate") &&
+        !["Анна", "5101", "Завтра", "смету"].some((w) => JSON.stringify(final.audit).includes(w)), JSON.stringify(final.audit));
+
+  await page.goto(URL_PAGE);
+  await page.waitForSelector("#screen-app:not([hidden])");
+  await page.click("#rehearsal-details > summary");
+  await page.waitForFunction(() => document.querySelector("#rh-stats .rh-tile .rh-num") &&
+                             document.querySelector("#rh-stats .rh-tile .rh-num").textContent === "1");
+  const stats = await page.textContent("#rh-stats");
+  check("репетиция: статистика за 7 дней — 1 карточка, 1 «почти»", stats.includes("1карточка") && stats.includes("1почти"), stats);
+  await cardShot(page, "rehearsal-on-desktop-light");
+
+  const views = [["desktop-dark", { ...desktop, colorScheme: "dark" }], ["phone-light", phone],
+                 ["phone-dark", { ...phone, colorScheme: "dark" }],
+                 ["phone360-light", { ...phone, viewport: { width: 360, height: 740 } }]];
+  const stored = await context.storageState();
+  for (const [name, options] of views) {
+    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const p = await ctx.newPage();
+    await p.goto(URL_PAGE);
+    await p.waitForSelector("#screen-app:not([hidden])");
+    await p.click("#rehearsal-details > summary");
+    await p.waitForSelector("#rh-people li .btn");
+    await cardShot(p, `rehearsal-on-${name}`);
+    const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    check(`вёрстка (репетиция; ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+    await ctx.close();
+  }
+}
+
 // --- «дашборд» на соседнем порту: тот же браузер владельца, вход на страницу выполнен -------------
 {
   const dash = await context.newPage();

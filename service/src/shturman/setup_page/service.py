@@ -1344,6 +1344,7 @@ async def chatgpt_remove(request: Request) -> JSONResponse:
 def routes() -> list[BaseRoute]:
     from . import memory, miniapp
     from . import notify as notify_page
+    from . import rehearsal as rehearsal_page
     from . import spheres as spheres_page
 
     account = API + "/tg/accounts/{account_id:int}"
@@ -1399,6 +1400,7 @@ def routes() -> list[BaseRoute]:
         *miniapp.routes(),
         *spheres_page.routes(),
         *notify_page.routes(),
+        *rehearsal_page.routes(),
     ]
 
 
