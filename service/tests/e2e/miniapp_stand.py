@@ -12,6 +12,10 @@
 то, что ждёт решения: подтверждение действия, предложение завести страницу о человеке (уже ушедшее
 сводкой) и черновик ответа «только для просмотра» (отправка на стенде выключена, как по умолчанию).
 
+Для экрана «Чаты» (Р-80) у стенда заданы ключи приложения Telegram и подключены два аккаунта —
+основной владельца и помощник — с подставным Telegram-клиентом из tests/tg (по полторы сотни
+диалогов, список уже в памяти сервиса). Способ подключения — «как вы», выбраны два чата владельца.
+
 Пульт (порт сервиса + 1):
   GET  /init-data?who=owner|stranger&age=N   строка initData, подписанная как у Telegram (age — сколько секунд назад)
   GET  /state                                что стало с заведённым, журнал действий, вызовы Bot API
@@ -21,6 +25,12 @@
                                              ответа, скрытое сообщение, сводки обязательств (и изменения),
                                              фактов о владельце, страниц памяти и проектов
   POST /clear-all                            всё ждущее — решено (для снимка пустого списка)
+  GET  /chats/seen                           экран «Чаты»: выбранные и исключённые чаты, сообщения владельцу
+                                             «Из приложения…», журнал app.sync_*/app.chat_*, запросы списка
+                                             диалогов к «Telegram», число сообщений в архиве
+  POST /chats/forget?role=owner|assistant    списка диалогов в памяти больше нет (как после перезапуска)
+  POST /chats/flood?role=…&seconds=N         «Telegram просит подождать» N секунд
+  POST /chats/pause?role=…, /chats/resume?role=…   аккаунт на паузе и обратно
 """
 
 from __future__ import annotations
@@ -37,7 +47,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 HERE = Path(__file__).resolve().parent
-for extra in (HERE.parent, HERE.parent / "executor"):
+for extra in (HERE.parent, HERE.parent / "executor", HERE.parent / "tg"):
     sys.path.insert(0, str(extra))
 
 import asyncpg  # noqa: E402
@@ -47,6 +57,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse  #
 from starlette.routing import Route  # noqa: E402
 
 import exec_fakes  # noqa: E402
+import tg_fakes  # noqa: E402
 from shturman import confirm, db, store  # noqa: E402
 from shturman.app import build_app  # noqa: E402
 from shturman.config import Config  # noqa: E402
@@ -260,6 +271,44 @@ async def _clear_all(conn) -> dict:
     return {"ok": True}
 
 
+def dialogs() -> list:
+    """Полторы сотни диалогов: личные, группы, каналы, с длинными названиями — чтобы список листался,
+    искался и было видно, как переносятся длинные строки."""
+    people = ["Иван Петров", "Мария", "Олег Смета", "Анна Дизайн", "Пётр Монтаж", "Ольга Бухгалтерия"]
+    items = [tg_fakes.U_IVAN, tg_fakes.U_MARIA, tg_fakes.U_BOT, tg_fakes.U_TELEGRAM,
+             tg_fakes.G_FAMILY, tg_fakes.C_SUPER, tg_fakes.C_NEWS,
+             tg_fakes.user(20_900, "Константин Александрович", "Верещагин-Добровольский", username="k_vereshchagin"),
+             tg_fakes.channel(40_900, "ЖК «Береговой»: стройка, корпус 2 и 3 — рабочий чат подрядчиков и технадзора",
+                              megagroup=True)]
+    for i in range(90):
+        first, _, last = (people[i % len(people)] + " ").partition(" ")
+        items.append(tg_fakes.user(20_000 + i, first, f"{last.strip()} {i + 1}".strip()))
+    for i in range(35):
+        items.append(tg_fakes.group(30_000 + i, f"Объект № {i + 1}: рабочая группа"))
+    for i in range(25):
+        items.append(tg_fakes.channel(40_000 + i, f"Новости отрасли {i + 1}", broadcast=True))
+    return items
+
+
+def make_world(me) -> tg_fakes.World:
+    world = tg_fakes.World(me)
+    world.authorized = False
+    world.dialogs = dialogs()
+    world.add(*(tg_fakes.msg(i, ("user", tg_fakes.IVAN), f"Сообщение {i} про смету по фасадам",
+                             sender=tg_fakes.IVAN) for i in range(1, 8)))
+    return world
+
+
+async def _login(manager, worlds, role: str, me) -> int:
+    """Вход в аккаунт по QR — так, как его проходит владелец на странице настройки."""
+    await manager.start_login(role, confirm_owner=role == "owner")
+    worlds[role].last.scan.set_result(me)
+    await exec_fakes.until(lambda: getattr(manager.runtimes.get(role), "status", None) == "running", timeout=15)
+    worlds[role].authorized = True                   # сессия на диске — уже вошедшая (для «снять с паузы»)
+    await manager.dialogs(manager.runtimes[role].account_id, refresh=True)      # список — в памяти сервиса
+    return manager.runtimes[role].account_id
+
+
 FRAMER = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Чужой сайт</title></head>
 <body><h1>Чужой сайт</h1><iframe id="f" src="{ORIGIN}/shturman-setup/app/" width="400" height="300"></iframe></body></html>"""
 
@@ -275,11 +324,13 @@ async def main() -> None:
     config = Config(
         dsn=DSN, api_token="e2e-api-token-0123456789abcdef0123456789",
         mcp_token="e2e-mcp-token-0123456789abcdef0123456789", host="127.0.0.1", port=PORT, data_dir=data_dir,
-        allowed_hosts=(f"127.0.0.1:{PORT}", f"localhost:{PORT}"), bot_token=TOKEN, timezone="Europe/Moscow")
+        allowed_hosts=(f"127.0.0.1:{PORT}", f"localhost:{PORT}"), bot_token=TOKEN, timezone="Europe/Moscow",
+        tg_api_id=1234567, tg_api_hash="0123456789abcdef0123456789abcdef")
     telegram = exec_fakes.FakeTelegram()
     executor_service.TEST_OVERRIDES.update(bot_transport=telegram.transport(), poll=0, idle=0.2)
     gate = build_app(config, migrate=False)
     seeded: dict = {}
+    worlds = {"owner": make_world(tg_fakes.ME), "assistant": make_world(tg_fakes.HELPER)}
 
     async def init_data(request):
         who = request.query_params.get("who", "owner")
@@ -310,9 +361,62 @@ async def main() -> None:
     async def clear_all(request):
         return JSONResponse(await _clear_all(conn))
 
+    # --- экран «Чаты» ---
+
+    def runtime(request):
+        return app.extras["tg"].runtimes[request.query_params.get("role", "owner")]
+
+    async def chats_seen(request):
+        rows = await conn.fetch(
+            """SELECT p.class, p.tg_id, c.title, c.excluded, s.enabled, s.backfill_since
+               FROM chats c JOIN peers p ON p.id = c.peer_id LEFT JOIN tg_sync_chats s ON s.chat_id = c.id
+               WHERE c.account_id = ANY($1::bigint[]) ORDER BY c.id""", [seeded["owner_account"], seeded["helper_account"]])
+        return JSONResponse({
+            "enabled": [r["title"] for r in rows if r["enabled"]],
+            "excluded": [r["title"] for r in rows if r["excluded"]],
+            "since": {r["title"]: r["backfill_since"].isoformat() if r["backfill_since"] else None
+                      for r in rows if r["enabled"]},
+            "told": [m["text"] for m in telegram.sent() if m["text"].startswith("Из приложения")],
+            "audit": [dict(r) for r in await conn.fetch(
+                """SELECT action, outcome, detail FROM setup_audit
+                   WHERE action LIKE 'app.sync%' OR action LIKE 'app.chat%' ORDER BY id""")],
+            "dialog_requests": {role: sum(1 for c in world.clients for r in c.requests
+                                          if type(r).__name__ == "GetDialogsRequest")
+                                for role, world in worlds.items()},
+            "messages": await conn.fetchval("SELECT count(*) FROM messages"),
+        })
+
+    async def chats_forget(request):
+        runtime(request).dialogs = None
+        return JSONResponse({"ok": True})
+
+    async def chats_flood(request):
+        rt = runtime(request)
+        rt.dialogs_at -= 1000                      # «Обновить» действительно пойдёт в Telegram
+        rt.pacer.flood(float(request.query_params.get("seconds", "6")))
+        return JSONResponse({"ok": True})
+
+    async def chats_pause(request):
+        await app.extras["tg"].pause(runtime(request).account_id)
+        return JSONResponse({"ok": True})
+
+    async def chats_resume(request):
+        role = request.query_params.get("role", "owner")
+        account = seeded["owner_account" if role == "owner" else "helper_account"]
+        await app.extras["tg"].resume(account)
+        await exec_fakes.until(lambda: getattr(app.extras["tg"].runtimes.get(role), "status", None) == "running",
+                               timeout=15)
+        await app.extras["tg"].dialogs(account, refresh=True)
+        return JSONResponse({"ok": True})
+
     control = Starlette(routes=[Route("/init-data", init_data), Route("/state", state_view), Route("/framer", framer),
                                 Route("/seed-all", seed_all, methods=["POST"]),
-                                Route("/clear-all", clear_all, methods=["POST"])])
+                                Route("/clear-all", clear_all, methods=["POST"]),
+                                Route("/chats/seen", chats_seen),
+                                Route("/chats/forget", chats_forget, methods=["POST"]),
+                                Route("/chats/flood", chats_flood, methods=["POST"]),
+                                Route("/chats/pause", chats_pause, methods=["POST"]),
+                                Route("/chats/resume", chats_resume, methods=["POST"])])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))
@@ -335,6 +439,18 @@ async def main() -> None:
         await store.upsert_messages(conn, [(chat_id, record, True)], source="session", owner_tg_id=1000)
         seeded["draft"] = (await drafts.create(conn, app, chat_id=chat_id, prepare_only=True,
                                                text="Добрый день! Смету пришлю в пятницу.\nС уважением."))["draft_id"]
+
+        # экран «Чаты»: два аккаунта с подставным Telegram-клиентом, способ «как вы», два чата выбраны
+        manager = app.extras["tg"]
+        manager.client_factory = lambda role, path, policy, on_reconnect: worlds[role].factory(
+            role, path, policy, on_reconnect)
+        manager.pacing = 0.0
+        seeded["owner_account"] = await _login(manager, worlds, "owner", tg_fakes.ME)
+        seeded["helper_account"] = await _login(manager, worlds, "assistant", tg_fakes.HELPER)
+        await conn.execute("""INSERT INTO setup_state (key, value) VALUES ('scenario', '{"scenario": "own"}')
+                              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""")
+        await manager.set_sync(seeded["owner_account"], enabled=True,
+                               chats=[("chat", tg_fakes.GROUP), ("channel", tg_fakes.SUPER)])
 
         servers = [
             uvicorn.Server(uvicorn.Config(gate, host="127.0.0.1", port=PORT, log_level="warning",

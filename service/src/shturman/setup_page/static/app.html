@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
 <meta name="color-scheme" content="light dark">
-<title>Штурман — согласования</title>
+<title>Штурман — согласования и чаты</title>
 <link rel="stylesheet" href="../static/app.css">
 </head>
 <body>
@@ -17,6 +17,15 @@
   </div>
   <button type="button" class="ghost" id="refresh" hidden>Обновить</button>
 </header>
+
+<nav class="tabs" id="tabs" role="tablist" aria-label="Разделы" hidden>
+  <button type="button" role="tab" id="tab-approvals" aria-controls="screen-approvals" aria-selected="true">
+    <span>Согласования</span><span class="badge" id="tab-count" hidden></span>
+  </button>
+  <button type="button" role="tab" id="tab-chats" aria-controls="screen-chats" aria-selected="false">
+    <span>Чаты</span>
+  </button>
+</nav>
 
 <main id="main">
   <!-- вход и его неудачи -->
@@ -45,7 +54,7 @@
   </section>
 
   <!-- экран «Согласования» -->
-  <section id="screen-approvals" hidden>
+  <section id="screen-approvals" role="tabpanel" aria-labelledby="tab-approvals" hidden>
     <div class="title-row">
       <h1>Согласования</h1>
       <span class="count" id="count"></span>
@@ -58,6 +67,76 @@
     <p class="muted foot">Те же решения приходят карточками в бот согласований — решать можно и там, и здесь.
       Отдельные экраны со списком обязательств и состоянием сервера появятся в следующих версиях приложения.</p>
     <button type="button" class="home" id="home-screen" hidden>Добавить «Штурман» на главный экран</button>
+  </section>
+
+  <!-- экран «Чаты» -->
+  <section id="screen-chats" role="tabpanel" aria-labelledby="tab-chats" hidden>
+    <div class="title-row">
+      <h1>Чаты</h1>
+      <span class="count" id="chats-count"></span>
+    </div>
+    <p class="lead muted">Какие чаты читает ассистент. То же, что шаг «Какие чаты читать» на странице «Переписка».</p>
+
+    <div class="segmented" id="chats-accounts" role="tablist" aria-label="Аккаунт Telegram" hidden></div>
+
+    <p class="muted" id="chats-loading">Загружаю чаты…</p>
+
+    <div class="panel" id="chats-none" hidden>
+      <h2>Аккаунт Telegram не подключён</h2>
+      <p>Войдите в него на странице «Переписка» в браузере — шаг со входом в аккаунт Telegram. В приложении
+         входа нет: QR-код для входа с этого же телефона не отсканировать.</p>
+      <button type="button" class="secondary" id="chats-none-retry">Проверить ещё раз</button>
+    </div>
+
+    <div class="panel" id="chats-offline" hidden>
+      <h2>Аккаунт сейчас не подключён</h2>
+      <p id="chats-offline-text">Поэтому список его чатов недоступен. Состояние аккаунта и вход в него — на странице «Переписка» в браузере.</p>
+      <button type="button" class="secondary" id="chats-offline-retry">Проверить ещё раз</button>
+    </div>
+
+    <div class="panel" id="chats-failed" hidden>
+      <h2>Чаты не загрузились</h2>
+      <p id="chats-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="chats-failed-retry">Повторить</button>
+    </div>
+
+    <div id="chats-body" hidden>
+      <div class="tools">
+        <input type="search" id="chats-q" placeholder="Поиск по названию или @имени" aria-label="Поиск чата"
+               autocomplete="off" spellcheck="false" enterkeyhint="search">
+        <div class="tools-row">
+          <select id="chats-kind" aria-label="Вид чатов">
+            <option value="">Все чаты</option>
+            <option value="personal">Личные</option>
+            <option value="group">Группы</option>
+            <option value="channel">Каналы</option>
+          </select>
+          <label class="check"><input type="checkbox" id="chats-only"><span>Только выбранные</span></label>
+        </div>
+        <label class="field" for="chats-depth">
+          <span>Глубина истории для чатов, которые вы включите</span>
+          <select id="chats-depth">
+            <option value="1">1 месяц</option>
+            <option value="3">3 месяца</option>
+            <option value="6">6 месяцев</option>
+            <option value="12">12 месяцев</option>
+            <option value="24">2 года</option>
+            <option value="60">5 лет</option>
+            <option value="all">вся история</option>
+          </select>
+        </label>
+      </div>
+
+      <p class="status" id="chats-status" role="status" hidden></p>
+      <p class="counter muted" id="chats-counter"></p>
+      <ul class="chats" id="chats-list" aria-live="polite"></ul>
+      <button type="button" class="secondary wide" id="chats-more" hidden></button>
+      <button type="button" class="secondary wide" id="chats-refresh">Обновить список из Telegram</button>
+
+      <p class="muted foot">Каждое включение и выключение чата отсюда бот согласований сообщит вам отдельным
+        сообщением — так вы заметите, если чаты меняет кто-то другой. Стереть уже сохранённые сообщения чата,
+        включить сразу все группы или каналы и войти в аккаунт — на странице «Переписка» в браузере.</p>
+    </div>
   </section>
 </main>
 

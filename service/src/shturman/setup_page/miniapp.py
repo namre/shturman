@@ -5,11 +5,19 @@
   POST   /shturman-setup/api/app/logout                 завершить эту сессию приложения
   GET    /shturman-setup/api/app/approvals              что ждёт решения владельца — с теми же кнопками, что в боте
   POST   /shturman-setup/api/app/approvals/decide       нажать одну из этих кнопок: {ref}
+  GET    /shturman-setup/api/app/chats                  экран «Чаты»: аккаунты Telegram с сессией
+  GET    /shturman-setup/api/app/chats/{id}/dialogs     диалоги аккаунта ?offset&limit&q&kind&only&refresh —
+                                                        из памяти сервиса; в Telegram — только с refresh=1
+  POST   /shturman-setup/api/app/chats/{id}/sync        включить или выключить чтение одного чата:
+                                                        {peer_class, tg_id, enabled, months} (months — при включении)
+  POST   /shturman-setup/api/app/chats/{id}/exclude     не сохранять чат или вернуть его: {peer_class, tg_id, excluded};
+                                                        уже сохранённое не стирается
 
 Приложение открывается кнопкой меню «Штурман» в чате владельца с ботом согласований (её ставит
 сервис: `executor/menu_button.py`). Это ещё одно окно к тем же решениям, что в боте: экран
-«Согласования» (`approvals.py`). Остальное — первая настройка, ключи и токены, вход в аккаунт
-Telegram, выбор чатов, выгрузка, своя модель — только на странице настройки.
+«Согласования» (`approvals.py`), и к выбору чатов — экран «Чаты» (решение владельца Р-80, ниже).
+Остальное — первая настройка, ключи и токены, вход в аккаунт Telegram, выгрузка, своя модель,
+удаление сохранённых сообщений — только на странице настройки.
 
 Где живёт. На адресе страницы настройки, под её префиксом — не на адресе дашборда Hermes: там
 ассистент может исполнять свой JavaScript (Р-56). Поэтому обратный прокси менять не нужно ни в
@@ -39,14 +47,24 @@ Hermes нет, поэтому данные входа ассистент под�
   * «выйти везде» на странице и `./ops/logout-all.sh` гасят и её (`auth.revoke_all`);
   * ключ сессии страницы здесь не действует, ключ приложения — на странице (тест это проверяет).
 
-Что приложение может: показать то, что ждёт решения, и нажать кнопку, которая под этим стоит в
-боте (`approvals.py`). Решение идёт тем же вызовом, что нажатие в боте (`bridge.dispatch_callback`),
-в контексте владельца из Telegram (`authority.miniapp_context`). Ничего сверх того, что уже умеют
-кнопки бота: ни настроек, ни правил, ни текста переписки за пределами карточек.
+Что приложение может:
+  * показать то, что ждёт решения, и нажать кнопку, которая под этим стоит в боте (`approvals.py`).
+    Решение идёт тем же вызовом, что нажатие в боте (`bridge.dispatch_callback`), в контексте
+    владельца из Telegram (`authority.miniapp_context`). Ничего сверх того, что уже умеют кнопки
+    бота: ни настроек, ни правил, ни текста переписки за пределами карточек;
+  * экран «Чаты» (Р-80): то же, что шаг «Какие чаты читать» на странице, теми же функциями
+    (`chats.py`), применяется сразу, в контексте владельца из Telegram. Отличия от страницы:
+    список диалогов — из памяти сервиса, в Telegram — только по кнопке «Обновить список из
+    Telegram»; чаты включаются по одному (без «все группы разом»); исключение не стирает
+    сохранённое. Цена и смягчения — `docs/decisions.md`, Р-80: войти в приложение может любой, у кого
+    есть токен бота согласований, — значит, и менять, какие чаты читает ассистент. Поэтому каждое
+    изменение отсюда сервис сообщает владельцу отдельным сообщением в бот согласований (`_tell`) и
+    пишет в журнал действий страницы с пометкой «из приложения».
 
 Журнал действий: `app.login`, `app.login_failed` (не чаще раза в минуту; повтор уже использованных
 данных входа — всегда, и владельцу уходит сообщение в бот), `app.logout`,
-`app.decide` — вид и номер пункта и подпись кнопки, без имён и текстов.
+`app.decide` — вид и номер пункта и подпись кнопки, без имён и текстов; `app.sync_on`,
+`app.sync_off`, `app.chat_exclude`, `app.chat_include` — номер чата в Telegram и глубина, без названий.
 """
 
 from __future__ import annotations
@@ -62,11 +80,13 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
 
-from .. import confirm
+from .. import authority, bridge, confirm
 from ..api_core import BadRequest, error_response
-from ..app import state_of
+from ..app import AppState, state_of
 from ..executor import binding
-from . import APP_PATH, approvals, audit, auth, initdata
+from ..tg import gateway, sync
+from ..tg.manager import TgError, TgManager
+from . import APP_PATH, approvals, audit, auth, chats, initdata
 from . import service as page
 
 APP_API = page.API + "/app"
@@ -198,6 +218,11 @@ def endpoint(fn: Handler | None = None, *, public: bool = False) -> Any:
             except confirm.Refused as exc:
                 return JSONResponse({"error": exc.message, **({"code": exc.code} if exc.code else {})},
                                     status_code=exc.status)
+            except TgError as exc:
+                extra = {"retry_after": exc.retry_after} if exc.retry_after else {}
+                return JSONResponse({"error": exc.message, **extra}, status_code=exc.status)
+            except gateway.AccountUnavailable:
+                return JSONResponse({"error": "Аккаунт не подключён.", "code": "offline"}, status_code=409)
             except ClientDisconnect:
                 return JSONResponse({"error": "Соединение оборвалось до конца запроса."}, status_code=400)
         wrapped.__name__ = fn.__name__
@@ -314,11 +339,137 @@ async def approvals_decide(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "answer": str(out.get("answer") or "Готово.")})
 
 
+# --- экран «Чаты» (Р-80) ---------------------------------------------------------------------------
+#
+# То же, что шаг «Какие чаты читать» на странице, теми же функциями (`chats.py`). Решение владельца
+# от 2026-10-14 с ценой: войти в приложение может любой, у кого есть токен бота согласований (у бота
+# «в одно нажатие» — и держатель посредника), — значит, и менять, какие чаты читает ассистент.
+# Смягчения: каждое изменение — отдельным сообщением владельцу в бот согласований и записью в
+# журнале страницы; список диалогов — из памяти, без запросов к Telegram, кроме кнопки «Обновить»;
+# по одному чату; без стирания сохранённого.
+
+TITLE_LIMIT = 80              # знаков названия чата в сообщении владельцу
+IF_NOT_YOU = ("Если это были не вы — {fix} на странице «Переписка» и нажмите там «Выйти на всех устройствах». "
+              "Если бот согласований создан в одно нажатие, замените его ботом, созданным вручную у @BotFather "
+              "(«Сменить токен»).")
+
+
+def _account_id(request: Request) -> int:
+    return int(request.path_params["account_id"])
+
+
+def _title(dialog: Any) -> str:
+    name = " ".join(str(getattr(getattr(dialog, "chat", None), "name", None) or "").split())
+    if not name:
+        return "без названия"
+    return name if len(name) <= TITLE_LIMIT else name[:TITLE_LIMIT - 1].rstrip() + "…"
+
+
+async def _tell(state: AppState, text: str) -> None:
+    """Сообщение владельцу в бот согласований о том, что сделано из приложения. Тем же путём, что
+    остальные служебные сообщения сервиса (`bridge.notify_owner`: очередь заданий, повторы при
+    сбое Telegram), а не «по возможности»: по нему владелец замечает чужие изменения."""
+    async with state.pool.acquire() as conn:
+        await bridge.notify_owner(conn, text)
+
+
+@endpoint
+async def chats_accounts(request: Request) -> JSONResponse:
+    """Аккаунты Telegram с сессией: какой выбран по способу подключения, подключён ли, сколько
+    чатов выбрано и глубина истории по умолчанию. Без ключей приложения и входа в аккаунт — пусто."""
+    state = state_of(request)
+    tg = state.extras.get("tg")
+    if not isinstance(tg, TgManager) or not tg.configured:
+        return JSONResponse({"accounts": [], "mine": None})
+    found = [a for a in await chats.accounts(state, tg) if a["account_id"] is not None]
+    chosen = (await page._scenario_state(state))["chosen"]
+    keep = ("account_id", "role", "role_name", "label", "status", "backfill_months", "chats_enabled")
+    return JSONResponse({"accounts": [{k: a[k] for k in keep} for a in found],
+                         "mine": {"own": "owner", "staff": "assistant"}.get(chosen or "")})
+
+
+@endpoint
+async def chats_dialogs(request: Request) -> JSONResponse:
+    state = state_of(request)
+    return JSONResponse(await chats.list_dialogs(state, chats.manager(state), _account_id(request), request,
+                                                 cached=True))
+
+
+async def _known_title(tg: TgManager, account_id: int, key: tuple[str, int]) -> str:
+    """Название чата из уже загруженного списка — для сообщения владельцу. Без запроса к Telegram."""
+    try:
+        return _title(await chats.find_dialog(tg, account_id, key, cached=True))
+    except (BadRequest, TgError):
+        return f"№ {key[1]}"
+
+
+@endpoint
+async def chats_sync(request: Request) -> JSONResponse:
+    data = await page._body(request)
+    if "chats" in data or "kind" in data:
+        raise BadRequest("Из приложения чаты включаются по одному. Все чаты одного вида разом — на странице "
+                         "«Переписка».", 400, "one_chat")
+    enabled = bool(page._flag(data, "enabled", required=True))
+    (key,) = chats.peer_keys([data])
+    if enabled and "months" not in data:
+        raise BadRequest("Выберите глубину истории для этого чата.")
+    months = chats.months_of(data) if enabled else sync.ACCOUNT_DEFAULT
+    state, session = state_of(request), request.state.app_session
+    tg, account_id = chats.manager(state), _account_id(request)
+    if enabled:
+        title = _title(await chats.find_dialog(tg, account_id, key, cached=True))
+    else:
+        title = await _known_title(tg, account_id, key)
+    with authority.miniapp_context(session.user_id, chat_id=session.chat_id):
+        result, on = await chats.set_sync(state, tg, account_id, enabled=enabled, keys=[key],
+                                          since=await chats.since_of(state, months), cached=True)
+    chat = f"чат {key[0]}:{key[1]}"
+    if enabled and not on:
+        await page._log(request, "app.sync_on", audit.REFUSED, chat + "; чат исключён из архива")
+    elif enabled:
+        depth = chats.depth_words(months)
+        await page._log(request, "app.sync_on", detail=f"{chat}; глубина: {depth}")
+        await _tell(state, f"Из приложения включено чтение чата «{title}» (глубина: {depth}).\n\n"
+                           + IF_NOT_YOU.format(fix="выключите этот чат"))
+    else:
+        await page._log(request, "app.sync_off", detail=chat)
+        await _tell(state, f"Из приложения выключено чтение чата «{title}».")
+    return JSONResponse({"chats": result, "enabled": on, "enabled_total": await chats.enabled_total(state, account_id)})
+
+
+@endpoint
+async def chats_exclude(request: Request) -> JSONResponse:
+    """Не сохранять чат или вернуть его в архив. Стереть уже сохранённое отсюда нельзя."""
+    data = await page._body(request)
+    if data.get("purge") not in (None, False):
+        raise BadRequest("Стереть сохранённые сообщения чата можно только на странице «Переписка».", 400, "page_only")
+    excluded = bool(page._flag(data, "excluded", required=True))
+    (key,) = chats.peer_keys([data])
+    state, session = state_of(request), request.state.app_session
+    tg, account_id = chats.manager(state), _account_id(request)
+    with authority.miniapp_context(session.user_id, chat_id=session.chat_id):
+        dialog, _ = await chats.exclude(state, tg, account_id, key, excluded=excluded, cached=True)
+    title, chat = _title(dialog), f"чат {key[0]}:{key[1]}"
+    if excluded:
+        await page._log(request, "app.chat_exclude", detail=chat)
+        await _tell(state, f"Из приложения чат «{title}» исключён из архива: новые сообщения из него не "
+                           "сохраняются, уже сохранённое осталось.\n\n" + IF_NOT_YOU.format(fix="верните чат в архив"))
+    else:
+        await page._log(request, "app.chat_include", detail=chat)
+        await _tell(state, f"Из приложения чат «{title}» возвращён в архив (читать его — отдельной отметкой).")
+    return JSONResponse({"excluded": excluded, "purged": 0})
+
+
 def routes() -> list[BaseRoute]:
+    account = APP_API + "/chats/{account_id:int}"
     return [
         Route(APP_PATH, index, methods=["GET"]),
         Route(APP_API + "/login", login, methods=["POST"]),
         Route(APP_API + "/logout", logout, methods=["POST"]),
         Route(APP_API + "/approvals", approvals_list, methods=["GET"]),
         Route(APP_API + "/approvals/decide", approvals_decide, methods=["POST"]),
+        Route(APP_API + "/chats", chats_accounts, methods=["GET"]),
+        Route(account + "/dialogs", chats_dialogs, methods=["GET"]),
+        Route(account + "/sync", chats_sync, methods=["POST"]),
+        Route(account + "/exclude", chats_exclude, methods=["POST"]),
     ]

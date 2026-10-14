@@ -266,7 +266,11 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
     routes = [r for r in setup_service.routes() if r.path.startswith(miniapp.APP_API) or r.path == APP_PATH]
     assert sorted((r.path, sorted(r.methods - {"HEAD"})) for r in routes) == sorted([
         (APP_PATH, ["GET"]), (miniapp.APP_API + "/login", ["POST"]), (miniapp.APP_API + "/logout", ["POST"]),
-        (miniapp.APP_API + "/approvals", ["GET"]), (miniapp.APP_API + "/approvals/decide", ["POST"])])
+        (miniapp.APP_API + "/approvals", ["GET"]), (miniapp.APP_API + "/approvals/decide", ["POST"]),
+        # экран «Чаты» (Р-80, tests/setup_page/test_miniapp_chats.py)
+        (miniapp.APP_API + "/chats", ["GET"]), (miniapp.APP_API + "/chats/{account_id:int}/dialogs", ["GET"]),
+        (miniapp.APP_API + "/chats/{account_id:int}/sync", ["POST"]),
+        (miniapp.APP_API + "/chats/{account_id:int}/exclude", ["POST"])])
     for route in routes:
         if route.path != APP_PATH:
             assert getattr(route.endpoint, "miniapp", False), route.path     # своя обёртка — своя сессия
@@ -614,8 +618,10 @@ def test_audit_knows_every_app_action():
 
     source = (resources.files("shturman.setup_page") / "miniapp.py").read_text(encoding="utf-8")
     used = set(re.findall(r'_log\(request, "([a-z_.]+)"', source))
-    assert used == {"app.login", "app.login_failed", "app.logout", "app.decide"}
+    assert used == {"app.login", "app.login_failed", "app.logout", "app.decide",
+                    "app.sync_on", "app.sync_off", "app.chat_exclude", "app.chat_include"}
     assert used <= set(audit.ACTIONS) and {"app.login", "app.decide"} <= audit.IMPORTANT
+    assert {"app.sync_on", "app.sync_off", "app.chat_exclude", "app.chat_include"} <= audit.IMPORTANT
     assert approvals.REF.fullmatch("sh:ob:s:12:" + "a" * 22)
 
 

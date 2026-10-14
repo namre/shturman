@@ -82,6 +82,13 @@ def _wait_error(seconds: int) -> TgError:
     return TgError(f"Telegram просит подождать {seconds} с. Попробуйте позже.", 429, retry_after=max(1, seconds))
 
 
+class DialogsNotLoaded(TgError):
+    """Списка диалогов в памяти нет, а ходить за ним в Telegram не просили (`cached=True`)."""
+
+    def __init__(self) -> None:
+        super().__init__("Список чатов ещё не загружен из Telegram. Нажмите «Обновить список из Telegram».", 409)
+
+
 class _Unauthorized(Exception):
     pass
 
@@ -841,11 +848,18 @@ class TgManager:
 
     # ------------------------------------------------------------------ диалоги и выбор чатов
 
-    async def dialogs(self, account_id: int, *, refresh: bool = False) -> list[DialogInfo]:
+    async def dialogs(self, account_id: int, *, refresh: bool = False, cached: bool = False) -> list[DialogInfo]:
+        """Диалоги аккаунта. `cached` — только то, что уже в памяти, без запроса к Telegram, как бы
+        давно список ни загружался (экран «Чаты» приложения «Штурман», Р-80); списка нет —
+        `DialogsNotLoaded`. `refresh` сильнее `cached`: это кнопка «Обновить список из Telegram»."""
         try:
             rt = self._running(account_id)
         except gateway.AccountUnavailable:
             raise TgError("Аккаунт не подключён: список чатов недоступен.", 409) from None
+        if cached and not refresh:
+            if rt.dialogs is None:
+                raise DialogsNotLoaded()
+            return rt.dialogs
         age = time.monotonic() - rt.dialogs_at
         if rt.dialogs is None or age > DIALOGS_TTL or (refresh and age > DIALOGS_MIN_GAP):
             waiting = rt.pacer.flood_remaining()
@@ -887,12 +901,19 @@ class TgManager:
     async def list_dialogs(
         self, account_id: int, *, offset: int = 0, limit: int = 100,
         chat_type: str | None = None, refresh: bool = False,
-        chat_types: Any = None, query: str | None = None, only_enabled: bool = False,
+        chat_types: Any = None, query: str | None = None, only_enabled: bool = False, cached: bool = False,
     ) -> dict[str, Any]:
         """Страница списка диалогов для экрана выбора. Отбор: один вид чата (`chat_type`),
         несколько видов (`chat_types`), подстрока названия или адреса (`query`), только уже
-        включённые (`only_enabled`). `total` — сколько диалогов прошло отбор."""
-        dialogs = await self.dialogs(account_id, refresh=refresh)
+        включённые (`only_enabled`). `total` — сколько диалогов прошло отбор. `cached` — без
+        запроса к Telegram (`dialogs`): если списка в памяти нет, ответ пустой и `loaded` — ложь.
+        `age` — сколько секунд назад список загружен из Telegram."""
+        try:
+            dialogs = await self.dialogs(account_id, refresh=refresh, cached=cached)
+        except DialogsNotLoaded:
+            return {"total": 0, "offset": offset, "items": [], "loaded": False, "age": None}
+        rt = self._by_account(account_id)
+        age = int(time.monotonic() - rt.dialogs_at) if rt is not None and rt.dialogs is not None else None
         if chat_type:
             dialogs = [d for d in dialogs if d.chat.type == chat_type]
         if chat_types:
@@ -925,22 +946,23 @@ class TgManager:
                 # числу. В личных чатах и обычных группах нумерация общая на аккаунт.
                 "message_estimate": d.top_message if d.chat.peer_class == "channel" else None,
             })
-        return {"total": len(dialogs), "offset": offset, "items": items}
+        return {"total": len(dialogs), "offset": offset, "items": items, "loaded": True, "age": age}
 
     async def set_sync(
         self, account_id: int, *, enabled: bool,
         chats: list[PeerKey] | None = None, chat_types: list[str] | None = None,
-        since: Any = sync.ACCOUNT_DEFAULT,
+        since: Any = sync.ACCOUNT_DEFAULT, cached: bool = False,
     ) -> list[dict[str, Any]]:
         """Включает или выключает синхронизацию чатов — поштучно или всех чатов заданных видов.
 
         `since` — граница загрузки истории вглубь для включаемых чатов: дата, None (вся история)
-        или не названа (глубина по умолчанию из настроек аккаунта)."""
+        или не названа (глубина по умолчанию из настроек аккаунта). `cached` — чат ищется только
+        в уже загруженном списке диалогов, без запроса к Telegram (`dialogs`)."""
         await self._slot_of(account_id)
         rt = self._by_account(account_id)
         by_key: dict[PeerKey, DialogInfo] = {}
         if enabled or chat_types:
-            by_key = {d.key: d for d in await self.dialogs(account_id)}
+            by_key = {d.key: d for d in await self.dialogs(account_id, cached=cached)}
         keys: list[PeerKey] = list(chats or [])
         if chat_types:
             keys += [k for k, d in by_key.items() if d.chat.type in chat_types and k not in keys]
