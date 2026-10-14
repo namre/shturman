@@ -5,9 +5,10 @@
 функциями: список диалогов аккаунта с поиском и отбором, включение и выключение чтения чата,
 исключение чата из архива и возврат. Различия — только в том, что разрешено вызывающему:
 
-  * приложение берёт список диалогов **только из памяти** сервиса (`cached=True`): в Telegram оно
-    ходит лишь по кнопке «Обновить список из Telegram». Включение и исключение там тоже ищут чат
-    только в уже загруженном списке;
+  * список диалогов у обоих — из базы (`tg_dialogs`, решение Р-81): его загружает из Telegram фоновая
+    загрузка, запрос экрана её только запускает и сразу отвечает. Страница сама запускает обновление,
+    когда список устарел; приложение (`cached=True`) — только по кнопке «Обновить список из Telegram».
+    Включение и исключение ищут чат в этом же списке, в Telegram за ним не ходят;
   * приложение включает и выключает чаты поштучно — «все группы разом» есть только на странице;
   * приложение не стирает уже сохранённые сообщения — `purge` только на странице.
 
@@ -83,7 +84,7 @@ async def enabled_total(state: AppState, account_id: int) -> int:
 async def list_dialogs(state: AppState, tg: TgManager, account_id: int, request: Request, *,
                        cached: bool = False) -> dict[str, Any]:
     """Страница списка диалогов по параметрам запроса `?offset&limit&q&kind&only&refresh` —
-    с видом чата, отметкой служебных чатов и числом выбранных."""
+    с видом чата, отметкой служебных чатов, числом выбранных и ходом загрузки списка (`load`)."""
     kind = request.query_params.get("kind") or ""
     if kind and kind not in KINDS:
         raise BadRequest("параметр kind: personal, group или channel")
@@ -149,33 +150,33 @@ def depth_words(months: Any) -> str:
 
 
 async def set_sync(state: AppState, tg: TgManager, account_id: int, *, enabled: bool, keys: list[tuple[str, int]],
-                   kind: str | None = None, since: Any = sync.ACCOUNT_DEFAULT,
-                   cached: bool = False) -> tuple[list[dict[str, Any]], int]:
+                   kind: str | None = None, since: Any = sync.ACCOUNT_DEFAULT) -> tuple[list[dict[str, Any]], int]:
     """Включить или выключить чтение чатов; возвращает итог по каждому и сколько включено."""
     if kind is not None and kind not in KINDS:
         raise BadRequest("поле kind: personal, group или channel")
     if not keys and kind is None:
         raise BadRequest("Не выбрано ни одного чата.")
     result = await tg.set_sync(account_id, enabled=enabled, chats=keys,
-                               chat_types=list(KINDS[kind]) if kind else None, since=since, cached=cached)
+                               chat_types=list(KINDS[kind]) if kind else None, since=since)
     return result, sum(1 for item in result if item.get("enabled"))
 
 
-async def find_dialog(tg: TgManager, account_id: int, key: tuple[str, int], *, cached: bool = False) -> Any:
-    dialog = next((d for d in await tg.dialogs(account_id, cached=cached) if d.key == key), None)
+async def find_dialog(tg: TgManager, account_id: int, key: tuple[str, int]) -> Any:
+    """Чат из списка диалогов аккаунта в базе. Списка нет — 409 (`DialogsNotLoaded`), чата нет — 404."""
+    dialog = (await tg.find_dialogs(account_id, [key])).get(key)
     if dialog is None:
         raise BadRequest("Чат не найден среди диалогов аккаунта.", 404)
     return dialog
 
 
 async def exclude(state: AppState, tg: TgManager, account_id: int, key: tuple[str, int], *, excluded: bool,
-                  purge: bool = False, cached: bool = False) -> tuple[Any, int]:
+                  purge: bool = False) -> tuple[Any, int]:
     """Исключить чат аккаунта из архива (по желанию — стерев сохранённое) или вернуть его.
     Действие самого владельца: применяется сразу (`confirm.apply_owner`). Возвращает (диалог,
     сколько сообщений стёрто)."""
     if purge and not excluded:
         raise BadRequest("Стереть сообщения можно только вместе с исключением чата.")
-    dialog = await find_dialog(tg, account_id, key, cached=cached)
+    dialog = await find_dialog(tg, account_id, key)
     if store.is_blocked_peer(dialog.chat.peer_class, dialog.chat.tg_id, dialog.chat.username):
         raise BadRequest("Служебный чат Telegram исключён всегда: в нём коды входа и токены.", 409, "locked")
     purged = 0

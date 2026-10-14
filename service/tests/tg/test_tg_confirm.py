@@ -9,8 +9,8 @@ from shturman import authority, bridge, confirm
 from shturman.tg.client import session_path
 from shturman.tg.manager import TgManager
 
-from tg_fakes import (C_NEWS, G_FAMILY, GROUP, HELPER, IVAN, MARIA, ME, SELF_ID, U_IVAN, U_MARIA, World, msg,
-                      tg_config, wait_for)
+from tg_fakes import (C_NEWS, G_FAMILY, GROUP, HELPER, IVAN, MARIA, ME, SELF_ID, U_IVAN, U_MARIA, World,
+                      dialogs_loaded, msg, tg_config, wait_for)
 
 MODULES = ("shturman.api_core", "shturman.tg.service")
 
@@ -235,6 +235,7 @@ async def owner_account(make_client, config, conn, approvals):
     client, state, manager = await service(make_client, config, conn, world)
     account_id = await login(client, world, approvals, "owner", confirm_owner=True)
     await running(manager, "owner")
+    await dialogs_loaded(manager, account_id)              # список чатов — в базе, как после «Обновить»
     return client, manager, account_id, f"/api/tg/accounts/{account_id}"
 
 

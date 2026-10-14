@@ -5,6 +5,7 @@
 карточки в боте согласований, — в том числе когда свой бот есть и тот же запрос через
 внутренний API ждал бы подтверждения."""
 
+import asyncio
 import json
 import logging
 import time
@@ -15,7 +16,7 @@ from conftest import as_file, full_export, msg
 from exec_fakes import BOT_NAME, IVAN_USER, OWNER, OWNER_USER, STRANGER_USER, private, refusal, until
 from telethon import errors
 from tg_fakes import (C_NEWS, C_SUPER, G_FAMILY, HELPER, IVAN, ME, PASSWORD, U_BOT, U_IVAN, U_MARIA, U_TELEGRAM,
-                      World, user, wait_for)
+                      World, dialogs_loaded, user, wait_for)
 from tg_fakes import msg as tg_msg
 
 from shturman import bridge
@@ -51,6 +52,13 @@ async def connect(s, role="assistant", world_user=HELPER, **extra):
     assert done["status"] == "completed", done
     await wait_for(lambda: s.manager.runtimes[role].status == "running")
     return done["account_id"]
+
+
+async def connected(s, role="assistant", world_user=HELPER, **extra):
+    """Аккаунт подключён, и список его чатов уже в базе — как после фоновой загрузки."""
+    account_id = await connect(s, role, world_user, **extra)
+    await dialogs_loaded(s.manager, account_id)
+    return account_id
 
 
 # --- 1. бот согласований ---
@@ -382,8 +390,16 @@ async def test_dialogs_are_paged_searched_and_filtered(stand, conn):
     s = await ready(stand, conn, world=crowded())
     account_id = await connect(s)
     base = f"/tg/accounts/{account_id}/dialogs"
+    # списка ещё нет: запрос страницы запускает загрузку в фоне и сразу отвечает
+    started = (await s.page.get(base)).json()
+    assert started["load"]["state"] in ("loading", "done")             # загрузка начата
+    await dialogs_loaded(s.manager, account_id, refresh=False)
+    assert s.world.dialog_pages == [0, 100]               # две страницы Telegram, каждая — один раз
     first = (await s.page.get(base)).json()
     assert first["total"] == 137 and len(first["items"]) == 50 and first["enabled_total"] == 0
+    assert first["load"] == {"state": "done", "running": False, "loaded": 137, "expected": 137, "wait_seconds": None,
+                             "updated_at": first["load"]["updated_at"], "error": None}
+    assert first["loaded"] is True and first["age"] == 0 and s.world.dialog_calls == 2   # свежий список не перечитывается
     assert set(first["items"][0]) >= {"peer_class", "tg_id", "title", "type", "kind", "enabled", "excluded", "locked"}
     last = (await s.page.get(base + "?offset=100&limit=50")).json()
     assert len(last["items"]) == 37
@@ -401,22 +417,39 @@ async def test_dialogs_are_paged_searched_and_filtered(stand, conn):
 
 
 async def test_dialogs_flood_wait_tells_page_how_long(stand, conn):
-    """«Telegram просит подождать» в списке чатов: ответ 429 несёт retry_after — страница
-    показывает отсчёт и повторяет сама."""
+    """«Telegram просит подождать», когда список обновляется: запрос страницы не ждёт и не получает
+    отказ — загрузка ждёт сама, страница видит, сколько осталось, и прежний список."""
     s = await ready(stand, conn, world=crowded())
-    account_id = await connect(s)
+    account_id = await connected(s)
     rt = next(r for r in s.manager.runtimes.values() if r.account_id == account_id)
-    rt.dialogs = None
+    await conn.execute("UPDATE tg_dialog_lists SET completed_at = now() - interval '100 seconds'")
+    naps = []
+
+    async def nap(delay, stop):               # ожидание по просьбе Telegram — короткими шагами
+        naps.append(delay)
+        await asyncio.sleep(0.01)
+        return stop.is_set()
+
+    rt.pacer._sleep = nap
     rt.pacer.flood(40)
     out = await s.page.get(f"/tg/accounts/{account_id}/dialogs", params={"refresh": "1"})
-    assert out.status_code == 429
+    assert out.status_code == 200
     body = out.json()
-    assert "подождать" in body["error"] and 40 <= body["retry_after"] <= 43
+    assert body["load"]["state"] == "waiting" and 40 <= body["load"]["wait_seconds"] <= 43
+    assert body["total"] == 137 and body["loaded"] is True               # прежний список на месте
+    calls = s.world.dialog_calls
+    again = (await s.page.get(f"/tg/accounts/{account_id}/dialogs", params={"refresh": "1"})).json()
+    assert again["load"]["state"] == "waiting" and s.world.dialog_calls == calls     # вторая загрузка не начата
+    rt.pacer._flood_at = 0.0                  # время ожидания вышло
+    await dialogs_loaded(s.manager, account_id, refresh=False)
+    assert naps and s.world.dialog_calls == calls + 2
+    done = (await s.page.get(f"/tg/accounts/{account_id}/dialogs")).json()
+    assert done["load"]["state"] == "done" and done["age"] == 0
 
 
 async def test_chats_are_enabled_at_once_and_counted(stand, conn):
     s = await ready(stand, conn, world=crowded())
-    account_id = await connect(s)
+    account_id = await connected(s)
     ivan = {"peer_class": "user", "tg_id": IVAN}
     # через внутренний API включение чата ждёт владельца…
     assert (await s.api.post(f"/api/tg/accounts/{account_id}/sync", json={"enabled": True, "chats": [ivan]})).status_code == 202
@@ -447,7 +480,7 @@ async def test_chats_are_enabled_at_once_and_counted(stand, conn):
 
 async def test_options_depth_and_auto_take_effect_at_once(stand, conn):
     s = await ready(stand, conn, world=crowded())
-    account_id = await connect(s)
+    account_id = await connected(s)
     url = f"/tg/accounts/{account_id}/options"
     assert (await s.api.put(f"/api{url}", json={"auto_personal": True})).status_code == 202   # через API — ждёт
     assert (await s.page.put(url, {"auto_personal": True, "backfill_months": 36})).status_code == 200
@@ -463,7 +496,7 @@ async def test_options_depth_and_auto_take_effect_at_once(stand, conn):
 
 async def test_chat_is_excluded_purged_and_returned_from_the_page(stand, conn):
     s = await ready(stand, conn, world=crowded())
-    account_id = await connect(s)
+    account_id = await connected(s)
     ivan = {"peer_class": "user", "tg_id": IVAN}
     await s.page.post(f"/tg/accounts/{account_id}/sync", {"enabled": True, "chats": [ivan]})
     await until(lambda: conn.fetchval("SELECT count(*) = 5 FROM messages"))

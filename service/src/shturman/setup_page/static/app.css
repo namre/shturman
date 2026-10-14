@@ -312,6 +312,26 @@ input[type="search"]:focus-visible, select:focus-visible { outline: 2px solid va
 
 .counter { font-size: 13px; margin: 10px 0 6px; }
 
+/* Ход фоновой загрузки списка чатов (Р-81). */
+.load {
+  margin: 10px 0;
+  padding: 10px 12px 12px;
+  border-radius: 10px;
+  background: var(--section);
+  border-left: 3px solid var(--accent);
+  font-size: 14px;
+}
+.load p { margin: 0; }
+.load-title { font-weight: 600; }
+.load-text { color: var(--hint); font-variant-numeric: tabular-nums; margin-top: 2px; }
+.load.wait { border-left-color: #F2B441; }
+.load.warn { border-left-color: var(--danger); }
+.load.idle { border-left-color: var(--hint); }
+.meter { height: 6px; border-radius: 999px; background: var(--quote); overflow: hidden; margin-top: 8px; }
+.meter span { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--button); transition: width .6s ease; }
+.load.wait .meter span { background: #F2B441; }
+@media (prefers-reduced-motion: reduce) { .meter span { transition: none; } }
+
 .chats {
   list-style: none;
   margin: 0 0 12px;

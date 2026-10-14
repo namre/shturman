@@ -141,6 +141,26 @@ class Pacer:
         """Сколько секунд ещё ждать по требованию Telegram (0 — ожидания нет)."""
         return max(0.0, self._flood_at - self._clock())
 
+    async def wait_flood(self, stop: asyncio.Event) -> None:
+        """Дожидается конца ожидания, которое велел Telegram, — без очереди за паузой между запросами.
+        Так идут страницы списка диалогов (tg/dialogs.py): паузу между ними держит `Spacer` клиента.
+        Бросает Stopped, если пришла остановка."""
+        while True:
+            if stop.is_set():
+                raise Stopped()
+            delay = self._flood_at - self._clock()
+            if delay <= 0:
+                break
+            if await self._sleep(delay, stop):
+                raise Stopped()
+        if self.flood_until is not None:
+            self.flood_until = None
+
+    def note_request(self) -> None:
+        """Запрос ушёл мимо очереди (страница списка диалогов): следующий запрос истории — не раньше
+        обычной паузы после него. Пока список грузится, история ждёт и с ним вместе Telegram не бьёт."""
+        self._next_at = max(self._next_at, self._clock() + self.gap())
+
     async def wait(self, stop: asyncio.Event) -> None:
         """Дожидается своей очереди. Бросает Stopped, если пришла остановка."""
         async with self._lock:

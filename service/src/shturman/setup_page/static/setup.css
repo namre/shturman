@@ -392,6 +392,22 @@ body.sc-staff .only-own, body:not(.sc-staff) .only-staff { display: none !import
 .toolbar .check input { margin: 0; }
 .counter { font-weight: 600; }
 
+/* Ход фоновой загрузки списка чатов: «загружено N из ~M», ожидание по просьбе Telegram, сбой. */
+.loadbar {
+  display: flex; flex-direction: column; gap: 6px; padding: 14px 16px; border-radius: 10px;
+  background: var(--info-bg); color: var(--info-ink); border-left: 4px solid var(--accent);
+}
+.loadbar p { margin: 0; }
+.loadbar-title { font-weight: 700; }
+.loadbar-text { font-variant-numeric: tabular-nums; }
+.loadbar.wait { background: var(--warn-bg); color: var(--warn-ink); border-left-color: var(--amber); }
+.loadbar.bad { background: var(--danger-bg); color: var(--danger); border-left-color: var(--danger); }
+.loadbar.idle { background: var(--sunken); color: var(--ink); border-left-color: var(--field-line); }
+.meter { height: 8px; border-radius: 999px; background: var(--surface); overflow: hidden; margin-top: 4px; }
+.meter span { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--accent); transition: width .6s ease; }
+.loadbar.wait .meter span { background: var(--amber); }
+@media (prefers-reduced-motion: reduce) { .meter span { transition: none; } }
+
 .chatlist { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .chatlist:empty { display: none; }
 .chat { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--line); min-height: 60px; }

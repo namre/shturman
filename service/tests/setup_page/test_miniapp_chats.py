@@ -5,12 +5,14 @@
     архива, на адресе дашборда — закрыты; чужой аккаунт Telegram в приложение не входит;
   * это то же, что шаг «Какие чаты читать» на странице: поиск, вид, «только выбранные», включение
     и выключение с глубиной истории, исключение и возврат — и применяется сразу;
-  * смягчения из Р-80: список диалогов — из памяти, в Telegram — только по «Обновить»; каждое изменение —
+  * смягчения из Р-80: список диалогов — из базы, в Telegram — только по «Обновить» (Р-81: загрузка в фоне,
+    запрос не ждёт её конца); каждое изменение —
     отдельным сообщением владельцу в бот согласований и записью «из приложения» в журнале страницы;
     по одному чату; исключение не стирает уже сохранённое; исключённый чат не включается;
-  * «Telegram просит подождать» — ответ 429 с retry_after, как на странице.
+  * «Telegram просит подождать» — загрузка ждёт сама, приложение видит, сколько осталось.
 """
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -19,7 +21,7 @@ from setup_fakes import API, API_HASH, ORIGIN, bind_owner, stand  # noqa: F401, 
 from conftest import API_AUTH, MCP_AUTH
 import exec_fakes  # noqa: E402
 from tg_fakes import (C_NEWS, C_SUPER, G_FAMILY, HELPER, IVAN, MARIA, U_BOT, U_IVAN, U_MARIA, U_TELEGRAM,  # noqa: E402
-                      World, user, wait_for)
+                      World, dialogs_loaded, user, wait_for)
 from tg_fakes import msg as tg_msg  # noqa: E402
 
 from shturman.setup_page import miniapp  # noqa: E402
@@ -78,10 +80,19 @@ async def told(s, words: str) -> list[str]:
 
 
 async def loaded(s):
-    """Список диалогов в памяти сервиса — как после «Обновить список из Telegram»."""
+    """Список диалогов в базе — как после «Обновить список из Telegram» и конца фоновой загрузки."""
     got = await s.app.get(f"/chats/{s.account}/dialogs", params={"refresh": "1"})
-    assert got.status_code == 200 and got.json()["loaded"] is True, got.text
+    assert got.status_code == 200 and got.json()["load"]["state"] in ("loading", "done"), got.text   # загрузка начата
+    await dialogs_loaded(s.manager, s.account, refresh=False)
+    got = await s.app.get(f"/chats/{s.account}/dialogs")
+    assert got.status_code == 200 and got.json()["loaded"] is True and got.json()["load"]["state"] == "done"
     return got.json()
+
+
+async def forget_list(conn):
+    """Списка диалогов в базе нет — как до первой загрузки."""
+    await conn.execute("DELETE FROM tg_dialogs")
+    await conn.execute("DELETE FROM tg_dialog_lists")
 
 
 # --- доступ ----------------------------------------------------------------------------------------
@@ -170,23 +181,31 @@ async def test_no_keys_or_no_account_means_an_empty_screen(stand, conn):
     assert got.status_code == 409 and got.json()["code"] == "no_keys"
 
 
-async def test_list_comes_from_memory_and_telegram_is_asked_only_by_refresh(stand, conn):
+async def test_list_comes_from_the_database_and_telegram_is_asked_only_by_refresh(stand, conn):
     s = await ready(stand, conn)
     base = f"/chats/{s.account}/dialogs"
-    s.rt.dialogs = None                              # в памяти списка нет
     asked = dialog_requests(s)
-    empty = (await s.app.get(base)).json()
-    assert empty == {"total": 0, "offset": 0, "items": [], "loaded": False, "age": None, "enabled_total": 0}
+    empty = (await s.app.get(base)).json()           # списка в базе ещё нет
+    assert {k: empty[k] for k in ("total", "offset", "items", "loaded", "age", "enabled_total")} == {
+        "total": 0, "offset": 0, "items": [], "loaded": False, "age": None, "enabled_total": 0}
+    assert empty["load"]["state"] == "idle" and empty["load"]["running"] is False
     assert dialog_requests(s) == asked               # в Telegram не ходили
     first = await loaded(s)
     assert dialog_requests(s) == asked + 1 and first["total"] == 47 and first["age"] == 0
-    # список в Telegram поменялся, а срок «свежести» давно вышел — приложение всё равно берёт из памяти
+    # список в Telegram поменялся, а срок «свежести» давно вышел — приложение всё равно берёт из базы
     s.world.dialogs.append(user(30_001, "Новый", "Собеседник"))
-    s.rt.dialogs_at -= 100_000
+    await conn.execute("UPDATE tg_dialog_lists SET completed_at = completed_at - interval '100000 seconds'")
     again = (await s.app.get(base, params={"q": "Новый"})).json()
     assert again["total"] == 0 and again["age"] >= 100_000 and dialog_requests(s) == asked + 1
-    # страница настройки в той же ситуации перечитала бы список сама; приложение — только по кнопке
-    assert (await s.app.get(base, params={"q": "Новый", "refresh": "1"})).json()["total"] == 1
+    assert again["load"]["running"] is False
+    # страница настройки в той же ситуации обновила бы список сама; приложение — только по кнопке
+    started = (await s.app.get(base, params={"q": "Новый", "refresh": "1"})).json()
+    assert started["load"]["state"] in ("loading", "done")
+    await dialogs_loaded(s.manager, s.account, refresh=False)
+    assert (await s.app.get(base, params={"q": "Новый"})).json()["total"] == 1
+    assert dialog_requests(s) == asked + 2
+    # «Обновить» сразу после обновления в Telegram не ходит (не чаще раза в 30 секунд)
+    assert (await s.app.get(base, params={"refresh": "1"})).json()["load"]["running"] is False
     assert dialog_requests(s) == asked + 2
 
     # поиск, вид, «только выбранные», страницы — как на странице
@@ -207,14 +226,20 @@ async def test_list_comes_from_memory_and_telegram_is_asked_only_by_refresh(stan
     assert await app_rows(conn) == []
 
 
-async def test_telegram_asks_to_wait_and_the_app_gets_retry_after(stand, conn):
+async def test_telegram_asks_to_wait_and_the_app_sees_how_long(stand, conn):
     s = await ready(stand, conn)
     await loaded(s)
-    s.rt.dialogs_at -= 100
+    await conn.execute("UPDATE tg_dialog_lists SET completed_at = completed_at - interval '100 seconds'")
+
+    async def nap(delay, stop):                      # ожидание по просьбе Telegram — короткими шагами
+        await asyncio.sleep(0.01)
+        return stop.is_set()
+
+    s.rt.pacer._sleep = nap
     s.rt.pacer.flood(40)
     got = await s.app.get(f"/chats/{s.account}/dialogs", params={"refresh": "1"})
-    assert got.status_code == 429
-    assert "подождать" in got.json()["error"] and 40 <= got.json()["retry_after"] <= 43
+    assert got.status_code == 200, got.text
+    assert got.json()["load"]["state"] == "waiting" and 40 <= got.json()["load"]["wait_seconds"] <= 43
     # пока Telegram просит ждать, уже загруженный список по-прежнему открывается и чаты включаются
     assert (await s.app.get(f"/chats/{s.account}/dialogs")).json()["total"] == 47
     on = await s.app.post(f"/chats/{s.account}/sync", {**IVAN_KEY, "enabled": True, "months": 1})
@@ -287,8 +312,8 @@ async def test_one_chat_at_a_time_with_a_chosen_depth(stand, conn):
     asked = dialog_requests(s)
     missing = await s.app.post(url, {"peer_class": "user", "tg_id": 123456, "enabled": True, "months": 3})
     assert missing.status_code == 404 and dialog_requests(s) == asked
-    # списка в памяти нет — включить нельзя, пока его не обновят
-    s.rt.dialogs = None
+    # списка в базе нет — включить нельзя, пока его не загрузят
+    await forget_list(conn)
     gone = await s.app.post(url, {**IVAN_KEY, "enabled": True, "months": 3})
     assert gone.status_code == 409 and "Обновить список из Telegram" in gone.json()["error"]
     assert dialog_requests(s) == asked

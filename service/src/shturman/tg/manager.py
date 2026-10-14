@@ -38,7 +38,7 @@ from .. import authority, bridge, control_peers, store
 from .. import events as ev
 from ..config import Config
 from ..events import Events
-from ..records import ChatRecord
+from . import dialogs as dl
 from . import gateway, normalize, sync
 from .client import (ROLES, ClientFactory, NotConfigured, RequestPolicy, make_client_factory,
                      remove_session_file, session_path)
@@ -50,7 +50,7 @@ from .qr import LoginFlow, LoginRejected, LoginStateError
 logger = logging.getLogger("shturman.tg")
 
 TEXT_LIMIT = 4096
-DIALOGS_TTL = 600.0       # сколько секунд верить списку диалогов
+DIALOGS_TTL = 600.0       # список старше — страница настройки сама запускает его обновление (в фоне)
 DIALOGS_MIN_GAP = 30.0    # чаще список не перечитывается даже по просьбе
 FLOW_KEEP = 600.0         # сколько помнить законченный вход, чтобы экран узнал итог
 RETRY_FIRST, RETRY_MAX = 5.0, 600.0
@@ -78,29 +78,20 @@ class TgError(Exception):
         self.retry_after = retry_after   # Telegram велел ждать столько секунд (для 429)
 
 
-def _wait_error(seconds: int) -> TgError:
-    return TgError(f"Telegram просит подождать {seconds} с. Попробуйте позже.", 429, retry_after=max(1, seconds))
-
-
 class DialogsNotLoaded(TgError):
-    """Списка диалогов в памяти нет, а ходить за ним в Telegram не просили (`cached=True`)."""
+    """Списка диалогов аккаунта в базе ещё нет: он ни разу не загружался (или загружается сейчас)."""
 
     def __init__(self) -> None:
-        super().__init__("Список чатов ещё не загружен из Telegram. Нажмите «Обновить список из Telegram».", 409)
+        super().__init__("Список чатов ещё не загружен из Telegram. Дождитесь, пока он загрузится, или нажмите "
+                         "«Обновить список из Telegram».", 409)
 
 
 class _Unauthorized(Exception):
     pass
 
 
-@dataclass
-class DialogInfo:
-    chat: ChatRecord
-    top_message: int
-
-    @property
-    def key(self) -> PeerKey:
-        return self.chat.peer_class, self.chat.tg_id
+# Диалог аккаунта: чат и номер его последнего сообщения (и сведения для будущей группировки).
+DialogInfo = dl.DialogRow
 
 
 @dataclass
@@ -123,9 +114,9 @@ class AccountRuntime:
     live: LiveIngest | None = None
     history: sync.HistorySync | None = None
     task: asyncio.Task | None = None
-    dialogs: list[DialogInfo] | None = None
-    dialogs_at: float = 0.0
-    dialogs_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    dialogs_load: dl.DialogsLoad = field(default_factory=dl.DialogsLoad)   # загрузка списка диалогов
+    dialogs_tried: float = 0.0     # когда (time.monotonic) последний раз начата загрузка списка
+    dialogs_done_at: float = 0.0   # когда она последний раз дошла до конца
     logout: bool = False
     lock_lost: bool = False
     terminated: bool = False  # сессия завершена на стороне Telegram
@@ -356,6 +347,10 @@ class TgManager:
             await self._close(rt)
 
     async def _close(self, rt: AccountRuntime) -> None:
+        loading = rt.dialogs_load.task
+        if loading is not None and not loading.done():
+            loading.cancel()   # загрузка списка ждёт и паузы Telegram — без клиента ей делать нечего
+            await asyncio.gather(loading, return_exceptions=True)
         client, rt.client = rt.client, None
         if client is not None:
             try:
@@ -742,8 +737,10 @@ class TgManager:
             if rt is not None:
                 await self._shutdown(rt)
             terminated = await self._logout_offline(slot)
-        async with self.pool.acquire() as conn:
+        async with self.pool.acquire() as conn, conn.transaction():
             await conn.execute("DELETE FROM tg_sessions WHERE account_id = $1", account_id)
+            # Список всех диалогов аккаунта нужен, только пока к нему есть сессия; архив остаётся.
+            await dl.forget(conn, account_id)
         logger.info("аккаунт %s (%s): выход, сессия на стороне Telegram %s",
                     account_id, slot, "завершена" if terminated else "не подтверждена")
         return {"ok": True, "terminated": terminated}
@@ -832,9 +829,18 @@ class TgManager:
         if auto_personal or auto_groups:
             if rt is None or rt.status != RUNNING:
                 raise TgError("Аккаунт не подключён: включить настройку можно только на работающем аккаунте.", 409)
-            dialogs = await self.dialogs(account_id, refresh=True)
             async with self.pool.acquire() as conn:
-                await sync.mark_seen(conn, account_id, [d.key for d in dialogs])
+                known = await dl.info(conn, account_id)
+                if known["completed_at"] is None:
+                    # Без полного списка сервис не отличит существующие чаты от новых: настройка
+                    # взяла бы и старые чаты, как только в них кто-то напишет.
+                    self.start_dialogs(rt)
+                    raise TgError("Список чатов аккаунта ещё не загружен из Telegram целиком. Дождитесь, пока он "
+                                  "загрузится (шаг «Какие чаты читать»), и включите настройку снова.", 409)
+                await sync.mark_seen(conn, account_id, [d.key for d in await dl.rows(conn, account_id)])
+            if known["age"] is None or known["age"] > DIALOGS_MIN_GAP:
+                # Чаты, появившиеся после прошлой загрузки, отметит свежая — когда дойдёт до конца.
+                self.start_dialogs(rt, mark_seen=True)
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """UPDATE tg_sessions SET auto_personal = COALESCE($2, auto_personal),
@@ -848,93 +854,174 @@ class TgManager:
 
     # ------------------------------------------------------------------ диалоги и выбор чатов
 
-    async def dialogs(self, account_id: int, *, refresh: bool = False, cached: bool = False) -> list[DialogInfo]:
-        """Диалоги аккаунта. `cached` — только то, что уже в памяти, без запроса к Telegram, как бы
-        давно список ни загружался (экран «Чаты» приложения «Штурман», Р-80); списка нет —
-        `DialogsNotLoaded`. `refresh` сильнее `cached`: это кнопка «Обновить список из Telegram»."""
-        try:
-            rt = self._running(account_id)
-        except gateway.AccountUnavailable:
-            raise TgError("Аккаунт не подключён: список чатов недоступен.", 409) from None
-        if cached and not refresh:
-            if rt.dialogs is None:
-                raise DialogsNotLoaded()
-            return rt.dialogs
-        age = time.monotonic() - rt.dialogs_at
-        if rt.dialogs is None or age > DIALOGS_TTL or (refresh and age > DIALOGS_MIN_GAP):
-            waiting = rt.pacer.flood_remaining()
-            if waiting > 5:   # запрос экрана не должен висеть всё время ожидания
-                raise _wait_error(int(waiting) + 1)
-            try:
-                await self._load_dialogs(rt)
-            except gateway.FloodWait as exc:
-                logger.warning("аккаунт %s: список чатов — Telegram просит подождать %s с", account_id, exc.seconds)
-                raise _wait_error(int(exc.seconds) + 1) from None
-            except sync.Stopped:
-                raise TgError("Аккаунт останавливается.", 409) from None
-        return rt.dialogs or []
+    def start_dialogs(self, rt: AccountRuntime, *, mark_seen: bool = False) -> bool:
+        """Запускает загрузку списка диалогов в фоне и сразу возвращается. Если она уже идёт, вторая
+        не начинается. True — начата сейчас. `mark_seen` — по окончании отметить все диалоги как уже
+        существующие (настройка «брать новые чаты»)."""
+        load = rt.dialogs_load
+        if mark_seen:
+            load.mark_seen = True          # идущая загрузка отметит, когда дойдёт до конца
+        if load.running:
+            return False
+        if rt.client is None or rt.account_id is None or rt.status != RUNNING:
+            return False
+        fresh = dl.DialogsLoad(state=dl.LOADING, started=time.monotonic(), mark_seen=load.mark_seen)
+        rt.dialogs_load, rt.dialogs_tried = fresh, fresh.started
+        fresh.task = asyncio.get_running_loop().create_task(
+            self._load_dialogs(rt, fresh), name=f"tg-{rt.slot}-dialogs", context=authority.background_context())
+        return True
 
-    async def _load_dialogs(self, rt: AccountRuntime) -> list[DialogInfo]:
-        async with rt.dialogs_lock:
-            await rt.pacer.wait(rt.stop)
-            items: list[DialogInfo] = []
-            try:
-                async for dialog in rt.client.iter_dialogs():
-                    chat = normalize.chat_record(dialog.entity, self_id=rt.self_id)
-                    if chat is not None:
-                        items.append(DialogInfo(chat, int(getattr(dialog.dialog, "top_message", 0) or 0)))
-            except sync.FLOOD as exc:
-                rt.pacer.flood(exc.seconds)
-                raise gateway.FloodWait(exc.seconds) from None
-            rt.dialogs, rt.dialogs_at = items, time.monotonic()
-            # Список диалогов наполнил Telethon ключами доступа — чаты, которые не удавалось
-            # опросить из-за их отсутствия, можно пробовать снова.
+    async def _load_dialogs(self, rt: AccountRuntime, load: dl.DialogsLoad) -> None:
+        """Фоновая загрузка списка: страница за страницей — в базу; FLOOD_WAIT — ожидание и та же
+        страница снова (tg/dialogs.py)."""
+        account_id = rt.account_id
+        try:
             async with self.pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE tg_sync_chats SET last_error = NULL WHERE account_id = $1 AND last_error = 'entity_unknown'",
-                    rt.account_id)
-            return items
+                load_id = await dl.begin(conn, account_id)
+
+            async def on_page(rows: list[dl.DialogRow], expected: int | None, done: bool) -> None:
+                async with self.pool.acquire() as conn:
+                    await dl.save_page(conn, account_id, load_id, rows, position=load.loaded, expected=expected)
+                load.loaded += len(rows)
+                load.pages += 1
+                load.expected = expected
+                load.state = dl.LOADING
+
+            async def on_wait(seconds: int) -> None:
+                load.waits += 1
+                load.state = dl.WAITING
+                logger.warning("аккаунт %s: список чатов — Telegram просит подождать %s с; загружено %s из ~%s, "
+                               "продолжу с той же страницы", account_id, seconds, load.loaded, load.expected or "?")
+
+            await dl.fetch_all(rt.client, self_id=rt.self_id, pacer=rt.pacer, stop=rt.stop,
+                               on_page=on_page, on_wait=on_wait)
+            async with self.pool.acquire() as conn:
+                removed = await dl.finish(conn, account_id, load_id, mark_seen=load.mark_seen)
+            load.mark_seen = False
+            load.state, rt.dialogs_done_at = dl.DONE, time.monotonic()
+            logger.info("аккаунт %s: список чатов загружен — диалогов %s, страниц %s, ожиданий %s, убрано %s",
+                        account_id, load.loaded, load.pages, load.waits, removed)
+        except sync.Stopped:
+            load.state, load.error = dl.FAILED, "Аккаунт отключается."
+        except asyncio.CancelledError:
+            load.state, load.error = dl.FAILED, "Аккаунт отключается."
+            raise
+        except Exception as exc:
+            load.state, load.error = dl.FAILED, _load_error(exc)
+            logger.warning("аккаунт %s: список чатов не загружен (%s); загружено %s", account_id,
+                           type(exc).__name__, load.loaded)
+        finally:
+            load.done.set()
+
+    def _load_status(self, rt: AccountRuntime | None, known: dict[str, Any]) -> dict[str, Any]:
+        """Загрузка списка для экрана: идёт ли, сколько получено, ждёт ли Telegram, когда список
+        последний раз загружен целиком."""
+        load = rt.dialogs_load if rt is not None else None
+        updated = known["completed_at"].isoformat() if known["completed_at"] is not None else None
+        out: dict[str, Any] = {"state": dl.DONE if updated else dl.IDLE, "running": False,
+                               "loaded": known["stored"], "expected": known["expected"],
+                               "wait_seconds": None, "updated_at": updated, "error": None}
+        if load is None or load.state == dl.IDLE or (load.state == dl.DONE and not load.running):
+            return out
+        out.update(state=load.state, running=load.running, loaded=load.loaded,
+                   expected=load.expected if load.expected is not None else known["expected"])
+        # Ждать может велеть и ответ на запрос истории: пауза у аккаунта общая (Pacer).
+        waiting = rt.pacer.flood_remaining() if load.running else 0.0
+        if waiting > 0:
+            out.update(state=dl.WAITING, wait_seconds=max(1, int(waiting + 0.999)))
+        elif load.running:
+            out["state"] = dl.LOADING
+        if load.state == dl.FAILED:
+            out["error"] = load.error
+        return out
+
+    async def dialogs(self, account_id: int) -> list[DialogInfo]:
+        """Диалоги аккаунта из базы, в порядке списка Telegram — без запроса к Telegram, как бы давно
+        список ни загружался. Списка нет вовсе — `DialogsNotLoaded`."""
+        async with self.pool.acquire() as conn:
+            known = await dl.info(conn, account_id)
+            if known["completed_at"] is None and not known["stored"]:
+                raise DialogsNotLoaded()
+            return await dl.rows(conn, account_id)
+
+    async def find_dialogs(self, account_id: int, keys: list[PeerKey]) -> dict[PeerKey, DialogInfo]:
+        """Названные диалоги аккаунта из базы. Списка нет вовсе — `DialogsNotLoaded`."""
+        async with self.pool.acquire() as conn:
+            known = await dl.info(conn, account_id)
+            if known["completed_at"] is None and not known["stored"]:
+                raise DialogsNotLoaded()
+            return {d.key: d for d in await dl.rows(conn, account_id, keys=keys)}
 
     async def _tops(self, rt: AccountRuntime) -> dict[PeerKey, int] | None:
-        return {d.key: d.top_message for d in await self._load_dialogs(rt)}
+        """Номер последнего сообщения каждого диалога — для дозагрузки истории (sync.gap_fill_pass).
+        Нужен свежий список: загрузка в фоне запускается (или идущая используется) и дожидается.
+        Не дошла до конца — None: тогда история опрашивает чаты по одному."""
+        load = rt.dialogs_load
+        fresh = load.state == dl.DONE and time.monotonic() - rt.dialogs_done_at < DIALOGS_MIN_GAP
+        if not load.running and not fresh:
+            self.start_dialogs(rt)
+        load = rt.dialogs_load
+        if load.running:
+            await load.done.wait()       # отмена истории загрузку не прерывает
+        if load.state != dl.DONE:
+            return None
+        async with self.pool.acquire() as conn:
+            return {d.key: d.top_message for d in await dl.rows(conn, rt.account_id)}
 
     async def list_dialogs(
         self, account_id: int, *, offset: int = 0, limit: int = 100,
         chat_type: str | None = None, refresh: bool = False,
         chat_types: Any = None, query: str | None = None, only_enabled: bool = False, cached: bool = False,
     ) -> dict[str, Any]:
-        """Страница списка диалогов для экрана выбора. Отбор: один вид чата (`chat_type`),
-        несколько видов (`chat_types`), подстрока названия или адреса (`query`), только уже
-        включённые (`only_enabled`). `total` — сколько диалогов прошло отбор. `cached` — без
-        запроса к Telegram (`dialogs`): если списка в памяти нет, ответ пустой и `loaded` — ложь.
-        `age` — сколько секунд назад список загружен из Telegram."""
+        """Страница списка диалогов для экрана выбора — из базы, сразу. Отбор: один вид чата
+        (`chat_type`), несколько видов (`chat_types`), подстрока названия или адреса (`query`),
+        только уже включённые (`only_enabled`). `total` — сколько диалогов прошло отбор.
+
+        `refresh` — кнопка «Обновить список из Telegram»: запускает загрузку в фоне (если она не
+        идёт и список не обновлялся последние `DIALOGS_MIN_GAP` секунд). Без неё страница настройки
+        сама запускает обновление, когда список старше `DIALOGS_TTL`; `cached` — не запускает
+        (приложение «Штурман», Р-80). `loaded` — есть ли что показать; `age` — сколько секунд назад
+        список загружен целиком; `load` — состояние загрузки (`_load_status`)."""
         try:
-            dialogs = await self.dialogs(account_id, refresh=refresh, cached=cached)
-        except DialogsNotLoaded:
-            return {"total": 0, "offset": offset, "items": [], "loaded": False, "age": None}
-        rt = self._by_account(account_id)
-        age = int(time.monotonic() - rt.dialogs_at) if rt is not None and rt.dialogs is not None else None
-        if chat_type:
-            dialogs = [d for d in dialogs if d.chat.type == chat_type]
-        if chat_types:
-            dialogs = [d for d in dialogs if d.chat.type in chat_types]
-        needle = (query or "").strip().lstrip("@").casefold()
-        if needle:
-            dialogs = [d for d in dialogs
-                       if needle in (d.chat.name or "").casefold() or needle in (d.chat.username or "").casefold()]
+            rt = self._running(account_id)
+        except gateway.AccountUnavailable:
+            raise TgError("Аккаунт не подключён: список чатов недоступен.", 409) from None
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
+            known = await dl.info(conn, account_id)
+        if refresh:
+            if known["age"] is None or known["age"] > DIALOGS_MIN_GAP:
+                self.start_dialogs(rt)
+        elif not cached and (known["age"] is None or known["age"] > DIALOGS_TTL) \
+                and (not rt.dialogs_tried or time.monotonic() - rt.dialogs_tried > DIALOGS_TTL):
+            self.start_dialogs(rt)
+        types_: list[str] | None = None
+        if chat_type:
+            types_ = [chat_type]
+        if chat_types:
+            types_ = [t for t in chat_types if types_ is None or t in types_]
+        needle = (query or "").strip().lstrip("@").casefold()
+        async with self.pool.acquire() as conn:
+            for _ in range(2):
+                running = rt.dialogs_load.running
+                known = await dl.info(conn, account_id)
+                total, rows = await dl.page(conn, account_id, offset=offset, limit=limit, chat_types=types_,
+                                            needle=needle, only_enabled=only_enabled)
+                # Ход загрузки — тот, что был, когда читали список: дальше ещё запросы к базе.
+                status = self._load_status(rt, known)
+                if not running or rt.dialogs_load.running:
+                    break     # загрузка не закончилась, пока читали, — прочитанное и есть её нынешний ход
+            states = await conn.fetch(
                 """SELECT p.class, p.tg_id, c.excluded, COALESCE(s.enabled, false) AS enabled
                    FROM chats c JOIN peers p ON p.id = c.peer_id
                    LEFT JOIN tg_sync_chats s ON s.chat_id = c.id
-                   WHERE c.account_id = $1""", account_id)
+                   WHERE c.account_id = $1 AND (p.class, p.tg_id) IN
+                         (SELECT * FROM unnest($2::text[], $3::bigint[]))""",
+                account_id, [d.chat.peer_class for d in rows], [d.chat.tg_id for d in rows])
             protected = await control_peers.blocked_ids(conn)
-        known = {(r["class"], r["tg_id"]): r for r in rows}
-        if only_enabled:
-            dialogs = [d for d in dialogs if d.key in known and known[d.key]["enabled"]]
+        known_rows = {(r["class"], r["tg_id"]): r for r in states}
         items = []
-        for d in dialogs[offset:offset + limit]:
-            row = known.get(d.key)
+        for d in rows:
+            row = known_rows.get(d.key)
             blocked = (store.is_blocked_peer(d.chat.peer_class, d.chat.tg_id, d.chat.username)
                        or (d.chat.peer_class == "user" and d.chat.tg_id in protected))
             items.append({
@@ -946,26 +1033,31 @@ class TgManager:
                 # числу. В личных чатах и обычных группах нумерация общая на аккаунт.
                 "message_estimate": d.top_message if d.chat.peer_class == "channel" else None,
             })
-        return {"total": len(dialogs), "offset": offset, "items": items, "loaded": True, "age": age}
+        return {"total": total, "offset": offset, "items": items,
+                "loaded": known["completed_at"] is not None or known["stored"] > 0,
+                "age": known["age"], "load": status}
 
     async def set_sync(
         self, account_id: int, *, enabled: bool,
         chats: list[PeerKey] | None = None, chat_types: list[str] | None = None,
-        since: Any = sync.ACCOUNT_DEFAULT, cached: bool = False,
+        since: Any = sync.ACCOUNT_DEFAULT,
     ) -> list[dict[str, Any]]:
         """Включает или выключает синхронизацию чатов — поштучно или всех чатов заданных видов.
 
         `since` — граница загрузки истории вглубь для включаемых чатов: дата, None (вся история)
-        или не названа (глубина по умолчанию из настроек аккаунта). `cached` — чат ищется только
-        в уже загруженном списке диалогов, без запроса к Telegram (`dialogs`)."""
+        или не названа (глубина по умолчанию из настроек аккаунта). Чат ищется в списке диалогов
+        аккаунта в базе, без запроса к Telegram (`dialogs`)."""
         await self._slot_of(account_id)
         rt = self._by_account(account_id)
+        keys: list[PeerKey] = list(chats or [])
         by_key: dict[PeerKey, DialogInfo] = {}
         if enabled or chat_types:
-            by_key = {d.key: d for d in await self.dialogs(account_id, cached=cached)}
-        keys: list[PeerKey] = list(chats or [])
+            by_key = await self.find_dialogs(account_id, keys)
         if chat_types:
-            keys += [k for k, d in by_key.items() if d.chat.type in chat_types and k not in keys]
+            async with self.pool.acquire() as conn:
+                of_types = await dl.rows(conn, account_id, chat_types=chat_types)
+            by_key.update((d.key, d) for d in of_types)
+            keys += [d.key for d in of_types if d.key not in keys]
         out = []
         async with self.pool.acquire() as conn:
             for key in keys:
@@ -1154,6 +1246,15 @@ class TgManager:
             raise
         except Exception:
             pass  # индикатор не важнее ответа
+
+
+def _load_error(exc: BaseException) -> str:
+    """Почему список не загрузился — для владельца, без подробностей ответа Telegram."""
+    if isinstance(exc, sync.FATAL):
+        return "Сессия аккаунта больше не действует: войдите в аккаунт заново."
+    if isinstance(exc, (ConnectionError, OSError, asyncio.TimeoutError)):
+        return "Нет связи с Telegram. Попробуйте обновить список позже."
+    return f"Telegram ответил ошибкой ({type(exc).__name__}). Попробуйте обновить список позже."
 
 
 def _photo_size(media: Any) -> int | None:

@@ -660,6 +660,11 @@
           <label class="check"><input type="checkbox" id="chats-only"><span>Только выбранные</span></label>
         </div>
 
+        <div class="loadbar" id="chats-load" role="status" aria-live="polite" hidden>
+          <p class="loadbar-title" id="chats-load-title"></p>
+          <p class="loadbar-text" id="chats-load-text"></p>
+          <div class="meter" id="chats-load-meter-box" aria-hidden="true"><span id="chats-load-meter"></span></div>
+        </div>
         <p class="counter" id="chats-counter" role="status"></p>
         <p class="note warn" id="chats-error" role="alert" hidden></p>
         <ul class="chatlist" id="chats-list"></ul>

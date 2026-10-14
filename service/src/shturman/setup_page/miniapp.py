@@ -7,7 +7,8 @@
   POST   /shturman-setup/api/app/approvals/decide       нажать одну из этих кнопок: {ref}
   GET    /shturman-setup/api/app/chats                  экран «Чаты»: аккаунты Telegram с сессией
   GET    /shturman-setup/api/app/chats/{id}/dialogs     диалоги аккаунта ?offset&limit&q&kind&only&refresh —
-                                                        из памяти сервиса; в Telegram — только с refresh=1
+                                                        из базы; refresh=1 запускает обновление из Telegram
+                                                        в фоне и сразу отвечает (ход — в поле load)
   POST   /shturman-setup/api/app/chats/{id}/sync        включить или выключить чтение одного чата:
                                                         {peer_class, tg_id, enabled, months} (months — при включении)
   POST   /shturman-setup/api/app/chats/{id}/exclude     не сохранять чат или вернуть его: {peer_class, tg_id, excluded};
@@ -54,8 +55,8 @@ Hermes нет, поэтому данные входа ассистент под�
     бота: ни настроек, ни правил, ни текста переписки за пределами карточек;
   * экран «Чаты» (Р-80): то же, что шаг «Какие чаты читать» на странице, теми же функциями
     (`chats.py`), применяется сразу, в контексте владельца из Telegram. Отличия от страницы:
-    список диалогов — из памяти сервиса, в Telegram — только по кнопке «Обновить список из
-    Telegram»; чаты включаются по одному (без «все группы разом»); исключение не стирает
+    список диалогов — из базы, обновление из Telegram запускает только кнопка «Обновить список из
+    Telegram» (Р-81: в фоне); чаты включаются по одному (без «все группы разом»); исключение не стирает
     сохранённое. Цена и смягчения — `docs/decisions.md`, Р-80: войти в приложение может любой, у кого
     есть токен бота согласований, — значит, и менять, какие чаты читает ассистент. Поэтому каждое
     изменение отсюда сервис сообщает владельцу отдельным сообщением в бот согласований (`_tell`) и
@@ -345,7 +346,7 @@ async def approvals_decide(request: Request) -> JSONResponse:
 # от 2026-10-14 с ценой: войти в приложение может любой, у кого есть токен бота согласований (у бота
 # «в одно нажатие» — и держатель посредника), — значит, и менять, какие чаты читает ассистент.
 # Смягчения: каждое изменение — отдельным сообщением владельцу в бот согласований и записью в
-# журнале страницы; список диалогов — из памяти, без запросов к Telegram, кроме кнопки «Обновить»;
+# журнале страницы; список диалогов — из базы, без запросов к Telegram, кроме кнопки «Обновить»;
 # по одному чату; без стирания сохранённого.
 
 TITLE_LIMIT = 80              # знаков названия чата в сообщении владельцу
@@ -398,7 +399,7 @@ async def chats_dialogs(request: Request) -> JSONResponse:
 async def _known_title(tg: TgManager, account_id: int, key: tuple[str, int]) -> str:
     """Название чата из уже загруженного списка — для сообщения владельцу. Без запроса к Telegram."""
     try:
-        return _title(await chats.find_dialog(tg, account_id, key, cached=True))
+        return _title(await chats.find_dialog(tg, account_id, key))
     except (BadRequest, TgError):
         return f"№ {key[1]}"
 
@@ -417,12 +418,12 @@ async def chats_sync(request: Request) -> JSONResponse:
     state, session = state_of(request), request.state.app_session
     tg, account_id = chats.manager(state), _account_id(request)
     if enabled:
-        title = _title(await chats.find_dialog(tg, account_id, key, cached=True))
+        title = _title(await chats.find_dialog(tg, account_id, key))
     else:
         title = await _known_title(tg, account_id, key)
     with authority.miniapp_context(session.user_id, chat_id=session.chat_id):
         result, on = await chats.set_sync(state, tg, account_id, enabled=enabled, keys=[key],
-                                          since=await chats.since_of(state, months), cached=True)
+                                          since=await chats.since_of(state, months))
     chat = f"чат {key[0]}:{key[1]}"
     if enabled and not on:
         await page._log(request, "app.sync_on", audit.REFUSED, chat + "; чат исключён из архива")
@@ -448,7 +449,7 @@ async def chats_exclude(request: Request) -> JSONResponse:
     state, session = state_of(request), request.state.app_session
     tg, account_id = chats.manager(state), _account_id(request)
     with authority.miniapp_context(session.user_id, chat_id=session.chat_id):
-        dialog, _ = await chats.exclude(state, tg, account_id, key, excluded=excluded, cached=True)
+        dialog, _ = await chats.exclude(state, tg, account_id, key, excluded=excluded)
     title, chat = _title(dialog), f"чат {key[0]}:{key[1]}"
     if excluded:
         await page._log(request, "app.chat_exclude", detail=chat)

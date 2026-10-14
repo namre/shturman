@@ -16,11 +16,11 @@ from shturman.records import ChatRecord
 from shturman.tg import gateway, sync
 from shturman.tg.client import RequestNotAllowed, session_path
 from shturman.tg.lock import SessionLock
-from shturman.tg.manager import TgManager
+from shturman.tg.manager import TgError, TgManager
 
 from conftest import DSN
 from tg_fakes import (C_NEWS, C_SUPER, CHANNEL, ENTITIES, G_FAMILY, GROUP, HELPER, IVAN, MARIA, ME,
-                      SELF_ID, SUPER, T0, U_BOT, U_IVAN, U_MARIA, U_TELEGRAM, World, msg, now_msg,
+                      SELF_ID, SUPER, T0, U_BOT, U_IVAN, U_MARIA, U_TELEGRAM, World, dialogs_loaded, msg, now_msg,
                       pool, start_account, tg_config, user, wait_for)  # noqa: F401 — pool это фикстура
 
 IVAN_KEY, GROUP_KEY, NEWS_KEY, SUPER_KEY = ("user", IVAN), ("chat", GROUP), ("channel", CHANNEL), ("channel", SUPER)
@@ -55,6 +55,8 @@ class Stage:
         return self.rt.account_id
 
     async def enable(self, *keys):
+        if self.rt.dialogs_load.state != "done":
+            await dialogs_loaded(self.manager, self.account_id)    # чаты включаются из списка в базе
         result = await self.manager.set_sync(self.account_id, enabled=True, chats=list(keys))
         await self.idle()
         return result
@@ -299,6 +301,11 @@ async def test_auto_enable_takes_only_chats_that_appeared_later(stage):
     newcomer = user(2500, "Новый", "Собеседник")
     await stage.emit(new_message(msg(1, ("user", 2500), "здравствуйте")), [newcomer, ME])
     assert await stage.ids() == []                      # по умолчанию настройка выключена
+    # пока список чатов не загружен целиком, существующие чаты от новых не отличить — настройка не включается
+    with pytest.raises(TgError) as refused:
+        await stage.manager.set_options(stage.account_id, auto_personal=True, auto_groups=None)
+    assert refused.value.status == 409 and "не загружен" in refused.value.message
+    await dialogs_loaded(stage.manager, stage.account_id, refresh=False)   # отказ сам запустил загрузку
     await stage.manager.set_options(stage.account_id, auto_personal=True, auto_groups=None)
     await stage.emit(new_message(msg(2, IVAN_KEY, "старый чат")))
     await stage.emit(new_message(msg(3, ("user", 2500), "новый чат")), [newcomer, ME])
