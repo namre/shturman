@@ -109,6 +109,34 @@ def _range(ent: Mapping[str, Any], text: str) -> tuple[int, int] | None:
     return (start, start + length) if fragment == ent.get("text") else None
 
 
+def mentions_username(message: Mapping[str, Any], usernames: Iterable[str]) -> bool:
+    """Разметка «упоминание @имени» (тип mention), где имя — @имя самого человека в Telegram.
+
+    Для уведомлений владельцу (notify/, Р-84): Telegram размечает упоминание пользователя с @именем
+    именно так, без числового ID, — иначе обращения к владельцу с @именем не находились бы вовсе.
+    Имя сверяется с тем, что сообщил сам Telegram (`peers.username` владельца), а не ищется в тексте:
+    разметку ставит Telegram; в цитате, коде и пересылке она не считается. Автоответу в группах
+    (is_direct_address) это не добавляет ничего."""
+    if message.get("is_forwarded") is not False:
+        return False
+    wanted = {"@" + u.casefold().lstrip("@") for u in usernames if isinstance(u, str) and u.strip("@ ")}
+    text = message.get("text")
+    if not wanted or not isinstance(text, str) or not text:
+        return False
+    ents = _entities(message.get("telegram_entities"))
+    blocked = _quoted_ranges(text) + [span for ent in ents if ent.get("type") in _BLOCKED
+                                      if (span := _range(ent, text)) is not None]
+    for ent in ents:
+        if ent.get("type") != "mention":
+            continue
+        span = _range(ent, text)
+        if span is None or any(span[0] < end and start < span[1] for start, end in blocked):
+            continue
+        if str(ent.get("text") or "").casefold() in wanted:
+            return True
+    return False
+
+
 def is_direct_address(message: Mapping[str, Any], user_ids: Iterable[int],
                       aliases: Iterable[str] = (), *, reply_sender_tg_id: int | None = None) -> bool:
     """Надёжное обращение в нормализованном сообщении; неизвестная метаинформация — отказ.

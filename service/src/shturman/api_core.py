@@ -241,7 +241,16 @@ async def overview(state: AppState) -> dict[str, Any]:
         voice = await voice_service.overview(conn, state)
         from .media import service as media_service
         media = await media_service.overview(conn, state)
+        from . import retry
+        from .notify import service as notify_service
+        notify = await notify_service.overview(conn)
+        retried = await retry.overview(conn, media_days=state.config.media_days)
     out = dict(row)
+    # Уведомления владельцу (Р-84): какие включены, сколько ждут и сколько ушло за сутки.
+    out.update(notify)
+    # Повтор того, что не получилось из-за сбоя модели (Р-84): сколько можно вернуть и сколько
+    # возвращено последним повтором.
+    out.update(retried)
     # Разбор фото и документов: включён ли владельцем и счётчики очереди.
     out.update(media)
     # Расшифровка голосовых: включена ли, отвечает ли контейнер, счётчики очереди.

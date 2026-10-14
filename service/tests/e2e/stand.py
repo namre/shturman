@@ -448,6 +448,95 @@ async def main() -> None:
                              "enabled": await conn.fetchval("SELECT count(*) FROM tg_sync_chats WHERE enabled"),
                              "audit": [dict(r) for r in audit]})
 
+    # --- уведомления, наблюдатель, повтор после сбоя (Р-84) ---
+
+    async def notify_seed(request):
+        """Личный чат «Анна Ким» и группа «Стройка ЖК: прораб» у основного аккаунта; живые сообщения —
+        личное и обращение к владельцу разметкой упоминания — уходят уведомлениями через бота стенда.
+        Для повтора: два фото «не получилось» (сбой модели и сам файл) и запрос разбора переписки, от
+        которого прогоны отказались."""
+        from shturman import bridge, events, jobs, store
+        from shturman.records import ChatRecord, MessageRecord
+
+        app = state["app"]
+        now = datetime.now(timezone.utc)
+        async with app.pool.acquire() as c:
+            account = await c.fetchval("SELECT id FROM accounts WHERE role = 'owner' ORDER BY id LIMIT 1")
+            owner_tg = await c.fetchval("SELECT tg_user_id FROM accounts WHERE id = $1", account)
+            anna, _ = await store.ensure_chat(c, account, ChatRecord("user", 5101, "personal_chat", "Анна Ким",
+                                                                     username="anna_kim_e2e"))
+            site, _ = await store.ensure_chat(c, account, ChatRecord("channel", 5201, "private_supergroup",
+                                                                     "Стройка ЖК: прораб"))
+
+            def rec(n, at, sender, name, text, entities=None, media=None):
+                return MessageRecord(tg_message_id=n, sent_at=at, kind="message", sender_class="user",
+                                     sender_tg_id=sender, sender_name=name, text=text, entities=None,
+                                     reply_to_tg_id=None, forwarded_from=None, edited_at=None, media_type=media,
+                                     media_path=None, service_action=None, telegram_entities=entities,
+                                     is_forwarded=False, telegram_via_bot=False, telegram_sender_bot=False)
+
+            mention = "Евгений"
+            group_text = f"{mention}, посмотрите акт по фасаду — нужна подпись до пятницы"
+            ents = [{"type": "mention_name", "offset": 0, "length": len(mention), "text": mention, "user_id": owner_tg}]
+            await store.upsert_messages(c, [
+                (anna, rec(1, now - timedelta(minutes=1), 5101, "Анна Ким", "Добрый день! Когда сможете посмотреть смету по корпусу 2?"), False),
+                (anna, rec(2, now - timedelta(days=2), 5101, "Анна Ким", "", media="photo"), False),
+                (anna, rec(3, now - timedelta(days=2), 5101, "Анна Ким", "", media="photo"), False),
+                (site, rec(1, now - timedelta(seconds=30), 5202, "Пётр Сидоров", group_text, ents), False),
+                (site, rec(2, now - timedelta(seconds=20), 5203, "Олег", "Срочно нужен аванс по договору поставки", []), False),
+            ], source="session", owner_tg_id=owner_tg)
+            ids = {(r["chat_id"], r["tg_message_id"]): r["id"] for r in await c.fetch(
+                "SELECT id, chat_id, tg_message_id FROM messages WHERE chat_id = ANY($1::bigint[])", [anna, site])}
+            await c.execute("UPDATE messages SET media_state = 'failed', media_error = 'model:плагин не ответил', "
+                            "media_attempts = 4, media_at = now() - interval '1 day' WHERE id = $1", ids[(anna, 2)])
+            await c.execute("UPDATE messages SET media_state = 'skipped', media_error = 'unsupported', "
+                            "media_at = now() WHERE id = $1", ids[(anna, 3)])
+            await c.execute("""INSERT INTO setup_state (key, value) VALUES ('media', '{"enabled": true}'::jsonb)
+                               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""")
+            run = await c.fetchval("INSERT INTO processing_runs (trigger, status) VALUES ('nightly', 'done') RETURNING id")
+            job = await jobs.enqueue(c, bridge.LLM_STRUCTURED, {}, handler="commitments.extract", executor="plugin")
+            await c.execute("UPDATE jobs SET status = 'failed', finished_at = now() WHERE id = $1", job)
+            await c.execute("""INSERT INTO processing_requests (job_id, run_id, kind, chat_id, message_ids, attempt, state)
+                               VALUES ($1, $2, 'extract', $3, $4::bigint[], 2, 'given_up')""",
+                            job, run, anna, [ids[(anna, 1)]])
+        for chat_id, n in ((anna, 1), (site, 1)):
+            app.events.publish(events.MESSAGE_LIVE, {"account_id": account, "chat_id": chat_id,
+                                                      "message_id": ids[(chat_id, n)], "source": "session",
+                                                      "outgoing": False, "edited": False, "via_bot": False})
+        await app.events.drain()
+        state["watch_message"] = (account, site, ids[(site, 2)])
+        return JSONResponse({"ok": True, "anna": anna, "site": site})
+
+    async def notify_watch_live(request):
+        """Сообщение «Срочно нужен аванс…» в группе пришло живым — для правил наблюдателя."""
+        from shturman import events
+        account, site, message_id = state["watch_message"]
+        state["app"].events.publish(events.MESSAGE_LIVE, {"account_id": account, "chat_id": site,
+                                                          "message_id": message_id, "source": "session",
+                                                          "outgoing": False, "edited": False, "via_bot": False})
+        await state["app"].events.drain()
+        return JSONResponse({"ok": True})
+
+    async def notify_seen(request):
+        """Что ушло владельцу в бота, что в настройках, правилах, очередях и журнале — для проверок."""
+        sent = [p.get("text", "") for p in telegram.calls("sendMessage")
+                if str(p.get("text", "")).startswith(("💬", "📣", "🔔"))]
+        rows = await conn.fetch(
+            """SELECT action, outcome, detail FROM setup_audit
+               WHERE action LIKE 'notify.%' OR action LIKE 'watch.%' OR action = 'retry.failed' OR action = 'app.notify'
+               ORDER BY id""")
+        return JSONResponse({
+            "sent": sent,
+            "settings": json.loads(await conn.fetchval("SELECT value::text FROM settings WHERE key = 'notify.settings'")
+                                   or "null"),
+            "rules": [dict(r) for r in await conn.fetch(
+                "SELECT id, name, enabled, chat_ids, sphere_ids, keywords FROM watch_rules ORDER BY id")],
+            "hits": await conn.fetchval("SELECT count(*) FROM watch_hits"),
+            "media": [dict(r) for r in await conn.fetch(
+                "SELECT media_state, media_error FROM messages WHERE media_state IS NOT NULL ORDER BY id")],
+            "requests": [r["state"] for r in await conn.fetch("SELECT state FROM processing_requests ORDER BY job_id")],
+            "audit": [dict(r) for r in rows]})
+
     async def dashboard_page(request):
         return HTMLResponse(DASHBOARD_PAGE)
 
@@ -463,7 +552,9 @@ async def main() -> None:
         Route("/seed-memory", seed_memory, methods=["POST"]),
         Route("/dialogs/big", dialogs_big, methods=["POST"]), Route("/dialogs/seen", dialogs_seen),
         Route("/spheres/seed", spheres_seed, methods=["POST"]),
-        Route("/spheres/folder-new", spheres_folder_new, methods=["POST"]), Route("/spheres/seen", spheres_seen)])
+        Route("/spheres/folder-new", spheres_folder_new, methods=["POST"]), Route("/spheres/seen", spheres_seen),
+        Route("/notify/seed", notify_seed, methods=["POST"]),
+        Route("/notify/watch-live", notify_watch_live, methods=["POST"]), Route("/notify/seen", notify_seen)])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

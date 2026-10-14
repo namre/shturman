@@ -14,6 +14,10 @@
                    вложения. Публикуется, только если сообщение отправлено не раньше часа назад
                    и видно ассистенту. Подписчики, которым важен текст (наблюдатель за группами),
                    разбирают его как живое сообщение.
+  message.held     {account_id, chat_id, message_id, source, outgoing, edited, via_bot}
+                   то же, что message.live, но сообщение при записи скрыла защита от внедрённых
+                   инструкций: ассистенту и его модулям оно не показывается. Подписчик один —
+                   уведомления владельцу (notify/): «вам написали» без текста, «решите в карточке».
   messages.deleted {message_ids: [...]}
   messages.hidden  {message_ids: [...]}
                    защита от внедрённых инструкций скрыла сообщения от ассистента (guard/). Они
@@ -35,6 +39,7 @@ logger = logging.getLogger("shturman.events")
 
 MESSAGE_LIVE = "message.live"
 MESSAGE_CONTENT = "message.content"
+MESSAGE_HELD = "message.held"
 MESSAGES_DELETED = "messages.deleted"
 MESSAGES_HIDDEN = "messages.hidden"
 CHAT_EXCLUDED = "chat.excluded"

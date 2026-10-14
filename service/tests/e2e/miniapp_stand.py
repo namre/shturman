@@ -520,7 +520,17 @@ async def main() -> None:
                 """SELECT action, outcome, detail FROM setup_audit
                    WHERE action LIKE 'app.sphere%' OR action LIKE 'app.bulk%' ORDER BY id""")]})
 
-    control = Starlette(routes=[Route("/spheres/seed", spheres_seed, methods=["POST"]),
+    async def notify_seen(request):
+        """Уведомления (Р-84): настройки, сообщения владельцу «Из приложения…» и журнал app.notify."""
+        raw = await conn.fetchval("SELECT value::text FROM settings WHERE key = 'notify.settings'")
+        return JSONResponse({
+            "settings": json.loads(raw) if raw else None,
+            "told": [m["text"] for m in telegram.sent() if m["text"].startswith("Из приложения изменены уведомления")],
+            "audit": [dict(r) for r in await conn.fetch(
+                "SELECT action, outcome, detail FROM setup_audit WHERE action = 'app.notify' ORDER BY id")]})
+
+    control = Starlette(routes=[Route("/notify/seen", notify_seen),
+                                Route("/spheres/seed", spheres_seed, methods=["POST"]),
                                 Route("/spheres/folder-new", spheres_folder_new, methods=["POST"]),
                                 Route("/spheres/seen", spheres_seen),
                                 Route("/init-data", init_data), Route("/state", state_view), Route("/framer", framer),

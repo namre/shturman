@@ -275,7 +275,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .tools-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 
-input[type="search"], input[type="text"], select {
+input[type="search"], input[type="text"], input[type="time"], select {
   font: inherit;
   font-size: 16px;            /* меньше 16 — телефон увеличит страницу при вводе */
   color: var(--text);
@@ -540,3 +540,16 @@ details.sect[open] > summary::before { transform: rotate(45deg); }
   .toast { transition: opacity 0.2s; }
   .switch .track, .switch .track::after { transition: background-color 0.15s, transform 0.15s; }
 }
+
+/* ---------------------------------------------------------------- «Уведомления» (Р-84) */
+
+.nt-now li { margin: 4px 0; color: var(--text); }
+.nt-off { flex-direction: column; }
+.nt-off button { width: 100%; }
+.nt-when { display: flex; flex-direction: column; gap: 10px; }
+.nt-when .tools-row .field { flex: 1 1 120px; }
+.nt-when .small { margin: 0; }
+/* Вкладка «🔔» узкая, остальные — по ширине подписи: на 360 пикселях «Согласования» не вылезает. */
+.tabs button:not(#tab-notify) { flex: 1 1 auto; padding: 6px 8px; }
+#tab-notify { flex: 0 0 44px; padding: 6px 0; }
+.small { font-size: 13px; }

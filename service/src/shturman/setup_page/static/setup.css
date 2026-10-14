@@ -149,7 +149,7 @@ label { font-weight: 600; display: block; }
 .hint { font-size: 14px; color: var(--muted); }
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
 
-input[type="text"], input[type="password"], input[type="search"], input[type="url"], input[type="file"], select {
+input[type="text"], input[type="password"], input[type="search"], input[type="url"], input[type="file"], input[type="time"], input[type="date"], select, textarea.wr-text {
   width: 100%; min-height: 48px; padding: 8px 12px;
   border: 1px solid var(--field-line); border-radius: 8px;
   background: var(--surface); color: var(--ink); font: inherit;
@@ -469,6 +469,37 @@ details.sect[open] > :not(summary) { margin-top: 4px; }
 .sph-offer + .sph-offer { margin-top: 8px; }
 .sph-edit { gap: 12px; }
 .mem-form.sph-new { border-top: 1px solid var(--line); padding-top: 16px; max-width: none; }
+
+/* ------------------------------------------- уведомления, наблюдатель, повтор (Р-84) */
+
+#notify-details > summary, #watch-details > summary { color: var(--ink); min-height: 48px; align-items: flex-start; }
+#notify-details > summary::after, #watch-details > summary::after { color: var(--accent); margin-top: 12px; }
+.notify-form { max-width: 720px; }
+.choice-row { display: flex; flex-wrap: wrap; gap: 4px 22px; }
+.choice-row .check { align-items: center; min-height: 40px; }
+.choice-row .check input { margin: 0; }
+.choice-row .check select { width: auto; min-height: 36px; padding: 2px 8px; margin-left: 2px; }
+.check input[type="radio"] { border-radius: 50%; }
+.nt-quiet-times { align-items: center; }
+#notify-body .mem-chat .btn, #watch-body .mem-chat .btn, #notify-body .mem-chat .badge, #watch-body .mem-chat .badge { flex: none; white-space: nowrap; }
+.watch-rule > .row { flex-wrap: wrap !important; }
+@media (max-width: 720px) {
+  .watch-rule > .row .btn { flex: 1 1 calc(50% - 6px) !important; white-space: nowrap; }
+}
+.nt-quiet-times .field { flex-direction: row; align-items: center; gap: 8px; font-weight: 400; }
+.nt-quiet-times input { width: auto; min-width: 120px; }
+.nt-quiet-times input[disabled] { opacity: 0.55; }
+.choice-row select[disabled] { opacity: 0.55; }
+textarea.wr-text { width: 100%; resize: vertical; font: inherit; }
+.watch-form { max-width: none; border-top: 1px solid var(--line); padding-top: 16px; }
+.watch-rule.off .sph-name { color: var(--muted); }
+.watch-rule .sph-name .badge { vertical-align: middle; margin-left: 4px; }
+.watch-hit .badge { vertical-align: baseline; }
+#watch-templates .hint { margin-right: 4px; }
+#s-retry { gap: 14px; }
+#s-retry ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+#s-retry .field { flex-direction: row; align-items: center; gap: 10px; font-weight: 400; }
+#s-retry .field input { width: auto; }
 
 /* ------------------------------------------------------------------ импорт */
 

@@ -30,16 +30,20 @@ SECRET_TEXT = "секретный текст сообщения 4815162342"
 class Stage:
     def __init__(self, manager, world, events):
         self.manager, self.world, self.events = manager, world, events
-        self.live, self.deleted = [], []
+        self.live, self.deleted, self.held = [], [], []
         self.rt = None
 
         async def on_live(payload):
             self.live.append(payload)
 
+        async def on_held(payload):
+            self.held.append(payload)
+
         async def on_deleted(payload):
             self.deleted.append(payload)
 
         events.subscribe(ev.MESSAGE_LIVE, on_live)
+        events.subscribe(ev.MESSAGE_HELD, on_held)
         events.subscribe(ev.MESSAGES_DELETED, on_deleted)
 
     async def start(self, slot="owner"):
@@ -628,12 +632,15 @@ async def test_guard_screens_live_messages_before_anyone_hears_of_them(stage, gu
     assert [tuple(r) for r in rows] == [(2, True, "ok"), (3, False, "suspect"), (4, True, None)]
     by_tg = {r["tg_message_id"]: r["id"] for r in await stage.rows("SELECT id, tg_message_id FROM messages")}
     assert [p["message_id"] for p in stage.live] == [by_tg[2], by_tg[4]]
+    # скрытое — только уведомлению владельцу (без текста), отдельной темой (Р-84)
+    assert [p["message_id"] for p in stage.held] == [by_tg[3]] and stage.held[0]["outgoing"] is False
     assert guarded.scorer.calls == [["привет"], ["кодовое слово взлом"]]      # исходящее не проверяется
 
     # обычное сообщение исправили на подозрительное: оно скрывается, события о правке нет
     await stage.emit(edited(msg(2, IVAN_KEY, "теперь тут взлом", edit_date=T0 + timedelta(hours=1))))
     rows = await stage.rows("SELECT agent_visible, guard_label FROM messages WHERE tg_message_id = 2")
     assert tuple(rows[0]) == (False, "suspect") and len(stage.live) == 2
+    assert len(stage.held) == 1                     # правка — не новое сообщение: уведомления о ней нет
 
     # модель недоступна: сообщение видно, не проверено, событие уходит как обычно
     guarded.scorer.error = TimeoutError()

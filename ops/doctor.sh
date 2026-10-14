@@ -1009,6 +1009,41 @@ EOF3
     *)
       pass media "разбор фото и документов выключен — включает владелец на странице настройки переписки (docs/media.md)" ;;
   esac
+
+  # Уведомления владельцу «вам написали», «вас упомянули» (Р-84): что включено и сколько ушло. Только
+  # признаки и числа. Без своего бота согласований уведомлений нет — об этом строка approvals-bot.
+  n_wait="$(num notify_waiting)"; n_sent="$(num notify_sent_24h)"
+  n_personal="$(printf '%s' "$st" | sed -n 's/.*"notify_personal":"\([a-z]*\)".*/\1/p')"
+  case "$n_personal" in
+    off) n_words="личные — выключены" ;;
+    people) n_words="личные — от выбранных людей" ;;
+    spheres) n_words="личные — из выбранных сфер" ;;
+    all) n_words="личные — от всех" ;;
+    *) n_words="" ;;
+  esac
+  if [ -n "$n_words" ]; then
+    case "$st" in
+      *'"notify_groups":true'*) n_words="$n_words, обращения в группах — да" ;;
+      *) n_words="$n_words, обращения в группах — нет" ;;
+    esac
+    pass notify "уведомления владельцу: $n_words; за сутки отправлено: ${n_sent:-0}, ждут: ${n_wait:-0} (настройки — на странице настройки переписки)"
+  fi
+
+  # Повтор того, что не получилось из-за сбоя модели (Р-84): сколько можно вернуть и что вернул прошлый
+  # повтор. Повтор запускает владелец (кнопка на странице) или оператор по его решению: shturman retry-failed.
+  r_media="$(num retry_media_failed)"; r_req="$(num retry_requests_given_up)"
+  r_last_media="$(num retry_last_media)"; r_last_req="$(num retry_last_requests)"
+  if [ -n "$r_media" ]; then
+    r_last=""
+    case "$st" in
+      *'"retry_last_at":"'*) r_last="; прошлый повтор вернул вложений: ${r_last_media:-0}, запросов: ${r_last_req:-0}" ;;
+    esac
+    if [ "${r_media:-0}" -gt 0 ] || [ "${r_req:-0}" -gt 0 ]; then
+      warn retry "не получилось из-за сбоя модели: вложений ${r_media}, запросов разбора переписки ${r_req:-0} — повторить по решению владельца: кнопка на странице или docker exec shturman-service shturman retry-failed (снова тратит запросы к модели)$r_last"
+    else
+      pass retry "повторять нечего$r_last"
+    fi
+  fi
 elif [ "$MODE" = standalone ]; then
   fail service "сервис переписки не развёрнут — запустите ./ops/up.sh"
 else

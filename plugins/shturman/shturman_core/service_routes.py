@@ -123,6 +123,9 @@ UI: Routes = _compile([
     ("PUT", rf"/api/watch/rules/{_INT}"),
     ("DELETE", rf"/api/watch/rules/{_INT}"),
     ("GET", r"/api/watch/hits"),
+    # уведомления владельцу (Р-84): расширение ждёт нажатия в боте согласований, сужение — сразу
+    ("GET", r"/api/notify"),
+    ("PUT", r"/api/notify"),
     # обязательства
     ("GET", r"/api/commitments"),
     ("GET", rf"/api/commitments/{_INT}"),

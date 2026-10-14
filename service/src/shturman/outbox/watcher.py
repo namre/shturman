@@ -43,7 +43,7 @@ HANDLER = "watcher.verdict"
 DEDUP_DAYS = 7            # столько помним текст, чтобы не разбирать повторы
 MAX_SCAN = 4096           # знаков сообщения, по которым ищем
 REGEX_TIMEOUT = 0.05      # секунд на одно выражение
-MAX_KEYWORDS, MAX_REGEXES, MAX_CHATS = 50, 10, 50
+MAX_KEYWORDS, MAX_REGEXES, MAX_CHATS, MAX_SPHERES = 50, 10, 50, 50
 MAX_KEYWORD_LEN, MAX_REGEX_LEN = 80, 200
 
 LIMITS: dict[str, tuple[float, float, float]] = {
@@ -232,11 +232,19 @@ def validate_rule(data: dict[str, Any], *, partial: bool = False) -> dict[str, A
             if len(value) > limit:
                 raise ValueError(f"поле {key}: длиннее {limit} знаков")
             out[key] = textlib.one_line(value, limit)
+    # Где смотреть: чаты (chat_ids) и сферы (sphere_ids, Р-82/Р-84) — хотя бы одно из двух не пусто.
+    if "sphere_ids" in data:
+        ids = data.get("sphere_ids")
+        if (not isinstance(ids, list) or len(ids) > MAX_SPHERES
+                or any(isinstance(i, bool) or not isinstance(i, int) or i <= 0 for i in ids)):
+            raise ValueError(f"поле sphere_ids: нужен список номеров сфер, не больше {MAX_SPHERES}")
+        out["sphere_ids"] = list(dict.fromkeys(ids))
     if "chat_ids" in data or not partial:
-        ids = data.get("chat_ids")
-        if (not isinstance(ids, list) or not ids or len(ids) > MAX_CHATS
+        ids = data.get("chat_ids", [] if out.get("sphere_ids") else None)
+        if (not isinstance(ids, list) or (not ids and not out.get("sphere_ids")) or len(ids) > MAX_CHATS
                 or any(isinstance(i, bool) or not isinstance(i, int) for i in ids)):
-            raise ValueError(f"поле chat_ids: нужен список номеров чатов, от 1 до {MAX_CHATS}")
+            raise ValueError(f"поле chat_ids: нужен список номеров чатов, от 1 до {MAX_CHATS} "
+                             "(или сферы в sphere_ids)")
         out["chat_ids"] = list(dict.fromkeys(ids))
     if "keywords" in data or not partial:
         out["keywords"] = strings("keywords", MAX_KEYWORDS, MAX_KEYWORD_LEN) if "keywords" in data else []
@@ -280,12 +288,22 @@ async def check_chats(conn: asyncpg.Connection, chat_ids: list[int]) -> None:
             raise ValueError(f"чат {chat_id} — личный; наблюдатель работает только с группами и каналами")
 
 
+async def check_spheres(conn: asyncpg.Connection, sphere_ids: list[int]) -> None:
+    """Сферы правила — только заведённые владельцем."""
+    if not sphere_ids:
+        return
+    known = {r["id"] for r in await conn.fetch("SELECT id FROM spheres WHERE id = ANY($1::bigint[])", sphere_ids)}
+    for sphere_id in sphere_ids:
+        if sphere_id not in known:
+            raise ValueError(f"сферы {sphere_id} нет")
+
+
 def rule_public(row: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(row)
     for key in ("created_at", "updated_at"):
         out[key] = out[key].isoformat()
-    for key in ("chat_ids", "keywords", "regexes"):
-        out[key] = list(out[key])
+    for key in ("chat_ids", "keywords", "regexes", "sphere_ids"):
+        out[key] = list(out.get(key) or [])
     return out
 
 
@@ -355,6 +373,8 @@ JOIN peers p ON p.id = c.peer_id
 WHERE m.id = $1 AND m.chat_id = $2 AND m.kind = 'message' AND m.deleted_at IS NULL AND m.agent_visible
 """
 _COUNTED = "('checking', 'relevant', 'not_relevant', 'failed', 'no_answer')"
+_SPHERE_JOIN = ("JOIN sphere_chats sc ON sc.account_id = c.account_id AND sc.peer_class = p.class "
+                "AND sc.tg_id = p.tg_id")
 
 
 async def on_message(mod: Any, payload: dict[str, Any]) -> None:
@@ -363,8 +383,13 @@ async def on_message(mod: Any, payload: dict[str, Any]) -> None:
     if payload.get("outgoing") is True or not isinstance(chat_id, int) or not isinstance(message_id, int):
         return
     async with mod.state.pool.acquire() as conn:
+        # Правило смотрит свои чаты и чаты своих сфер (Р-84); личные чаты сфер ниже отсекаются.
         rules = await conn.fetch(
-            "SELECT * FROM watch_rules WHERE enabled AND $1 = ANY (chat_ids) ORDER BY id", chat_id)
+            f"""SELECT * FROM watch_rules
+                WHERE enabled AND ($1 = ANY (chat_ids) OR (cardinality(sphere_ids) > 0 AND sphere_ids && ARRAY(
+                    SELECT sc.sphere_id FROM chats c JOIN peers p ON p.id = c.peer_id {_SPHERE_JOIN}
+                    WHERE c.id = $1)))
+                ORDER BY id""", chat_id)
         if not rules:
             return
         msg = await conn.fetchrow(_MESSAGE, message_id, chat_id)
