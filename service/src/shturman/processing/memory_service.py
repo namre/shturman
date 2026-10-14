@@ -194,7 +194,7 @@ async def create_project(request: Request) -> JSONResponse:
         about = sanitize.clean_line(description or "", DESCRIPTION_CARD) or None
         # На карточке — всё, что будет записано: название, другие названия, описание; чаты — названиями.
         summary = (f"Завести проект «{clean}». У него будет страница в памяти ассистента; "
-                   "обязательства, факты и решения по нему ассистент будет собирать из переписки.")
+                   "договорённости, факты и решения по нему ассистент будет собирать из переписки.")
         if chat_ids:
             summary += f" Чаты проекта: {await _chat_titles(conn, chat_ids)}."
         if names:
@@ -259,7 +259,7 @@ async def project_chats(request: Request) -> JSONResponse:
         if removed:
             parts.append(f"убрать {await _chat_titles(conn, removed)}")
         summary = (f"Изменить чаты проекта {await _project_title(conn, project_id)}: " + "; ".join(parts)
-                   + ". Сводка и обязательства проекта будут собираться по сообщениям его чатов.")
+                   + ". Сводка и договорённости проекта будут собираться по сообщениям его чатов.")
         answer, result = await settle(conn, PROJECT_CHATS, {"project_id": project_id, "add": added, "remove": removed},
                                       summary=summary)
     return answer or JSONResponse(result)
@@ -287,7 +287,7 @@ async def archive_project(request: Request) -> JSONResponse:
         if row["status"] != "active":
             raise BadRequest("Проект ещё не заведён или отклонён.", status=409, code="bad_status")
         summary = (f"Перенести проект {await _project_title(conn, project_id)} в архив: страница останется, "
-                   "но сводка по нему больше не будет обновляться, а новые обязательства из его чатов "
+                   "но сводка по нему больше не будет обновляться, а новые договорённости из его чатов "
                    "к нему относиться не будут.")
         answer, result = await settle(conn, PROJECT_ARCHIVE, {"project_id": project_id}, summary=summary)
     return answer or JSONResponse(result)
@@ -323,7 +323,7 @@ async def decide_proposal(request: Request) -> JSONResponse:
                                  status=409, code="bad_status")
             summary = None if status in ("active", "archived") else (
                 f"Завести предложенный проект {await _project_title(conn, project_id)}. У него будет страница "
-                "в памяти ассистента; обязательства, факты и решения по нему ассистент будет собирать из переписки.")
+                "в памяти ассистента; договорённости, факты и решения по нему ассистент будет собирать из переписки.")
             answer, result = await settle(conn, PROJECT_ACCEPT, {"project_id": project_id}, summary=summary)
             return answer or JSONResponse(result)
         try:

@@ -28,7 +28,7 @@ from typing import Any, Iterable, Sequence
 
 import asyncpg
 
-from .. import authority, bridge
+from .. import authority, bridge, words
 from . import dates
 from .extract import Candidate, clean_text, normalize
 
@@ -354,19 +354,19 @@ async def _move(
     async with conn.transaction():
         row = await _locked(conn, commitment_id)
         if row is None or not await is_visible(conn, commitment_id):
-            return _result(False, error="Такого обязательства нет.", code="not_found")
+            return _result(False, error="Такой договорённости нет.", code="not_found")
         if expected_fingerprint is not None and fingerprint(row) != expected_fingerprint:
             return _result(False, error="Содержание изменилось. Подтвердите новое предложение.", code="changed_meanwhile")
         needs_approval = to in ("open", "done") and not approved(row)
         if needs_approval and not authority.is_owner():
-            return _result(False, error="Это обязательство ещё не подтверждено владельцем.", code="approval_required")
+            return _result(False, error="Эта договорённость ещё не подтверждена владельцем.", code="approval_required")
         if row["status"] == to:
             if needs_approval:
                 await _record_approval(conn, row)
                 await log_event(conn, commitment_id, actor="owner", action="approved", from_status=to, to_status=to)
             return _result(True, changed=False, commitment=await get_commitment(conn, commitment_id, today=today))
         if row["status"] not in allowed:
-            return _result(False, error=f"Нельзя: обязательство в статусе «{STATUS_TEXT[row['status']]}».",
+            return _result(False, error=f"Нельзя: договорённость в статусе «{STATUS_TEXT[row['status']]}».",
                            code="bad_status", commitment=await get_commitment(conn, commitment_id, today=today))
         if needs_approval:
             await _record_approval(conn, row)
@@ -448,11 +448,11 @@ async def reschedule(
     async with conn.transaction():
         row = await _locked(conn, commitment_id)
         if row is None or not await is_visible(conn, commitment_id):
-            return _result(False, error="Такого обязательства нет.", code="not_found")
+            return _result(False, error="Такой договорённости нет.", code="not_found")
         if expected_fingerprint is not None and fingerprint(row) != expected_fingerprint:
             return _result(False, error="Содержание изменилось. Подтвердите новый срок.", code="changed_meanwhile")
         if row["status"] not in ("open", "proposed"):
-            return _result(False, error=f"Нельзя: обязательство в статусе «{STATUS_TEXT[row['status']]}».",
+            return _result(False, error=f"Нельзя: договорённость в статусе «{STATUS_TEXT[row['status']]}».",
                            code="bad_status")
         if row["status"] != "proposed" and not authority.is_owner():
             return _result(False, error="Изменение срока требует подтверждения владельца.", code="approval_required")
@@ -509,11 +509,11 @@ async def apply_change(conn: asyncpg.Connection, change_id: int, *, actor: str =
             return _result(True, changed=False, status=change["status"])
         row = await _locked(conn, change["commitment_id"])
         if expected_fingerprint is not None and fingerprint(row) != expected_fingerprint:
-            return _result(False, error="Обязательство изменилось. Нужна новая карточка.", code="changed_meanwhile")
+            return _result(False, error="Договорённость изменилась. Нужна новая карточка.", code="changed_meanwhile")
         if row["status"] != "open":
             await conn.execute(
                 "UPDATE commitment_changes SET status = 'expired', decided_at = now() WHERE id = $1", change_id)
-            return _result(False, error="Обязательство уже не открыто.", code="bad_status")
+            return _result(False, error="Договорённость уже не открыта.", code="bad_status")
         await conn.execute(
             "UPDATE commitment_changes SET status = 'accepted', decided_at = now() WHERE id = $1", change_id)
         details = {"proposed_by": "model", "change_id": change_id}
@@ -701,14 +701,16 @@ async def build_digests(
             lines.append(f"{pos}. {body}")
             accept_data, reject_data = (f"a:{target}", f"r:{target}") if kind == "c" else (f"ca:{target}", f"cr:{target}")
             accept_data += ":" + prints[(kind, target)][:24]
-            buttons.append([bridge.button(f"{pos} ✓", CALLBACK_MODULE, accept_data),
-                            bridge.button(f"{pos} ✗", CALLBACK_MODULE, reject_data)])
+            # Подписи словами (Б6), данные кнопок прежние: старые сводки работают как раньше.
+            yes, no = ("верно", "не так") if kind == "c" else ("применить", "оставить")
+            buttons.append([bridge.button(f"{pos} — {yes}", CALLBACK_MODULE, accept_data),
+                            bridge.button(f"{pos} — {no}", CALLBACK_MODULE, reject_data)])
             table = "commitments" if kind == "c" else "commitment_changes"
             await conn.execute(
                 f"""UPDATE {table} SET digest_batch = $2, digest_pos = $3, notified_at = now(),
                            digest_attempts = digest_attempts + 1, digest_fingerprint = $4 WHERE id = $1""",
                 target, batch, pos, prints[(kind, target)])
-        head = "Обязательства из переписки. ✓ — верно, ✗ — нет."
+        head = "Договорённости из переписки: верно ли записано?"
         if len(chunks) > 1:
             head += f" ({n} из {len(chunks)})"
         text = head + "\n\n" + "\n\n".join(lines)
@@ -756,7 +758,7 @@ async def batch_summary(conn: asyncpg.Connection, batch: str) -> tuple[bool, str
             mark = "✓ принято"
         lines.append(f"{r['pos']}. {prefix}{_short(r['what'], 120)} — {mark}")
     done = bool(rows) and all(r["status"] != "proposed" for r in rows)
-    return done, bridge.fit_message("Обязательства из переписки — решено:\n" + "\n".join(lines))
+    return done, bridge.fit_message("Договорённости из переписки — решено:\n" + "\n".join(lines))
 
 
 async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit: int = 100) -> dict[str, Any]:
@@ -774,10 +776,10 @@ async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit:
     for row in rows:
         target = row["id"]
         items.append({
-            "id": target, "title": "Верно ли это обязательство?",
+            "id": target, "title": "Верно ли записана договорённость?",
             "text": _render_commitment(to_dict(row, today), today),
-            "buttons": [[bridge.button("Верно", CALLBACK_MODULE, f"a:{target}:{row['digest_fingerprint'][:24]}"),
-                         bridge.button("Нет", CALLBACK_MODULE, f"r:{target}")]],
+            "buttons": [[bridge.button(words.COMMITMENT_YES, CALLBACK_MODULE, f"a:{target}:{row['digest_fingerprint'][:24]}"),
+                         bridge.button(words.COMMITMENT_NO, CALLBACK_MODULE, f"r:{target}")]],
             "card_message_id": None})
     changes = await conn.fetch(
         f"""SELECT x.* FROM commitment_changes x JOIN commitments c ON c.id = x.commitment_id
@@ -813,7 +815,7 @@ async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]
     if action in ("a", "r"):
         row = await conn.fetchrow("SELECT status, digest_batch, digest_fingerprint FROM commitments WHERE id = $1", target)
         if row is None or not await is_visible(conn, target):
-            return {"answer": "Это обязательство уже удалено.", "edit_text": None, "remove_buttons": False}
+            return {"answer": "Эта договорённость уже удалена.", "edit_text": None, "remove_buttons": False}
         if row["status"] != "proposed":
             answer = f"Уже решено: {STATUS_TEXT[row['status']]}."
         elif action == "a":

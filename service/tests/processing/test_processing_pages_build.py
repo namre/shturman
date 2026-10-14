@@ -625,8 +625,8 @@ async def test_pages_for_unconfirmed_people_need_the_owner(conn, config):
     assert text.startswith("Страницы памяти: завести страницу о человеке?")
     assert "1. Иван Петров — открытых обязательств: 1" in text and "2. Мария Сидорова — сообщений за 30 дн.: 27" in text
     assert "Пётр" not in text and "смет" not in text.lower()              # мало переписки; текста сообщений нет
-    assert buttons_of(notes[0]) == [("1 ✓", f"sh:pg:a:{w.ivan}"), ("1 ✗", f"sh:pg:r:{w.ivan}"),
-                                    ("2 ✓", f"sh:pg:a:{w.maria}"), ("2 ✗", f"sh:pg:r:{w.maria}")]
+    assert buttons_of(notes[0]) == [("1 — завести страницу", f"sh:pg:a:{w.ivan}"), ("1 — не нужно", f"sh:pg:r:{w.ivan}"),
+                                    ("2 — завести страницу", f"sh:pg:a:{w.maria}"), ("2 — не нужно", f"sh:pg:r:{w.maria}")]
     assert all(len(data.encode()) <= 64 for _, data in buttons_of(notes[0]))
     await bridge.deliver_result(conn, notes[0]["id"], {"message_id": 1})
 

@@ -1257,12 +1257,12 @@ async def _propose(conn: asyncpg.Connection, build_id: int, *, now: datetime, op
     for pos, r in enumerate(rows, start=1):
         name = clean_line(r["display_name"], 80) or "без имени"
         lines.append(f"{pos}. {name} — {_reason_text(_loads(r['reason']) or {}, options.propose_days)}")
-        buttons.append([bridge.button(f"{pos} ✓", CALLBACK_MODULE, f"a:{r['person_id']}"),
-                        bridge.button(f"{pos} ✗", CALLBACK_MODULE, f"r:{r['person_id']}")])
+        buttons.append([bridge.button(f"{pos} — завести страницу", CALLBACK_MODULE, f"a:{r['person_id']}"),
+                        bridge.button(f"{pos} — не нужно", CALLBACK_MODULE, f"r:{r['person_id']}")])
         await conn.execute(
             "UPDATE page_proposals SET batch = $2, pos = $3, notified_at = now() WHERE person_id = $1",
             r["person_id"], batch, pos)
-    text = ("Страницы памяти: завести страницу о человеке? ✓ — да, ✗ — нет.\n\n" + "\n".join(lines))
+    text = ("Страницы памяти: завести страницу о человеке?\n\n" + "\n".join(lines))
     if waiting > 0:
         text += f"\n\nЕщё ждут решения: {waiting}. Придут со следующей сборкой."
     await bridge.notify_owner(conn, text, buttons=buttons, handler=HANDLER_DIGEST,

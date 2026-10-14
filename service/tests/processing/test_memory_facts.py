@@ -74,6 +74,9 @@ async def test_extraction_writes_person_facts_and_proposes_owner_facts(conn):
     accept, reject = buttons(digest, "of")
     fp = facts.fingerprint(await conn.fetchrow("SELECT * FROM facts WHERE subject_type = 'owner'"))
     assert accept == f"sh:of:a:{rows[1]['id']}:{fp[:24]}" and reject == f"sh:of:r:{rows[1]['id']}"
+    # подписи словами (Б6, Р-86), данные кнопок прежние
+    labels = [b["text"] for row in digest[0]["payload"]["buttons"] for b in row]
+    assert labels == ["1 — запомнить", "1 — не запоминать"]
     assert await conn.fetchval("SELECT count(*) FROM pages WHERE entity_type = 'owner'") == 0
 
     # подменённая кнопка (другой отпечаток) не принимает факт

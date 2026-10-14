@@ -15,7 +15,7 @@ from outbox_helpers import (  # noqa: F401 - env — фикстура
     live, new_draft, owner_messages, owner_request, completion, press, settle, switch, take, texts,
 )
 
-OFF_TEXT = "Отправка сообщений выключена в настройках сервера"
+OFF_TEXT = "Отправка сообщений выключена на сервере"
 YES = {"parsed": {"relevant": True, "reason": "нужно"}, "text": "", "model": "t"}
 
 
@@ -289,11 +289,13 @@ async def test_card_identifies_recipient_beyond_display_name(env):
     real = texts(await owner_messages(env.conn))
     await new_draft(env, lookalike, "Ответ двойнику")
     fake = texts(await owner_messages(env.conn))
-    assert f"Кому: Иван Петров (личный чат) · @ivan_petrov · номер в Telegram {IVAN}\n" in real
-    assert "В архиве: 3 сообщения, первое " in real
+    assert real.startswith("Ответ: Иван Петров (личный чат) · от вашего имени\n")
+    assert f"Служебное: номер в Telegram {IVAN} · @ivan_petrov · " in real
+    assert " · в архиве 3 сообщения, первое " in real
     # двойник: то же имя, но другой номер, нет адреса и почти нет истории
-    assert "Кому: Иван Петров id 2001 (личный чат) · номер в Telegram 7070707\n" in fake
-    assert "@" not in fake.split("От кого")[0] and "В архиве: 1 сообщение, первое " in fake
+    assert fake.startswith("Ответ: Иван Петров id 2001 (личный чат) · от вашего имени\n")
+    assert "Служебное: номер в Telegram 7070707 · в архиве 1 сообщение, первое " in fake
+    assert "@" not in fake.split("\n\n")[0]
     assert "‮" not in fake
     # чат без единого сообщения (до карточки такой не дойдёт, но строка для него есть)
     empty = await add_chat(env.conn, env.helper_acc, 5151, name="Пустой", history=False)
@@ -425,13 +427,13 @@ async def test_cards_of_finished_drafts_lose_buttons_and_show_the_outcome(env):
     new_cards = await owner_messages(env.conn)
     replaced = await edits(env.conn)
     assert [(e["message_id"], e["remove_buttons"]) for e in replaced] == [(7000 + old_cards[0]["id"], True)]
-    assert replaced[0]["text"].startswith(f"Черновик № {old} — заменён новым, не отправлен\n")
+    assert replaced[0]["text"].split("\n")[1] == f"Черновик № {old} — заменён новым, не отправлен"
     # просроченный
     await env.conn.execute("UPDATE outbox_drafts SET expires_at = now() - interval '1 second' WHERE id = $1", new)
     await drafts.sweep(env.mod)
     expired = await edits(env.conn)
     assert [e["message_id"] for e in expired] == [7000 + new_cards[0]["id"]]
-    assert expired[0]["text"].startswith(f"Черновик № {new} — срок истёк, не отправлен\n")
+    assert expired[0]["text"].split("\n")[1] == f"Черновик № {new} — срок истёк, не отправлен"
     # длинный, из нескольких карточек: после отправки обновляются все части
     long_text = "\n\n".join(f"Абзац {i}. " + "слово " * 180 for i in range(8))
     long_id = (await new_draft(env, chat, long_text)).json()["draft_id"]
@@ -463,7 +465,7 @@ async def test_card_that_arrives_after_the_draft_is_resolved_is_fixed_at_once(en
     assert await edits(env.conn) == []
     await owner_messages(env.conn)                           # теперь доставил обе
     late = await edits(env.conn)
-    assert len(late) == 1 and late[0]["text"].startswith(f"Черновик № {old} — заменён новым")
+    assert len(late) == 1 and late[0]["text"].split("\n")[1].startswith(f"Черновик № {old} — заменён новым")
     assert late[0]["remove_buttons"] is True
 
 

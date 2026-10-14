@@ -176,7 +176,7 @@ async def test_minute_six_owner_clarification_survives_background_completion(env
     with authority.owner_context(OWNER, chat_id=OWNER):
         async with env.conn.transaction():
             result = await owner.handle_command(env.conn, env.state, f'/replytask {task["id"]} answer В пятницу.', OWNER)
-    assert "продолжена" in result["text"]
+    assert "ассистент продолжает" in result["text"]
     await model_says(env, "Смета будет в пятницу.")
     draft = await env.conn.fetchrow("SELECT * FROM outbox_drafts")
     assert draft["status"] == "pending"

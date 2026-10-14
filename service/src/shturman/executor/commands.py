@@ -141,7 +141,7 @@ def bot_status(local_api: Callable[[str, str], tuple[int, dict]]) -> None:
         print(f"Своя модель: {llm.get('model')}"
               + (" — по подписке ChatGPT" if llm.get("way") == "subscription" else ""))
         state = {"limit": "лимит подписки исчерпан, задания ждут",
-                 "relogin": "нужно войти через ChatGPT заново — на странице настройки переписки",
+                 "relogin": "нужно войти через ChatGPT заново — в «Настройках Штурмана»",
                  "denied": "OpenAI отказал подписке в доступе"}.get(llm.get("subscription") or "")
         if state:
             print(f"  подписка: {state}")

@@ -152,7 +152,7 @@ async def test_screen_opens_ordinary_and_hides_suspect_with_one_card(conn, guard
     card, = await cards(conn)
     text = card["text"]
     assert "От: Иван Петров" in text and "Чат: Иван Петров (личный чат)" in text
-    assert "оценка классификатора 0,97 из 1" in text and "Кодовое слово взлом" in text
+    assert "почти наверняка попытка управлять ассистентом" in text and "0,97" not in text and "Кодовое слово взлом" in text
     assert "https://" not in text and "@evil_bot" not in text and "/start" not in text and "\nсм." not in text
     assert [[b["text"] for b in line] for line in card["buttons"]] == [["Показать ассистенту", "Оставить скрытым"]]
     assert all(len(b["data"].encode()) <= 64 and b["data"].startswith("sh:gd:") for b in card["buttons"][0])
@@ -257,7 +257,7 @@ async def test_card_sent_through_hermes_carries_no_text_of_the_message(conn, gua
     job, = await jobs.claim(conn, [bridge.NOTIFY_OWNER], worker="plugin", limit=5)     # так забирает плагин
     text = job["payload"]["text"]
     assert "взлом" not in text and "Кодовое" not in text and "Текст сюда не включён" in text
-    assert "От: Иван Петров" in text and "оценка классификатора 0,97 из 1" in text
+    assert "От: Иван Петров" in text and "почти наверняка попытка управлять ассистентом" in text
     assert await bridge.deliver_result(conn, job["id"], {"message_id": 1}, executor="plugin")
     out = await press(conn, button(job["payload"], "Показать ассистенту"))
     assert out["answer"] == "Показано ассистенту." and await state(conn, one) == [(True, "released")]
@@ -319,7 +319,7 @@ async def test_model_outage_fails_open_and_is_counted_not_hidden(conn, guarded, 
     assert counts == {"guard_checked": 1, "guard_hidden": 1, "guard_waiting_owner": 1, "guard_released": 0,
                       "guard_unchecked": 2}
     card, = await cards(conn)
-    assert "признаки:" in card["text"] and "оценка классификатора" not in card["text"]
+    assert "\nПочему: признаки:" in card["text"] and "наверняка" not in card["text"]  # решили только правила — оценки модели нет
 
     # пока модель в паузе после сбоя, живое сообщение её не ждёт
     calls = len(guarded.scorer.calls)

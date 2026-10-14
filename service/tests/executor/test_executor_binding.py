@@ -128,7 +128,7 @@ async def test_owner_free_text_gets_one_short_hint_per_hour(rig):
     rig.tg.text("а мне ответишь?", user=STRANGER_USER)
     await rig.bot.poll_once()
     hints = rig.tg.sent()[before:]
-    assert len(hints) == 1 and hints[0]["text"].startswith("Управление Штурманом")
+    assert len(hints) == 1 and hints[0]["text"].startswith("Я понимаю кнопки и команды")
     assert hints[0]["chat_id"] == OWNER
     # подсказка верна и без Hermes: к «ассистенту в другом чате» она не отсылает
     assert "ассистент" not in hints[0]["text"] and "Hermes" not in hints[0]["text"]

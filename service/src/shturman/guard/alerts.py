@@ -70,12 +70,23 @@ def _score(value: float | None) -> str:
     return f"{value:.2f}".replace(".", ",") if value is not None else "—"
 
 
+def certainty(value: float | None) -> str:
+    """Оценка модели словами (Б12): владельцу не нужно знать, что такое «0,97 из 1»."""
+    if value is None:
+        return "проверка сочла это попыткой управлять ассистентом"
+    if value >= 0.95:
+        return "почти наверняка попытка управлять ассистентом"
+    if value >= 0.8:
+        return "очень похоже на попытку управлять ассистентом"
+    return "похоже на попытку управлять ассистентом, но проверка не уверена"
+
+
 def why(row: Any) -> str:
-    """Почему сообщение скрыто: оценка модели и сработавшие правила."""
+    """Почему сообщение скрыто: насколько модель уверена (словами) и сработавшие правила."""
     parts: list[str] = []
     model = row["guard_model"] or ""
     if model and model != rules.NAME:   # решила модель (одна или вместе с правилами)
-        parts.append(f"оценка классификатора {_score(row['guard_score'])} из 1")
+        parts.append(certainty(row["guard_score"]))
     fired = rules.explain(row["text"] or "")
     if fired and rules.score_one(row["text"] or "") >= rules.THRESHOLD:
         parts.append("признаки: " + "; ".join(rule.reason for rule in fired[:3]))
@@ -104,8 +115,8 @@ def summary(row: Any, *, same: int, chats: int, tz: str) -> str:
 def card(head: str, text: str | None) -> str:
     """Текст карточки. text=None — без цитаты (уведомление идёт не через своего бота)."""
     shown = (["Начало текста (ссылки обезврежены):", f"«{quote(text)}»"] if text is not None else
-             ["Текст сюда не включён: уведомление идёт через Hermes, где его мог бы прочитать "
-              "ассистент. Посмотрите сообщение в Telegram — чат и время указаны выше."])
+             ["Текст сюда не включён: уведомление идёт через бота ассистента, где его мог бы прочитать "
+              "сам ассистент. Посмотрите сообщение в Telegram — чат и время указаны выше."])
     return "\n".join([
         "Скрыл от ассистента входящее сообщение: оно похоже на попытку им управлять.",
         "",

@@ -178,7 +178,7 @@ async def test_hidden_commitment_is_not_shown_to_owner_either(conn):
     # предложение, чей чат исключили уже после показа: кнопка не работает, в итог не попадает
     proposed = await conn.fetchval("SELECT id FROM commitments")
     await conn.execute("UPDATE chats SET excluded = true WHERE id = $1", ivan_chat)
-    assert (await press(conn, f"sh:cm:a:{proposed}"))["answer"] == "Это обязательство уже удалено."
+    assert (await press(conn, f"sh:cm:a:{proposed}"))["answer"] == "Эта договорённость уже удалена."
     assert await conn.fetchval("SELECT status FROM commitments WHERE id = $1", proposed) == "proposed"
     assert out["planned"] == 2
 
@@ -283,7 +283,7 @@ async def test_emoji_heavy_digest_fits_telegram_limit_by_splitting(conn):
     for d in sent:
         assert bridge.utf16_len(d["payload"]["text"]) <= bridge.MESSAGE_LIMIT
         assert len(d["payload"]["text"]) < bridge.utf16_len(d["payload"]["text"])
-        assert [b[0] for b in buttons_of(d)][:2] == ["1 ✓", "1 ✗"]   # нумерация в каждом сообщении своя
+        assert [b[0] for b in buttons_of(d)][:2] == ["1 — верно", "1 — не так"]   # нумерация в каждом сообщении своя
     assert f"(1 из {len(sent)})" in sent[0]["payload"]["text"]
     # нажатия работают, итоговый текст тоже в пределе
     for d in sent:

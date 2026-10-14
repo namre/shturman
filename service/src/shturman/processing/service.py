@@ -230,7 +230,7 @@ async def get_commitment(request: Request) -> JSONResponse:
         if item is not None:
             await _mark_commitments(conn, [item])
     if item is None:
-        raise BadRequest("такого обязательства нет", status=404)
+        raise BadRequest("такой договорённости нет", status=404)
     return JSONResponse(item)
 
 
@@ -281,13 +281,13 @@ def _commitment_ask(action: str, item: dict[str, Any]) -> str:
     due = f"срок {date.fromisoformat(item['due_date']):%d.%m.%Y}" if item["due_date"] else "срок не определён"
     state = commitments.STATUS_TEXT.get(item["status"], item["status"])
     head = {
-        "accept": f"Принять предложенное обязательство № {item['id']}",
-        "reopen": f"Вернуть в работу обязательство № {item['id']}, которое вы не подтверждали (сейчас: {state})",
-        "close": f"Отметить выполненным обязательство № {item['id']}, которое вы ещё не подтверждали",
-        "reschedule": f"Перенести срок обязательства № {item['id']}",
+        "accept": f"Принять предложенную договорённость № {item['id']}",
+        "reopen": f"Вернуть в работу договорённость № {item['id']}, которую вы не подтверждали (сейчас: {state})",
+        "close": f"Отметить выполненной договорённость № {item['id']}, которую вы ещё не подтверждали",
+        "reschedule": f"Перенести срок договорённости № {item['id']}",
     }[action]
     return (f"{head} ({who}; {due}). Содержание: «{clean_line(item['what'], 1200)}». "
-            "Ассистент будет считать его договорённостью, которую вы подтвердили, "
+            "Ассистент будет считать её подтверждённой вами "
             "и показывать в сводках.")
 
 
@@ -422,7 +422,7 @@ async def merge_people(request: Request) -> JSONResponse:
         answer, result = await settle(
             conn, PEOPLE_MERGE, payload,
             summary=f"Объединить записи о людях: {names[0]} и {names[1]} станут одним человеком. Их учётные "
-                    "записи, имена и обязательства ассистент будет относить к одному человеку, и страница "
+                    "записи, имена и договорённости ассистент будет относить к одному человеку, и страница "
                     "памяти у них будет общая.")
         if answer is not None:
             return answer

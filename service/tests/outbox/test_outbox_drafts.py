@@ -29,7 +29,9 @@ async def test_session_draft_is_sent_only_after_owner_tap(env):
     chat = await add_chat(env.conn, env.helper_acc)
     draft_id, cards = await approved(env, chat)
     card = texts(cards)
-    assert f"Кому: Иван Петров (личный чат) · номер в Telegram {IVAN}" in card and "от имени помощника" in card
+    # первая строка — кому и от чьего имени (Б10); то, что подделать нельзя, — в служебной строке
+    assert card.startswith("Ответ: Иван Петров (личный чат) · от помощника\n")
+    assert f"Служебное: номер в Telegram {IVAN} · " in card and "аккаунт помощника «" in card
     assert card.endswith("Добрый день! Смету пришлю в пятницу.")
     await settle(env)
     assert env.tg.sent == [] and (await draft_row(env.conn, draft_id))["status"] == "pending"
@@ -47,7 +49,7 @@ async def test_session_draft_is_sent_only_after_owner_tap(env):
     # итог — в самой карточке (кнопок под ней больше нет), отдельного сообщения о каждой отправке нет
     assert await owner_messages(env.conn) == []
     final = (await edits(env.conn))[-1]
-    assert final["remove_buttons"] is True and final["text"].startswith(f"Черновик № {draft_id} — отправлен\n")
+    assert final["remove_buttons"] is True and final["text"].split("\n")[1] == f"Черновик № {draft_id} — отправлен"
     assert final["text"].endswith("Добрый день! Смету пришлю в пятницу.")
 
 
@@ -517,9 +519,9 @@ async def test_text_is_cleaned_once_and_the_same_string_is_shown_and_sent(env):
     assert card.endswith("\n\n" + clean)
     header = card[: -len(clean)]
     # имя чата — чужая строка: в шапке оно в одну строку и без невидимых знаков
-    assert "Кому: Иван Черновик № 999 — отправлен (личный чат)" in header
+    assert header.startswith("Ответ: Иван Черновик № 999 — отправлен (личный чат) · от помощника\n")
     assert "‮" not in card and "​" not in card and "\x07" not in card
-    assert header.count("\n") == 6
+    assert header.count("\n") == 4
     await press(env, button(cards, "Отправить"))
     await settle(env)
     assert [m["text"] for m in env.tg.sent] == [clean]

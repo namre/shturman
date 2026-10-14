@@ -19,8 +19,10 @@ async def test_owner_menu_and_explicit_policy(rig):
     await bind(rig)
     rig.tg.text('/menu')
     await rig.bot.poll_once()
-    assert '/sourcepolicy' in rig.tg.sent()[-1]['text']
     assert rig.tg.sent()[-1]['reply_markup']['inline_keyboard']
+    rig.tg.text('/advanced')                    # полный список команд — отдельной командой (Р-86)
+    await rig.bot.poll_once()
+    assert '/sourcepolicy' in rig.tg.sent()[-1]['text']
     rig.tg.text('/policy {"daily_cap":17}')
     await rig.bot.poll_once()
     value = json.loads(await rig.conn.fetchval("SELECT value FROM settings WHERE key='outbox.policy'"))
@@ -60,9 +62,12 @@ async def test_menu_callback_other_chat_refused(rig):
 @pytest.mark.asyncio
 async def test_menu_callback_verified_owner(rig):
     await bind(rig)
+    before = len(rig.tg.sent())
     rig.tg.press('sh:oc:help')
     await rig.bot.poll_once()
-    assert await rig.conn.fetchval("SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='notify.owner')")
+    # ответ на кнопку меню бот отправляет сам, в личный чат владельца (Р-86)
+    reply = rig.tg.sent()[before:]
+    assert len(reply) == 1 and reply[0]['chat_id'] == OWNER and reply[0]['text'].startswith('Как пользоваться ботом')
     assert not authority.is_owner()
 
 
