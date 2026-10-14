@@ -18,6 +18,7 @@ Telegram и выход из них, смена модели — хранятся
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import asyncpg
@@ -182,10 +183,67 @@ async def write(pool: asyncpg.Pool, action: str, outcome: str = OK, detail: str 
         logger.error("журнал страницы настройки: запись не сделана (%s)", type(exc).__name__)
 
 
+# Коды причин в подробностях — словами (С5, Р-86). В базе код остаётся как есть (по нему ищет тот,
+# кто обслуживает сервер); на странице владелец видит слова. Незнакомый код словом не заменить —
+# тогда пишется, где искать подробности, а не сам код.
+CODE_WORDS = {
+    # вход через ChatGPT (executor/siwc.py)
+    "wrong_state": "адрес из другой, устаревшей попытки входа",
+    "no_attempt": "попытка входа уже закончилась",
+    "not_callback": "это не тот адрес, что открывается после входа",
+    "no_params": "в адресе нет нужных данных",
+    "no_code": "в адресе нет кода входа",
+    "code_rejected": "OpenAI не принял код входа",
+    "denied": "OpenAI отказал в доступе",
+    "expired": "срок истёк",
+    "client_mismatch": "адрес от другого подключения",
+    "no_models": "подписке не доступна ни одна модель",
+    # проверка своей модели (apply.py)
+    "blocked_address": "адрес во внутренней сети сервера — так нельзя",
+    "blocked_base_url": "адрес во внутренней сети сервера — так нельзя",
+    "bad_base_url": "адрес API записан неверно",
+    "bad_address": "адрес записан неверно",
+    "not_https": "адрес не https",
+    "dns_failed": "сервер не нашёл такого адреса",
+    "timeout": "провайдер не ответил вовремя",
+    "bad_response": "по адресу ответил не API модели",
+    "http_401": "провайдер не принял ключ",
+    "http_402": "на счёте у провайдера нет средств",
+    "http_403": "провайдер отказал ключу в доступе",
+    "http_404": "провайдер не знает такой модели или адреса",
+    "http_400": "провайдер отклонил пробный запрос",
+    "http_422": "провайдер отклонил пробный запрос",
+    "http_429": "провайдер ограничил запросы",
+    "proxy_needs_socksio": "для прокси не хватает пакета на сервере",
+    "bad_proxy_url": "адрес прокси на сервере записан неверно",
+    "no_connection": "нет связи",
+    "too_many_requests": "слишком много запросов, нужно подождать",
+    # вход в приложение «Штурман» (initdata.py, miniapp.py)
+    "replayed": "те же данные входа уже использованы",
+    "not_owner": "приложение открыл не привязанный владелец",
+    "bad_signature": "данные входа не подписаны вашим ботом",
+    "malformed": "данные входа повреждены",
+    "from_future": "время в данных входа впереди часов сервера",
+    "no_bot": "бот согласований не настроен",
+    "bot_conflict": "ботом пользуется ещё одна программа",
+    # бот в одно нажатие (bot_setup.py)
+    "wrong_bot": "не тот бот",
+    "not_pending": "создание уже закончилось",
+}
+_CODE = re.compile(r"\b(?:http_\d{3}|[a-z][a-z0-9]*_[a-z0-9_]+|replayed|denied|expired|malformed|timeout)\b")
+
+
+def human_detail(detail: str | None) -> str:
+    """Подробности записи для страницы: коды причин заменены словами."""
+    if not detail:
+        return detail or ""
+    return _CODE.sub(lambda m: CODE_WORDS.get(m.group(0), "подробности — в журнале сервиса"), detail)
+
+
 def _row(r: Any) -> dict[str, Any]:
     title = (NOT_DONE.get(r["action"]) if r["outcome"] != OK else None) or ACTIONS.get(r["action"], r["action"])
     return {"at": r["at"].isoformat(), "action": r["action"], "title": title, "outcome": r["outcome"],
-            "detail": r["detail"]}
+            "detail": human_detail(r["detail"])}
 
 
 async def recent(conn: asyncpg.Connection, limit: int = 30) -> list[dict[str, Any]]:

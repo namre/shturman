@@ -376,11 +376,12 @@ async def login_link(request: Request) -> JSONResponse:
     if created is None:
         await _page(request).slow_refusal()
         await _failed_login(request, "ссылка не подошла")
-        raise BadRequest("Эта ссылка уже использована или устарела. Попросите того, кто ставил ассистента, "
-                         "выдать новую — или выполните на сервере ./ops/setup-link.sh", 401, "link_invalid")
+        raise BadRequest("Эта ссылка уже использована или устарела. Попросите того, кто обслуживает ваш сервер, "
+                         "выдать новую.", 401, "link_invalid")
     await _log(request, "login.link", detail="прежние сессии завершены")
-    _tell_owner(state, "Выполнен вход на страницу настройки Штурмана по одноразовой ссылке. "
-                       "Если это были не вы — выполните на сервере ./ops/logout-all.sh")
+    _tell_owner(state, "Выполнен вход в «Настройки Штурмана» по одноразовой ссылке. "
+                       "Если это были не вы — нажмите там «Выйти на всех устройствах» или попросите того, кто "
+                       "обслуживает сервер, завершить все входы.")
     return _signed_in(*created)
 
 

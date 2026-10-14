@@ -153,7 +153,7 @@ async def app_notify_put(request: Request) -> JSONResponse:
         if wider:
             await page._log(request, "app.notify", audit.REFUSED, "расширение — только на странице: " + ",".join(wider))
             raise BadRequest("Из приложения уведомления можно только сузить или перенастроить по времени. "
-                             "Включить больше — на странице «Переписка».", 400, "page_only")
+                             "Включить больше — в «Настройках Штурмана».", 400, "page_only")
         with authority.miniapp_context(session.user_id, chat_id=session.chat_id):
             out = await confirm.apply_owner(conn, notify_service.SETTINGS, {"changes": changes})
         titles = await notify_service.sphere_titles(conn)

@@ -117,6 +117,70 @@
     toastTimer = setTimeout(function () { node.hidden = true; }, bad ? 9000 : 5000);
   }
 
+  /* Подтверждение в строке вместо системного окна confirm() (С6, Р-86): вопрос и кнопки появляются
+   * прямо под тем, что нажали. На телефоне системное окно выглядит как сбой браузера, а «ОК» жмут
+   * не читая. Возвращает Promise: true — главная кнопка, false — «Отмена» (или открыт другой вопрос),
+   * либо value дополнительной кнопки. options: {note, yes, danger (главная — красная), extra: [{text, value,
+   * danger}], no}. Главная кнопка помечена data-ask="yes", отмена — data-ask="no". */
+  var openAsk = null;
+  function ask(anchor, question, options) {
+    options = options || {};
+    if (openAsk) openAsk(false);
+    return new Promise(function (resolve) {
+      var holder = anchor && anchor.closest ? (anchor.closest("li, .row, .actions, .field, label, p") || anchor) : anchor;
+      var panel = el("div", { class: "ask", role: "group", "aria-label": question });
+      function done(value) {
+        if (panel.parentNode) panel.parentNode.removeChild(panel);
+        if (openAsk === done) openAsk = null;
+        resolve(value);
+      }
+      var buttons = [el("button", { class: "btn small-btn" + (options.danger ? " danger-fill" : ""), type: "button",
+                                    "data-ask": "yes", text: options.yes || "Да", onclick: function () { done(true); } })];
+      (options.extra || []).forEach(function (b) {
+        buttons.push(el("button", { class: "btn small-btn " + (b.danger ? "danger-fill" : "ghost"), type: "button",
+                                    "data-ask": b.value, text: b.text, onclick: function () { done(b.value); } }));
+      });
+      buttons.push(el("button", { class: "btn ghost small-btn", type: "button", "data-ask": "no",
+                                  text: options.no || "Отмена", onclick: function () { done(false); } }));
+      panel.appendChild(el("p", { text: question }));
+      if (options.note) panel.appendChild(el("p", { class: "ask-note", text: options.note }));
+      panel.appendChild(el("div", { class: "ask-buttons" }, buttons));
+      if (holder && holder.parentNode) {
+        if (holder.tagName === "LI") holder.appendChild(panel);
+        else holder.parentNode.insertBefore(panel, holder.nextSibling);
+      } else {
+        document.body.appendChild(panel);
+      }
+      openAsk = done;
+      // Фокус — на безопасной кнопке: у опасного вопроса это «Отмена».
+      (options.danger ? buttons[buttons.length - 1] : buttons[0]).focus();
+    });
+  }
+
+  /* Часовой пояс словами (С5, С16): «по московскому времени», а не «Europe/Moscow». Незнакомый пояс —
+   * смещением от UTC, как его покажет браузер; без пояса — «по часам сервера». */
+  var TZ_WORDS = {
+    "Europe/Moscow": "по московскому времени", "Europe/Astrakhan": "по астраханскому времени",
+    "Europe/Samara": "по самарскому времени", "Europe/Volgograd": "по волгоградскому времени",
+    "Europe/Saratov": "по саратовскому времени", "Europe/Ulyanovsk": "по ульяновскому времени",
+    "Europe/Kaliningrad": "по калининградскому времени", "Asia/Yekaterinburg": "по екатеринбургскому времени",
+    "Asia/Omsk": "по омскому времени", "Asia/Novosibirsk": "по новосибирскому времени",
+    "Asia/Krasnoyarsk": "по красноярскому времени", "Asia/Irkutsk": "по иркутскому времени",
+    "Asia/Yakutsk": "по якутскому времени", "Asia/Vladivostok": "по владивостокскому времени",
+    "Asia/Magadan": "по магаданскому времени", "Asia/Kamchatka": "по камчатскому времени",
+    "UTC": "по всемирному времени (UTC)", "Etc/UTC": "по всемирному времени (UTC)"
+  };
+  function tzWords(tz) {
+    if (!tz) return "по часам сервера";
+    if (TZ_WORDS[tz]) return TZ_WORDS[tz];
+    try {
+      var parts = new Intl.DateTimeFormat("ru-RU", { timeZone: tz, timeZoneName: "shortOffset" }).formatToParts(new Date());
+      var name = parts.filter(function (p) { return p.type === "timeZoneName"; })[0];
+      if (name && name.value) return "по времени " + name.value.replace("GMT", "UTC");
+    } catch (e) { /* пояс браузеру незнаком */ }
+    return "по часам сервера";
+  }
+
   function fast(seconds) { ui.fastUntil = Date.now() + (seconds || 30) * 1000; }
 
   /* ------------------------------------------------------------- запросы */
@@ -184,7 +248,7 @@
     expired: "Срок действия кода вышел. Запросите новый.",
     none: "Этот код уже использован или не запрашивался. Запросите новый.",
     locked: "Слишком много неверных попыток. Вход по коду временно закрыт — попробуйте позже или войдите по новой ссылке.",
-    no_owner: "Код прислать некому: бот согласований не настроен. Войдите по одноразовой ссылке — попросите того, кто ставил ассистента, или выполните на сервере ./ops/setup-link.sh",
+    no_owner: "Код прислать некому: бот согласований не настроен. Войдите по одноразовой ссылке — попросите её у того, кто обслуживает ваш сервер.",
     wait: "Недавняя отправка не удалась. Попробуйте ещё раз через минуту.",
     send_failed: "Не удалось отправить код: бот сейчас не может написать вам в Telegram. Попробуйте через минуту."
   };
@@ -232,8 +296,8 @@
         if (r.ok && r.data.key) { saveKey(r.data.key); startApp(); return; }
         // Ссылка одноразовая. Если владелец открыл её впервые, а она уже израсходована, по ней мог войти
         // кто-то другой (docs/architecture.md, «Что осталось») — говорим, что делать.
-        loginMessage((r.error || GENERIC[500]) + " Если вы открываете эту ссылку впервые, попросите того, кто ставил ассистента, " +
-          "завершить все входы (./ops/logout-all.sh) и выдать новую ссылку.", false);
+        loginMessage((r.error || GENERIC[500]) + " Если вы открываете эту ссылку впервые, попросите того, кто обслуживает " +
+          "ваш сервер, завершить все входы и выдать новую ссылку.", false);
       });
     });
 
@@ -358,7 +422,7 @@
   /* Шаги зависят от выбранного способа подключения:
    *   own   — «ассистент видит всё как вы»: вход в основной аккаунт, выбор чатов;
    *   staff — «ассистент — отдельный сотрудник»: бизнес-режим для личных чатов и
-   *           аккаунт ассистента для групп.
+   *           аккаунт помощника для групп.
    * Шаг другого способа, где уже что-то подключено, остаётся виден без номера и с пояснением:
    * иначе подключённое нельзя было бы ни увидеть, ни отключить. */
   var PLAN = {
@@ -414,7 +478,7 @@
       "s-accounts": !f.bot ? BOT : !f.keys ? "Откроется, когда будут сохранены ключи приложения — шаг " + num("s-keys") + "." : "",
       "s-assistant": !f.bot ? BOT : !f.keys ? "Откроется, когда будут сохранены ключи приложения — шаг " + num("s-keys") + "." : "",
       "s-chats": !f.bot ? BOT : f.sc === "staff"
-        ? (!f.helper ? "Откроется, когда будет подключён аккаунт ассистента — шаг " + num("s-assistant") + "." : "")
+        ? (!f.helper ? "Откроется, когда будет подключён аккаунт помощника — шаг " + num("s-assistant") + "." : "")
         : (!f.owner ? "Откроется после входа в аккаунт — шаг " + num("s-accounts") + "." : "")
     };
     // Подключённое раньше или в другом способе остаётся видно, чтобы его можно было отключить.
@@ -441,7 +505,7 @@
     var current = null;
     var steps = items.map(function (it) {
       var id = it[0], ok = done[id], optional = !!it[2], state;
-      if (ok) state = id === "s-chats" ? "выбрано: " + f.chats : id === "s-mode" ? (f.sc === "own" ? "как вы" : "сотрудник") : "готово";
+      if (ok) state = id === "s-chats" ? "выбрано: " + f.chats : id === "s-mode" ? (f.sc === "own" ? "через ваш аккаунт" : "через бота и помощника") : "готово";
       else if (optional) state = "по желанию";
       else if (!current && !lock[id]) { current = id; state = "сделайте сейчас"; }
       else if (!lock[id]) state = "можно сейчас";
@@ -467,7 +531,8 @@
 
   /* ------------------------------------------------ способ подключения */
 
-  var MODE_NAMES = { own: "Как вы", staff: "Сотрудник" };
+  // Названия способов — из единого словаря (Р-86); коды own и staff прежние.
+  var MODE_NAMES = { own: "Через ваш аккаунт", staff: "Через бота и помощника" };
 
   function renderMode(sc) {
     var chosen = sc.chosen || null;
@@ -476,8 +541,7 @@
     pill("mode", chosen ? "Выбрано: " + MODE_NAMES[chosen].toLowerCase() : "Не выбран", chosen ? "done" : "");
     // На экземпляре, где что-то уже подключено, подсказываем способ — но выбирает владелец.
     note("mode-hint", "info", !chosen && sc.suggested ? "Судя по тому, что уже подключено, это способ «" +
-      (sc.suggested === "own" ? "Ассистент видит всё как вы" : "Ассистент — отдельный сотрудник") +
-      "». Выберите его, чтобы страница показала оставшиеся шаги, — или другой." : "");
+      MODE_NAMES[sc.suggested] + "». Выберите его, чтобы страница показала оставшиеся шаги, — или другой." : "");
     ["own", "staff"].forEach(function (name) {
       var on = chosen === name, button = $("mode-" + name);
       $("choice-" + name).classList.toggle("is-chosen", on);
@@ -490,10 +554,17 @@
   function wireMode() {
     ["own", "staff"].forEach(function (name) {
       $("mode-" + name).addEventListener("click", function () {
-        var chosen = S && S.scenario && S.scenario.chosen;
-        if (chosen && chosen !== name && !confirm("Сменить способ подключения?\n\nНичего не удаляется и не отключается: собранное остаётся в архиве, подключённое — подключённым. Изменится набор шагов на странице. То, что не нужно в новом способе, вы отключите сами.")) return;
-        act(this, "mode-error", "PUT", "scenario", { scenario: name }, function () {
-          toast(name === "own" ? "Способ выбран. Дальше — шаги для входа в ваш аккаунт." : "Способ выбран. Дальше — бизнес-режим для личных чатов.");
+        var chosen = S && S.scenario && S.scenario.chosen, button = this;
+        var asked = chosen && chosen !== name
+          ? ask(button, "Сменить способ на «" + MODE_NAMES[name] + "»?", {
+              yes: "Сменить способ",
+              note: "Ничего не удаляется и не отключается: собранное остаётся в архиве, подключённое — подключённым. Изменится набор шагов на странице. То, что не нужно в новом способе, вы отключите сами." })
+          : Promise.resolve(true);
+        asked.then(function (ok) {
+          if (!ok) return;
+          act(button, "mode-error", "PUT", "scenario", { scenario: name }, function () {
+            toast(name === "own" ? "Способ выбран. Дальше — шаги для входа в ваш аккаунт." : "Способ выбран. Дальше — бизнес-режим для личных чатов.");
+          });
         });
       });
     });
@@ -512,9 +583,15 @@
 
   function wireMedia() {
     $("media-on").addEventListener("click", function () {
-      if (!confirm("Включить разбор фото и документов?\n\nФото, сканы и текст документов из переписки будут уходить модели — её провайдеру, как уже уходит текст сообщений. Сами файлы на сервере не хранятся: разобрав, сервис их удаляет.")) return;
-      act(this, "media-error", "PUT", "media", { enabled: true }, function () {
-        toast("Разбор включён. Свежие фото и документы разберутся в ближайшие минуты.");
+      var button = this;
+      ask(button, "Включить разбор фото и документов?", {
+        yes: "Включить разбор",
+        note: "Фото, сканы и текст документов из переписки будут уходить модели — её провайдеру, как уже уходит текст сообщений. Сами файлы на сервере не хранятся: разобрав, сервис их удаляет."
+      }).then(function (ok) {
+        if (!ok) return;
+        act(button, "media-error", "PUT", "media", { enabled: true }, function () {
+          toast("Разбор включён. Свежие фото и документы разберутся в ближайшие минуты.");
+        });
       });
     });
     $("media-off").addEventListener("click", function () {
@@ -718,12 +795,24 @@
     $("bot-change").addEventListener("click", function () { ui.botEditing = true; render(); input.focus(); });
     $("bot-form-cancel").addEventListener("click", function () { ui.botEditing = false; note("bot-error", "warn", ""); render(); });
     $("bot-remove").addEventListener("click", function () {
-      if (!confirm("Убрать токен бота согласований?\n\nБот перестанет присылать карточки, а привязка владельца к нему потеряет силу. Токен можно будет ввести снова.")) return;
-      act(this, "bot-error", "DELETE", "bot/token", {}, function () { toast("Токен бота убран."); });
+      var button = this;
+      ask(button, "Убрать токен бота согласований?", {
+        yes: "Убрать токен", danger: true,
+        note: "Бот перестанет присылать карточки, а привязка владельца к нему потеряет силу. Токен можно будет ввести снова."
+      }).then(function (ok) {
+        if (ok) act(button, "bot-error", "DELETE", "bot/token", {}, function () { toast("Токен бота убран."); });
+      });
     });
     $("bind-go").addEventListener("click", function () {
       var button = this;
-      if (S && S.bot.owner_bound && !confirm("Владелец уже привязан.\n\nЕсли новую ссылку откроет другой аккаунт, владелец сменится: ждущие черновики отклонятся, список доверенных очистится. Продолжить?")) return;
+      var asked = S && S.bot.owner_bound
+        ? ask(button, "Владелец уже привязан. Выдать новую ссылку привязки?", {
+            yes: "Выдать ссылку",
+            note: "Если новую ссылку откроет другой аккаунт, владелец сменится: ждущие черновики отклонятся, список доверенных очистится." })
+        : Promise.resolve(true);
+      asked.then(function (ok) { if (ok) bindLink(button); });
+    });
+    function bindLink(button) {
       busy(button, true);
       note("bind-error", "warn", "");
       call("POST", "bot/bind", {}).then(function (r) {
@@ -741,7 +830,7 @@
         render();
         refreshOverview();
       });
-    });
+    }
   }
 
   /* ------------------------------------------ 2. ключи приложения Telegram */
@@ -770,8 +859,12 @@
     $("keys-change").addEventListener("click", function () { ui.keysEditing = true; render(); $("keys-id").focus(); });
     $("keys-form-cancel").addEventListener("click", function () { ui.keysEditing = false; note("keys-error", "warn", ""); render(); });
     $("keys-remove").addEventListener("click", function () {
-      if (!confirm("Убрать ключи приложения Telegram?\n\nБез них сервис не сможет подключать аккаунты.")) return;
-      act(this, "keys-error", "DELETE", "tg/keys", {}, function () { toast("Ключи приложения убраны."); });
+      var button = this;
+      ask(button, "Убрать ключи приложения Telegram?", {
+        yes: "Убрать ключи", danger: true, note: "Без них сервис не сможет подключать аккаунты."
+      }).then(function (ok) {
+        if (ok) act(button, "keys-error", "DELETE", "tg/keys", {}, function () { toast("Ключи приложения убраны."); });
+      });
     });
   }
 
@@ -795,11 +888,11 @@
       nodes.push(el("label", { class: "check" }, [consent, el("span", { text: "Понимаю: на сервере будет храниться вход в мой основной аккаунт. Если Telegram сочтёт его подозрительным, ограничения коснутся моего номера. Отключить его можно в Telegram: «Настройки» → «Устройства»." })]));
     }
     if (role === "assistant" && !tg.owner_known) {
-      nodes.push(el("p", { class: "note info", text: "Сначала привяжите себя к боту согласований — шаг 1. Пока сервис не знает, какой аккаунт ваш, он не сможет отличить его от аккаунта ассистента." }));
+      nodes.push(el("p", { class: "note info", text: "Сначала привяжите себя к боту согласований — шаг 1. Пока сервис не знает, какой аккаунт ваш, он не сможет отличить его от аккаунта помощника." }));
       return nodes;
     }
     nodes.push(el("div", { class: "row" }, [el("button", {
-      class: "btn", type: "button", text: again ? "Войти заново" : role === "owner" ? "Показать QR-код для входа" : "Подключить аккаунт ассистента",
+      class: "btn", type: "button", text: again ? "Войти заново" : role === "owner" ? "Показать QR-код для входа" : "Подключить аккаунт помощника",
       onclick: function () {
         if (consent && !consent.checked) { toast("Отметьте, что понимаете: на сервере будет храниться вход в ваш основной аккаунт.", true); consent.focus(); return; }
         startLogin(role, this);
@@ -829,8 +922,13 @@
     }
     if (id !== null) {
       buttons.push(el("button", { class: "btn ghost danger small-btn", type: "button", text: "Выйти из аккаунта", onclick: function () {
-        if (!confirm("Выйти из аккаунта?\n\nСессия на сервере завершится. Уже сохранённые сообщения останутся в архиве.\n\nЕсли подключили не тот аккаунт — после выхода удалите его из архива в блоке «Аккаунты в архиве без подключения».")) return;
-        act(this, null, "POST", "tg/accounts/" + id + "/logout", {}, function () { toast("Сессия аккаунта завершена."); });
+        var button = this;
+        ask(button, "Выйти из аккаунта?", {
+          yes: "Выйти из аккаунта", danger: true,
+          note: "Сессия на сервере завершится. Уже сохранённые сообщения останутся в архиве. Если подключили не тот аккаунт — после выхода удалите его из архива в блоке «Аккаунты в архиве без подключения»."
+        }).then(function (ok) {
+          if (ok) act(button, null, "POST", "tg/accounts/" + id + "/logout", {}, function () { toast("Сессия аккаунта завершена."); });
+        });
       } }));
     }
     if (buttons.length) nodes.push(el("div", { class: "row" }, buttons));
@@ -872,9 +970,13 @@
       el("span", { class: "account-name", text: name }),
       el("span", { class: "small", text: "записан как " + account.role_name + " · сообщений: " + account.messages }),
       el("button", { class: "btn ghost danger small-btn", type: "button", text: "Удалить из архива", onclick: function () {
-        if (!confirm("Удалить «" + name + "» из архива?\n\nУдалятся его чаты и сообщения (" + account.messages +
-                     ") и всё, что сервис из них извлёк. Вернуть их нельзя. Если подключить этот аккаунт снова, переписка загрузится заново.")) return;
-        act(this, null, "DELETE", "tg/accounts/" + id, {}, function () { toast("Аккаунт удалён из архива. Теперь его можно подключить заново."); });
+        var button = this;
+        ask(button, "Удалить «" + name + "» из архива?", {
+          yes: "Удалить из архива (сообщений: " + number(account.messages) + ")", danger: true,
+          note: "Удалятся его чаты и сообщения и всё, что сервис из них извлёк. Вернуть их нельзя. Если подключить этот аккаунт снова, переписка загрузится заново."
+        }).then(function (ok) {
+          if (ok) act(button, null, "DELETE", "tg/accounts/" + id, {}, function () { toast("Аккаунт удалён из архива. Теперь его можно подключить заново."); });
+        });
       } })
     ]);
   }
@@ -900,7 +1002,7 @@
   }
 
   function showLogin(flow) {
-    text("tg-login-title", flow.role === "owner" ? "Вход в ваш аккаунт" : "Вход в аккаунт ассистента");
+    text("tg-login-title", flow.role === "owner" ? "Вход в ваш аккаунт" : "Вход в аккаунт помощника");
     var pending = flow.status === "pending", password = flow.status === "password_required";
     show("tg-login-qr-box", pending);
     show("tg-password-form", password);
@@ -1174,14 +1276,23 @@
       text: item.excluded ? "Вернуть в архив" : "Не сохранять",
       "aria-label": (item.excluded ? "Вернуть в архив чат " : "Не сохранять чат ") + (item.title || ""),
       onclick: function () {
-        var body = { peer_class: item.peer_class, tg_id: item.tg_id, excluded: !item.excluded };
-        if (!item.excluded) {
-          if (!confirm("Не сохранять этот чат?\n\nСервис перестанет принимать его сообщения из любого источника: из аккаунта, бизнес-режима и выгрузки.")) return;
-          body.purge = confirm("Стереть и то, что из этого чата уже сохранено?\n\nОК — стереть (вернуть будет нельзя). Отмена — оставить сохранённое.");
+        var button = this, body = { peer_class: item.peer_class, tg_id: item.tg_id, excluded: !item.excluded };
+        function send() {
+          act(button, "chats-error", "POST", "tg/accounts/" + ui.chatAccount + "/exclude", body, function (data) {
+            toast(data.excluded ? "Чат исключён из архива" + (data.purged ? ": стёрто сообщений — " + data.purged + "." : ".") : "Чат возвращён. Отметьте «читать», чтобы сервис снова его сохранял.");
+            loadChats(true);
+          });
         }
-        act(this, "chats-error", "POST", "tg/accounts/" + ui.chatAccount + "/exclude", body, function (data) {
-          toast(data.excluded ? "Чат исключён из архива" + (data.purged ? ": стёрто сообщений — " + data.purged + "." : ".") : "Чат возвращён. Отметьте «читать», чтобы сервис снова его сохранял.");
-          loadChats(true);
+        if (item.excluded) { send(); return; }
+        // Два явных выбора вместо двух системных окон подряд (С6): стирание — отдельная красная кнопка.
+        ask(button, "Не сохранять чат «" + (item.title || "без названия") + "»?", {
+          yes: "Только перестать сохранять",
+          extra: [{ text: "Перестать и стереть сохранённое", value: "purge", danger: true }],
+          note: "Сервис перестанет принимать его сообщения из любого источника: из аккаунта, бизнес-режима и выгрузки. Уже сохранённое останется, если не выбрать «стереть»; стёртое вернуть нельзя."
+        }).then(function (choice) {
+          if (!choice) return;
+          body.purge = choice === "purge";
+          send();
         });
       }
     });
@@ -1407,14 +1518,19 @@
     var depth = $("opt-depth"), depthText = depth.options[depth.selectedIndex] ? depth.options[depth.selectedIndex].textContent : "";
     var n = enabled ? sec.can_enable : sec.enabled;
     var question = enabled
-      ? "Читать все чаты раздела «" + sec.title + "» (" + n + ")?\n\nСервис загрузит их историю (глубина: " + depthText + ") и будет сохранять новые сообщения. Исключённые и служебные чаты останутся выключенными."
-      : "Выключить чтение всех чатов раздела «" + sec.title + "» (" + n + ")?\n\nУже сохранённые сообщения останутся в архиве.";
-    if (!confirm(question)) return;
+      ? "Читать все чаты раздела «" + sec.title + "» (" + n + ")?"
+      : "Выключить чтение всех чатов раздела «" + sec.title + "» (" + n + ")?";
+    var detail = enabled
+      ? "Сервис загрузит их историю (глубина: " + depthText + ") и будет сохранять новые сообщения. Исключённые и служебные чаты останутся выключенными."
+      : "Уже сохранённые сообщения останутся в архиве.";
     var body = { section: sec.id, enabled: enabled, q: $("chats-q").value.trim(), kind: $("chats-kind").value, only: $("chats-only").checked };
-    act(button, "chats-error", "POST", "tg/accounts/" + ui.chatAccount + "/bulk", body, function (data) {
-      toast((enabled ? "Включено чатов: " : "Выключено чатов: ") + data.changed + (data.skipped ? ". Пропущено исключённых: " + data.skipped : "") + ".");
-      ui.sectionItems[sec.id] = null;
-      loadChats(true);
+    ask(button, question, { yes: enabled ? "Читать все (" + n + ")" : "Выключить все (" + n + ")", note: detail }).then(function (ok) {
+      if (!ok) return;
+      act(button, "chats-error", "POST", "tg/accounts/" + ui.chatAccount + "/bulk", body, function (data) {
+        toast((enabled ? "Включено чатов: " : "Выключено чатов: ") + data.changed + (data.skipped ? ". Пропущено исключённых: " + data.skipped : "") + ".");
+        ui.sectionItems[sec.id] = null;
+        loadChats(true);
+      });
     });
   }
 
@@ -1481,10 +1597,16 @@
     $("chats-bulk").addEventListener("click", function () {
       var kind = $("chats-kind").value;
       if (!kind) return;
-      if (!confirm("Читать все " + KIND_BULK[kind] + " этого аккаунта (" + ui.chatsTotal + ")?\n\nСервис загрузит их историю на выбранную глубину и будет сохранять новые сообщения. Исключённые чаты останутся исключёнными.")) return;
-      act(this, "chats-error", "POST", "tg/accounts/" + ui.chatAccount + "/sync", { enabled: true, kind: kind }, function (data) {
-        toast("Включено чатов: " + data.enabled + ".");
-        loadChats(true);
+      var button = this;
+      ask(button, "Читать все " + KIND_BULK[kind] + " этого аккаунта (" + ui.chatsTotal + ")?", {
+        yes: "Читать все",
+        note: "Сервис загрузит их историю на выбранную глубину и будет сохранять новые сообщения. Исключённые чаты останутся исключёнными."
+      }).then(function (ok) {
+        if (!ok) return;
+        act(button, "chats-error", "POST", "tg/accounts/" + ui.chatAccount + "/sync", { enabled: true, kind: kind }, function (data) {
+          toast("Включено чатов: " + data.enabled + ".");
+          loadChats(true);
+        });
       });
     });
 
@@ -1500,14 +1622,23 @@
     $("opt-depth").addEventListener("change", function () {
       saveOptions({ backfill_months: this.value === "all" ? null : Number(this.value) }, this);
     });
-    $("opt-auto-personal").addEventListener("change", function () {
-      if (this.checked && !confirm("Брать новые личные чаты в архив без вашего выбора?\n\nЛюбой, кто впервые напишет на этот аккаунт, попадёт в архив сам.")) { this.checked = false; return; }
-      saveOptions({ auto_personal: this.checked }, this);
-    });
-    $("opt-auto-groups").addEventListener("change", function () {
-      if (this.checked && !confirm("Брать новые группы и каналы в архив без вашего выбора?\n\nГруппа, в которую добавят этот аккаунт, попадёт в архив сама.")) { this.checked = false; return; }
-      saveOptions({ auto_groups: this.checked }, this);
-    });
+    // Расширение (флажок включают) — после вопроса в строке; сужение — сразу.
+    function autoOption(box, field, question, detail) {
+      box.addEventListener("change", function () {
+        if (!box.checked) { saveOptions(makeBody(false), box); return; }
+        box.checked = false;
+        ask(box, question, { yes: "Да, брать", note: detail }).then(function (ok) {
+          if (!ok) return;
+          box.checked = true;
+          saveOptions(makeBody(true), box);
+        });
+      });
+      function makeBody(on) { var b = {}; b[field] = on; return b; }
+    }
+    autoOption($("opt-auto-personal"), "auto_personal", "Брать новые личные чаты в архив без вашего выбора?",
+      "Любой, кто впервые напишет на этот аккаунт, попадёт в архив сам.");
+    autoOption($("opt-auto-groups"), "auto_groups", "Брать новые группы и каналы в архив без вашего выбора?",
+      "Группа, в которую добавят этот аккаунт, попадёт в архив сама.");
   }
 
   /* ------------------------------------- 5. выгрузка из Telegram Desktop */
@@ -1580,9 +1711,15 @@
     buttons.push(el("button", { class: "btn ghost small-btn" + (item.state === "running" ? " danger" : ""), type: "button",
       text: item.state === "running" ? "Остановить импорт" : item.file_kept ? "Удалить файл с сервера" : "Убрать из списка",
       onclick: function () {
-        if (item.state === "running" && !confirm("Остановить импорт?\n\nУже записанные сообщения останутся в архиве.")) return;
-        delete ui.scans[id]; delete ui.exclude[id];
-        act(this, "import-error", "DELETE", "imports/" + id, {});
+        var button = this;
+        var asked = item.state === "running"
+          ? ask(button, "Остановить импорт?", { yes: "Остановить импорт", note: "Уже записанные сообщения останутся в архиве." })
+          : Promise.resolve(true);
+        asked.then(function (ok) {
+          if (!ok) return;
+          delete ui.scans[id]; delete ui.exclude[id];
+          act(button, "import-error", "DELETE", "imports/" + id, {});
+        });
       } }));
     nodes.push(el("div", { class: "row" }, buttons));
     return el("div", { class: "import-item" }, nodes);
@@ -1763,9 +1900,19 @@
   function startSubscription(button, fresh) {
     var body = { "new": !!fresh };
     if (S && S.llm && S.llm.key.source === "page") {
-      if (!confirm("Сейчас своя модель сервиса работает по ключу API.\n\nПодписка ChatGPT его заменит: после входа ключ будет удалён с сервера. Продолжить?")) return;
-      body["switch"] = true;
+      ask(button, "Сейчас своя модель сервиса работает по ключу API. Заменить его подпиской ChatGPT?", {
+        yes: "Заменить подпиской", note: "После входа ключ будет удалён с сервера."
+      }).then(function (ok) {
+        if (!ok) return;
+        body["switch"] = true;
+        goSubscription(button, body);
+      });
+      return;
     }
+    goSubscription(button, body);
+  }
+
+  function goSubscription(button, body) {
     busy(button, true);
     note("sub-error", "warn", "");
     call("POST", "llm/chatgpt/start", body).then(function (r) {
@@ -1780,8 +1927,10 @@
   function wireSubscription() {
     $("sub-start").addEventListener("click", function () { startSubscription(this, false); });
     $("sub-new").addEventListener("click", function () {
-      if (!confirm("Войти другой учётной записью ChatGPT?\n\nПосле входа сервис будет пользоваться подпиской новой учётной записи.")) return;
-      startSubscription(this, true);
+      var button = this;
+      ask(button, "Войти другой учётной записью ChatGPT?", {
+        yes: "Войти другой", note: "После входа сервис будет пользоваться подпиской новой учётной записи."
+      }).then(function (ok) { if (ok) startSubscription(button, true); });
     });
     $("sub-paste").addEventListener("submit", function (event) {
       event.preventDefault();
@@ -1810,9 +1959,15 @@
       act(null, "sub-error", "PUT", "llm/chatgpt/model", { model: model }, function () { toast("Модель подписки выбрана."); });
     });
     $("sub-remove").addEventListener("click", function () {
-      if (!confirm("Выйти из подписки ChatGPT?\n\nСервис перестанет обращаться к модели по подписке; сессия у OpenAI будет отозвана.")) return;
-      act(this, "sub-error", "DELETE", "llm/chatgpt", {}, function (data) {
-        toast(data.revoked ? "Вы вышли из подписки ChatGPT." : "Вы вышли из подписки, но OpenAI не подтвердил отзыв. Отключить доступ можно в настройках ChatGPT.", !data.revoked);
+      var button = this;
+      ask(button, "Выйти из подписки ChatGPT?", {
+        yes: "Выйти из подписки", danger: true,
+        note: "Сервис перестанет обращаться к модели по подписке; сессия у OpenAI будет отозвана."
+      }).then(function (ok) {
+        if (!ok) return;
+        act(button, "sub-error", "DELETE", "llm/chatgpt", {}, function (data) {
+          toast(data.revoked ? "Вы вышли из подписки ChatGPT." : "Вы вышли из подписки, но OpenAI не подтвердил отзыв. Отключить доступ можно в настройках ChatGPT.", !data.revoked);
+        });
       });
     });
   }
@@ -1822,34 +1977,61 @@
     $("llm-form").addEventListener("submit", function (event) {
       event.preventDefault();
       var key = $("llm-key"), body = { api_key: key.value.trim(), base_url: $("llm-url").value.trim(), model: $("llm-model").value.trim() };
-      if (S && S.llm && S.llm.way === "subscription") {
-        if (!confirm("Сейчас своя модель сервиса работает по подписке ChatGPT.\n\nКлюч API её заменит: сервис выйдет из подписки. Продолжить?")) return;
-        body["switch"] = true;
+      function save() {
+        key.value = "";
+        act($("llm-save"), "llm-error", "PUT", "llm", body, function (data) {
+          ui.signatures.llm = "";
+          toast("Модель ответила, ключ сохранён" + (data.model ? ": " + data.model : "") + ".");
+        });
       }
-      key.value = "";
-      act($("llm-save"), "llm-error", "PUT", "llm", body, function (data) {
-        ui.signatures.llm = "";
-        toast("Модель ответила, ключ сохранён" + (data.model ? ": " + data.model : "") + ".");
-      });
+      if (S && S.llm && S.llm.way === "subscription") {
+        ask($("llm-save"), "Сейчас своя модель сервиса работает по подписке ChatGPT. Заменить её ключом API?", {
+          yes: "Заменить ключом", note: "Сервис выйдет из подписки."
+        }).then(function (ok) {
+          if (!ok) return;
+          body["switch"] = true;
+          save();
+        });
+        return;
+      }
+      save();
     });
     $("llm-remove").addEventListener("click", function () {
-      if (!confirm("Убрать свою модель сервиса?\n\nСервис перестанет обращаться к модели сам.")) return;
-      act(this, "llm-error", "DELETE", "llm", {}, function () { ui.signatures.llm = ""; toast("Своя модель убрана."); });
+      var button = this;
+      ask(button, "Убрать свою модель сервиса?", {
+        yes: "Убрать модель", danger: true, note: "Сервис перестанет обращаться к модели сам."
+      }).then(function (ok) {
+        if (ok) act(button, "llm-error", "DELETE", "llm", {}, function () { ui.signatures.llm = ""; toast("Своя модель убрана."); });
+      });
     });
   }
 
   /* --------------------------------------------------- 8. что собрано */
 
-  function fact(title, value) {
-    return el("div", { class: "fact" }, [el("b", { text: title }), el("span", { class: "value", text: value })]);
+  /* admin — команда для того, кто обслуживает сервер: свёрнутой строкой мелко, не в тексте владельцу. */
+  function fact(title, value, admin) {
+    return el("div", { class: "fact" }, [el("b", { text: title }), el("span", { class: "value", text: value }),
+      admin ? el("details", { class: "for-admin" }, [el("summary", { text: "Для того, кто обслуживает сервер" }),
+                                                     el("p", {}, [el("code", { text: admin })])]) : null]);
+  }
+
+  /* Что сейчас с ответами без отправки — по способу работы (Х4, Р-86). */
+  function sendingFaq(sending) {
+    var mode = S && S.scenario && S.scenario.chosen;
+    if (sending) {
+      return "Отправка сообщений включена на сервере. Ассистент отправляет только после вашего «Да» в боте согласований или по правилам, которые вы разрешили; отсюда отправку не включить и не выключить.";
+    }
+    var own = "В способе «Через ваш аккаунт» пока только репетиция: ассистент пишет, что ответил бы, вы оцениваете; ничего не отправляется.";
+    var staff = "В способе «Через бота и помощника» — черновики ответов, если вы их включите (в боте согласований командой /prepare on): ассистент готовит ответ и показывает вам; отправка — только после вашего нажатия и когда она включена на сервере.";
+    return "Сейчас нет: отправка сообщений выключена на сервере и отсюда не включается. " +
+      (mode === "own" ? own : mode === "staff" ? staff : own + " " + staff) +
+      " Включить отправку — отдельное решение, которое принимаете вы.";
   }
 
   function renderSummary(data) {
     var a = data.archive || {};
     $("sending-note").hidden = !!a.sending;
-    text("faq-sending", a.sending
-      ? "Отправка сообщений включена в настройках сервера. Ассистент отправляет только после вашего «Да» в боте согласований или по правилам, которые вы разрешили; с этой страницы отправку не включить и не выключить."
-      : "Сейчас нет: отправка сообщений выключена в настройках сервера и с этой страницы не включается. Ассистент читает, запоминает и готовит черновики. Включить отправку — отдельное решение, которое принимаете вы.");
+    text("faq-sending", sendingFaq(a.sending));
     text("collected", number(a.messages));
     renderIfChanged("tiles", a, function () {
       return [
@@ -1857,28 +2039,30 @@
       ].map(function (t) { return el("div", { class: "tile" }, [el("b", { text: number(t[1]) }), el("span", { text: t[0] })]); });
     });
     renderIfChanged("facts", a, function () {
+      var ASK_ADMIN = " Включает тот, кто обслуживает сервер, — попросите его.";
       var search = !a.embeddings_enabled
-        ? "Выключен: поиск идёт по словам. Включает оператор на сервере: ./ops/embeddings.sh on"
-        : a.embeddings_problem ? "Включён, но модель не отвечает. Проверка на сервере: ./ops/embeddings.sh status"
+        ? "Выключен: поиск идёт по словам." + ASK_ADMIN
+        : a.embeddings_problem ? "Включён, но модель не отвечает. Попросите того, кто обслуживает сервер, проверить."
         : "Включён. Посчитано сообщений: " + number(a.embeddings_embedded) + (a.embeddings_left ? ", осталось: " + number(a.embeddings_left) : "");
       var guard = !a.guard_enabled
-        ? "Выключена: входящие сообщения ассистент читает без проверки. Включает оператор на сервере: ./ops/guard.sh on"
+        ? "Выключена: входящие сообщения ассистент читает без проверки." + ASK_ADMIN
         : "Включена" + (a.guard_model_used ? "" : " (без модели — только правила)") + ". Проверено: " + number(a.guard_checked) + ", скрыто: " + number(a.guard_hidden) +
           (a.guard_problem ? ". Модель сейчас не отвечает." : "");
       return [
         fact("Последнее новое сообщение", a.last_message_seen_at ? when(a.last_message_seen_at) : "ещё не было"),
         fact("Очередь заданий", "ждут: " + number(a.jobs_waiting) + ", не выполнено: " + number(a.jobs_failed)),
-        fact("Поиск по смыслу", search),
-        fact("Защита от внедрённых инструкций", guard),
+        fact("Поиск по смыслу", search, !a.embeddings_enabled ? "./ops/embeddings.sh on" : a.embeddings_problem ? "./ops/embeddings.sh status" : null),
+        fact("Защита от внедрённых инструкций", guard, !a.guard_enabled ? "./ops/guard.sh on" : null),
         fact("Голосовые и «кружки»", !a.voice_enabled
-          ? "Не расшифровываются: ассистент видит, что было голосовое, но не его содержание. Включает оператор на сервере: ./ops/asr.sh on"
+          ? "Не расшифровываются: ассистент видит, что было голосовое, но не его содержание." + ASK_ADMIN
           : a.voice_problem ? "Расшифровка включена, но распознавание сейчас не отвечает. Ждут: " + number(a.voice_pending)
-          : "Расшифровываются. Готово: " + number(a.voice_done) + (a.voice_pending ? ", ждут: " + number(a.voice_pending) : "")),
+          : "Расшифровываются. Готово: " + number(a.voice_done) + (a.voice_pending ? ", ждут: " + number(a.voice_pending) : ""),
+          !a.voice_enabled ? "./ops/asr.sh on" : null),
         fact("Фото и документы", !a.media_enabled
           ? "Не разбираются: ассистент видит, что было фото или файл, но не что в нём. Включается в шаге «Фото и документы»."
           : "Разбираются. Готово: " + number(a.media_done) + ((a.media_pending || a.media_asking) ? ", ждут: " + number((a.media_pending || 0) + (a.media_asking || 0)) : "") +
             (a.media_skipped ? ", пропущено: " + number(a.media_skipped) : "") + (a.media_failed ? ", не получилось: " + number(a.media_failed) : "")),
-        fact("Отправка сообщений", a.sending ? "Включена в настройках сервера." : "Выключена. Включается только в настройках сервера, не здесь.")
+        fact("Отправка сообщений", a.sending ? "Включена на сервере." : "Выключена. Включается только на сервере, не здесь.")
       ];
     });
     [["audit-key", data.audit_key], ["audit", data.audit]].forEach(function (pair) {
@@ -1925,7 +2109,7 @@
     { id: "people", label: "Люди", load: loadPeople, draw: drawPeople },
     { id: "projects", label: "Проекты", load: loadProjects, draw: drawProjects },
     { id: "profile", label: "Профиль", load: loadProfile, draw: drawProfile },
-    { id: "pending", label: "Ждут решения", load: loadPending, draw: drawPending,
+    { id: "pending", label: "Согласования", load: loadPending, draw: drawPending,
       count: function () { return mem.pending ? mem.pending.total : 0; } }
   ];
 
@@ -1947,7 +2131,7 @@
 
   function memPill() {
     var n = mem.pending ? mem.pending.total : 0;
-    pill("memory", n ? "ждут решения: " + n : "", n ? "todo" : "");
+    pill("memory", n ? "на согласовании: " + n : "", n ? "todo" : "");
   }
 
   /* Ждущее решения нужно и для числа на свёрнутой карточке: спрашивается вместе со счётчиками. */
@@ -2072,15 +2256,20 @@
         el("button", { class: "btn ghost danger small-btn", type: "button", text: "Неверно",
           "aria-label": "Неверно: " + (f.slot ? f.slot + ": " : "") + f.text,
           onclick: function () {
-            if (!confirm("Отметить как неверное?\n\nАссистент перестанет на это опираться. Если это сменило прежнее, прежнее снова будет действовать.")) return;
             var button = this;
-            busy(button, true);
-            error.hidden = true;
-            call("POST", "memory/facts/" + f.id + "/retract", {}).then(function (r) {
-              if (!r.ok) { busy(button, false); error.textContent = r.error; error.hidden = false; return; }
-              toast("Отмечено как неверное.");
-              refreshOverview();
-              after();
+            ask(button, "Отметить как неверное?", {
+              yes: "Неверно",
+              note: "Ассистент перестанет на это опираться. Если это сменило прежнее, прежнее снова будет действовать."
+            }).then(function (ok) {
+              if (!ok) return;
+              busy(button, true);
+              error.hidden = true;
+              call("POST", "memory/facts/" + f.id + "/retract", {}).then(function (r) {
+                if (!r.ok) { busy(button, false); error.textContent = r.error; error.hidden = false; return; }
+                toast("Отмечено как неверное.");
+                refreshOverview();
+                after();
+              });
             });
           } })
       ]);
@@ -2181,7 +2370,7 @@
     if (!items.length) {
       return el("p", { id: "mem-list", class: "note", text: mem.q
         ? "Ничего не нашлось. Попробуйте другое слово или часть имени."
-        : "Страниц пока нет. Они появятся после ночной обработки переписки: ассистент предложит завести страницы о людях, с кем вы больше всего переписываетесь, — в боте согласований и во вкладке «Ждут решения»." });
+        : "Страниц пока нет. Они появятся после ночной обработки переписки: ассистент предложит завести страницы о людях, с кем вы больше всего переписываетесь, — в боте согласований и во вкладке «Согласования»." });
     }
     return el("ul", { id: "mem-list", class: "mem-list" }, items.map(function (p) {
       var meta = [p.updated ? "обновлена " + day(p.updated) : "ещё не записана"];
@@ -2294,7 +2483,7 @@
         onclick: function () { mem.creating = true; openAndFocus(); } })])
     ];
     nodes.push(active.length ? el("ul", { class: "mem-list", id: "mem-projects" }, active.map(row))
-      : el("p", { class: "note", text: archived.length ? "Действующих проектов нет." : "Проектов пока нет. Заведите проект сами или дождитесь предложения ассистента — оно придёт в бот согласований и во вкладку «Ждут решения»." }));
+      : el("p", { class: "note", text: archived.length ? "Действующих проектов нет." : "Проектов пока нет. Заведите проект сами или дождитесь предложения ассистента — оно придёт в бот согласований и во вкладку «Согласования»." }));
     if (archived.length) {
       nodes.push(el("details", { class: "sub mem-archive" }, [
         el("summary", { text: "В архиве: " + archived.length }),
@@ -2437,17 +2626,22 @@
       nodes.push(memSection("Проект закончился?", "В архиве страница останется, но перестанет обновляться.", [
         el("div", { class: "row" }, [el("button", { class: "btn ghost danger", id: "mem-archive", type: "button", text: "В архив",
           onclick: function () {
-            if (!confirm("Перенести проект «" + p.title + "» в архив?\n\nСтраница останется, но сводка перестанет обновляться, а новые договорённости из его чатов не будут к нему относиться.")) return;
             var button = this;
-            busy(button, true);
-            call("POST", "memory/projects/" + p.id + "/archive", {}).then(function (r) {
-              busy(button, false);
-              if (!r.ok) { error.textContent = r.error; error.hidden = false; return; }
-              toast("Проект перенесён в архив.");
-              refreshOverview();
-              mem.projectId = null;
-              mem.project = null;
-              showMemory(true);
+            ask(button, "Перенести проект «" + p.title + "» в архив?", {
+              yes: "В архив",
+              note: "Страница останется, но сводка перестанет обновляться, а новые договорённости из его чатов не будут к нему относиться."
+            }).then(function (ok) {
+              if (!ok) return;
+              busy(button, true);
+              call("POST", "memory/projects/" + p.id + "/archive", {}).then(function (r) {
+                busy(button, false);
+                if (!r.ok) { error.textContent = r.error; error.hidden = false; return; }
+                toast("Проект перенесён в архив.");
+                refreshOverview();
+                mem.projectId = null;
+                mem.project = null;
+                showMemory(true);
+              });
             });
           } })]),
         error
@@ -2468,7 +2662,7 @@
   function drawProfile() {
     var p = mem.profile || { facts: [], owner: "", editable: true };
     return [
-      el("p", { text: "Что ассистент знает о вас и каким правилам следует. Факты о вас появляются здесь только после вашего «✓» — в боте согласований или во вкладке «Ждут решения»." }),
+      el("p", { text: "Что ассистент знает о вас и каким правилам следует. Факты о вас появляются здесь только после вашего «Запомнить» — в боте согласований или во вкладке «Согласования»." }),
       ownerBlock({
         title: "Ваши правила и указания", label: "Текст правил", value: p.owner, editable: p.editable,
         path: "memory/profile/owner-block", saved: function (v) { p.owner = v; },
@@ -2477,7 +2671,7 @@
         placeholder: "Например: отвечать коротко; по выходным не беспокоить, кроме срочного по стройке; платежи — только с моего «да»."
       }),
       factsSection("Что ассистент знает о вас", "Одобренные вами факты: должность, компания, город и подобное.",
-        p.facts, "Пока ничего. Когда ассистент заметит в переписке что-то о вас, он спросит — в боте согласований и во вкладке «Ждут решения».",
+        p.facts, "Пока ничего. Когда ассистент заметит в переписке что-то о вас, он спросит — в боте согласований и во вкладке «Согласования».",
         function () { showMemory(true); })
     ];
   }
@@ -2525,7 +2719,7 @@
   function drawPending() {
     var d = mem.pending || {};
     var groups = { projects: d.projects || [], owner_facts: d.owner_facts || [], pages: d.pages || [], commitments: d.commitments || [] };
-    var nodes = [el("p", { class: "small", text: "То же, что бот согласований присылает с кнопками ✓ и ✗. Решение здесь действует сразу — как нажатие в боте." })];
+    var nodes = [el("p", { class: "small", text: "То же, что бот согласований присылает карточками с кнопками. Решение здесь действует сразу — как нажатие в боте." })];
     if (!d.total) {
       nodes.push(el("p", { class: "note ok", text: "Сейчас ничего не ждёт вашего решения." }));
       return nodes;
@@ -2538,20 +2732,20 @@
             el("span", { class: "mem-meta", text: "Почему предложено: " + p.reason }),
             p.chats.length ? el("span", { class: "mem-meta", text: "Чаты: " + p.chats.join(", ") }) : null
           ],
-            ["✓ Завести проект", function (b, item) { decide(b, item, path, { accept: true }, "Проект заведён."); }],
-            ["✗ Не нужно", function (b, item) { decide(b, item, path, { accept: false }, "Не заводим."); }]);
+            ["Завести проект", function (b, item) { decide(b, item, path, { accept: true }, "Проект заведён."); }],
+            ["Не нужно", function (b, item) { decide(b, item, path, { accept: false }, "Не заводим."); }]);
         }))]));
     }
     if (groups.owner_facts.length) {
-      nodes.push(memSection("Факты о вас", "Верно — ассистент запомнит это в вашем профиле. Неверно — забудет и больше не спросит об этом сообщении.",
+      nodes.push(memSection("Факты о вас", "«Запомнить» — ассистент запомнит это в вашем профиле. «Не запоминать» — забудет и больше не спросит об этом сообщении.",
         [el("ul", { class: "mem-items" }, groups.owner_facts.map(function (f) {
           var path = "memory/pending/owner-facts/" + f.id;
           return pendingItem(f.slot ? f.slot + ": " + f.text : f.text, [
             el("span", { class: "mem-meta", text: "с " + day(f.since) + (f.said ? "; " + f.said : "") }),
             f.quote ? el("q", { class: "mem-quote", text: f.quote }) : null
           ],
-            ["✓ Верно", function (b, item) { decide(b, item, path, { accept: true, fingerprint: f.fingerprint }, "Запомнено в профиле."); }],
-            ["✗ Неверно", function (b, item) { decide(b, item, path, { accept: false }, "Не запоминаем."); }]);
+            ["Запомнить", function (b, item) { decide(b, item, path, { accept: true, fingerprint: f.fingerprint }, "Запомнено в профиле."); }],
+            ["Не запоминать", function (b, item) { decide(b, item, path, { accept: false }, "Не запоминаем."); }]);
         }))]));
     }
     if (groups.pages.length) {
@@ -2559,12 +2753,12 @@
         [el("ul", { class: "mem-items" }, groups.pages.map(function (p) {
           var path = "memory/pending/pages/" + p.person_id;
           return pendingItem(p.name, [el("span", { class: "mem-meta", text: "Почему предложено: " + p.reason })],
-            ["✓ Завести страницу", function (b, item) { decide(b, item, path, { accept: true }, "Страница будет заведена."); }],
-            ["✗ Не нужно", function (b, item) { decide(b, item, path, { accept: false }, "Не заводим."); }]);
+            ["Завести страницу", function (b, item) { decide(b, item, path, { accept: true }, "Страница будет заведена."); }],
+            ["Не нужно", function (b, item) { decide(b, item, path, { accept: false }, "Не заводим."); }]);
         }))]));
     }
     if (groups.commitments.length) {
-      nodes.push(memSection("Новые договорённости из переписки", "Верно — ассистент запишет договорённость и будет напоминать о ней. Неверно — забудет.",
+      nodes.push(memSection("Новые договорённости из переписки", "«Верно» — ассистент запишет договорённость и будет напоминать о ней. «Не так» — забудет.",
         [el("ul", { class: "mem-items" }, groups.commitments.map(function (c) {
           var path = "memory/pending/commitments/" + c.id;
           return pendingItem(c.who, [
@@ -2572,8 +2766,8 @@
             el("span", { class: "mem-meta", text: c.due }),
             c.quote ? el("q", { class: "mem-quote", text: c.quote }) : null
           ],
-            ["✓ Верно", function (b, item) { decide(b, item, path, { accept: true, fingerprint: c.fingerprint }, "Договорённость записана."); }],
-            ["✗ Неверно", function (b, item) { decide(b, item, path, { accept: false }, "Отклонено."); }]);
+            ["Верно", function (b, item) { decide(b, item, path, { accept: true, fingerprint: c.fingerprint }, "Договорённость записана."); }],
+            ["Не так", function (b, item) { decide(b, item, path, { accept: false }, "Отклонено."); }]);
         }))]));
     }
     return nodes;
@@ -2707,15 +2901,20 @@
         onclick: function () { ui.sphEdit = sp.id; drawSpheres(); } }),
       el("button", { class: "btn ghost small-btn danger", type: "button", text: "Удалить",
         onclick: function () {
-          if (!confirm("Удалить сферу «" + sp.title + "»?\n\nОна будет снята с чатов (" + sp.chats + ") и проектов (" + sp.projects + "). Сами чаты, сохранённые сообщения и проекты останутся.")) return;
           var button = this;
-          busy(button, true);
-          call("DELETE", "spheres/" + sp.id).then(function (r) {
-            busy(button, false);
-            if (!r.ok) { toast(r.error, true); return; }
-            toast("Сфера удалена. Чаты и проекты остались.");
-            refreshSpheres();
-            if (ui.chatsLayout) loadChats(true);
+          ask(button, "Удалить сферу «" + sp.title + "»?", {
+            yes: "Удалить сферу", danger: true,
+            note: "Она будет снята с чатов (" + sp.chats + ") и проектов (" + sp.projects + "). Сами чаты, сохранённые сообщения и проекты останутся."
+          }).then(function (ok) {
+            if (!ok) return;
+            busy(button, true);
+            call("DELETE", "spheres/" + sp.id).then(function (r) {
+              busy(button, false);
+              if (!r.ok) { toast(r.error, true); return; }
+              toast("Сфера удалена. Чаты и проекты остались.");
+              refreshSpheres();
+              if (ui.chatsLayout) loadChats(true);
+            });
           });
         } })
     ]));
@@ -2759,7 +2958,7 @@
       if (!items.length) box.appendChild(el("p", { class: "mem-note", text: "В сфере пока нет чатов. Добавьте их здесь, в строке чата в шаге «Какие чаты читать» или сделайте сферу из папки Telegram." }));
       else box.appendChild(el("ul", { class: "mem-items" }, items.map(function (c) {
         var meta = [c.enabled ? "читается" : c.excluded ? "не сохраняется" : "не читается"];
-        if (c.account_role === "assistant") meta.push("аккаунт ассистента");
+        if (c.account_role === "assistant") meta.push("аккаунт помощника");
         return el("li", { class: "mem-chat" }, [
           el("span", {}, [c.title || "без названия", el("span", { class: "mem-meta", text: " · " + meta.join(" · ") })]),
           el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать из сферы чат " + (c.title || ""),
@@ -2841,7 +3040,7 @@
           select, el("button", { class: "btn ghost small-btn", type: "button", text: "Предлагать новые",
           onclick: function () { linkFolder(Number(select.value), f.account_id, f.folder_id, true, this, function () { loadSphereFolders().then(drawSphereFolders); }); } })]));
       }
-      var meta = f.count + " " + plural(f.count, "чат", "чата", "чатов") + (f.account_role === "assistant" ? " · аккаунт ассистента" : "");
+      var meta = f.count + " " + plural(f.count, "чат", "чата", "чатов") + (f.account_role === "assistant" ? " · аккаунт помощника" : "");
       if (made) meta += " · сфера «" + made.title + "»" + (linked ? ", новые предлагаются" : "");
       list.appendChild(el("li", { class: "sph-folder" }, [
         el("div", { class: "sph-main" }, [
@@ -2918,7 +3117,7 @@
     $("nt-digest").value = String(s.digest_minutes);
     $("nt-quiet-from").value = s.quiet_from;
     $("nt-quiet-to").value = s.quiet_to;
-    text("nt-tz", "по часам " + (d.timezone || "сервера"));
+    text("nt-tz", tzWords(d.timezone));
     nt.people = d.people.slice();
     var list = $("nt-spheres");
     list.textContent = "";
@@ -3191,15 +3390,20 @@
           onclick: function () { wt.hitsRule = wt.hitsRule === rule.id ? null : rule.id; loadHits().then(drawHits); } }),
         el("button", { class: "btn ghost small-btn danger", type: "button", text: "Удалить",
           onclick: function () {
-            if (!confirm("Удалить правило «" + rule.name + "» вместе с журналом его срабатываний?\n\nЕсли нужно только остановить его — нажмите «Выключить».")) return;
             var button = this;
-            busy(button, true);
-            call("DELETE", "watch/" + rule.id).then(function (r) {
-              busy(button, false);
-              if (!r.ok) { toast(r.error, true); return; }
-              if (wt.hitsRule === rule.id) wt.hitsRule = null;
-              toast("Правило удалено.");
-              showWatch();
+            ask(button, "Удалить правило «" + rule.name + "» вместе с журналом его срабатываний?", {
+              yes: "Удалить правило", danger: true,
+              note: "Если нужно только остановить его — нажмите «Выключить»."
+            }).then(function (ok) {
+              if (!ok) return;
+              busy(button, true);
+              call("DELETE", "watch/" + rule.id).then(function (r) {
+                busy(button, false);
+                if (!r.ok) { toast(r.error, true); return; }
+                if (wt.hitsRule === rule.id) wt.hitsRule = null;
+                toast("Правило удалено.");
+                showWatch();
+              });
             });
           } })
       ])
@@ -3369,13 +3573,17 @@
 
   function wireRetry() {
     $("retry-run").addEventListener("click", function () {
-      var d = rt.data || { media: 0, requests: 0 };
-      if (!confirm("Повторить то, что не получилось?\n\nФото и документы (" + d.media + ") и разбор переписки (" + d.requests +
-                   ") снова уйдут провайдеру модели и потратят запросы.")) return;
-      var since = $("retry-since").value;
-      act(this, "retry-error", "POST", "retry", since ? { since: since } : {}, function (out) {
-        toast("Возвращено в работу: вложений — " + out.media + ", запросов разбора — " + out.requests + ".");
-        refreshRetry();
+      var d = rt.data || { media: 0, requests: 0 }, button = this;
+      ask(button, "Повторить то, что не получилось?", {
+        yes: "Повторить",
+        note: "Фото и документы (" + d.media + ") и разбор переписки (" + d.requests + ") снова уйдут провайдеру модели и потратят запросы."
+      }).then(function (ok) {
+        if (!ok) return;
+        var since = $("retry-since").value;
+        act(button, "retry-error", "POST", "retry", since ? { since: since } : {}, function (out) {
+          toast("Возвращено в работу: вложений — " + out.media + ", запросов разбора — " + out.requests + ".");
+          refreshRetry();
+        });
       });
     });
   }
@@ -3391,8 +3599,12 @@
       call("POST", "logout", {}, true).then(function () { saveKey(""); loginScreen(""); });
     });
     $("logout-all").addEventListener("click", function () {
-      if (!confirm("Завершить все сессии этой страницы — на всех устройствах?\n\nВойти снова можно будет по новой ссылке: ./ops/setup-link.sh")) return;
-      call("POST", "logout-all", {}, true).then(function () { saveKey(""); loginScreen(""); });
+      ask(this, "Завершить все входы в «Настройки Штурмана» — на всех устройствах?", {
+        yes: "Выйти везде", danger: true,
+        note: "Войти снова можно будет по коду от бота согласований или по новой ссылке от того, кто обслуживает сервер."
+      }).then(function (ok) {
+        if (ok) call("POST", "logout-all", {}, true).then(function () { saveKey(""); loginScreen(""); });
+      });
     });
     document.addEventListener("visibilitychange", function () { if (!document.hidden && key) { refresh(); refreshOverview(); } });
     // Вышли в соседней вкладке — выходим и здесь; вошли — подхватываем вход.

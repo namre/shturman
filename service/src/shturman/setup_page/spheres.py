@@ -341,8 +341,8 @@ async def app_bulk(request: Request) -> JSONResponse:
     enabled = page._flag(data, "enabled", required=True)
     if enabled:
         await page._log(request, "app.bulk_on", audit.REFUSED, "массовое включение — только на странице")
-        raise BadRequest("Из приложения чаты включаются по одному. Включить все чаты раздела можно на странице "
-                         "«Переписка».", 400, "page_only")
+        raise BadRequest("Из приложения чаты включаются по одному. Включить все чаты раздела можно в "
+                         "«Настройках Штурмана».", 400, "page_only")
     state, session = state_of(request), request.state.app_session
     account_id = int(request.path_params["account_id"])
     with authority.miniapp_context(session.user_id, chat_id=session.chat_id):

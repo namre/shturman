@@ -111,7 +111,7 @@ def origins(config: Any) -> dict[str, str]:
 # `fetch` из страницы и приложения получают JSON, как раньше. В странице нет ничего из запроса.
 
 _SWAPPED_TYPES = (b"application/json", b"text/plain")
-_LINK_PAGE = f'<p><a href="{PREFIX}/">Открыть страницу «Переписка»</a></p>'
+_LINK_PAGE = f'<p><a href="{PREFIX}/">Открыть «Настройки Штурмана»</a></p>'
 _OPEN_APP = "Приложение открывается кнопкой <strong>«Штурман»</strong> внизу чата с вашим ботом согласований."
 
 
@@ -135,7 +135,7 @@ def human_page(path: str, status: int) -> bytes:
     elif path.startswith(APP_PATH):
         title, body = "Такой страницы нет", f"<p>{_OPEN_APP}</p>"
     elif path.startswith(PREFIX + "/api/") or path == PREFIX + "/api":
-        title, body = "Это служебный адрес", "<p>Через него страница «Переписка» получает данные — страницы здесь нет.</p>" + _LINK_PAGE
+        title, body = "Это служебный адрес", "<p>Через него «Настройки Штурмана» получают данные — страницы здесь нет.</p>" + _LINK_PAGE
     else:
         title, body = "Такой страницы нет", _LINK_PAGE
     css = f'<link rel="stylesheet" href="{PREFIX}/static/app.css">' if styled else ""

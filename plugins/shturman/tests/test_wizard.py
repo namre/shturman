@@ -130,7 +130,7 @@ def test_correspondence_step_is_short_and_names_the_approvals_bot_and_two_ways()
                  "по коду от бота", "токен второго бота", "Почему отдельная страница", "Шагов там три"):
         assert gone not in _CODE, gone
     assert "чтобы ваш вход в Telegram не проходил через ассистента" in step
-    assert "бота согласований" in step and "ассистент видит всё как вы" in step and "отдельный" in step
+    assert "бота согласований" in step and "«Через ваш аккаунт»" in step and "помощника» (бизнес-режим" in step
     fine = step[step.index("shturman-fine"):]
     assert "Разрешить ассистенту отправлять сообщения можно позже" in fine and "«Дополнительно»" not in fine
     # бот-ассистент в бизнес-режиме — только спокойное предупреждение для экземпляра прежней схемы
@@ -148,8 +148,8 @@ def test_correspondence_step_names_every_state_in_plain_words():
     problem = _CODE[_CODE.index("function CorrProblem"):_CODE.index("function CorrFacts")]
     for state in ("no_origin", "same_origin", "outdated", "disabled", "no_service"):
         assert f'state === "{state}"' in problem, state
-    assert "Страница настройки переписки недоступна — обновите экземпляр" in problem
-    assert "ей задан тот же адрес, что у ассистента" in problem and "./ops/set-setup-url.sh" in _CODE
+    assert "«Настройки Штурмана» недоступны — обновите экземпляр" in problem
+    assert "им задан тот же адрес, что у ассистента" in problem and "./ops/set-setup-url.sh" in _CODE
     assert "пока нет адреса в интернете" in problem
 
 
@@ -167,7 +167,7 @@ def test_wizard_does_not_ask_for_show_or_proxy_the_setup_page():
     requests = set(re.findall(r'(?:get|post)\("(/[a-z/]+)"', _CODE))
     assert requests == {"/state", "/persona", "/model/probe", "/bot/check", "/pairing/start", "/pairing",
                         "/pairing/confirm", "/pairing/reject", "/mark", "/correspondence"}
-    link = _CODE[_CODE.index("Открыть настройку переписки") - 300:_CODE.index("Открыть настройку переписки")]
+    link = _CODE[_CODE.index("Открыть «Настройки Штурмана»") - 300:_CODE.index("Открыть «Настройки Штурмана»")]
     assert "href: c.url" in link and 'target: "_blank"' in link and 'rel: "noopener noreferrer"' in link
     # Кнопка есть только в состоянии «всё в порядке» и только с адресом, который отдал сервер.
     assert 'const open = !!(c && c.state === "ok" && c.url);' in _CODE

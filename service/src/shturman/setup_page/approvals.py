@@ -19,9 +19,9 @@
   |---|---|---|---|
   | Черновик ответа | `outbox/drafts.py` | «Отправить», «Отклонить» | `drafts.on_button` |
   | Подтверждение действия | `confirm.py` | «Да, сделать», «Нет» | `confirm._pressed` |
-  | Задача ответа ждёт источник или ответ | `replies/workflow.py` | «Прочитать один раз», «на 30 дней», «Отказать» / «Не отвечать» | `replies/owner.on_button` |
+  | Ответ на сообщение (нужно разрешение прочитать) или вопрос ассистента | `replies/workflow.py` | «Прочитать один раз», «на 30 дней», «Отказать» / «Не отвечать» | `replies/owner.on_button` |
   | Скрытое сообщение | `guard/alerts.py` | «Показать ассистенту», «Оставить скрытым» | `alerts._pressed` |
-  | Обязательство и изменение обязательства | `processing/commitments.py` | «Верно», «Нет» / «Применить», «Оставить как есть» | `commitments.handle_callback` |
+  | Договорённость и изменение договорённости | `processing/commitments.py` | «Верно», «Не так» / «Применить», «Оставить как есть» | `commitments.handle_callback` |
   | Факт о владельце | `processing/facts.py` | «Запомнить», «Не запоминать» | `facts.on_button` |
   | Страница о человеке | `processing/pages_build.py` | «Завести страницу», «Не нужно» | `pages_build.on_button` |
   | Предложенный проект | `processing/projects.py` | «Завести проект», «Не нужно» | `projects.on_button` |
@@ -48,7 +48,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from .. import authority, bridge
+from .. import authority, bridge, words
 
 logger = logging.getLogger("shturman.setup")
 
@@ -68,8 +68,8 @@ REF = re.compile(
 
 DRAFT_NOTE = ("Изменить текст здесь нельзя — как и в боте. Нужен другой текст — попросите ассистента "
               "подготовить новый черновик: этот заменится.")
-PRIMARY = frozenset({"Отправить", "Да, сделать", "Прочитать один раз", "Показать ассистенту", "Верно",
-                     "Применить", "Запомнить", "Завести страницу", "Завести проект"})
+PRIMARY = frozenset({"Отправить", "Да, сделать", "Прочитать один раз", "Показать ассистенту", words.COMMITMENT_YES,
+                     words.CHANGE_YES, words.FACT_YES, words.PAGE_YES, words.PROJECT_YES, words.DRAFT_SEEN})
 
 
 def _iso(value: Any) -> str | None:
@@ -106,17 +106,22 @@ async def collect(conn: asyncpg.Connection, config: Any) -> dict[str, Any]:
     from .. import confirm
 
     items: list[dict[str, Any]] = []
+    sendable = bool(getattr(config, "sending", False)) and not getattr(config, "prepare_only", False)
     for entry in await drafts.awaiting_owner(conn):
-        items.append(_item("draft", "Черновик ответа", entry, note=DRAFT_NOTE))
+        item = _item("draft", "Черновик ответа", entry, note=DRAFT_NOTE)
+        if entry.get("prepare_only") or not sendable:
+            item = _seen_only(item)
+        items.append(item)
     for entry in await confirm.awaiting_owner(conn):
         items.append(_item("action", "Подтверждение действия", entry))
     for entry in await workflow.awaiting_owner(conn):
-        items.append(_item("reply", "Задача ответа", entry))
+        title = words.REPLY_SOURCE if entry.get("subkind") == "source" else words.REPLY_QUESTION
+        items.append(_item("reply", title, entry))
     for entry in await alerts.awaiting_owner(conn):
         items.append(_item("hidden", "Скрытое сообщение", entry))
     later: dict[str, int] = {"hidden": await alerts.waiting(conn)}
     for kind, kind_title, found in (
-        ("commitment", "Обязательство", await commitments.awaiting_owner(conn, today=today_of(config))),
+        ("commitment", "Договорённость", await commitments.awaiting_owner(conn, today=today_of(config))),
         ("owner_fact", "Факт о вас", await facts.awaiting_owner(conn)),
         ("page", "Страница памяти", await pages_build.awaiting_owner(conn, days=pages_build.Options().propose_days)),
         ("project", "Проект", await projects.awaiting_owner(conn)),
@@ -124,6 +129,20 @@ async def collect(conn: asyncpg.Connection, config: Any) -> dict[str, Any]:
         items.extend(_item(kind, kind_title, entry) for entry in found["items"])
         later[kind] = found["later"]
     return {"items": items, "later": later}
+
+
+def _seen_only(item: dict[str, Any]) -> dict[str, Any]:
+    """Черновик, который сейчас отправить нельзя (отправка выключена, режим без отправки или черновик
+    подготовлен только для просмотра), — П2: вместо «Отправить» и «Отклонить» одна кнопка «Понятно».
+    Она нажимает ту же кнопку, что «Отклонить» под карточкой в боте (данные `sh:ob:r:…`): ничего не
+    отправляется, черновик снимается. Кнопка «Отправить» из списка уходит — её нажатие из приложения
+    больше не принимается (`find`), а в боте всё равно ответило бы «Пока нельзя»."""
+    reject = [a for a in item["actions"] if a["ref"].startswith("sh:ob:r:")]
+    if reject:
+        item["actions"] = [{"label": words.DRAFT_SEEN, "ref": reject[0]["ref"], "primary": True}]
+        item["note"] = ("Отправка сейчас выключена: этот черновик только для просмотра. «Понятно» убирает "
+                        "его из списка, ничего не отправляя.")
+    return item
 
 
 def public(collected: dict[str, Any]) -> dict[str, Any]:
