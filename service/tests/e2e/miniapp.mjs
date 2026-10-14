@@ -760,6 +760,64 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
   }
 }
 
+// --- 10. «Уведомления» (Р-84) ----------------------------------------------------------------------
+// Смотреть и сужать: выключить личные, обращения в группах, текст; время и тихие часы. Включить больше —
+// только на странице: сервер отвергает расширение из приложения. Каждое изменение — сообщение в бот.
+{
+  const NOTIFY_OUT = process.env.E2E_NOTIFY_OUT || OUT;
+  mkdirSync(NOTIFY_OUT, { recursive: true });
+  const seen = async () => (await fetch(CONTROL + "/notify/seen")).json();
+  const { ctx, p, errs } = await openApp(390, "light", THEME_LIGHT);
+  await p.click("#tab-notify");
+  await p.waitForSelector("#nt-body:not([hidden]) #nt-now li");
+  const now = await p.$$eval("#nt-now li", (n) => n.map((x) => x.textContent));
+  check("приложение, «Уведомления»: по умолчанию — личные от всех, обращения в группах, тихие часы 23:00–08:00",
+        now[0] === "личные сообщения: от всех" && now.includes("прямые обращения в группах: да") &&
+        now.includes("тихие часы: 23:00–08:00"), now.join(" | "));
+  const offs = await p.$$eval("#nt-off button", (n) => n.map((x) => x.textContent));
+  check("приложение, «Уведомления»: только кнопки «выключить» — включить отсюда нечем",
+        offs.length === 3 && offs.every((t) => t.startsWith("Не ")), offs.join(" | "));
+  await p.screenshot({ path: path.join(NOTIFY_OUT, "app-notify-390-light.png"), fullPage: true });
+  await p.locator("#nt-off button", { hasText: "Не показывать текст сообщений" }).click();
+  await p.waitForFunction(() => [...document.querySelectorAll("#nt-now li")].some((x) => x.textContent.includes("не показывать")));
+  await p.selectOption("#nt-when", "d60");
+  await p.fill("#nt-from", "22:30");
+  await p.click("#nt-save");
+  // сообщение владельцу уходит очередью заданий — ждём и его
+  const saved = await waitFor(async () => { const x = await seen(); const s = x.settings;
+    return s && s.mode === "digest" && s.quiet_from === "22:30" && x.told.length >= 2; }, 10000);
+  const state = await seen();
+  check("приложение, «Уведомления»: сужение и время сохранены, владельцу — сообщение в бот, в журнале «из приложения»",
+        saved && state.settings.preview === false && state.told.length >= 2 &&
+        state.audit.filter((r) => r.outcome === "ok").length >= 2, JSON.stringify(state));
+  const refused = await p.evaluate(async () => {
+    const key = sessionStorage.getItem("shturman-app-session");
+    const res = await fetch("../api/app/notify", { method: "PUT", credentials: "omit",
+      headers: { "Content-Type": "application/json", "X-Shturman-Setup": "1", "X-Shturman-App": key },
+      body: JSON.stringify({ preview: true }) });
+    return { status: res.status, body: await res.json() };
+  });
+  check("приложение: расширение уведомлений сервер отвергает (только на странице)",
+        refused.status === 400 && refused.body.code === "page_only" && (await seen()).settings.preview === false, JSON.stringify(refused));
+  check("приложение, «Уведомления»: в консоли нет ошибок", realErrors(errs).length === 0, realErrors(errs).join(" | "));
+  await ctx.close();
+  for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark", THEME], [390, "dark", THEME]]) {
+    const tag = `${width}-${scheme}`;
+    const opened = await openApp(width, scheme, theme);
+    await opened.p.click("#tab-notify");
+    await opened.p.waitForSelector("#nt-body:not([hidden]) #nt-now li");
+    const wide = await opened.p.evaluate(() => {
+      const out = [...document.querySelectorAll("main button, main select, main input, .tabs button")]
+        .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+      return { wide: document.documentElement.scrollWidth <= window.innerWidth + 1, out };
+    });
+    check(`приложение, «Уведомления» ${tag}: страница не шире экрана, кнопки и вкладки не выходят за край`,
+          wide.wide && wide.out === 0, JSON.stringify(wide));
+    await opened.p.screenshot({ path: path.join(NOTIFY_OUT, `app-notify-${tag}.png`), fullPage: true });
+    await opened.ctx.close();
+  }
+}
+
 await browser.close();
 console.log(failed ? `ИТОГ: ${failed} FAIL` : "ИТОГ: OK");
 process.exit(failed ? 1 : 0);

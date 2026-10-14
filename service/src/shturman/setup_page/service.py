@@ -50,6 +50,8 @@
   PUT    /shturman-setup/api/llm/chatgpt/model          модель подписки из списка OpenAI: {model}
   DELETE /shturman-setup/api/llm/chatgpt                выйти из подписки (отзыв сессии у OpenAI)
   GET    /shturman-setup/api/memory/…                   экран «Память ассистента» — маршруты в `memory.py`
+  GET|PUT /shturman-setup/api/notify…, …/watch…, …/retry   уведомления, наблюдатель, повтор после сбоя (Р-84) —
+                                                        маршруты в `notify.py`
 
   Mini App бота согласований — своя узкая роль и свой ключ сессии, маршруты в `miniapp.py`:
   GET    /shturman-setup/app/                           приложение (единственное, что можно открыть в рамке
@@ -1341,6 +1343,7 @@ async def chatgpt_remove(request: Request) -> JSONResponse:
 
 def routes() -> list[BaseRoute]:
     from . import memory, miniapp
+    from . import notify as notify_page
     from . import spheres as spheres_page
 
     account = API + "/tg/accounts/{account_id:int}"
@@ -1395,6 +1398,7 @@ def routes() -> list[BaseRoute]:
         *memory.routes(),
         *miniapp.routes(),
         *spheres_page.routes(),
+        *notify_page.routes(),
     ]
 
 

@@ -310,6 +310,8 @@
     if (memOpen()) showMemory(true);
     refreshSpheres();
     if ($("spheres-details").open) showSpheres();
+    if ($("notify-details").open) showNotify(); else refreshNotify();
+    if ($("watch-details").open) showWatch(); else refreshWatch();
     refresh().then(function () { refreshOverview(); });
     startLoop();
   }
@@ -327,6 +329,7 @@
   function refreshOverview() {
     ui.lastOverview = Date.now();
     refreshMemoryCount();
+    refreshRetry();
     return call("GET", "overview").then(function (r) { if (r.ok) renderSummary(r.data); });
   }
 
@@ -2872,6 +2875,400 @@
     });
   }
 
+  /* ------------------------------------------------------- уведомления (Р-84) */
+
+  var nt = { data: null, people: [], timer: null };
+
+  function radioValue(name) {
+    var node = document.querySelector('input[name="' + name + '"]:checked');
+    return node ? node.value : "";
+  }
+  function setRadio(name, value) {
+    Array.prototype.forEach.call(document.querySelectorAll('input[name="' + name + '"]'), function (node) { node.checked = node.value === value; });
+  }
+
+  function refreshNotify() {
+    return call("GET", "notify", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      nt.data = r.data;
+      var s = r.data.settings, on = s.personal !== "off" || s.groups;
+      pill("notify", !r.data.own_bot ? "нет бота" : on ? (r.data.default ? "включены по умолчанию" : "включены") : "выключены",
+           !r.data.own_bot ? "todo" : on ? "done" : "");
+    });
+  }
+
+  function drawNotify() {
+    var d = nt.data;
+    if (!d) return;
+    var s = d.settings;
+    show("notify-nobot", !d.own_bot);
+    show("notify-default", d.default);
+    setRadio("nt-personal", s.personal);
+    setRadio("nt-mode", s.mode);
+    $("nt-groups").checked = s.groups;
+    $("nt-preview").checked = s.preview;
+    $("nt-quiet").checked = s.quiet;
+    $("nt-aliases").value = s.aliases.join(", ");
+    $("nt-gap").value = String(s.gap_minutes);
+    if ($("nt-gap").value !== String(s.gap_minutes)) {
+      $("nt-gap").appendChild(el("option", { value: String(s.gap_minutes), text: s.gap_minutes + " мин" }));
+      $("nt-gap").value = String(s.gap_minutes);
+    }
+    $("nt-digest").value = String(s.digest_minutes);
+    $("nt-quiet-from").value = s.quiet_from;
+    $("nt-quiet-to").value = s.quiet_to;
+    text("nt-tz", "по часам " + (d.timezone || "сервера"));
+    nt.people = d.people.slice();
+    var list = $("nt-spheres");
+    list.textContent = "";
+    d.spheres.forEach(function (sp) {
+      list.appendChild(el("label", { class: "check" }, [
+        el("input", { type: "checkbox", value: String(sp.id), checked: s.spheres.indexOf(sp.id) >= 0 }), el("span", { text: sp.title })]));
+    });
+    show("nt-spheres-empty", !d.spheres.length);
+    drawNtPeople();
+    ntToggle();
+    var st = d.status;
+    text("notify-stats", "За сутки отправлено: " + number(st.sent_24h) + (st.waiting ? ", ждут отправки: " + number(st.waiting) : "") +
+         (st.answered_24h ? ", не понадобилось (вы уже ответили): " + number(st.answered_24h) : ""));
+  }
+
+  function ntToggle() {
+    var personal = radioValue("nt-personal"), mode = radioValue("nt-mode");
+    show("nt-spheres-box", personal === "spheres");
+    show("nt-people-box", personal === "people");
+    $("nt-gap").disabled = mode !== "instant";
+    $("nt-digest").disabled = mode !== "digest";
+    $("nt-quiet-from").disabled = $("nt-quiet-to").disabled = !$("nt-quiet").checked;
+  }
+
+  function personName(p) { return p.name || (p.username ? "@" + p.username : "№ " + p.tg_id); }
+
+  function drawNtPeople() {
+    var list = $("nt-people");
+    list.textContent = "";
+    if (!nt.people.length) list.appendChild(el("li", { class: "mem-chat mem-note", text: "Пока никого. Найдите человека ниже." }));
+    nt.people.forEach(function (p, i) {
+      list.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", {}, [personName(p), el("span", { class: "mem-meta", text: " · № " + p.tg_id })]),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать " + personName(p),
+          onclick: function () { nt.people.splice(i, 1); drawNtPeople(); } })
+      ]));
+    });
+  }
+
+  function searchNtPeople() {
+    var q = $("nt-people-q").value.trim(), found = $("nt-people-found");
+    found.textContent = "";
+    if (!q) return;
+    call("GET", "notify/people?limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+      found.textContent = "";
+      if (!r.ok) { found.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+      if (!r.data.items.length) found.appendChild(el("li", { class: "mem-chat mem-note", text: "Ничего не нашлось среди ваших личных чатов." }));
+      r.data.items.forEach(function (p) {
+        var chosen = nt.people.some(function (x) { return x.tg_id === p.tg_id; });
+        found.appendChild(el("li", { class: "mem-chat" }, [
+          el("span", {}, [personName(p), p.username && p.name ? el("span", { class: "mem-meta", text: " · @" + p.username }) : null]),
+          chosen ? el("span", { class: "badge ok", text: "выбран" }) : el("button", { class: "btn ghost small-btn", type: "button", text: "Добавить",
+            onclick: function () { nt.people.push(p); drawNtPeople(); searchNtPeople(); } })
+        ]));
+      });
+    });
+  }
+
+  function notifyBody() {
+    var spheres = Array.prototype.map.call(document.querySelectorAll("#nt-spheres input:checked"), function (n) { return Number(n.value); });
+    var aliases = $("nt-aliases").value.split(",").map(function (a) { return a.trim(); }).filter(Boolean);
+    return {
+      personal: radioValue("nt-personal"), spheres: spheres, people: nt.people.map(function (p) { return p.tg_id; }),
+      groups: $("nt-groups").checked, aliases: aliases, preview: $("nt-preview").checked,
+      mode: radioValue("nt-mode"), gap_minutes: Number($("nt-gap").value), digest_minutes: Number($("nt-digest").value),
+      quiet: $("nt-quiet").checked, quiet_from: $("nt-quiet-from").value, quiet_to: $("nt-quiet-to").value
+    };
+  }
+
+  function showNotify() { return refreshNotify().then(drawNotify); }
+
+  function wireNotify() {
+    $("notify-details").addEventListener("toggle", function () { if ($("notify-details").open) showNotify(); });
+    $("notify-form").addEventListener("change", ntToggle);
+    $("nt-people-q").addEventListener("input", function () { clearTimeout(nt.timer); nt.timer = setTimeout(searchNtPeople, 300); });
+    $("notify-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var save = $("notify-save"), body = notifyBody();
+      busy(save, true);
+      note("notify-error", "warn", "");
+      call("PUT", "notify", body).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { note("notify-error", "warn", r.error); return; }
+        nt.data = r.data;
+        drawNotify();
+        refreshNotify();
+        toast(body.personal === "off" && !body.groups ? "Уведомления выключены." : "Уведомления сохранены.");
+      });
+    });
+  }
+
+  /* ------------------------------------------------------- наблюдатель (Р-84) */
+
+  var wt = { data: null, editing: null, hits: [], hitsRule: null, chatTimer: null };
+  var HIT_KIND = { relevant: "ok", not_relevant: "", duplicate: "", limited: "warn", failed: "warn", no_answer: "warn", checking: "" };
+
+  function refreshWatch() {
+    return call("GET", "watch", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      wt.data = r.data;
+      var on = r.data.rules.filter(function (x) { return x.enabled; }).length;
+      pill("watch", r.data.rules.length ? "правил: " + on + (on < r.data.rules.length ? " из " + r.data.rules.length : "") : "", "");
+    });
+  }
+
+  function loadHits() {
+    return call("GET", "watch/hits?limit=20" + (wt.hitsRule ? "&rule_id=" + wt.hitsRule : "")).then(function (r) { if (r.ok) wt.hits = r.data.items; });
+  }
+
+  function showWatch() { return Promise.all([refreshWatch(), loadHits()]).then(drawWatch); }
+
+  function wordsLine(list, limit) {
+    return list.slice(0, limit).map(function (w) { return "«" + w + "»"; }).join(", ") + (list.length > limit ? " и ещё " + (list.length - limit) : "");
+  }
+
+  function ruleWhere(rule) {
+    var parts = [];
+    if (rule.spheres.length) parts.push((rule.spheres.length > 1 ? "сферы " : "сфера ") + rule.spheres.map(function (s) { return "«" + (s.title || "удалена") + "»"; }).join(", "));
+    if (rule.chats.length) parts.push(rule.chats.length > 3 ? rule.chats.length + " " + plural(rule.chats.length, "чат", "чата", "чатов")
+      : rule.chats.map(function (c) { return "«" + (c.title || "без названия") + "»"; }).join(", "));
+    return parts.join(" и ") || "нигде";
+  }
+
+  function drawWatch() {
+    var d = wt.data;
+    if (!d) return;
+    var tpl = $("watch-templates");
+    tpl.textContent = "";
+    tpl.appendChild(el("span", { class: "hint", text: "Готовые правила:" }));
+    d.templates.forEach(function (t) {
+      tpl.appendChild(el("button", { class: "btn ghost small-btn", type: "button", text: "+ " + t.name,
+        onclick: function () { editRule({ name: t.name, description: t.description, keywords: t.keywords.slice(), regexes: [], use_lemmas: t.use_lemmas,
+                                          chat_ids: [], chats: [], sphere_ids: [], enabled: true, ask_name: !!t.ask_name }); } }));
+    });
+    var list = $("watch-list");
+    list.textContent = "";
+    if (!d.rules.length) list.appendChild(el("li", { class: "mem-note sph-empty", text: "Правил пока нет. Начните с готового — выше — или заведите своё." }));
+    d.rules.forEach(function (rule) { list.appendChild(ruleItem(rule)); });
+    drawRuleForm();
+    drawHits();
+  }
+
+  function ruleItem(rule) {
+    var meta = [ruleWhere(rule)];
+    if (rule.hits.notified_7d) meta.push("за неделю сообщено: " + rule.hits.notified_7d);
+    else if (rule.hits.total) meta.push("срабатываний: " + rule.hits.total);
+    return el("li", { class: "sph watch-rule" + (rule.enabled ? "" : " off") }, [
+      el("div", { class: "sph-head" }, [
+        el("div", { class: "sph-main" }, [
+          el("span", { class: "sph-name" }, [rule.name, " ", el("span", { class: rule.enabled ? "badge ok" : "badge", text: rule.enabled ? "включено" : "выключено" })]),
+          el("span", { class: "sph-desc", text: "Слова: " + (wordsLine(rule.keywords, 8) || "—") + (rule.regexes.length ? "; выражений: " + rule.regexes.length : "") }),
+          el("span", { class: "mem-meta", text: "Где: " + meta.join(" · ") })
+        ])
+      ]),
+      el("div", { class: "row" }, [
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Изменить", onclick: function () { editRule(rule); } }),
+        el("button", { class: "btn ghost small-btn", type: "button", text: rule.enabled ? "Выключить" : "Включить",
+          onclick: function () { saveRule(rule.id, { enabled: !rule.enabled }, this, rule.enabled ? "Правило выключено." : "Правило включено."); } }),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Срабатывания",
+          onclick: function () { wt.hitsRule = wt.hitsRule === rule.id ? null : rule.id; loadHits().then(drawHits); } }),
+        el("button", { class: "btn ghost small-btn danger", type: "button", text: "Удалить",
+          onclick: function () {
+            if (!confirm("Удалить правило «" + rule.name + "» вместе с журналом его срабатываний?\n\nЕсли нужно только остановить его — нажмите «Выключить».")) return;
+            var button = this;
+            busy(button, true);
+            call("DELETE", "watch/" + rule.id).then(function (r) {
+              busy(button, false);
+              if (!r.ok) { toast(r.error, true); return; }
+              if (wt.hitsRule === rule.id) wt.hitsRule = null;
+              toast("Правило удалено.");
+              showWatch();
+            });
+          } })
+      ])
+    ]);
+  }
+
+  function editRule(rule) {
+    wt.editing = JSON.parse(JSON.stringify(rule));
+    wt.editing.chats = (rule.chats || []).filter(Boolean).map(function (c) { return { id: c.id, title: c.title }; });
+    drawRuleForm();
+    var form = $("watch-form");
+    form.scrollIntoView({ block: "start" });
+    var first = form.querySelector(rule.ask_name ? "#wr-keywords" : "#wr-name");
+    if (first) first.focus();
+  }
+
+  function drawRuleForm() {
+    var form = $("watch-form"), r = wt.editing;
+    form.textContent = "";
+    show(form, !!r);
+    show("watch-new", !r);
+    if (!r) return;
+    var spheres = (wt.data && wt.data.spheres) || [];
+    var chatList = el("ul", { class: "mem-items", id: "wr-chats" });
+    function drawChats() {
+      chatList.textContent = "";
+      if (!r.chats.length) chatList.appendChild(el("li", { class: "mem-chat mem-note", text: "Чаты не выбраны." }));
+      r.chats.forEach(function (c, i) {
+        chatList.appendChild(el("li", { class: "mem-chat" }, [el("span", { text: c.title || "без названия" }),
+          el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", onclick: function () { r.chats.splice(i, 1); drawChats(); } })]));
+      });
+    }
+    drawChats();
+    var search = el("input", { type: "search", id: "wr-chat-q", autocomplete: "off", placeholder: "Название группы или канала" });
+    var found = el("ul", { class: "mem-items sph-found" });
+    search.addEventListener("input", function () {
+      clearTimeout(wt.chatTimer);
+      wt.chatTimer = setTimeout(function () {
+        var q = search.value.trim();
+        found.textContent = "";
+        if (!q) return;
+        call("GET", "watch/chats?limit=8&q=" + encodeURIComponent(q)).then(function (x) {
+          found.textContent = "";
+          if (!x.ok) { found.appendChild(el("li", { class: "mem-note", text: x.error })); return; }
+          if (!x.data.items.length) found.appendChild(el("li", { class: "mem-chat mem-note", text: "Не нашлось среди читаемых групп и каналов." }));
+          x.data.items.forEach(function (c) {
+            var inside = r.chats.some(function (y) { return y.id === c.id; });
+            found.appendChild(el("li", { class: "mem-chat" }, [el("span", {}, [c.title || "без названия", el("span", { class: "mem-meta", text: " · " + (/channel$/.test(c.type || "") ? "канал" : "группа") })]),
+              inside ? el("span", { class: "badge ok", text: "выбран" }) : el("button", { class: "btn ghost small-btn", type: "button", text: "Добавить",
+                onclick: function () { r.chats.push({ id: c.id, title: c.title }); drawChats(); search.value = ""; found.textContent = ""; search.focus(); } })]));
+          });
+        });
+      }, 300);
+    });
+    var sphereBoxes = spheres.map(function (sp) {
+      return el("label", { class: "check" }, [el("input", { type: "checkbox", value: String(sp.id), checked: r.sphere_ids.indexOf(sp.id) >= 0 }), el("span", { text: sp.title })]);
+    });
+    form.appendChild(el("h3", { class: "mem-form-title", text: r.id ? "Правило «" + r.name + "»" : "Новое правило" }));
+    form.appendChild(el("div", { class: "field inline" }, [el("label", { for: "wr-name", text: "Название" }),
+      el("input", { id: "wr-name", type: "text", maxlength: "100", value: r.name || "" })]));
+    form.appendChild(el("div", { class: "field" }, [el("label", { for: "wr-keywords", text: "Слова и выражения" }),
+      el("textarea", { id: "wr-keywords", rows: "2", class: "wr-text", text: (r.keywords || []).join(", "),
+                       placeholder: r.ask_name ? "Ваше имя и варианты: Евгений, Женя, Эрман" : "Через запятую" }),
+      el("span", { class: "hint", text: r.ask_name ? "Впишите своё имя и как вас ещё называют — через запятую." : "Через запятую. Регистр и «ё» не важны." })]));
+    form.appendChild(el("label", { class: "check" }, [el("input", { type: "checkbox", id: "wr-lemmas", checked: r.use_lemmas !== false }),
+      el("span", { text: "Учитывать формы слов («счёт» найдёт «счета», «счетов»)" })]));
+    form.appendChild(el("div", { class: "field" }, [el("label", { for: "wr-description", text: "Что для вас важно — это прочитает модель" }),
+      el("textarea", { id: "wr-description", rows: "3", maxlength: "1000", class: "wr-text", text: r.description || "" })]));
+    form.appendChild(el("fieldset", { class: "mem-fieldset" }, [el("legend", { text: "Где искать" }),
+      spheres.length ? el("div", { class: "sph-pick-list", id: "wr-spheres" }, sphereBoxes) : el("p", { class: "hint", text: "Сфер пока нет — можно выбрать отдельные чаты." }),
+      spheres.length ? el("p", { class: "hint", text: "Сфера — все её группы и каналы, в том числе добавленные в неё позже. Личные чаты сферы наблюдатель не смотрит." }) : null,
+      el("span", { class: "hint", text: "Отдельные группы и каналы:" }), chatList,
+      el("div", { class: "field" }, [el("label", { for: "wr-chat-q", text: "Добавить группу или канал" }), search]), found]));
+    var regex = el("details", { class: "sub" }, [el("summary", { text: "Для опытных: регулярные выражения" }),
+      el("div", { class: "field" }, [el("label", { for: "wr-regexes", text: "По одному в строке" }),
+        el("textarea", { id: "wr-regexes", rows: "2", class: "wr-text", text: (r.regexes || []).join("\n") })])]);
+    if ((r.regexes || []).length) regex.open = true;
+    form.appendChild(regex);
+    form.appendChild(el("label", { class: "check" }, [el("input", { type: "checkbox", id: "wr-enabled", checked: r.enabled !== false }), el("span", { text: "Правило включено" })]));
+    form.appendChild(el("div", { class: "row" }, [el("button", { class: "btn", type: "submit", id: "wr-save", text: r.id ? "Сохранить" : "Завести правило" }),
+      el("button", { class: "btn ghost", type: "button", text: "Отмена", onclick: function () { wt.editing = null; note("watch-error", "warn", ""); drawRuleForm(); } })]));
+  }
+
+  function ruleBody() {
+    var r = wt.editing;
+    var split = function (value, sep) { return value.split(sep).map(function (x) { return x.trim(); }).filter(Boolean); };
+    return {
+      name: $("wr-name").value.trim(), description: $("wr-description").value.trim(),
+      keywords: split($("wr-keywords").value, ","), regexes: split($("wr-regexes").value, "\n"),
+      use_lemmas: $("wr-lemmas").checked, enabled: $("wr-enabled").checked,
+      chat_ids: r.chats.map(function (c) { return c.id; }),
+      sphere_ids: Array.prototype.map.call(document.querySelectorAll("#wr-spheres input:checked"), function (n) { return Number(n.value); })
+    };
+  }
+
+  function saveRule(id, body, button, done) {
+    busy(button, true);
+    note("watch-error", "warn", "");
+    return call(id ? "PUT" : "POST", id ? "watch/" + id : "watch", body).then(function (r) {
+      busy(button, false);
+      if (!r.ok) { if (wt.editing) note("watch-error", "warn", r.error); else toast(r.error, true); return r; }
+      wt.editing = null;
+      toast(done);
+      showWatch();
+      return r;
+    });
+  }
+
+  function drawHits() {
+    var list = $("watch-hits");
+    list.textContent = "";
+    var rule = wt.hitsRule && wt.data ? wt.data.rules.filter(function (x) { return x.id === wt.hitsRule; })[0] : null;
+    text(document.querySelector("#watch-hits-box h4"), rule ? "Срабатывания правила «" + rule.name + "»" : "Последние срабатывания");
+    if (!wt.hits.length) { list.appendChild(el("li", { class: "mem-chat mem-note", text: "Пока ничего не нашлось." })); return; }
+    wt.hits.forEach(function (h) {
+      var line = [when(h.at), h.rule_name, h.chat_title || "без названия"].join(" · ");
+      list.appendChild(el("li", { class: "mem-item watch-hit" }, [
+        el("div", { class: "mem-item-main" }, [
+          el("span", {}, [el("span", { class: "badge " + (HIT_KIND[h.status] || ""), text: h.status_text + (h.notified ? " · сообщено" : "") }), " ", el("span", { class: "mem-meta", text: line })]),
+          el("span", { class: "small", text: "Совпало: " + wordsLine(h.matched, 6) + (h.reason ? ". Модель: " + h.reason : "") }),
+          h.link ? el("a", { href: h.link, target: "_blank", rel: "noopener noreferrer", class: "small", text: "Открыть в Telegram" }) : null
+        ])
+      ]));
+    });
+  }
+
+  function wireWatch() {
+    $("watch-details").addEventListener("toggle", function () { if ($("watch-details").open) showWatch(); });
+    $("watch-new").addEventListener("click", function () {
+      editRule({ name: "", description: "", keywords: [], regexes: [], use_lemmas: true, chat_ids: [], chats: [], sphere_ids: [], enabled: true });
+    });
+    $("watch-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var r = wt.editing;
+      saveRule(r.id, ruleBody(), $("wr-save"), r.id ? "Правило сохранено." : "Правило заведено.");
+    });
+  }
+
+  /* ------------------------------------------------ повтор после сбоя (Р-84) */
+
+  var rt = { data: null };
+
+  function refreshRetry() {
+    return call("GET", "retry", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      rt.data = r.data;
+      var d = r.data, last = d.last, any = d.media + d.requests > 0;
+      var recent = last && Date.now() - new Date(last.at).getTime() < 3 * 86400000;
+      show("s-retry", any || !!recent);
+      pill("retry", any ? "можно повторить: " + number(d.media + d.requests) : "", any ? "todo" : "");
+      var items = [];
+      if (d.media) items.push("Фото и документы: " + number(d.media) + (d.media_enabled ? " — разберутся заново в ближайшие минуты." : " — разбор сейчас выключен, они не вернутся, пока вы его не включите."));
+      if (d.requests) items.push("Разбор переписки (договорённости, факты, проекты): " + number(d.requests) + " " + plural(d.requests, "запрос", "запроса", "запросов") + " — в следующий прогон, ночью.");
+      if (d.pages) items.push("Страницы памяти без свежей сводки: " + number(d.pages) + " — пересоберутся сами, повторять не нужно.");
+      if (!any) items.push("Сейчас повторять нечего.");
+      var list = $("retry-list");
+      list.textContent = "";
+      items.forEach(function (t) { list.appendChild(el("li", { text: t })); });
+      $("retry-run").disabled = !any;
+      ["retry-since-row", "retry-run-row", "retry-cost"].forEach(function (id) { show(id, any); });
+      text("retry-lead", any ? "Пока задания модели не выполнялись, часть работы честно сдалась после нескольких попыток."
+                             : "Всё, что не получилось из-за сбоя модели, уже возвращено в работу.");
+      note("retry-status", "", last ? "Последний повтор " + when(last.at) + (last.by === "cli" ? " (из терминала)" : "") + ": вложений — " +
+           number(last.media) + ", запросов разбора — " + number(last.requests) + "." : "");
+    });
+  }
+
+  function wireRetry() {
+    $("retry-run").addEventListener("click", function () {
+      var d = rt.data || { media: 0, requests: 0 };
+      if (!confirm("Повторить то, что не получилось?\n\nФото и документы (" + d.media + ") и разбор переписки (" + d.requests +
+                   ") снова уйдут провайдеру модели и потратят запросы.")) return;
+      var since = $("retry-since").value;
+      act(this, "retry-error", "POST", "retry", since ? { since: since } : {}, function (out) {
+        toast("Возвращено в работу: вложений — " + out.media + ", запросов разбора — " + out.requests + ".");
+        refreshRetry();
+      });
+    });
+  }
+
   function wireMemory() {
     $("memory-details").addEventListener("toggle", function () {
       if (memOpen()) showMemory(true);
@@ -2899,7 +3296,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireMemory(); wireSession();
+  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireWatch(); wireRetry(); wireMemory(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.

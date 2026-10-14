@@ -363,12 +363,14 @@ async def accept_business_message(
         return {"stored": False, "message_id": None, "reason": "excluded"}
     # Новый входящий текст записан скрытым от ассистента; проверка решает, открыть ли его.
     hidden = await guard.screen([saved["message_id"]])
+    payload = {"account_id": link["account_id"], "chat_id": saved["chat_id"],
+               "message_id": saved["message_id"], "source": "business",
+               "outgoing": saved["outgoing"], "edited": edited, "via_bot": norm.via_bot}
     if saved["changed"] and not hidden:
-        state.events.publish(events.MESSAGE_LIVE, {
-            "account_id": link["account_id"], "chat_id": saved["chat_id"],
-            "message_id": saved["message_id"], "source": "business",
-            "outgoing": saved["outgoing"], "edited": edited, "via_bot": norm.via_bot,
-        })
+        state.events.publish(events.MESSAGE_LIVE, payload)
+    elif saved["new"] and hidden and not edited:
+        # скрыто защитой: только уведомлению владельцу, без текста (events.MESSAGE_HELD)
+        state.events.publish(events.MESSAGE_HELD, payload)
     return {"stored": True, "message_id": saved["message_id"], "new": saved["new"], "changed": saved["changed"]}
 
 

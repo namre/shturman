@@ -1044,6 +1044,154 @@ await shot(page, "27-app-done-desktop-light");
   }
 }
 
+// --- уведомления, наблюдатель, повтор после сбоя (Р-84) -------------------------------------------
+// Карточка «Уведомления»: умолчание, сохранение, выбор людей; живые сообщения стенда уходят владельцу
+// через бота стенда («Вам написали», «Вас упомянули»). «Наблюдатель»: шаблон «Сроки и деньги», группа из
+// поиска, срабатывание без текста сообщения. «Повторить то, что не получилось»: только сбой модели.
+{
+  const NOTIFY_OUT = process.env.E2E_NOTIFY_OUT || OUT;
+  mkdirSync(NOTIFY_OUT, { recursive: true });
+  const seen = async () => control("GET", "/notify/seen");
+  async function waitFor(test, timeout = 15000) {
+    const until = Date.now() + timeout;
+    while (Date.now() < until) { if (await test()) return true; await page.waitForTimeout(200); }
+    return false;
+  }
+  async function cardShot(p, selector, name) {
+    await p.evaluate(() => { const t = document.getElementById("toast"); if (t) t.hidden = true;
+                             document.querySelector(".top").style.position = "static"; });
+    await p.locator(selector).screenshot({ path: path.join(NOTIFY_OUT, name + ".png") });
+    await p.evaluate(() => { document.querySelector(".top").style.position = ""; });
+  }
+
+  await page.goto(URL_PAGE);
+  await page.waitForSelector("#screen-app:not([hidden])");
+  await page.waitForFunction(() => document.getElementById("st-notify").textContent !== "", null, { timeout: 10000 }).catch(() => {});
+  check("уведомления: карточка видна, по умолчанию включены", await page.isVisible("#s-notify") &&
+        (await page.textContent("#st-notify")) === "включены по умолчанию", await page.textContent("#st-notify"));
+  await page.click("#notify-details > summary");
+  await page.waitForSelector("#notify-form input[name=nt-personal]:checked");
+  check("уведомления: умолчание названо, «от всех», обращения в группах, «сразу», тихие часы 23:00–08:00",
+        await page.isVisible("#notify-default") && (await page.inputValue("#nt-quiet-from")) === "23:00" &&
+        await page.isChecked("#nt-groups") && await page.isChecked("input[name=nt-personal][value=all]") &&
+        await page.isChecked("input[name=nt-mode][value=instant]"));
+  await cardShot(page, "#s-notify", "notify-default-desktop-light");
+  // тихие часы выключаются — иначе уведомления стенда ночью копились бы до утра
+  await page.uncheck("#nt-quiet");
+  check("уведомления: без тихих часов время не выбирается", await page.isDisabled("#nt-quiet-from"));
+  await page.click("#notify-save");
+  check("уведомления: сохранено со страницы сразу", await waitFor(async () => {
+    const s = (await seen()).settings; return s && s.quiet === false; }));
+
+  const seeded = await control("POST", "/notify/seed");
+  const told = await waitFor(async () => {
+    const sent = (await seen()).sent;
+    return sent.some((t) => t.startsWith("💬 Вам написали: Анна Ким") && t.includes("«Добрый день! Когда сможете посмотреть смету по корпусу 2?»")) &&
+           sent.some((t) => t.startsWith("📣 Вас упомянули в «Стройка ЖК: прораб»") && t.includes("Пётр Сидоров"));
+  }, 30000);
+  check("уведомления: личное и обращение в группе ушли владельцу в бот согласований", told && seeded.ok,
+        JSON.stringify((await seen()).sent));
+
+  await page.check("input[name=nt-personal][value=people]");
+  await page.fill("#nt-people-q", "анна");
+  await page.waitForSelector("#nt-people-found button");
+  await page.click("#nt-people-found button");
+  await page.fill("#nt-aliases", "Евгений, Евгений Сергеевич");
+  await page.check("input[name=nt-mode][value=digest]");
+  await page.selectOption("#nt-digest", "60");
+  await page.check("#nt-quiet");
+  await page.click("#notify-save");
+  const people = await waitFor(async () => {
+    const s = (await seen()).settings;
+    return s && s.personal === "people" && s.people.length === 1 && s.aliases.length === 2 && s.mode === "digest";
+  });
+  check("уведомления: «только от выбранных людей» (по номеру), обращения, пачка раз в час — сохранены", people,
+        JSON.stringify((await seen()).settings));
+  await page.waitForSelector("#notify-default", { state: "hidden" });
+  await cardShot(page, "#s-notify", "notify-people-desktop-light");
+
+  // наблюдатель
+  await page.click("#watch-details > summary");
+  await page.waitForSelector("#watch-templates button");
+  await page.locator("#watch-templates button", { hasText: "Сроки и деньги" }).click();
+  await page.waitForSelector("#watch-form:not([hidden]) #wr-name");
+  check("наблюдатель: шаблон заполнил название, слова и описание",
+        (await page.inputValue("#wr-name")) === "Сроки и деньги" && (await page.inputValue("#wr-keywords")).includes("аванс"));
+  await page.fill("#wr-chat-q", "строй");
+  await page.waitForSelector("#watch-form .sph-found button");
+  await page.locator("#watch-form .sph-found li", { hasText: "Стройка ЖК: прораб" }).locator("button").click();
+  await cardShot(page, "#s-watch", "watch-form-desktop-light");
+  await page.click("#wr-save");
+  check("наблюдатель: правило заведено со страницы сразу, с группой", await waitFor(async () =>
+    (await seen()).rules.some((r) => r.name === "Сроки и деньги" && r.chat_ids.length === 1 && r.enabled)));
+  await page.waitForSelector("#watch-list .watch-rule");
+  await control("POST", "/notify/watch-live");
+  check("наблюдатель: сообщение «аванс по договору» нашлось", await waitFor(async () => (await seen()).hits > 0));
+  await page.locator("#watch-list .watch-rule").first().locator("button", { hasText: "Срабатывания" }).click();
+  await page.waitForSelector("#watch-hits .watch-hit");
+  const hitText = await page.textContent("#watch-hits");
+  check("наблюдатель: срабатывание показано без текста сообщения", hitText.includes("Совпало:") &&
+        hitText.includes("«аванс»") && !hitText.includes("Срочно нужен аванс"), hitText);
+  await page.locator("#watch-list .watch-rule").first().locator("button", { hasText: "Выключить" }).click();
+  check("наблюдатель: «Выключить» — сразу", await waitFor(async () => (await seen()).rules.every((r) => !r.enabled)));
+  await cardShot(page, "#s-watch", "watch-list-desktop-light");
+
+  // повтор после сбоя
+  await page.goto(URL_PAGE);
+  await page.waitForSelector("#s-retry:not([hidden])");
+  const retryText = await page.textContent("#s-retry");
+  check("повтор: карточка видна — фото 1 и разбор переписки 1, файл «не тот вид» не считается",
+        retryText.includes("Фото и документы: 1") && retryText.includes("Разбор переписки") && retryText.includes("тратит запросы"),
+        retryText);
+  await cardShot(page, "#s-retry", "retry-desktop-light");
+  await page.click("#retry-run");
+  // вложение со сбоем модели возвращается в очередь, и разбор сразу берёт его снова (у подставного
+  // Telegram файла нет — «пропущено» с другой причиной); «не тот вид файла» остаётся как было
+  const retried = await waitFor(async () => {
+    const s = await seen();
+    return !s.media.some((m) => m.media_state === "failed") &&
+           s.media.some((m) => m.media_state === "skipped" && m.media_error === "unsupported") &&
+           !s.media.some((m) => String(m.media_error).startsWith("model:")) && s.requests.includes("retry");
+  });
+  check("повтор: вложение со сбоем модели и запрос разбора возвращены, «не тот вид файла» — нет", retried,
+        JSON.stringify(await seen()));
+  await page.waitForFunction(() => document.querySelector("#retry-status").textContent.includes("Последний повтор"));
+  await cardShot(page, "#s-retry", "retry-done-desktop-light");
+
+  const audit = (await seen()).audit;
+  const actions = audit.map((r) => r.action);
+  check("журнал: уведомления, наблюдатель и повтор записаны — без имён, названий и слов правил",
+        ["notify.settings", "watch.create", "watch.update", "retry.failed"].every((a) => actions.includes(a)) &&
+        !["Анна", "Ким", "Стройка", "аванс", "Евгений", "Сроки"].some((w) => JSON.stringify(audit).includes(w)),
+        JSON.stringify(audit));
+
+  // те же карточки в тёмной теме и на телефоне
+  const views = [["desktop-dark", { ...desktop, colorScheme: "dark" }], ["phone-light", phone],
+                 ["phone-dark", { ...phone, colorScheme: "dark" }],
+                 ["phone360-light", { ...phone, viewport: { width: 360, height: 740 } }]];
+  const stored = await context.storageState();
+  for (const [name, options] of views) {
+    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const p = await ctx.newPage();
+    p.on("dialog", (d) => d.accept());
+    await p.goto(URL_PAGE);
+    await p.waitForSelector("#screen-app:not([hidden])");
+    await p.click("#notify-details > summary");
+    await p.waitForSelector("#notify-form input[name=nt-personal]:checked");
+    await cardShot(p, "#s-notify", `notify-${name}`);
+    await p.click("#watch-details > summary");
+    await p.waitForSelector("#watch-list .watch-rule");
+    await p.locator("#watch-list .watch-rule").first().locator("button", { hasText: "Изменить" }).click();
+    await p.waitForSelector("#watch-form:not([hidden]) #wr-name");
+    await cardShot(p, "#s-watch", `watch-${name}`);
+    await p.waitForSelector("#s-retry:not([hidden])");
+    await cardShot(p, "#s-retry", `retry-${name}`);
+    const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    check(`вёрстка (уведомления, наблюдатель, повтор; ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+    await ctx.close();
+  }
+}
+
 // --- «дашборд» на соседнем порту: тот же браузер владельца, вход на страницу выполнен -------------
 {
   const dash = await context.newPage();

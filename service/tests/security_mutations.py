@@ -150,6 +150,21 @@ MUTATIONS = (
              "        answer, result = await settle(conn, SPHERE_CHATS, {\"sphere_id\": sphere_id, \"add\": add, \"remove\": remove},\n                                      summary=None)",
              "tests/processing/test_spheres_tools.py::test_sphere_changes_through_the_api_wait_for_the_owner",
              database=True),
+    # Уведомления владельцу (Р-84): расширение через внутренний API ждёт владельца; из приложения —
+    # только сузить; скрытое защитой уходит без текста.
+    Mutation("notify_api_widening_waits", "src/shturman/notify/service.py",
+             "        summary = None\n        if wider:", "        summary = None\n        if False:",
+             "tests/notify/test_notify_api.py::test_widening_waits_for_the_owner_in_the_bot",
+             database=True),
+    Mutation("notify_app_only_narrows", "src/shturman/setup_page/notify.py",
+             "        if wider:\n            await page._log(request, \"app.notify\"",
+             "        if False:\n            await page._log(request, \"app.notify\"",
+             "tests/setup_page/test_notify_page.py::test_app_can_only_narrow_and_owner_is_told",
+             database=True),
+    Mutation("notify_hidden_without_text", "src/shturman/notify/core.py",
+             "    if not row[\"agent_visible\"]:\n        return HIDDEN_TEXT", "    if False:\n        return HIDDEN_TEXT",
+             "tests/notify/test_notify_core.py::test_hidden_by_guard_is_told_without_text",
+             database=True),
 )
 
 # Capture actual pytest phases and exception types, rather than treating a

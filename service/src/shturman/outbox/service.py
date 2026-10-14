@@ -539,7 +539,7 @@ async def remove_trusted(request: Request) -> JSONResponse:
 
 # --- наблюдатель ---
 
-_RULE_COLUMNS = ("name", "enabled", "chat_ids", "keywords", "regexes", "use_lemmas", "description",
+_RULE_COLUMNS = ("name", "enabled", "chat_ids", "sphere_ids", "keywords", "regexes", "use_lemmas", "description",
                  *watcher.LIMITS)
 
 
@@ -571,6 +571,12 @@ async def _chat_names(conn: asyncpg.Connection, chat_ids: list[int]) -> str:
     return _listed([titles.get(i, f"чат {i}") for i in chat_ids], 8, 40)
 
 
+async def _sphere_names(conn: asyncpg.Connection, sphere_ids: list[int]) -> str:
+    rows = await conn.fetch("SELECT id, title FROM spheres WHERE id = ANY($1::bigint[])", sphere_ids)
+    titles = {r["id"]: r["title"] for r in rows}
+    return _listed([titles.get(i, f"сфера {i}") for i in sphere_ids], 8, 40) or "—"
+
+
 async def _rule_lines(conn: asyncpg.Connection, fields: dict[str, Any], before: Any = None) -> str:
     """Поля правила строками для карточки владельцу. before — прежнее правило (для правки)."""
     lines: list[str] = []
@@ -580,8 +586,11 @@ async def _rule_lines(conn: asyncpg.Connection, fields: dict[str, Any], before: 
         lines.append("• включить правило")
     if fields.get("enabled") is False:
         lines.append("• правило выключено" if before is None else "• выключить правило")
-    if "chat_ids" in fields:
+    if "chat_ids" in fields and (fields["chat_ids"] or before is not None):
         lines.append(f"• чаты ({len(fields['chat_ids'])}): {await _chat_names(conn, fields['chat_ids'])}")
+    if fields.get("sphere_ids") or ("sphere_ids" in fields and before is not None):
+        lines.append(f"• сферы ({len(fields['sphere_ids'])}): {await _sphere_names(conn, fields['sphere_ids'])} "
+                     "— группы и каналы этих сфер, в том числе добавленные в них позже")
     if fields.get("keywords"):
         lines.append(f"• слова: {_listed(fields['keywords'], 12, 40)}")
     if fields.get("regexes"):
@@ -601,8 +610,8 @@ def _rule_widens(current: Any, changes: dict[str, Any]) -> bool:
     уведомлений, выше пределы. Сужение (выключить, убрать чаты и слова, снизить пределы) — нет."""
     for key, value in changes.items():
         old = current[key]
-        if key in ("chat_ids", "keywords", "regexes"):
-            if set(value) - set(old):
+        if key in ("chat_ids", "keywords", "regexes", "sphere_ids"):
+            if set(value) - set(old or ()):
                 return True
         elif key in ("enabled", "use_lemmas"):
             if value and not old:
@@ -615,11 +624,18 @@ def _rule_widens(current: Any, changes: dict[str, Any]) -> bool:
     return False
 
 
-async def _checked_chats(conn: asyncpg.Connection, chat_ids: list[int], error: type[Exception]) -> None:
+async def _checked_chats(conn: asyncpg.Connection, chat_ids: list[int], error: type[Exception],
+                         sphere_ids: list[int] | None = None) -> None:
     try:
-        await watcher.check_chats(conn, chat_ids)
+        if chat_ids:
+            await watcher.check_chats(conn, chat_ids)
+        await watcher.check_spheres(conn, sphere_ids or [])
     except ValueError as exc:
         raise error(str(exc), 400) from None
+
+
+def _where_empty(merged: dict[str, Any]) -> bool:
+    return not merged["chat_ids"] and not merged.get("sphere_ids")
 
 
 @confirm.applier(RULE_CREATE)
@@ -629,7 +645,7 @@ async def _apply_rule_create(conn: asyncpg.Connection, payload: dict[str, Any]) 
         rule = watcher.validate_rule(dict(payload))
     except ValueError as exc:
         raise confirm.Refused(str(exc), 400) from None
-    await _checked_chats(conn, rule["chat_ids"], confirm.Refused)
+    await _checked_chats(conn, rule["chat_ids"], confirm.Refused, rule.get("sphere_ids"))
     columns = [c for c in _RULE_COLUMNS if c in rule]
     row = await conn.fetchrow(
         f"""INSERT INTO watch_rules ({', '.join(columns)})
@@ -637,7 +653,8 @@ async def _apply_rule_create(conn: asyncpg.Connection, payload: dict[str, Any]) 
         *[rule[c] for c in columns])
     await confirm.tell(
         conn, f"Добавлено правило наблюдателя «{row['name']}»: чатов — {len(row['chat_ids'])}, "
-              f"слов — {len(row['keywords'])}, выражений — {len(row['regexes'])}.", silent=True)
+              f"сфер — {len(row['sphere_ids'])}, слов — {len(row['keywords'])}, "
+              f"выражений — {len(row['regexes'])}.", silent=True)
     return confirm.Done(result=watcher.rule_public(row))
 
 
@@ -657,8 +674,10 @@ async def _apply_rule_update(conn: asyncpg.Connection, payload: dict[str, Any]) 
     merged = {**dict(current), **changes}
     if not merged["keywords"] and not merged["regexes"]:
         raise confirm.Refused("нужно хотя бы одно слово в keywords или выражение в regexes", 400)
-    if "chat_ids" in changes:
-        await _checked_chats(conn, changes["chat_ids"], confirm.Refused)
+    if _where_empty(merged):
+        raise confirm.Refused("нужен хотя бы один чат или сфера", 400)
+    if "chat_ids" in changes or "sphere_ids" in changes:
+        await _checked_chats(conn, changes.get("chat_ids") or [], confirm.Refused, changes.get("sphere_ids"))
     columns = [c for c in _RULE_COLUMNS if c in changes]
     row = await conn.fetchrow(
         f"""UPDATE watch_rules SET {', '.join(f'{c} = ${i}' for i, c in enumerate(columns, 2))},
@@ -680,7 +699,7 @@ async def _apply_rule_delete(conn: asyncpg.Connection, payload: dict[str, Any]) 
 async def create_rule(request: Request) -> JSONResponse:
     rule = _checked(watcher.validate_rule, await body(request))
     async with _pool(request).acquire() as conn:
-        await _checked_chats(conn, rule["chat_ids"], BadRequest)
+        await _checked_chats(conn, rule["chat_ids"], BadRequest, rule.get("sphere_ids"))
         summary = (f"Добавить правило наблюдателя «{rule['name']}». Сервис будет просматривать новые "
                    "сообщения в этих чатах, показывать совпадения модели и писать вам о важном.\n"
                    + await _rule_lines(conn, rule))
@@ -701,8 +720,10 @@ async def update_rule(request: Request) -> JSONResponse:
         merged = {**dict(current), **changes}
         if not merged["keywords"] and not merged["regexes"]:
             raise BadRequest("нужно хотя бы одно слово в keywords или выражение в regexes")
-        if "chat_ids" in changes:
-            await _checked_chats(conn, changes["chat_ids"], BadRequest)
+        if _where_empty(merged):
+            raise BadRequest("нужен хотя бы один чат или сфера")
+        if "chat_ids" in changes or "sphere_ids" in changes:
+            await _checked_chats(conn, changes.get("chat_ids") or [], BadRequest, changes.get("sphere_ids"))
         summary = None
         if _rule_widens(current, changes):
             changed = {k: v for k, v in changes.items()

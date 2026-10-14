@@ -28,6 +28,10 @@
   <button type="button" role="tab" id="tab-spheres" aria-controls="screen-spheres" aria-selected="false">
     <span>Сферы</span><span class="badge" id="tab-spheres-count" hidden></span>
   </button>
+  <button type="button" role="tab" id="tab-notify" aria-controls="screen-notify" aria-selected="false"
+          aria-label="Уведомления" title="Уведомления">
+    <span aria-hidden="true">🔔</span>
+  </button>
 </nav>
 
 <main id="main">
@@ -192,6 +196,54 @@
       <ul class="sph-list" id="sph-folders"></ul>
       <p class="muted foot">Добавить чат в сферу — кнопкой «Сферы» в строке чата на экране «Чаты». Изменения сфер отсюда
         записываются в журнал действий страницы с пометкой «из приложения». Какие чаты читаются, сферы не меняют.</p>
+    </div>
+  </section>
+  <!-- экран «Уведомления» (Р-84): смотреть и сужать; включить больше — на странице «Переписка» -->
+  <section id="screen-notify" role="tabpanel" aria-labelledby="tab-notify" hidden>
+    <div class="title-row">
+      <h1>Уведомления</h1>
+    </div>
+    <p class="lead muted">Бот пишет вам, когда вам написали в личку или обратились к вам в группе. Здесь можно
+      выключить лишнее и выбрать время. Включить больше — на странице «Переписка» в браузере.</p>
+    <p class="muted" id="nt-loading">Загружаю…</p>
+    <div class="panel" id="nt-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="nt-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="nt-retry">Повторить</button>
+    </div>
+    <div id="nt-body" hidden>
+      <p class="banner" id="nt-nobot" hidden>Бот согласований не настроен — уведомлений не будет.</p>
+      <div class="panel">
+        <h2>Сейчас</h2>
+        <ul class="lines nt-now" id="nt-now"></ul>
+      </div>
+      <div class="panel" id="nt-off-box">
+        <h2>Выключить</h2>
+        <div class="actions nt-off" id="nt-off"></div>
+        <p class="muted small" id="nt-off-none" hidden>Всё уже выключено.</p>
+      </div>
+      <form class="panel nt-when" id="nt-when-form" autocomplete="off" novalidate>
+        <h2>Когда присылать</h2>
+        <label class="field" for="nt-when"><span>Как присылать</span>
+          <select id="nt-when">
+            <option value="i5">Сразу, не чаще раза в 5 мин</option>
+            <option value="i10">Сразу, не чаще раза в 10 мин</option>
+            <option value="i15">Сразу, не чаще раза в 15 мин</option>
+            <option value="i30">Сразу, не чаще раза в 30 мин</option>
+            <option value="i60">Сразу, не чаще раза в час</option>
+            <option value="d15">Пачкой раз в 15 мин</option>
+            <option value="d30">Пачкой раз в 30 мин</option>
+            <option value="d60">Пачкой раз в час</option>
+          </select></label>
+        <p class="muted small">«Сразу» — для каждого чата отдельно: следующие сообщения того же чата придут одним уведомлением «…и ещё N».</p>
+        <label class="check"><input type="checkbox" id="nt-quiet"><span>Тихие часы</span></label>
+        <div class="tools-row">
+          <label class="field" for="nt-from"><span>с</span><input type="time" id="nt-from" step="300"></label>
+          <label class="field" for="nt-to"><span>до</span><input type="time" id="nt-to" step="300"></label>
+        </div>
+        <button type="submit" class="primary wide" id="nt-save">Сохранить</button>
+      </form>
+      <p class="muted foot">Каждое изменение отсюда бот согласований сообщит вам отдельным сообщением.</p>
     </div>
   </section>
 </main>

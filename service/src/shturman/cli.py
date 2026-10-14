@@ -350,6 +350,52 @@ async def _setup_logout_all() -> None:
     print(f"Завершено сессий страницы настройки: {count}. Невостребованная ссылка входа отменена.")
 
 
+async def _retry_failed(since_text: str | None, dry_run: bool) -> None:
+    """Повтор того, что не получилось из-за сбоя модели (retry.py, Р-84). Запускает оператор по решению
+    владельца: повторный разбор снова отправляет данные провайдеру модели и тратит запросы."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from . import retry
+
+    try:
+        days = min(3650, max(0, int(os.environ.get("SHTURMAN_MEDIA_DAYS", "") or 30)))
+    except ValueError:
+        sys.exit("SHTURMAN_MEDIA_DAYS: нужно целое число дней")
+    since = None
+    if since_text:
+        try:
+            tz = ZoneInfo(os.environ.get("SHTURMAN_TIMEZONE", "").strip() or "Europe/Moscow")
+            since = datetime.strptime(since_text, "%Y-%m-%d").replace(tzinfo=tz)
+        except ValueError:
+            sys.exit("--since: дата вида 2026-10-01")
+        except Exception:
+            sys.exit("SHTURMAN_TIMEZONE: неизвестный часовой пояс")
+    conn = await db.connect(_dsn())
+    try:
+        await db.migrate(conn)
+        found = await retry.candidates(conn, media_days=days, since=since)
+        if dry_run:
+            print(f"Можно вернуть: вложений — {found['media']}"
+                  + ("" if found["media_enabled"] else " (разбор фото и документов выключен — не вернутся)")
+                  + f", запросов обработки переписки — {found['requests']}.")
+            print(f"Не повторяются (не сбой модели): вложений — {found['media_not_model']}. "
+                  f"Страниц памяти без сводки (пересоберутся сами): {found['pages']}.")
+            return
+        out = await retry.run(conn, media_days=days, since=since, by="cli")
+        await conn.execute(
+            "INSERT INTO setup_audit (action, outcome, detail) VALUES ('retry.failed', 'ok', $1)",
+            f"из терминала; вложений: {out['media']}; запросов обработки: {out['requests']}"
+            + (f"; с {since.date().isoformat()}" if since else ""))
+    finally:
+        await conn.close()
+    print(f"Возвращено в работу: вложений — {out['media']}, запросов обработки переписки — {out['requests']}.")
+    if not out["media_enabled"]:
+        print("Разбор фото и документов выключен владельцем: вложения не возвращались.")
+    print("Вложения разберутся в ближайшие минуты; запросы обработки — в следующий прогон (ночью). "
+          "Повторный разбор снова уходит провайдеру модели и тратит запросы.")
+
+
 def _serve() -> None:
     import logging
 
@@ -404,6 +450,10 @@ def main() -> None:
     link.add_argument("--url", action="store_true",
                       help="напечатать полный адрес, а не только путь /shturman-setup/#…")
     sub.add_parser("setup-logout-all", help="завершить все сессии страницы настройки")
+    rf = sub.add_parser("retry-failed", help="вернуть в работу то, что не получилось из-за сбоя модели "
+                                             "(по решению владельца: снова тратит запросы к модели)")
+    rf.add_argument("--since", metavar="ГГГГ-ММ-ДД", help="с какой даты считать сбой (по умолчанию — всё)")
+    rf.add_argument("--dry-run", action="store_true", help="только показать, сколько вернётся")
     a = p.parse_args()
 
     if a.cmd == "migrate":
@@ -428,6 +478,8 @@ def main() -> None:
         asyncio.run(_setup_link(a.url))
     elif a.cmd == "setup-logout-all":
         asyncio.run(_setup_logout_all())
+    elif a.cmd == "retry-failed":
+        asyncio.run(_retry_failed(a.since, a.dry_run))
 
 
 if __name__ == "__main__":

@@ -773,6 +773,122 @@
       </details>
     </section>
 
+    <!-- ===================================================== уведомления (не шаг, Р-84) -->
+    <!-- Рисует setup.js (раздел «уведомления»). -->
+    <section class="card memory" id="s-notify" aria-labelledby="h-notify">
+      <details id="notify-details">
+        <summary>
+          <span class="memory-head">
+            <span class="card-head">
+              <span class="h2" id="h-notify" role="heading" aria-level="2">Уведомления</span>
+              <span class="pill" id="st-notify"></span>
+            </span>
+            <span class="memory-lead">Бот согласований пишет вам, когда вам написали в личку или обратились к вам в группе: кто, где, когда и начало сообщения.</span>
+          </span>
+        </summary>
+        <div class="memory-body" id="notify-body">
+          <p class="note warn" id="notify-nobot" hidden>Уведомления приходят в бот согласований — сначала настройте его (шаг 1). Пока бота нет, уведомлений не будет.</p>
+          <p class="note info" id="notify-default" hidden>Сейчас действуют настройки по умолчанию: личные — от всех, обращения в группах — да, сразу (не чаще раза на чат за 10 минут), тихие часы 23:00–08:00. Измените их ниже или выключите.</p>
+          <form class="mem-form notify-form" id="notify-form" autocomplete="off" novalidate>
+            <fieldset class="mem-fieldset">
+              <legend>Личные сообщения</legend>
+              <div class="choice-row" role="radiogroup" aria-label="О каких личных сообщениях сообщать">
+                <label class="check"><input type="radio" name="nt-personal" value="all"><span>От всех</span></label>
+                <label class="check"><input type="radio" name="nt-personal" value="spheres"><span>Только из выбранных сфер</span></label>
+                <label class="check"><input type="radio" name="nt-personal" value="people"><span>Только от выбранных людей</span></label>
+                <label class="check"><input type="radio" name="nt-personal" value="off"><span>Не сообщать</span></label>
+              </div>
+              <div id="nt-spheres-box" class="sph-pick" hidden>
+                <span class="hint">Сферы, из чатов которых сообщать:</span>
+                <div class="sph-pick-list" id="nt-spheres"></div>
+                <p class="hint" id="nt-spheres-empty" hidden>Сфер пока нет — заведите их в разделе «Сферы» выше.</p>
+              </div>
+              <div id="nt-people-box" class="sph-pick" hidden>
+                <span class="hint">Люди, о сообщениях которых сообщать (по номеру в Telegram, а не по имени):</span>
+                <ul class="mem-items" id="nt-people"></ul>
+                <div class="field">
+                  <label for="nt-people-q">Добавить человека из ваших личных чатов</label>
+                  <input id="nt-people-q" type="search" placeholder="Имя или @имя" autocomplete="off">
+                </div>
+                <ul class="mem-items sph-found" id="nt-people-found"></ul>
+              </div>
+              <p class="hint">Только новые входящие от людей: не о своих сообщениях, ботах, служебных чатах Telegram, правках и загруженной истории.</p>
+            </fieldset>
+            <fieldset class="mem-fieldset">
+              <legend>Группы</legend>
+              <label class="check"><input type="checkbox" id="nt-groups"><span>Сообщать, когда обращаются ко мне: упоминают меня, отвечают на моё сообщение или обращаются по имени в начале реплики</span></label>
+              <div class="field">
+                <label for="nt-aliases">Как к вам обращаются — по желанию</label>
+                <input id="nt-aliases" type="text" maxlength="400" placeholder="Например: Евгений, Евгений Сергеевич">
+                <p class="hint">Через запятую. Считается, только если реплика начинается с этого обращения и знака: «Евгений, посмотрите…». Имя в середине текста — нет.</p>
+              </div>
+            </fieldset>
+            <fieldset class="mem-fieldset">
+              <legend>Что показывать и когда</legend>
+              <label class="check"><input type="checkbox" id="nt-preview"><span>Показывать начало сообщения (до 300 знаков)</span></label>
+              <div class="choice-row" role="radiogroup" aria-label="Как присылать">
+                <label class="check"><input type="radio" name="nt-mode" value="instant"><span>Сразу, но не чаще раза на чат за</span>
+                  <select id="nt-gap" aria-label="Минут между уведомлениями одного чата"><option value="5">5 мин</option><option value="10">10 мин</option><option value="15">15 мин</option><option value="30">30 мин</option><option value="60">час</option></select></label>
+                <label class="check"><input type="radio" name="nt-mode" value="digest"><span>Пачкой раз в</span>
+                  <select id="nt-digest" aria-label="Как часто присылать пачку"><option value="15">15 мин</option><option value="30">30 мин</option><option value="60">час</option></select></label>
+              </div>
+              <label class="check"><input type="checkbox" id="nt-quiet"><span>Тихие часы — в это время копить, а потом прислать одной пачкой</span></label>
+              <div class="row nt-quiet-times" id="nt-quiet-times">
+                <label class="field" for="nt-quiet-from"><span>с</span><input id="nt-quiet-from" type="time" step="300"></label>
+                <label class="field" for="nt-quiet-to"><span>до</span><input id="nt-quiet-to" type="time" step="300"></label>
+                <span class="hint" id="nt-tz"></span>
+              </div>
+            </fieldset>
+            <p class="note warn" id="notify-error" role="alert" hidden></p>
+            <div class="row"><button class="btn" id="notify-save" type="submit">Сохранить</button><span class="hint" id="notify-stats"></span></div>
+          </form>
+          <details class="faq">
+            <summary>Вопросы про уведомления</summary>
+            <dl>
+              <dt>Ассистент читает мои сообщения, чтобы решить, о чём сообщить?</dt>
+              <dd>Нет. Отбор делает сам сервис по простым признакам: личный ли это чат, от кого, есть ли в сообщении упоминание вас. Модель не спрашивается, текст никуда не отправляется — кроме вас, в бот согласований.</dd>
+              <dt>Что если я уже ответил?</dt>
+              <dd>Если до отправки уведомления вы ответили в этом чате, уведомление не придёт.</dd>
+              <dt>А если сообщение скрыла защита?</dt>
+              <dd>Уведомление придёт без текста: «скрыто защитой — решите в карточке». Текст увидите, открыв его кнопкой в карточке защиты.</dd>
+              <dt>Можно ли ответить из уведомления?</dt>
+              <dd>Нет. Это только сообщение «вам написали». Отвечаете вы сами в Telegram.</dd>
+              <dt>Кто ещё может менять эти настройки?</dt>
+              <dd>Ассистент может попросить: сузить — сразу, а расширить (например, «от всех» или показывать текст) — только после вашего «Да» в боте. В приложении «Штурман» можно только сузить или поменять время.</dd>
+            </dl>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ===================================================== наблюдатель (не шаг, Р-84) -->
+    <section class="card memory" id="s-watch" aria-labelledby="h-watch">
+      <details id="watch-details">
+        <summary>
+          <span class="memory-head">
+            <span class="card-head">
+              <span class="h2" id="h-watch" role="heading" aria-level="2">Наблюдатель</span>
+              <span class="pill" id="st-watch"></span>
+            </span>
+            <span class="memory-lead">Следит за группами и каналами по словам — сроки, деньги, «срочно», ваше имя — и пишет вам о важном.</span>
+          </span>
+        </summary>
+        <div class="memory-body" id="watch-body">
+          <p>Правило — это слова, где их искать (группы и каналы или целые сферы) и что для вас важно. Когда слово нашлось, модель проверяет, действительно ли сообщение подходит под ваше описание, и только тогда бот согласований пишет вам. <b>Сообщение с совпадением уходит модели — её провайдеру</b>, как уже уходит переписка при разборе. В группе наблюдатель ничего не пишет.</p>
+          <div class="row" id="watch-templates" aria-label="Готовые правила"></div>
+          <p class="note warn" id="watch-error" role="alert" hidden></p>
+          <ul class="sph-list" id="watch-list"></ul>
+          <form class="mem-form watch-form" id="watch-form" autocomplete="off" novalidate hidden></form>
+          <div class="row"><button class="btn ghost" id="watch-new" type="button">Новое правило</button></div>
+          <section class="mem-block" id="watch-hits-box">
+            <h4>Последние срабатывания</h4>
+            <p class="small">Что нашлось и что решила модель — без текста сообщений. Открыть сообщение можно ссылкой, если у чата она есть.</p>
+            <ul class="mem-items" id="watch-hits"></ul>
+          </section>
+        </div>
+      </details>
+    </section>
+
     <!-- -------------------------------- аккаунты в архиве без подключения (оба способа) -->
     <section class="card" id="detached-box" aria-labelledby="h-detached" hidden>
       <div class="card-head">
@@ -913,6 +1029,23 @@
           </details>
         </div>
       </details>
+    </section>
+
+    <!-- ===================================== повтор после сбоя (виден, когда есть что повторить; Р-84) -->
+    <section class="card" id="s-retry" aria-labelledby="h-retry" hidden>
+      <div class="card-head">
+        <h3 id="h-retry">Повторить то, что не получилось</h3>
+        <span class="pill" id="st-retry"></span>
+      </div>
+      <p id="retry-lead">Пока задания модели не выполнялись, часть работы честно сдалась после нескольких попыток.</p>
+      <ul id="retry-list"></ul>
+      <p class="small" id="retry-cost">Повторный разбор снова отправляет эти фото, документы и переписку провайдеру модели и тратит запросы (по подписке — её лимит). Не повторяется то, что не получилось из-за самого файла: вид, размер, файла нет.</p>
+      <div class="row" id="retry-since-row">
+        <label class="field" for="retry-since"><span>Сбой начался — по желанию</span><input id="retry-since" type="date"></label>
+      </div>
+      <p class="note warn" id="retry-error" role="alert" hidden></p>
+      <p class="note" id="retry-status" role="status" hidden></p>
+      <div class="row" id="retry-run-row"><button class="btn" id="retry-run" type="button">Повторить то, что не получилось</button></div>
     </section>
 
     <!-- ============================================================ дополнительно -->

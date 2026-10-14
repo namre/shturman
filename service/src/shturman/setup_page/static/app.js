@@ -41,7 +41,7 @@
   var listTimer = null;
   var listShown = false;                         // список уже был на экране хотя бы раз
   var signedIn = false;                          // на экране — разделы, а не вход или его неудача
-  var tab = "approvals";                         // открытый раздел: approvals | chats | spheres
+  var tab = "approvals";                         // открытый раздел: approvals | chats | spheres | notify
 
   function $(id) { return document.getElementById(id); }
   function show(id, on) { $(id).hidden = !on; }
@@ -200,18 +200,20 @@
     show("screen-approvals", signedIn && tab === "approvals");
     show("screen-chats", signedIn && tab === "chats");
     show("screen-spheres", signedIn && tab === "spheres");
+    show("screen-notify", signedIn && tab === "notify");
     show("refresh", signedIn && tab === "approvals");
   }
 
   function openTab(name) {
-    tab = name === "chats" || name === "spheres" ? name : "approvals";
+    tab = name === "chats" || name === "spheres" || name === "notify" ? name : "approvals";
     try { sessionStorage.setItem(TAB_NAME, tab); } catch (e) { /* не страшно */ }
-    ["approvals", "chats", "spheres"].forEach(function (one) {
+    ["approvals", "chats", "spheres", "notify"].forEach(function (one) {
       $("tab-" + one).setAttribute("aria-selected", one === tab ? "true" : "false");
     });
     if (signedIn) screen("main");
     if (tab === "chats") { chatsOpened(); schedulePoll(); }
     if (tab === "spheres" && signedIn) loadSpheres(false);
+    if (tab === "notify" && signedIn) loadNotify(false);
   }
 
   // Ключ сессии больше не действует (срок, «выйти везде», смена владельца): войти заново можно,
@@ -342,6 +344,7 @@
     if (first || !signedIn) screen("main");
     if (first && tab === "chats") chatsOpened();
     if (first && tab === "spheres") loadSpheres(false);
+    if (first && tab === "notify") loadNotify(false);
     if (first) refreshSphereList();
   }
 
@@ -1345,17 +1348,116 @@
     });
   }
 
+  /* ------------------------------------------------------------ «Уведомления» (Р-84) */
+
+  // Здесь — только посмотреть, выключить лишнее и выбрать время: включить больше можно только на
+  // странице «Переписка» (сервер отвергает расширение из приложения, код page_only).
+  var nt = { data: null, loaded: false };
+  var NT_OFF = [
+    ["personal", "off", "Не сообщать о личных сообщениях", function (s) { return s.personal !== "off"; }],
+    ["groups", false, "Не сообщать об обращениях в группах", function (s) { return s.groups; }],
+    ["preview", false, "Не показывать текст сообщений", function (s) { return s.preview; }]
+  ];
+
+  function ntPanel(name) {
+    ["nt-loading", "nt-failed", "nt-body"].forEach(function (id) { show(id, id === name); });
+  }
+
+  function loadNotify(quiet) {
+    if (!quiet && !nt.loaded) ntPanel("nt-loading");
+    return request("GET", "notify").then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) {
+        $("nt-failed-text").textContent = got.data.error || "Сервер не ответил. Попробуйте ещё раз через минуту.";
+        ntPanel("nt-failed");
+        return;
+      }
+      nt.data = got.data;
+      nt.loaded = true;
+      ntPanel("nt-body");
+      drawNotify();
+    }, function () {
+      $("nt-failed-text").textContent = "Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.";
+      ntPanel("nt-failed");
+    });
+  }
+
+  function drawNotify() {
+    var d = nt.data, s = d.settings;
+    show("nt-nobot", !d.own_bot);
+    var now = $("nt-now");
+    now.textContent = "";
+    (d.describe || []).forEach(function (line) { now.appendChild(el("li", "", line.replace(/^• /, ""))); });
+    var box = $("nt-off");
+    box.textContent = "";
+    var any = false;
+    NT_OFF.forEach(function (item) {
+      if (!item[3](s)) return;
+      any = true;
+      var button = el("button", "secondary", item[2]);
+      button.type = "button";
+      button.addEventListener("click", function () {
+        var body = {};
+        body[item[0]] = item[1];
+        saveNotify(body, button, "Готово: " + item[2].toLowerCase() + ".");
+      });
+      box.appendChild(button);
+    });
+    show("nt-off-none", !any);
+    $("nt-when").value = (s.mode === "digest" ? "d" + s.digest_minutes : "i" + s.gap_minutes);
+    $("nt-quiet").checked = s.quiet;
+    $("nt-from").value = s.quiet_from;
+    $("nt-to").value = s.quiet_to;
+    $("nt-from").disabled = $("nt-to").disabled = !s.quiet;
+  }
+
+  function saveNotify(body, button, done) {
+    if (busy) return Promise.resolve();
+    busy = true;
+    if (button) button.disabled = true;
+    return request("PUT", "notify", body).then(function (got) {
+      busy = false;
+      if (button) button.disabled = false;
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) { toast(got.data.error || "Не получилось. Попробуйте ещё раз."); return; }
+      nt.data = got.data;
+      drawNotify();
+      toast(done);
+    }, function () {
+      busy = false;
+      if (button) button.disabled = false;
+      toast("Нет связи с сервером.");
+    });
+  }
+
+  function wireNotify() {
+    $("nt-retry").addEventListener("click", function () { loadNotify(false); });
+    $("nt-quiet").addEventListener("change", function () {
+      $("nt-from").disabled = $("nt-to").disabled = !$("nt-quiet").checked;
+    });
+    $("nt-when-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var when = $("nt-when").value, minutes = Number(when.slice(1));
+      var body = when.charAt(0) === "d" ? { mode: "digest", digest_minutes: minutes } : { mode: "instant", gap_minutes: minutes };
+      body.quiet = $("nt-quiet").checked;
+      if (body.quiet) { body.quiet_from = $("nt-from").value; body.quiet_to = $("nt-to").value; }
+      saveNotify(body, $("nt-save"), "Сохранено.");
+    });
+  }
+
   /* ------------------------------------------------------------ запуск */
 
   $("refresh").addEventListener("click", function () { load(); });
   $("tab-approvals").addEventListener("click", function () { openTab("approvals"); });
   $("tab-chats").addEventListener("click", function () { openTab("chats"); });
   $("tab-spheres").addEventListener("click", function () { openTab("spheres"); });
+  $("tab-notify").addEventListener("click", function () { openTab("notify"); });
   wireChats();
   wireSpheres();
+  wireNotify();
   try {
     var saved = sessionStorage.getItem(TAB_NAME);
-    tab = saved === "chats" || saved === "spheres" ? saved : "approvals";
+    tab = saved === "chats" || saved === "spheres" || saved === "notify" ? saved : "approvals";
   } catch (e) { tab = "approvals"; }
   openTab(tab);
   $("retry").addEventListener("click", function () {
@@ -1370,6 +1472,7 @@
     // Список чатов — из базы сервиса, без запроса к Telegram: можно перечитать при возвращении.
     if (tab === "chats" && chats.opened && !chats.loading) loadAccounts(true);
     if (tab === "spheres") loadSpheres(true);
+    if (tab === "notify") loadNotify(true);
   });
 
   postEvent("web_app_ready");

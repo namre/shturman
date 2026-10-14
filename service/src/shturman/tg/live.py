@@ -149,12 +149,15 @@ class LiveIngest:
         else:
             ids = result.new_ids
         for message_id in ids:
+            payload = {"account_id": self.account_id, "chat_id": chat_id, "message_id": message_id,
+                       "source": "session", "outgoing": outgoing, "edited": edited, "via_bot": via_bot}
             if message_id in hidden:
-                continue   # скрыто защитой: остальные модули о нём не узнают
-            self.events.publish(ev.MESSAGE_LIVE, {
-                "account_id": self.account_id, "chat_id": chat_id, "message_id": message_id,
-                "source": "session", "outgoing": outgoing, "edited": edited, "via_bot": via_bot,
-            })
+                # Скрыто защитой: модули ассистента о нём не узнают; уведомлению владельцу
+                # (без текста) — отдельной темой.
+                if not edited:
+                    self.events.publish(ev.MESSAGE_HELD, payload)
+                continue
+            self.events.publish(ev.MESSAGE_LIVE, payload)
 
     async def _refresh_chat(self, conn: asyncpg.Connection, key: PeerKey, entities: normalize.Entities) -> None:
         """Живой источник знает актуальное название чата — обновляет его, когда оно изменилось."""

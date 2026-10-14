@@ -60,6 +60,7 @@ MODULES = (
     "shturman.spheres_service",    # сферы (Р-82): маршруты с подтверждением и инструмент list_spheres
     "shturman.processing.mcp_tools",
     "shturman.outbox.service",
+    "shturman.notify.service",     # уведомления владельцу «вам написали», «вас упомянули» (Р-84)
     "shturman.replies.service",    # продолжение задач после Telegram-решений владельца
     "shturman.remote_mcp",
     "shturman.setup_page.service",  # последним: страница настройки пользуется остальными модулями

@@ -281,7 +281,9 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
         (miniapp.APP_API + "/spheres/{sphere_id:int}/chats", ["GET"]),
         (miniapp.APP_API + "/spheres/{sphere_id:int}/chats", ["POST"]),
         (miniapp.APP_API + "/spheres/{sphere_id:int}/folders", ["POST"]),
-        (miniapp.APP_API + "/spheres/{sphere_id:int}/proposals", ["POST"])])
+        (miniapp.APP_API + "/spheres/{sphere_id:int}/proposals", ["POST"]),
+        # уведомления (Р-84, tests/setup_page/test_notify_page.py): только сузить и время
+        (miniapp.APP_API + "/notify", ["GET"]), (miniapp.APP_API + "/notify", ["PUT"])])
     for route in routes:
         if route.path != APP_PATH:
             assert getattr(route.endpoint, "miniapp", False), route.path     # своя обёртка — своя сессия

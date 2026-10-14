@@ -565,3 +565,28 @@ async def test_rule_is_rechecked_when_the_owner_presses(env, own_bot, approvals)
     assert out["answer"] == "Не получилось." and "исключён владельцем" in out["edit_text"]
     assert await rules(env) == []
 
+
+# --- наблюдатель по сферам (Р-84) ---
+
+async def test_adding_a_sphere_to_a_rule_waits_and_dropping_it_is_immediate(env, own_bot, approvals):
+    from shturman import spheres
+
+    rule_id, chat, _ = await a_rule(env)
+    work = (await spheres.create_sphere(env.conn, "Работа"))["id"]
+
+    async def read():
+        return list(await env.conn.fetchval("SELECT sphere_ids FROM watch_rules WHERE id = $1", rule_id))
+
+    async def send():
+        return await env.client.put(f"/api/watch/rules/{rule_id}", json={"sphere_ids": [work]})
+
+    await approvals.gate(send, read, [], [work])
+    summary = await env.conn.fetchval("SELECT summary FROM pending_actions ORDER BY id DESC LIMIT 1")
+    assert "сферы (1): «Работа»" in summary and "добавленные в них позже" in summary
+    answer = await env.client.put(f"/api/watch/rules/{rule_id}", json={"sphere_ids": []})
+    assert answer.status_code == 200 and answer.json()["sphere_ids"] == [] and await approvals.pending() == 0
+    # без чатов и без сфер правило не бывает; несуществующая сфера — отказ до карточки
+    assert (await env.client.put(f"/api/watch/rules/{rule_id}", json={"chat_ids": []})).status_code == 400
+    bad = await env.client.post("/api/watch/rules", json={**RULE, "chat_ids": [], "sphere_ids": [999]})
+    assert bad.status_code == 400 and await approvals.pending() == 0
+
