@@ -538,3 +538,139 @@ def test_send_on_owners_behalf_is_never_cut_only_refused():
     too_long = run(executor.execute(BUSINESS_SEND, {**SEND, "text": "😀" * 2049}, 1))   # 2049 знаков, 4098 единиц
     assert fits.ok and bot.business[0][2] == "😀" * 2048
     assert too_long.error.startswith("not_sent:") and len(bot.business) == 1
+
+
+# --- область секретов профиля Hermes вокруг вызова модели (Р-83) ---
+
+import contextlib  # noqa: E402
+import contextvars  # noqa: E402
+
+from shturman_core.executor import FailureLog, error_label  # noqa: E402
+
+SCOPE = contextvars.ContextVar("scope", default=None)
+
+
+class UnscopedSecretError(RuntimeError):
+    """Как agent.secret_scope.UnscopedSecretError: ключ спрошен вне области при мультиплексе."""
+
+
+class ScopedHermesLlm(FakeLlm):
+    """Подставной Hermes с включённым мультиплексом: модель доступна только внутри области."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scopes: list = []
+
+    def _key(self):
+        self.scopes.append(SCOPE.get())
+        if SCOPE.get() is None:
+            raise UnscopedSecretError("Hermes could not read this profile's OPENAI_API_KEY " + SECRET_TEXT)
+
+    async def acomplete_structured(self, **kwargs):
+        self._key()
+        return await super().acomplete_structured(**kwargs)
+
+    async def acomplete(self, messages, **kwargs):
+        self._key()
+        return await super().acomplete(messages, **kwargs)
+
+
+def launch_scope():
+    entered = []
+
+    @contextlib.asynccontextmanager
+    async def scope():
+        token = SCOPE.set("launch")
+        entered.append(True)
+        try:
+            yield
+        finally:
+            SCOPE.reset(token)
+    return scope, entered
+
+
+STRUCT = {"instructions": "Найди обязательства", "input": SECRET_TEXT}
+TEXT = {"messages": [{"role": "user", "content": SECRET_TEXT}]}
+
+
+def test_without_profile_scope_hermes_refuses_and_only_the_class_name_leaves():
+    executor, _, _, _, _ = make(llm=ScopedHermesLlm())
+    out = run(executor.execute(LLM_STRUCTURED, STRUCT, 1))
+    assert not out.ok and out.error == "UnscopedSecretError" and out.label == "UnscopedSecretError"
+    assert SECRET_TEXT not in out.error
+
+
+def test_model_is_called_inside_the_profile_scope_for_both_llm_kinds():
+    scope, entered = launch_scope()
+    llm = ScopedHermesLlm()
+    executor, service, _, _, _ = make([job(LLM_STRUCTURED, STRUCT, 1), job(LLM_TEXT, TEXT, 2)],
+                                      llm=llm, llm_scope=scope)
+    assert run(executor.poll("llm")) == 2
+    assert llm.scopes == ["launch", "launch"] and len(entered) == 2
+    assert sorted(p for p, _ in service.reports()) == ["/api/jobs/1/complete", "/api/jobs/2/complete"]
+    assert SCOPE.get() is None                       # область снята после вызова
+
+
+def test_bot_jobs_do_not_enter_the_model_scope():
+    scope, entered = launch_scope()
+    executor, _, bot, _, _ = make(llm_scope=scope)
+    assert run(executor.execute(NOTIFY_OWNER, {"text": "Привет"}, 1)).ok
+    assert entered == [] and bot.sent
+
+
+def test_scope_that_fails_to_open_is_a_retry_with_its_class_name():
+    @contextlib.asynccontextmanager
+    async def broken():
+        raise UnscopedSecretError("не удалось " + SECRET_TEXT)
+        yield
+    executor, _, _, llm, _ = make(llm_scope=broken)
+    out = run(executor.execute(LLM_TEXT, TEXT, 1))
+    assert out.error == "UnscopedSecretError" and out.retry_in == 30 and llm.calls == []
+
+
+def test_failure_log_names_the_error_kind_and_folds_repeats(caplog, clock):
+    executor, service, _, _, _ = make(llm=ScopedHermesLlm(), clock=clock)
+    with caplog.at_level(logging.WARNING, logger="shturman.executor"):
+        for n in range(5):
+            run(executor.handle(job(LLM_STRUCTURED, STRUCT, job_id=n + 1)))
+            clock.tick(5)
+        lines = [r.getMessage() for r in caplog.records]
+        assert lines == ["shturman: задание вида llm.structured не выполнено: UnscopedSecretError"]
+        clock.tick(60)
+        run(executor.handle(job(LLM_STRUCTURED, STRUCT, job_id=9)))
+        run(executor.handle(job(LLM_TEXT, TEXT, job_id=10)))       # другой вид задания — своя строка
+    lines = [r.getMessage() for r in caplog.records]
+    assert lines[1].startswith(
+        "shturman: задание вида llm.structured не выполнено: UnscopedSecretError (ещё 4 таких за ")
+    assert lines[2] == "shturman: задание вида llm.text не выполнено: UnscopedSecretError"
+    assert len(lines) == 3 and SECRET_TEXT not in caplog.text
+    assert len(service.reports()) == 7               # сервису сообщается о каждом задании
+
+
+def test_failure_log_keeps_a_bounded_number_of_keys(clock):
+    log = FailureLog(logging.getLogger("shturman.test"), clock=clock)
+    for n in range(FailureLog.MAX_KEYS + 50):
+        log.failed("llm.text", f"E{n}")
+    assert len(log._seen) == FailureLog.MAX_KEYS
+
+
+@pytest.mark.parametrize("error, label", [
+    ("ValueError", "ValueError"),
+    ("UnscopedSecretError", "UnscopedSecretError"),
+    ("у плагина нет доступа к модели Hermes", "no_model_access"),
+    ("в задании нет поля input", "bad_payload"),
+    ("поле images задано неверно", "bad_payload"),
+    ("владелец не привязан к боту", "owner_unbound"),
+    ("бот не подключён", "bot_not_ready"),
+    ("Telegram отказал: BadRequest: " + SECRET_TEXT, "Telegram:BadRequest"),
+    ("Telegram отказал: Telegram просит подождать (слишком много запросов)", "Telegram:RetryAfter"),
+    ("Telegram отказал: нет связи с Telegram (ConnectError)", "Telegram:no_connection"),
+    ("not_sent: Forbidden: " + SECRET_TEXT, "not_sent"),
+    ("исход неизвестен: TimedOut", "unknown_outcome:TimedOut"),
+    ("исход неизвестен: " + SECRET_TEXT, "unknown_outcome"),
+    (SECRET_TEXT, "other"),
+    ("", "other"),
+])
+def test_error_label_never_carries_free_text(error, label):
+    assert error_label(error) == label
+    assert SECRET_TEXT not in error_label(error)

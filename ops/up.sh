@@ -4,7 +4,10 @@
 #   ./ops/up.sh --pull   — сначала обновить образы указанных версий
 #   ./ops/up.sh --help   — эта справка; ничего не запускается
 # Что запускается, зависит от режима установки (SHTURMAN_MODE в .env, ./ops/mode.sh):
-#   hermes      — Hermes, сервис переписки, база; плагин и архив подключаются к Hermes;
+#   hermes      — Hermes, сервис переписки, база; плагин и архив подключаются к Hermes: запись
+#                 mcp_servers.shturman в настройках Hermes и токен архива в .env профиля Hermes
+#                 (data/hermes/.env — штатной функцией Hermes внутри контейнера, значение
+#                 не печатается; при изменении Hermes перезапускается);
 #   standalone  — только сервис переписки и база. Шаги Hermes пропускаются, его образ
 #                 не скачивается, а оставшийся от прежнего режима контейнер убирается.
 # В режиме с Hermes, если адрес дашборда задан, а адреса страницы настройки переписки в .env ещё
@@ -155,6 +158,31 @@ else:
     save_config(cfg)
     print("changed")' 2>/dev/null | tail -n 1
 }
+# Токен архива — в .env профиля Hermes (/opt/data/.env, Р-83). Запись в настройках ссылается на
+# переменную MCP_SHTURMAN_API_KEY; контейнеру её передаёт compose.yaml, но этого мало: когда шлюз
+# обслуживает несколько профилей, Hermes подставляет переменные только из .env профиля, а значение
+# из окружения контейнера не видит — и архив отвечает шлюзу 401. Значение берётся из окружения
+# контейнера и записывается штатной функцией Hermes (hermes_cli.config.save_env_value — так же
+# токен сохраняет `hermes mcp add`). Сравнение — внутри контейнера; значение не печатается
+# и сюда не попадает. Смена токена (./ops/mcp-token.sh) доходит сюда при следующем ./ops/up.sh:
+# Compose пересоздаёт контейнер с новым значением, а эта функция обновляет .env профиля.
+# Вывод: same | changed | missing (в окружении контейнера нет токена) | failed.
+mcp_key_sync() {
+  hx /opt/hermes/.venv/bin/python -c '
+import os
+from hermes_cli.config import load_env, save_env_value
+name = "MCP_SHTURMAN_API_KEY"
+want = (os.environ.get(name) or "").strip()
+if not want:
+    print("missing")
+elif load_env().get(name) == want:
+    print("same")
+else:
+    save_env_value(name, want)
+    from hermes_cli.config import invalidate_env_cache
+    invalidate_env_cache()
+    print("changed" if load_env().get(name) == want else "failed")' 2>/dev/null | tail -n 1
+}
 wait_service() {
   for _ in $(seq 1 45); do
     if curl -fsS -o /dev/null -m 3 http://127.0.0.1:8765/health 2>/dev/null; then return 0; fi
@@ -273,6 +301,12 @@ case "$(mcp_register)" in
   changed) echo "Архив переписки подключён к Hermes (MCP-сервер shturman)."; restart=yes ;;
   same) ;;
   *) echo "не удалось записать MCP-сервер shturman в настройки Hermes" >&2; exit 1 ;;
+esac
+case "$(mcp_key_sync)" in
+  changed) echo "Токен архива записан в .env профиля Hermes — Hermes перезапустится и подключится к архиву."; restart=yes ;;
+  same) ;;
+  missing) echo "В окружении контейнера Hermes нет токена архива (SHTURMAN_MCP_TOKEN в .env пуст?) — архив не будет доступен ассистенту. ./ops/init-env.sh --auto, затем ./ops/up.sh" >&2 ;;
+  *) echo "не удалось записать токен архива в .env профиля Hermes" >&2; exit 1 ;;
 esac
 # Hermes читает плагин при запуске и держит его в памяти. Если файлы плагина изменились с прошлого
 # запуска (обновление репозитория), а контейнер Hermes при этом не перезапускался, он продолжает

@@ -260,6 +260,54 @@ async def test_executor_round_trip_over_http(make_client, conn):
     assert status["owner_known"] is True and status["jobs_waiting"] == 0
 
 
+async def test_llm_job_outcomes_for_the_last_hour_are_counted_without_text(make_client, conn):
+    from shturman import jobstats
+
+    class Clock:
+        t = 10_000.0
+
+        def __call__(self):
+            return self.t
+    clock = Clock()
+    jobstats.reset(clock)
+    client, _ = await make_client("shturman.api_core")
+    secret = "Пароль от сейфа 7391"
+    ids = [await bridge.request_text(conn, handler="t.none", messages=[{"role": "user", "content": secret}],
+                                     dedup_key=f"k{n}") for n in range(4)]
+    await bridge.notify_owner(conn, "не задание модели")
+    for job_id in ids:
+        claimed = (await client.post("/api/jobs/claim", json={"kinds": ["llm.text"], "limit": 1})).json()["jobs"]
+        assert claimed and claimed[0]["id"] == job_id
+    await client.post(f"/api/jobs/{ids[0]}/fail", json={"error": "UnscopedSecretError", "retry_in": 30})
+    await client.post(f"/api/jobs/{ids[1]}/fail", json={"error": "UnscopedSecretError", "retry_in": None})
+    await client.post(f"/api/jobs/{ids[2]}/fail", json={"error": secret, "retry_in": 30})
+    await client.post(f"/api/jobs/{ids[3]}/complete", json={"result": {"text": "ok", "model": "m"}})
+    claimed = (await client.post("/api/jobs/claim", json={"kinds": ["notify.owner"]})).json()["jobs"]
+    await client.post(f"/api/jobs/{claimed[0]['id']}/fail", json={"error": "BadRequest", "retry_in": None})
+    await client.post("/api/jobs/999999/fail", json={"error": "ValueError"})          # такого нет — не считается
+    clock.t += 120
+    status = await client.get("/api/status")
+    llm = status.json()["llm_jobs"]
+    assert llm == {"window_s": 120, "done": 1, "failed": 3, "errors": [["UnscopedSecretError", 2], ["other", 1]]}
+    assert secret not in status.text
+    clock.t += 3600                                                                   # час прошёл
+    assert (await client.get("/api/status")).json()["llm_jobs"] == {
+        "window_s": 3600, "done": 0, "failed": 0, "errors": []}
+    jobstats.reset()
+
+
+def test_job_error_labels_carry_no_free_text():
+    from shturman.jobstats import label_of
+
+    assert label_of("TimeoutError") == "TimeoutError"
+    assert label_of("модель: rate_limit") == "model:rate_limit"
+    assert label_of("модель: что-то своё") == "model"
+    assert label_of("у плагина нет доступа к модели Hermes") == "no_model_access"
+    assert label_of("в задании нет поля messages") == "bad_payload"
+    assert label_of("исполнитель не ответил") == "lost"
+    assert label_of("Пароль от сейфа 7391") == "other" and label_of(None) == "other"
+
+
 async def test_service_username_does_not_exclude_an_unrelated_numeric_peer(conn):
     account_id = await store.ensure_account(conn, 1000, "Владелец")
     chat_id, excluded = await store.ensure_chat(
