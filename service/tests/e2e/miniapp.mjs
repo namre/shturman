@@ -1,8 +1,8 @@
 // Браузерная проверка Mini App бота согласований: вход по данным Telegram → «Согласования» →
 // решение → пункт ушёл; чужой пользователь, устаревшие и повторённые данные входа не проходят;
 // сессия приложения не открывает страницу настройки; рамка — только у web.telegram.org;
-// экран «Чаты» (Р-80): список из памяти, поиск, отбор, включение с глубиной, «Не сохранять»,
-// ожидание Telegram с отсчётом, аккаунт не подключён.
+// экран «Чаты» (Р-80): список из базы, поиск, отбор, включение с глубиной, «Не сохранять»,
+// список большого аккаунта (Р-81: загрузка в фоне, «подождите» от Telegram с отсчётом), аккаунт не подключён.
 // Запуск и стенд — README.md в этом каталоге. Печатает строки PASS/FAIL, код возврата 1 при FAIL.
 //
 // Настоящего Telegram здесь нет: данные входа подписывает пульт стенда так же, как Telegram, и
@@ -21,6 +21,7 @@ const PORT = process.env.E2E_PORT || "8775";
 const APP = `http://localhost:${PORT}/shturman-setup/app/`;
 const CONTROL = `http://127.0.0.1:${Number(PORT) + 1}`;
 const OUT = process.env.E2E_OUT || path.join(tmpdir(), "shturman-miniapp-shots");
+const LOAD_OUT = process.env.E2E_LOAD_OUT || OUT;               // снимки загрузки списка чатов (Р-81)
 const TOKEN = "7000000001:SENTINEL-bot-token_DoNotLeak-0123456789";
 const THEME = { bg_color: "#1c242f", text_color: "#f5f5f5", hint_color: "#8d9aa8", button_color: "#3e88f7",
                 button_text_color: "#ffffff", section_bg_color: "#232e3c", accent_text_color: "#6ab2f2" };
@@ -32,6 +33,7 @@ const THEME_LIGHT = { bg_color: "#ffffff", secondary_bg_color: "#efeff4", sectio
                       section_header_text_color: "#6d6d72", header_bg_color: "#f8f8f8" };
 
 mkdirSync(OUT, { recursive: true });
+mkdirSync(LOAD_OUT, { recursive: true });
 let failed = 0;
 function check(name, ok, detail = "") {
   if (!ok) failed += 1;
@@ -360,9 +362,9 @@ for (const scheme of ["light", "dark"]) {
 }
 
 // --- 8. экран «Чаты» (Р-80) ------------------------------------------------------------------------
-// То же, что шаг «Какие чаты читать» на странице: список из памяти сервиса, поиск, вид, «только
-// выбранные», включение с глубиной, «Не сохранять» без стирания, «Обновить список из Telegram» с
-// отсчётом, когда Telegram просит подождать. Каждое изменение — сообщением владельцу в бот.
+// То же, что шаг «Какие чаты читать» на странице: список из базы сервиса, поиск, вид, «только
+// выбранные», включение с глубиной, «Не сохранять» без стирания, «Обновить список из Telegram» — в фоне,
+// с ходом загрузки и отсчётом, когда Telegram просит подождать. Каждое изменение — сообщением владельцу в бот.
 // Ждёт, пока условие не станет истинным (сообщения владельцу уходят через очередь заданий).
 async function waitFor(fn, ms = 5000) {
   const until = Date.now() + ms;
@@ -412,7 +414,7 @@ async function layoutOk(p) {
   const before = await chatsSeen();
   const { ctx, p, errs } = await openChats(390, "light", THEME_LIGHT);
   let seen = await chatsSeen();
-  check("«Чаты»: список открылся из памяти сервиса, без запроса к Telegram",
+  check("«Чаты»: список открылся из базы сервиса, без запроса к Telegram",
         JSON.stringify(seen.dialog_requests) === JSON.stringify(before.dialog_requests), JSON.stringify(seen.dialog_requests));
   const tabs = await p.$$eval("#chats-accounts button", (b) => b.map((x) => [x.textContent, x.getAttribute("aria-selected")]));
   check("«Чаты»: два аккаунта, выбран ваш (способ «как вы»)",
@@ -498,34 +500,76 @@ async function layoutOk(p) {
   await p.fill("#chats-q", "");
   await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 20);
 
-  // список не загружен — подсказка нажать «Обновить»
+  // списка в базе нет — подсказка нажать «Обновить»
   await chatsControl("/chats/forget?role=owner");
   await p.fill("#chats-q", "а");
-  await p.waitForSelector("#chats-status:not([hidden])");
-  const notLoaded = await p.textContent("#chats-status");
-  check("«Чаты»: списка в памяти нет — приложение просит нажать «Обновить список из Telegram»",
-        notLoaded.includes("ещё не загружен") && (await rowsOf(p)).length === 0, notLoaded);
+  await p.waitForSelector("#chats-load.idle:not([hidden])");
+  const notLoaded = await p.textContent("#chats-load");
+  check("«Чаты»: списка в базе нет — приложение просит нажать «Обновить список из Telegram»",
+        notLoaded.includes("ещё не загружен") && notLoaded.includes("Обновить список из Telegram") && (await rowsOf(p)).length === 0,
+        notLoaded);
   await p.fill("#chats-q", "");
   await p.waitForTimeout(600);                             // поиск перечитывает список через 0,3 с после ввода
-  await p.waitForSelector("#chats-status:not([hidden])");
+  await p.waitForSelector("#chats-load.idle:not([hidden])");
   await p.screenshot({ path: path.join(OUT, `${SHOT}chats-not-loaded-390-light.png`), fullPage: false });
 
-  // Telegram просит подождать: отсчёт и повтор сам
-  const asked = (await chatsSeen()).dialog_requests.owner;
-  await chatsControl("/chats/flood?role=owner&seconds=7");
+  // большой аккаунт (Р-81): ещё 4 000 диалогов, страница «думает» 0,6 с, на 25-м запросе — «подождите 25 с»
+  const pagesBefore = await (await fetch(CONTROL + "/chats/pages?role=owner")).json();
+  const big = await chatsControl("/chats/big?role=owner&n=4000&delay=0.6&flood_at=25&seconds=25");
+  const total = big.dialogs;                               // сколько диалогов у аккаунта теперь
+  const pages = Math.ceil(total / 100) + (total % 100 ? 0 : 1);   // при ровной сотне — ещё пустая страница
+  const clicked = Date.now();
   await p.click("#chats-refresh");
-  await p.waitForSelector("#chats-status.wait:not([hidden])");
-  const waiting = await p.textContent("#chats-status");
-  check("«Чаты»: Telegram просит подождать — отсчёт, кнопка «Обновить» недоступна",
-        /Повторю сам через \d+ с/.test(waiting) && await p.isDisabled("#chats-refresh"), waiting);
-  await p.waitForTimeout(1200);
-  const later = await p.textContent("#chats-status");
-  check("«Чаты»: отсчёт идёт", later !== waiting, `${waiting} → ${later}`);
-  await p.screenshot({ path: path.join(OUT, `${SHOT}chats-wait-390-light.png`), fullPage: false });
-  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 20, null, { timeout: 15000 });
+  await p.waitForFunction(() => !document.querySelector("#chats-load").hidden &&
+    document.querySelector("#chats-load-title").textContent.includes("Загружаю"));
+  check("«Чаты»: «Обновить» отвечает сразу, список грузится в фоне", Date.now() - clicked < 3000, `${Date.now() - clicked} мс`);
+  await p.waitForFunction((n) => {
+    const words = document.querySelector("#chats-load-text").textContent.replace(/\s/g, "");
+    return /Загружено[1-9]/.test(words) && words.includes("из~" + n);
+  }, total, { timeout: 15000 });
+  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 20, null, { timeout: 10000 });
+  check(`«Чаты»: пока список грузится — «Загружено N из ~${total}», уже загруженные видны, «Обновить» недоступна`,
+        await p.isDisabled("#chats-refresh") && (await rowsOf(p)).length === 20, await p.textContent("#chats-load"));
+  await p.waitForTimeout(700);
+  await p.locator("#screen-chats").screenshot({ path: path.join(LOAD_OUT, `${SHOT}app-dialogs-loading-390-light.png`) });
+  // тот же экран в тёмной теме — второе окно приложения видит ту же загрузку
+  const dark = await openChats(390, "dark", THEME);
+  await dark.p.waitForFunction(() => !document.querySelector("#chats-load").hidden &&
+    document.querySelector("#chats-load-title").textContent.includes("Загружаю"), null, { timeout: 10000 }).catch(() => {});
+  check("«Чаты»: второе окно видит ту же загрузку и вторую не начинает",
+        (await dark.p.textContent("#chats-load-title")).includes("Загружаю"), await dark.p.textContent("#chats-load"));
+  await dark.p.waitForTimeout(700);
+  await dark.p.locator("#screen-chats").screenshot({ path: path.join(LOAD_OUT, `${SHOT}app-dialogs-loading-390-dark.png`) });
+
+  await p.waitForFunction(() => document.querySelector("#chats-load-title").textContent.includes("Telegram просит подождать"),
+                          null, { timeout: 30000 });
+  const waiting = await p.textContent("#chats-load-text");
+  await p.waitForTimeout(1600);
+  const later = await p.textContent("#chats-load-text");
+  const left = (t) => Number((t.match(/через (\d+) с/) || [])[1]);
+  check("«Чаты»: Telegram просит подождать — отсчёт идёт, продолжит сам с того же места",
+        left(later) < left(waiting) && waiting.includes("с того же места") && await p.isDisabled("#chats-refresh"),
+        `${waiting} → ${later}`);
+  await p.locator("#screen-chats").screenshot({ path: path.join(LOAD_OUT, `${SHOT}app-dialogs-waiting-390-light.png`) });
+  await dark.p.waitForFunction(() => document.querySelector("#chats-load-title").textContent.includes("Telegram просит подождать"),
+                               null, { timeout: 10000 }).catch(() => {});
+  await dark.p.locator("#screen-chats").screenshot({ path: path.join(LOAD_OUT, `${SHOT}app-dialogs-waiting-390-dark.png`) });
+  const darkLayout = await layoutOk(dark.p);
+  check("«Чаты» 390 тёмная, во время загрузки: страница не шире экрана, ничего не обрезано",
+        darkLayout.wide && darkLayout.clipped === 0 && darkLayout.controls === 0, JSON.stringify(darkLayout));
+  check("«Чаты», второе окно: в консоли нет ошибок", realErrors(dark.errs).length === 0, realErrors(dark.errs).join(" | "));
+  await dark.ctx.close();
+
+  await p.waitForFunction(() => document.querySelector("#chats-load").hidden, null, { timeout: 90000 });
+  await p.waitForFunction((n) => document.querySelector("#chats-counter").textContent.replace(/\s/g, "").includes(`из${n}.`), total,
+                          { timeout: 10000 });
+  const pagesAfter = await (await fetch(CONTROL + "/chats/pages?role=owner")).json();
+  const served = pagesAfter.pages.slice(pagesBefore.pages.length);
+  check("«Чаты»: после ожидания загрузка продолжилась с той же страницы — каждая страница по одному разу",
+        served.length === pages && new Set(served).size === pages && pagesAfter.calls - pagesBefore.calls === pages + 1,
+        JSON.stringify({ pages: served.length, calls: pagesAfter.calls - pagesBefore.calls }));
+  await p.locator("#screen-chats").screenshot({ path: path.join(LOAD_OUT, `${SHOT}app-dialogs-done-390-light.png`) });
   seen = await chatsSeen();
-  check("«Чаты»: после ожидания список загружен из Telegram одним повтором",
-        seen.dialog_requests.owner === asked + 1 && await p.isHidden("#chats-status"), JSON.stringify(seen.dialog_requests));
 
   // аккаунт помощника на паузе — «не подключён»
   await chatsControl("/chats/pause?role=assistant");

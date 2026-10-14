@@ -14,7 +14,7 @@
 
 Для экрана «Чаты» (Р-80) у стенда заданы ключи приложения Telegram и подключены два аккаунта —
 основной владельца и помощник — с подставным Telegram-клиентом из tests/tg (по полторы сотни
-диалогов, список уже в памяти сервиса). Способ подключения — «как вы», выбраны два чата владельца.
+диалогов, список уже в базе сервиса). Способ подключения — «как вы», выбраны два чата владельца.
 
 Пульт (порт сервиса + 1):
   GET  /init-data?who=owner|stranger&age=N   строка initData, подписанная как у Telegram (age — сколько секунд назад)
@@ -28,8 +28,12 @@
   GET  /chats/seen                           экран «Чаты»: выбранные и исключённые чаты, сообщения владельцу
                                              «Из приложения…», журнал app.sync_*/app.chat_*, запросы списка
                                              диалогов к «Telegram», число сообщений в архиве
-  POST /chats/forget?role=owner|assistant    списка диалогов в памяти больше нет (как после перезапуска)
+  POST /chats/forget?role=owner|assistant    списка диалогов в базе нет (как до первой загрузки)
   POST /chats/flood?role=…&seconds=N         «Telegram просит подождать» N секунд
+  POST /chats/big?role=…&n=4000&delay=0.6&flood_at=25&seconds=25
+                                             большой аккаунт (Р-81): ещё n диалогов, страница списка «думает»
+                                             delay секунд, запрос № flood_at получает FLOOD_WAIT
+  GET  /chats/pages?role=…                   сколько раз спрашивали список и с какого места отдана каждая страница
   POST /chats/pause?role=…, /chats/resume?role=…   аккаунт на паузе и обратно
 """
 
@@ -305,7 +309,7 @@ async def _login(manager, worlds, role: str, me) -> int:
     worlds[role].last.scan.set_result(me)
     await exec_fakes.until(lambda: getattr(manager.runtimes.get(role), "status", None) == "running", timeout=15)
     worlds[role].authorized = True                   # сессия на диске — уже вошедшая (для «снять с паузы»)
-    await manager.dialogs(manager.runtimes[role].account_id, refresh=True)      # список — в памяти сервиса
+    await tg_fakes.dialogs_loaded(manager, manager.runtimes[role].account_id)   # список — в базе сервиса
     return manager.runtimes[role].account_id
 
 
@@ -387,14 +391,31 @@ async def main() -> None:
         })
 
     async def chats_forget(request):
-        runtime(request).dialogs = None
+        """Списка диалогов в базе нет — как до первой загрузки."""
+        account = runtime(request).account_id
+        await conn.execute("DELETE FROM tg_dialogs WHERE account_id = $1", account)
+        await conn.execute("DELETE FROM tg_dialog_lists WHERE account_id = $1", account)
         return JSONResponse({"ok": True})
 
     async def chats_flood(request):
         rt = runtime(request)
-        rt.dialogs_at -= 1000                      # «Обновить» действительно пойдёт в Telegram
+        await conn.execute("UPDATE tg_dialog_lists SET completed_at = completed_at - interval '1 hour'")
         rt.pacer.flood(float(request.query_params.get("seconds", "6")))
         return JSONResponse({"ok": True})
+
+    async def chats_big(request):
+        """Большой аккаунт (Р-81): ещё n диалогов, страница списка «думает» delay секунд, запрос № flood_at
+        (от следующего) получает FLOOD_WAIT. ?role=owner&n=4000&delay=0.4&flood_at=20&seconds=25"""
+        q = request.query_params
+        world = worlds[q.get("role", "owner")]
+        tg_fakes.crowd(world, int(q.get("n", "4000")), delay=float(q.get("delay", "0.4")),
+                       flood_at=int(q.get("flood_at", "0")), seconds=int(q.get("seconds", "25")))
+        await conn.execute("UPDATE tg_dialog_lists SET completed_at = completed_at - interval '1 hour'")
+        return JSONResponse({"ok": True, "dialogs": len(world.dialogs)})
+
+    async def chats_pages(request):
+        world = worlds[request.query_params.get("role", "owner")]
+        return JSONResponse({"calls": world.dialog_calls, "pages": world.dialog_pages, "dialogs": len(world.dialogs)})
 
     async def chats_pause(request):
         await app.extras["tg"].pause(runtime(request).account_id)
@@ -406,7 +427,7 @@ async def main() -> None:
         await app.extras["tg"].resume(account)
         await exec_fakes.until(lambda: getattr(app.extras["tg"].runtimes.get(role), "status", None) == "running",
                                timeout=15)
-        await app.extras["tg"].dialogs(account, refresh=True)
+        await tg_fakes.dialogs_loaded(app.extras["tg"], account)
         return JSONResponse({"ok": True})
 
     control = Starlette(routes=[Route("/init-data", init_data), Route("/state", state_view), Route("/framer", framer),
@@ -415,6 +436,8 @@ async def main() -> None:
                                 Route("/chats/seen", chats_seen),
                                 Route("/chats/forget", chats_forget, methods=["POST"]),
                                 Route("/chats/flood", chats_flood, methods=["POST"]),
+                                Route("/chats/big", chats_big, methods=["POST"]),
+                                Route("/chats/pages", chats_pages),
                                 Route("/chats/pause", chats_pause, methods=["POST"]),
                                 Route("/chats/resume", chats_resume, methods=["POST"])])
 

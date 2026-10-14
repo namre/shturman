@@ -29,7 +29,7 @@ from setup_fakes import (  # noqa: F401, I001 — stand — фикстура; и
 )
 from conftest import API_TOKEN, DSN, MCP_TOKEN
 from exec_fakes import until
-from tg_fakes import G_FAMILY, ME, U_IVAN, U_MARIA, wait_for
+from tg_fakes import G_FAMILY, ME, U_IVAN, U_MARIA, dialogs_loaded, wait_for
 
 from shturman import bridge, netguard
 from shturman.config import Config, ConfigError, normalize_origin
@@ -171,6 +171,8 @@ async def test_dashboard_script_cannot_read_chat_names_or_turn_reading_on(stand,
     s.page = s.browser(SETUP)
     await s.page.login(conn)
     account_id = await connect_owner_account(s)
+    await wait_for(lambda: s.manager.runtimes["owner"].status == "running")
+    await dialogs_loaded(s.manager, account_id)
     assert (await s.page.get(f"/tg/accounts/{account_id}/dialogs")).json()["total"] == 3   # владелец список видит
 
     script = dashboard_script(s)

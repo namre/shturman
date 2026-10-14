@@ -10,6 +10,10 @@ SHTURMAN_TEST_DSN: база должна быть отдельной тесто�
 Рядом с сервисом поднимается «пульт» (порт сервиса + 1) — им сценарий делает то, что в жизни
 делает человек в Telegram: сканирует QR, нажимает «Запустить» в боте, подключает бизнес-режим.
 
+Для списка чатов большого аккаунта (Р-81) пульт добавляет тысячи диалогов, задержку страницы и
+«подождите» от Telegram на середине загрузки (`POST /dialogs/big`), а `GET /dialogs/seen` говорит, какие
+страницы отдал подставной Telegram.
+
 Для экрана «Память ассистента» пульт заводит (`POST /seed-memory`) переписку с двумя людьми и группу,
 страницу об одном человеке со сводкой и фактом — ответ «модели» подставляет сам стенд, — проект с
 решением и фактами, а ждущими решения — страницу о втором человеке, его договорённость, факт о
@@ -318,6 +322,27 @@ async def main() -> None:
                    ON CONFLICT (person_id) DO NOTHING""", sergey)
         return JSONResponse({"ok": True, "olga": olga, "sergey": sergey, "project": project, "plan": plan.get("status")})
 
+
+    # --- большой аккаунт (Р-81): тысячи диалогов, страницы с задержкой, «подождите» на середине ---
+
+    async def dialogs_big(request):
+        """У аккаунта стало ещё n диалогов; страница списка «думает» delay секунд, запрос № flood_at
+        (от следующего) получает FLOOD_WAIT на seconds секунд. Список в базе — «старый», чтобы «Обновить»
+        пошла в Telegram. ?role=owner|assistant&n=4000&delay=0.4&flood_at=20&seconds=25"""
+        q = request.query_params
+        role = q.get("role", "owner")
+        tg_fakes.crowd(worlds[role], int(q.get("n", "4000")), delay=float(q.get("delay", "0.4")),
+                       flood_at=int(q.get("flood_at", "0")), seconds=int(q.get("seconds", "25")))
+        await conn.execute("UPDATE tg_dialog_lists SET completed_at = completed_at - interval '1 hour'")
+        return JSONResponse({"ok": True, "dialogs": len(worlds[role].dialogs)})
+
+    async def dialogs_seen(request):
+        """Сколько раз спрашивали список, с какого места отдана каждая страница, сколько в базе."""
+        role = request.query_params.get("role", "owner")
+        world = worlds[role]
+        return JSONResponse({"calls": world.dialog_calls, "pages": world.dialog_pages, "dialogs": len(world.dialogs),
+                             "stored": await conn.fetchval("SELECT count(*) FROM tg_dialogs")})
+
     async def dashboard_page(request):
         return HTMLResponse(DASHBOARD_PAGE)
 
@@ -330,7 +355,8 @@ async def main() -> None:
         Route("/scan", scan, methods=["POST"]), Route("/start", start, methods=["POST"]),
         Route("/last-code", last_code), Route("/business", business, methods=["POST"]), Route("/seen", seen),
         Route("/chatgpt/authorize", chatgpt_authorize, methods=["POST"]),
-        Route("/seed-memory", seed_memory, methods=["POST"])])
+        Route("/seed-memory", seed_memory, methods=["POST"]),
+        Route("/dialogs/big", dialogs_big, methods=["POST"]), Route("/dialogs/seen", dialogs_seen)])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

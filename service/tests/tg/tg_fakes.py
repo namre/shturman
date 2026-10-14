@@ -1,7 +1,9 @@
 """Подставной клиент Telegram для тестов модуля tg. В сеть ничего не ходит.
 
 Подмена стоит на границе, которую модуль сам и определил: объект с методами клиента Telethon,
-которыми пользуется сервис (`connect`, `get_me`, `iter_dialogs`, `qr_login`, вызов запроса…).
+которыми пользуется сервис (`connect`, `get_me`, `qr_login`, вызов запроса…). Список диалогов
+сервис читает сам запросами `messages.GetDialogs` (tg/dialogs.py) — подставной клиент отвечает на
+них страницами по смещению, как Telegram.
 Ответы собраны из настоящих объектов TL. Каждый запрос подставной клиент проверяет настоящим
 перечнем разрешённых запросов (`RequestPolicy`) — так тесты заодно показывают, что чтение под
 ролью owner обходится только разрешёнными запросами.
@@ -31,6 +33,7 @@ IVAN, MARIA, BOT = 2001, 2002, 2100
 GROUP, SUPER, CHANNEL = 3001, 4002, 4001
 PASSWORD = "очень-секретный-пароль-77"
 T0 = datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc)
+DIALOGS_NOW = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)   # «последнее сообщение» первого диалога
 
 
 def user(uid: int, first: str, last: str | None = None, **kw: Any) -> types.User:
@@ -85,6 +88,12 @@ class World:
         self.hint = "кличка кота"
         self.history: dict[tuple[str, int], dict[int, Any]] = {}
         self.dialogs: list[Any] = []          # сущности в порядке списка диалогов
+        self.archived: set[tuple[str, int]] = set()   # диалоги в архиве Telegram (папка 1)
+        self.pinned: set[tuple[str, int]] = set()
+        self.dialog_calls = 0                 # сколько раз спрашивали список диалогов
+        self.dialog_pages: list[int] = []     # с какого места списка отдана каждая страница
+        self.dialog_fail: dict[int, BaseException] = {}   # номер запроса списка → ошибка
+        self.dialog_delay = 0.0               # сколько «думает» Telegram над страницей списка (стенды)
         self.unknown: set[tuple[str, int]] = set()   # собеседники без ключа доступа
         self.fail: dict[type, list[BaseException]] = {}   # ошибки по классу запроса, по очереди
         self.lost: dict[tuple[str, int], BaseException] = {}   # чаты, к которым доступа больше нет
@@ -258,14 +267,6 @@ class FakeClient:
             types.InputDocumentFileLocation(doc.id, doc.access_hash, doc.file_reference, ""), 0, 512 * 1024))
         return self.world.files.get(message.id)
 
-    async def iter_dialogs(self):
-        await self(functions.messages.GetDialogsRequest(
-            offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=100, hash=0))
-        for entity in self.world.dialogs:
-            key = normalize.entity_key(entity)
-            top = max(self.world.history.get(key, {0: None}))
-            yield SimpleNamespace(entity=entity, dialog=SimpleNamespace(top_message=top))
-
     async def __call__(self, request: Any) -> Any:
         self.policy.check(request)
         if not self.connected:
@@ -327,6 +328,44 @@ class FakeClient:
                 pool.update(items)
         return types.messages.Messages(messages=self._by_ids(pool, r.id), topics=[], chats=[], users=[])
 
+    async def _GetDialogsRequest(self, r: Any) -> Any:
+        """Страница списка диалогов: после диалога `offset_peer` (без него — с начала), не больше
+        `limit`. Последнее сообщение диалога — с временем, убывающим по списку, как у Telegram."""
+        world = self.world
+        world.dialog_calls += 1
+        number = world.dialog_calls
+        if world.dialog_delay:
+            await asyncio.sleep(world.dialog_delay)
+        failure = world.dialog_fail.pop(number, None)
+        if failure is not None:
+            raise failure
+        every = list(world.dialogs)
+        start = 0
+        if not isinstance(r.offset_peer, types.InputPeerEmpty):
+            wanted = self._key(r.offset_peer)
+            start = next(i for i, e in enumerate(every) if normalize.entity_key(e) == wanted) + 1
+        world.dialog_pages.append(start)
+        chunk = every[start:start + r.limit]
+        dialogs, messages = [], []
+        for index, entity in enumerate(chunk, start):
+            key = normalize.entity_key(entity)
+            top = max(world.history.get(key, {0: None}))
+            p = peer(key)
+            dialogs.append(types.Dialog(
+                peer=p, top_message=top, read_inbox_max_id=0, read_outbox_max_id=0, unread_count=0,
+                unread_mentions_count=0, unread_reactions_count=0, unread_poll_votes_count=0,
+                notify_settings=types.PeerNotifySettings(), pinned=key in world.pinned or None,
+                folder_id=1 if key in world.archived else None, pts=1 if key[0] == "channel" else None))
+            # У настоящего диалога последнее сообщение есть всегда; у подставного без истории — номер 0.
+            # Время убывает по списку: по нему Telegram (и сервис) отсчитывает следующую страницу.
+            messages.append(types.Message(id=top, peer_id=p, message="", date=DIALOGS_NOW - timedelta(minutes=index)))
+        users = [e for e in chunk if isinstance(e, types.User)]
+        chats = [e for e in chunk if not isinstance(e, types.User)]
+        if start == 0 and len(every) <= r.limit:
+            return types.messages.Dialogs(dialogs=dialogs, messages=messages, chats=chats, users=users)
+        return types.messages.DialogsSlice(count=len(every), dialogs=dialogs, messages=messages,
+                                           chats=chats, users=users)
+
     async def _SendMessageRequest(self, r: Any) -> Any:
         key = self._key(r.peer)
         self.world.next_id += 1
@@ -383,6 +422,34 @@ async def start_account(manager: TgManager, world: World, slot: str) -> Any:
 async def settle(times: int = 5) -> None:
     for _ in range(times):
         await asyncio.sleep(0)
+
+
+FIRST_NAMES = ("Алексей", "Марина", "Сергей", "Ольга", "Дмитрий", "Наталья", "Игорь", "Елена", "Павел", "Татьяна")
+LAST_NAMES = ("Смирнов", "Кузнецов", "Попов", "Васильев", "Соколов", "Морозов", "Новиков", "Волков", "Фёдоров")
+
+
+def crowd(world: World, n: int, *, delay: float = 0.0, flood_at: int = 0, seconds: int = 25) -> None:
+    """Большой аккаунт (стенды): ещё `n` личных диалогов в конце списка; Telegram «думает» над каждой
+    страницей `delay` секунд, а запрос списка № `flood_at` (считая от следующего) получает FLOOD_WAIT."""
+    start = 100_000 + len(world.dialogs)
+    def name(i: int) -> tuple[str, str]:
+        first = FIRST_NAMES[i % len(FIRST_NAMES)]
+        last = LAST_NAMES[(i // len(FIRST_NAMES)) % len(LAST_NAMES)] + ("а" if first[-1] in "ая" else "")
+        return first, f"{last} {i + 1}"
+
+    world.dialogs += [user(start + i, *name(i)) for i in range(n)]
+    world.dialog_delay = delay
+    if flood_at:
+        world.dialog_fail[world.dialog_calls + flood_at] = errors.FloodWaitError(None, capture=seconds)
+
+
+async def dialogs_loaded(manager: TgManager, account_id: int, *, refresh: bool = True, timeout: float = 10.0) -> None:
+    """Загружает список диалогов аккаунта в базу (фоном, как кнопка «Обновить») и ждёт конца загрузки."""
+    rt = next(r for r in manager.runtimes.values() if r.account_id == account_id)
+    if refresh and not rt.dialogs_load.running:
+        assert manager.start_dialogs(rt), "загрузка списка не началась"
+    await asyncio.wait_for(rt.dialogs_load.done.wait(), timeout)
+    assert rt.dialogs_load.state == "done", rt.dialogs_load.error
 
 
 async def wait_for(predicate: Any, timeout: float = 5.0) -> None:

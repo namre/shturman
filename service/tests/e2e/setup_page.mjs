@@ -1,5 +1,5 @@
 // Браузерная проверка страницы настройки: ссылка → вход → бот согласований → способ «как вы» → ключи,
-// вход, чаты → выгрузка → смена способа на «сотрудник»: бизнес-режим, аккаунт ассистента → «Дополнительно» →
+// вход, чаты (и список большого аккаунта: загрузка в фоне, «подождите» от Telegram) → выгрузка → смена способа на «сотрудник»: бизнес-режим, аккаунт ассистента → «Дополнительно» →
 // попытки «дашборда» с соседнего порта → выход → вход по коду.
 // Запуск и стенд — README.md в этом каталоге. Печатает строки PASS/FAIL, код возврата 1 при FAIL.
 
@@ -20,6 +20,7 @@ const CONTROL = process.env.E2E_CONTROL || `http://127.0.0.1:${Number(PORT) + 1}
 const PYTHON = process.env.E2E_PYTHON || "python3";            // окружение сервиса: им запускается `shturman setup-link`
 const DECODER = process.env.E2E_QR_PYTHON || "";               // python с OpenCV: распознаёт QR со снимка (необязательно)
 const OUT = process.env.E2E_OUT || path.join(tmpdir(), "shturman-setup-shots");
+const LOAD_OUT = process.env.E2E_LOAD_OUT || OUT;                // снимки загрузки списка чатов (Р-81)
 const SRC = process.env.E2E_SRC || path.resolve(import.meta.dirname, "../../src");
 const DSN = process.env.SHTURMAN_TEST_DSN;
 const GOOD_TOKEN = "7000000001:SENTINEL-bot-token_DoNotLeak-0123456789";
@@ -340,6 +341,102 @@ await page.evaluate(() => { document.getElementById("toast").hidden = true; docu
 await shot(page, "23-chats-desktop-light");
 await page.locator("#s-chats").screenshot({ path: path.join(OUT, "23b-chats-section-desktop-light.png") });
 await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
+
+// --- список чатов большого аккаунта (Р-81): загрузка в фоне, «подождите» от Telegram на середине ---
+// У аккаунта становится на 4 000 диалогов больше (4 157, 42 страницы); подставной Telegram «думает» над страницей 0,6 с,
+// а на 25-м запросе просит подождать 25 с. «Обновить» отвечает сразу, страница показывает ход, отсчёт,
+// уже загруженное, и загрузка продолжается с той же страницы.
+{
+  mkdirSync(LOAD_OUT, { recursive: true });
+  const loadTitle = () => page.evaluate(() => document.querySelector("#chats-load").hidden ? "" :
+    document.querySelector("#chats-load-title").textContent + " | " + document.querySelector("#chats-load-text").textContent);
+  async function loadShot(p, name) {
+    // снимок шага целиком: липкая шапка страницы иначе ложится поверх строк списка
+    await p.evaluate(() => { const t = document.getElementById("toast"); if (t) t.hidden = true;
+                             document.querySelector(".top").style.position = "static"; });
+    await p.locator("#s-chats").screenshot({ path: path.join(LOAD_OUT, name + ".png") });
+    await p.evaluate(() => { document.querySelector(".top").style.position = ""; });
+  }
+  // тот же экран в остальных видах — пока загрузка в нужном состоянии
+  async function loadVariants(stage, word) {
+    const stored = await context.storageState();
+    for (const [name, options] of VARIANTS) {
+      const ctx = await browser.newContext({ ...options, storageState: stored });
+      const p = await ctx.newPage();
+      await p.goto(URL_PAGE);
+      await p.waitForSelector("#screen-app:not([hidden])");
+      await p.waitForSelector("#chats-list li");
+      await p.evaluate(() => document.getElementById("s-chats").scrollIntoView());
+      const seen = await p.waitForFunction((w) => !document.querySelector("#chats-load").hidden &&
+        document.querySelector("#chats-load-title").textContent.includes(w), word, { timeout: 15000 }).then(() => true, () => false);
+      await p.waitForTimeout(700);                         // полоса хода доезжает плавно
+      await loadShot(p, `${stage}-${name}`);
+      const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      check(`большой аккаунт (${stage}, ${name}): «${word}» видно, страница не шире экрана`, seen && overflow <= 1,
+            "лишних пикселей: " + overflow);
+      await ctx.close();
+    }
+  }
+
+  const before = await control("GET", "/dialogs/seen?role=owner");
+  const big = await control("POST", "/dialogs/big?role=owner&n=4000&delay=0.6&flood_at=25&seconds=25");
+  const total = big.dialogs;                               // сколько диалогов у аккаунта теперь
+  const pageCount = Math.ceil(total / 100) + (total % 100 ? 0 : 1);   // при ровной сотне — ещё пустая страница
+  await page.evaluate(() => document.getElementById("s-chats").scrollIntoView());
+  const rowsBefore = await page.locator("#chats-list li").count();
+  const started = Date.now();
+  await page.click("#chats-refresh");
+  await page.waitForFunction(() => !document.querySelector("#chats-load").hidden &&
+    document.querySelector("#chats-load-title").textContent.includes("Загружаю"));
+  check("большой аккаунт: «Обновить» отвечает сразу, загрузка идёт в фоне", Date.now() - started < 3000,
+        `${Date.now() - started} мс`);
+  check("большой аккаунт: кнопка «Обновить» недоступна, пока список грузится", await page.isDisabled("#chats-refresh"));
+  check("большой аккаунт: прежний список виден, пока грузится новый",
+        (await page.locator("#chats-list li").count()) === rowsBefore && rowsBefore > 0, String(rowsBefore));
+  await page.waitForFunction((n) => {
+    const words = document.querySelector("#chats-load-text").textContent.replace(/\s/g, "");
+    return /Загружено[1-9]/.test(words) && words.includes("из~" + n);
+  }, total, { timeout: 15000 });
+  const loading = await loadTitle();
+  check(`большой аккаунт: «Загружено N из ~${total}»`, loading.replace(/\s/g, "").includes("из~" + total), loading);
+  await page.waitForTimeout(700);
+  await loadShot(page, "dialogs-loading-desktop-light");
+  await loadVariants("dialogs-loading", "Загружаю");
+
+  await page.waitForFunction(() => document.querySelector("#chats-load-title").textContent.includes("Telegram просит подождать"),
+                             null, { timeout: 30000 });
+  const wait1 = await loadTitle();
+  await page.waitForTimeout(1600);
+  const wait2 = await loadTitle();
+  const left = (t) => Number((t.match(/через (\d+) с/) || [])[1]);
+  check("большой аккаунт: Telegram просит подождать — отсчёт идёт, «нажимать ничего не нужно»",
+        left(wait2) < left(wait1) && wait1.includes("нажимать ничего не нужно") && wait1.includes("с того же места"),
+        `${wait1} → ${wait2}`);
+  check("большой аккаунт: во время ожидания уже загруженное на месте и «Обновить» недоступна",
+        (await page.locator("#chats-list li").count()) >= rowsBefore && await page.isDisabled("#chats-refresh"));
+  await loadShot(page, "dialogs-waiting-desktop-light");
+  await loadVariants("dialogs-waiting", "Telegram просит подождать");
+
+  await page.waitForFunction(() => document.querySelector("#chats-load").hidden, null, { timeout: 90000 });
+  await page.waitForFunction((n) => document.querySelector("#chats-counter").textContent.replace(/\s/g, "").includes(`из${n}.`), total,
+                             { timeout: 10000 });
+  const after = await control("GET", "/dialogs/seen?role=owner");
+  const pages = after.pages.slice(before.pages.length);
+  check("большой аккаунт: после ожидания загрузка продолжилась с той же страницы — каждая страница по одному разу",
+        pages.length === pageCount && new Set(pages).size === pageCount && after.calls - before.calls === pageCount + 1
+        && after.stored === total,
+        JSON.stringify({ pages: pages.length, calls: after.calls - before.calls, stored: after.stored, dialogs: big.dialogs }));
+  check("большой аккаунт: счётчик говорит, когда список обновлён",
+        (await page.textContent("#chats-counter")).includes("Список из Telegram обновлён только что"),
+        await page.textContent("#chats-counter"));
+  await page.fill("#chats-q", "Татьяна Фёдорова");
+  await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length > 0 &&
+    [...document.querySelectorAll("#chats-list .chat-title")].every((n) => n.textContent.startsWith("Татьяна Фёдорова")));
+  check("большой аккаунт: поиск находит диалог из конца длинного списка", (await page.locator("#chats-list li").count()) > 0);
+  await page.fill("#chats-q", "");
+  await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 15);
+  await loadShot(page, "dialogs-done-desktop-light");
+}
 
 // --- выгрузка ----------------------------------------------------------------------------------
 const exportFile = path.join(OUT, "result.json");

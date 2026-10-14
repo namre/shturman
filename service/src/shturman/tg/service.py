@@ -11,7 +11,8 @@
   POST /api/tg/accounts/{id}/pause               поставить на паузу
   POST /api/tg/accounts/{id}/resume              снять с паузы
   PUT  /api/tg/accounts/{id}/options             {auto_personal?, auto_groups?, backfill_months?}
-  GET  /api/tg/accounts/{id}/dialogs             чаты для экрана выбора: ?offset&limit&type&refresh
+  GET  /api/tg/accounts/{id}/dialogs             чаты для экрана выбора из базы: ?offset&limit&type&refresh
+                                                 (refresh=1 — обновить из Telegram в фоне; ход — в поле load)
   POST /api/tg/accounts/{id}/sync                включить/выключить: {enabled, chats? | types?, since?}
   GET  /api/tg/accounts/{id}/sync                состояние синхронизации: счётчики и курсоры
 
@@ -45,7 +46,7 @@ from ..api_core import BadRequest, body, handler, need_str, settle
 from ..app import AppState, state_of
 from ..sanitize import clean_line
 from . import gateway, normalize, sync
-from .manager import KEEP, ROLE_NAMES, TgError, TgManager
+from .manager import KEEP, ROLE_NAMES, DialogsNotLoaded, TgError, TgManager
 
 PEER_CLASSES = ("user", "chat", "channel")
 LOGIN_PERMIT_SECONDS = 600   # столько действует разрешение начать вход после подтверждения владельца
@@ -447,7 +448,10 @@ async def _already_on(conn: Any, account_id: int, keys: list[tuple[str, int]], t
 async def _sync_ask(manager: TgManager, account_id: int, row: Any, keys: list[tuple[str, int]],
                     types_: list[str], since: Any) -> str:
     """Текст карточки: какие чаты станут читаться. Названия — из списка диалогов аккаунта."""
-    known = {d.key: d for d in await manager.dialogs(account_id)}
+    try:   # названия — из списка диалогов в базе; в Telegram за ними не ходим
+        known = {d.key: d for d in await manager.dialogs(account_id)}
+    except DialogsNotLoaded:
+        known = {}
     lines: list[str] = []
     if keys:
         names = [f"«{clean_line(known[k].chat.name, 40) or f'{k[0]} {k[1]}'}»" if k in known

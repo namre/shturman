@@ -111,7 +111,7 @@ git вызывается как отдельная программа и с ко
 | kawaiiDango/telegram-delete-logger | Apache-2.0 | Поиск удалённого сообщения без указания чата | `service/src/shturman/tg/live.py`, `store.py` |
 | mukhanov/telemcp | MIT | Формулировки описаний инструментов, состав полей чата и фильтры | `service/src/shturman/mcp_server.py` |
 | pgvector/pgvector-python | MIT | Слияние рангов двух веток поиска | `service/src/shturman/search.py` |
-| Telethon | MIT | Преобразование коротких обновлений | `service/src/shturman/tg/normalize.py` |
+| Telethon | MIT | Преобразование коротких обновлений; цикл страниц списка диалогов (`_DialogsIter`: смещения, признак конца) | `service/src/shturman/tg/normalize.py`, `tg/dialogs.py` |
 
 Только замысел, без кода (названы в шапках файлов): getzep/graphiti (Apache-2.0), nearai/ironclaw (MIT / Apache-2.0), garrytan/gbrain (MIT), скилл `llm-wiki` из NousResearch/hermes-agent (MIT), tolboy/telegram-mcp-tdlib (Apache-2.0), Prgebish/mcp-telegram (MIT).
 

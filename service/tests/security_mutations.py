@@ -100,7 +100,7 @@ MUTATIONS = (
              "tests/setup_page/test_miniapp.py::test_only_known_buttons_of_the_screen_are_accepted",
              database=True),
     # Экран «Чаты» приложения (Р-80): каждое изменение сообщается владельцу в бот; список диалогов —
-    # только из памяти, в Telegram — по кнопке «Обновить».
+    # только из базы, обновление из Telegram — только по кнопке «Обновить» (Р-81).
     Mutation("miniapp_chats_tell_owner", "src/shturman/setup_page/miniapp.py",
              "        await bridge.notify_owner(conn, text)", "        pass",
              "tests/setup_page/test_miniapp_chats.py::test_enable_and_disable_with_depth_are_told_to_the_owner_and_logged",
@@ -108,7 +108,7 @@ MUTATIONS = (
     Mutation("miniapp_chats_cached_list", "src/shturman/setup_page/miniapp.py",
              "_account_id(request), request,\n                                                 cached=True))",
              "_account_id(request), request,\n                                                 cached=False))",
-             "tests/setup_page/test_miniapp_chats.py::test_list_comes_from_memory_and_telegram_is_asked_only_by_refresh",
+             "tests/setup_page/test_miniapp_chats.py::test_list_comes_from_the_database_and_telegram_is_asked_only_by_refresh",
              database=True),
     # Бот согласований в одно нажатие (Р-77): только создатель становится владельцем; токен — именно
     # того бота, что создавался по ссылке; без живой сессии страницы токен не ждёт подтверждения;

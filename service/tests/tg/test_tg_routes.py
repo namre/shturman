@@ -11,7 +11,7 @@ from shturman.tg.client import session_path
 from shturman.tg.manager import TgManager
 
 from tg_fakes import (C_NEWS, C_SUPER, G_FAMILY, GROUP, HELPER, HELPER_ID, IVAN, ME, PASSWORD, SELF_ID, U_BOT,
-                      U_IVAN, U_MARIA, U_TELEGRAM, World, msg, tg_config, wait_for)
+                      U_IVAN, U_MARIA, U_TELEGRAM, World, dialogs_loaded, msg, tg_config, wait_for)
 
 MODULES = ("shturman.api_core", "shturman.tg.service")
 
@@ -193,8 +193,13 @@ async def test_dialogs_selection_sync_and_status(make_client, config):
     base = f"/api/tg/accounts/{account_id}"
     await wait_for(lambda: manager.runtimes["owner"].status == "running")
 
+    # первый запрос списка только запускает его загрузку из Telegram и сразу отвечает тем, что есть в базе
+    first = (await client.get(f"{base}/dialogs?limit=3")).json()
+    assert first["load"]["state"] in ("loading", "done") and first["age"] is None
+    await dialogs_loaded(manager, account_id, refresh=False)
     page = (await client.get(f"{base}/dialogs?limit=3")).json()
     assert page["total"] == 7 and page["offset"] == 0 and len(page["items"]) == 3
+    assert page["load"]["state"] == "done" and page["load"]["running"] is False and page["age"] == 0
     assert page["items"][0] == {"peer_class": "user", "tg_id": IVAN, "type": "personal_chat",
                                 "title": "Иван Петров", "username": "ivan_p", "enabled": False,
                                 "excluded": False, "message_estimate": None}
@@ -451,6 +456,7 @@ async def test_backfill_depth_per_chat_and_account_default(make_client, config):
     base = f"/api/tg/accounts/{status['account_id']}"
     await wait_for(lambda: manager.runtimes["owner"].status == "running")
     rt = manager.runtimes["owner"]
+    await dialogs_loaded(manager, rt.account_id)
 
     async def settled():
         await wait_for(lambda: rt.history.idle and not rt.wake.is_set())
