@@ -420,6 +420,56 @@ body.sc-staff .only-own, body:not(.sc-staff) .only-staff { display: none !import
 .chat-read input { width: 22px; height: 22px; margin: 0; accent-color: var(--accent); }
 .chat .btn { flex: none; }
 
+/* Раскладки списка чатов (Р-82): «Папки Telegram / Сферы / По активности / По виду» — разделы со
+   счётчиком «читается X из Y», сворачиваются; внутри — тот же список чатов постранично. */
+.layouts { display: flex; flex-direction: column; gap: 8px; }
+.layouts-label { font-weight: 600; font-size: 15px; color: var(--muted); }
+.layouts .tab { min-height: 40px; padding: 6px 14px; font-size: 15px; }
+.sections { display: flex; flex-direction: column; gap: 10px; }
+details.sect { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 0 14px; }
+details.sect[open] { background: var(--sunken); }
+details.sect > summary { color: var(--ink); min-height: 56px; gap: 10px 14px; flex-wrap: wrap; padding: 6px 0; }
+details.sect > summary::after { color: var(--accent); order: -1; margin-left: 0; }
+details.sect[open] > :not(summary) { margin-top: 4px; }
+.sect-title { font-weight: 600; font-size: 17px; flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.sect-count { font-size: 14px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sect-count.on { color: var(--ok-ink); }
+.sect-body { display: flex; flex-direction: column; gap: 12px; padding-bottom: 14px; }
+.sect-body .chatlist { background: var(--surface); }
+.sect-folder { gap: 10px; }
+.sect-link { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.sect-link select { width: auto; min-width: 160px; min-height: 40px; padding: 4px 10px; }
+.sect-link-label { font-size: 14px; color: var(--muted); }
+.badge.sph-chip { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
+.sph-pick { flex-basis: 100%; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; margin-top: 4px; border-radius: 10px; background: var(--sunken); border: 1px solid var(--line); }
+.sph-pick-list { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+.sph-pick-list .check { align-items: center; min-height: 40px; }
+.sph-pick-list .check input { margin: 0; }
+
+/* Раздел «Сферы». */
+#spheres-details > summary { color: var(--ink); min-height: 48px; align-items: flex-start; }
+#spheres-details > summary::after { color: var(--accent); margin-top: 12px; }
+.sph-list, .sph-folders { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.sph-list:empty, .sph-folders:empty { display: none; }
+.sph-list > li + li, .sph-folders > li + li { border-top: 1px solid var(--line); }
+.sph, .sph-folder { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; background: var(--surface); }
+.sph-empty { padding: 14px 16px; }
+.sph-head { display: flex; align-items: flex-start; gap: 12px; }
+.sph-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.sph-name { font-weight: 600; font-size: 18px; overflow-wrap: anywhere; }
+.sph-desc { overflow-wrap: anywhere; }
+.sph-order { flex: none; display: flex; gap: 6px; }
+.sph-order .btn { min-width: 44px; padding: 6px 10px; }
+.sph-chats { display: flex; flex-direction: column; gap: 12px; padding-top: 4px; }
+.sph-chats .mem-chat { padding: 10px 12px; }
+.sph-chats .mem-chat .btn, .sph-found .btn, .sph-found .badge { flex: none; white-space: nowrap; }
+.sph-found:empty { display: none; }
+.sph-add { max-width: 560px; }
+.sph-offer { display: flex; flex-direction: column; gap: 8px; }
+.sph-offer + .sph-offer { margin-top: 8px; }
+.sph-edit { gap: 12px; }
+.mem-form.sph-new { border-top: 1px solid var(--line); padding-top: 16px; max-width: none; }
+
 /* ------------------------------------------------------------------ импорт */
 
 .import-item { border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--sunken); margin-top: 14px; }
@@ -569,6 +619,21 @@ body.sc-staff .only-own, body:not(.sc-staff) .only-staff { display: none !import
   #mem-tabs { gap: 6px; }
   #mem-tabs .tab { min-height: 44px; padding: 6px 12px; font-size: 15px; }
   .mem-add .btn { flex: 1 1 100%; }
+  .layouts .tabs { gap: 6px; }
+  .layouts .tab { padding: 6px 12px; font-size: 14px; }
+  details.sect { padding: 0 8px; }
+  .sect-body .chat { padding: 10px; gap: 8px 10px; }
+  .chat .small-btn { min-height: 40px; padding: 6px 10px; font-size: 13px; }
+  .chat-read { gap: 6px; }
+  .sect-link { flex: 1 1 100%; }
+  .sect-link select { flex: 1 1 140px; }
+  .sect-title { font-size: 16px; }
+  .sect-body .row .btn { flex: 1 1 auto; }
+  .sph-head { gap: 8px; }
+  .sph-order { gap: 4px; }
+  .sph-order .btn { min-width: 40px; min-height: 40px; padding: 4px 8px; }
+  .sph > .row { flex-wrap: nowrap; gap: 6px; }
+  .sph > .row .btn { flex: 1 1 0; min-width: 0; padding-left: 6px; padding-right: 6px; white-space: nowrap; }
 }
 
 /* Бот согласований: шаги у @BotFather и создание в одно нажатие */

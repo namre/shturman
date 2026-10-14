@@ -134,8 +134,12 @@ async def _to_dict(conn: asyncpg.Connection, row: asyncpg.Record, *, full: bool 
                       AND f.status = 'active' AND f.valid_to IS NULL AND f.kind = 'fact') AS facts,
                    (SELECT count(*) {facts._FROM} WHERE {facts.VISIBLE} AND f.project_id = $1
                       AND f.status = 'active' AND f.kind = 'decision') AS decisions""", row["id"])
+    sphere = await conn.fetchrow("SELECT id, title FROM spheres WHERE id = $1", row["sphere_id"]) \
+        if row["sphere_id"] is not None else None
     out = {
         "id": row["id"], "title": row["title"], "status": row["status"], "origin": row["origin"],
+        # сфера проекта (Р-82): название — слова владельца, не чужой текст
+        "sphere_id": sphere["id"] if sphere else None, "sphere": sphere["title"] if sphere else None,
         "aliases": await _aliases(conn, row["id"]), "chats": await _chats(conn, row["id"]),
         "commitments_open": counts["commitments_open"], "facts": counts["facts"],
         "decisions": counts["decisions"],

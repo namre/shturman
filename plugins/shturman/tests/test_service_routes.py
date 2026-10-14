@@ -131,13 +131,25 @@ def test_owner_ui_keeps_only_reading_of_telegram_accounts():
     ("POST", "/api/projects"),
     ("POST", "/api/projects/7/chats"),
     ("POST", "/api/projects/7/archive"),
+    # сферы (Р-82): чтение и просьбы, которые ждут нажатия владельца в боте
+    ("GET", "/api/spheres"),
+    ("POST", "/api/spheres"),
+    ("POST", "/api/spheres/7/chats"),
+    ("POST", "/api/projects/7/sphere"),
 ])
 def test_agent_tools_reach_exactly_their_routes(method, path):
     assert allowed(TOOLS, method, path)
 
 
 def test_agent_tool_list_has_nothing_else():
-    assert len(TOOLS) == 11
+    assert len(TOOLS) == 15
+
+
+@pytest.mark.parametrize("method, path", [("PUT", "/api/spheres/7"), ("DELETE", "/api/spheres/7"),
+                                          ("POST", "/api/spheres/7"), ("PUT", "/api/spheres/order")])
+def test_agent_tools_do_not_rename_or_delete_spheres(method, path):
+    """Переименовать и удалить сферу — только владелец: на странице, в приложении или в кабинете с подтверждением."""
+    assert not allowed(TOOLS, method, path)
 
 
 @pytest.mark.parametrize("method, path", [

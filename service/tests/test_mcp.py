@@ -623,7 +623,8 @@ async def test_search_results_are_rechecked_against_visibility_rules(service, co
     assert seen["sender_peer_id"] is not None and seen["until"] is None
     assert seen["since"].isoformat() == "2026-09-01T00:00:00+03:00"
     assert seen["state"].ro_pool is not None and set(seen) == {
-        "query", "state", "chat_id", "sender_peer_id", "since", "until", "limit"}
+        "query", "state", "chat_id", "sender_peer_id", "since", "until", "limit", "chat_ids"}
+    assert seen["chat_ids"] is None          # без `spheres` поиск по сферам не сужается
 
 
 # --- чужой текст ---

@@ -275,7 +275,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .tools-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 
-input[type="search"], select {
+input[type="search"], input[type="text"], select {
   font: inherit;
   font-size: 16px;            /* меньше 16 — телефон увеличит страницу при вводе */
   color: var(--text);
@@ -288,7 +288,7 @@ input[type="search"], select {
   max-width: 100%;
 }
 
-input[type="search"]:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input[type="search"]:focus-visible, input[type="text"]:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .tools-row select { flex: 1 1 130px; width: auto; }
 
@@ -366,6 +366,8 @@ input[type="search"]:focus-visible, select:focus-visible { outline: 2px solid va
 
 .tag { color: var(--danger); }
 
+.chat-links { display: flex; flex-wrap: wrap; gap: 0 18px; }
+
 .link {
   background: none;
   color: var(--hint);
@@ -427,6 +429,110 @@ input[type="search"]:focus-visible, select:focus-visible { outline: 2px solid va
 .chats-empty { padding: 18px 14px; color: var(--hint); text-align: center; }
 .chats:empty { display: none; }
 #chats-more { margin-bottom: 10px; }
+
+/* ------------------------------------------------- раскладки и сферы (Р-82) */
+
+.sections { display: flex; flex-direction: column; gap: 10px; margin: 0 0 12px; }
+
+details.sect {
+  background: var(--section);
+  border: 1px solid var(--sep);
+  border-radius: 14px;
+  overflow: hidden;
+}
+details.sect > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 10px;
+  padding: 12px 14px;
+  min-height: 48px;
+}
+details.sect > summary::-webkit-details-marker { display: none; }
+details.sect > summary::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--accent);
+  border-bottom: 2px solid var(--accent);
+  transform: rotate(-45deg);
+  margin-right: 2px;
+}
+details.sect[open] > summary::before { transform: rotate(45deg); }
+.sect-title { font-weight: 600; flex: 1 1 140px; min-width: 0; overflow-wrap: anywhere; }
+.sect-count { font-size: 13px; color: var(--hint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sect-count.on { color: var(--accent); font-weight: 600; }
+.sect-body { padding: 0 14px 12px; border-top: 1px solid var(--sep); }
+.sect-body .chats { margin: 10px 0 0; border-radius: 12px; }
+.sect-body .actions { margin-top: 10px; }
+.sect-note { font-size: 13px; color: var(--hint); margin: 8px 0 0; }
+.sect-link { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.sect-link select { flex: 1 1 150px; min-width: 0; }
+.sect-link button { flex: 1 1 auto; white-space: nowrap; }
+
+.chip {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 8px;
+  border-radius: 8px;
+  background: var(--quote);
+  color: var(--accent);
+}
+
+.pick {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--quote);
+  font-size: 14px;
+}
+.pick p { margin: 0 0 4px; }
+.pick .check { min-height: 38px; }
+
+.offer {
+  background: var(--section);
+  border-left: 3px solid #F2B441;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  font-size: 14px;
+}
+.offer p { margin: 0 0 4px; }
+
+.sph-list { list-style: none; margin: 10px 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.sph-list:empty { display: none; }
+.sph {
+  background: var(--section);
+  border: 1px solid var(--sep);
+  border-radius: 14px;
+  padding: 12px 14px;
+  overflow-wrap: anywhere;
+}
+.sph-name { font-weight: 600; font-size: 16px; }
+.sph-desc { font-size: 14px; margin-top: 2px; }
+.sph-meta { font-size: 13px; color: var(--hint); margin-top: 2px; }
+.sph .actions button { flex: 1 1 auto; }
+.sph .actions .narrow { flex: 0 0 auto; min-width: 44px; }
+.sph .actions .arrows { display: flex; gap: 8px; flex: 0 0 auto; }
+.sph-chats li button { flex: none; white-space: nowrap; }
+.sph-chats { list-style: none; margin: 10px 0 0; padding: 0; border-top: 1px solid var(--sep); }
+.sph-chats li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--sep); font-size: 14px; }
+.sph-chats li:last-child { border-bottom: 0; }
+.sph-new { display: flex; flex-direction: column; gap: 10px; }
+.sph-new h2 { margin: 0; }
+.sub-h { font-size: 17px; margin: 20px 0 4px; }
+.small { font-size: 13px; }
+.sph-form { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+
+/* Три вкладки на узком телефоне: «Согласования» не должна упираться в край. */
+@media (max-width: 380px) {
+  .tabs button { padding: 6px 4px; font-size: 14px; gap: 4px; }
+}
 
 [hidden] { display: none !important; }
 

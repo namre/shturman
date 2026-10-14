@@ -25,6 +25,9 @@
   <button type="button" role="tab" id="tab-chats" aria-controls="screen-chats" aria-selected="false">
     <span>Чаты</span>
   </button>
+  <button type="button" role="tab" id="tab-spheres" aria-controls="screen-spheres" aria-selected="false">
+    <span>Сферы</span><span class="badge" id="tab-spheres-count" hidden></span>
+  </button>
 </nav>
 
 <main id="main">
@@ -102,6 +105,16 @@
 
     <div id="chats-body" hidden>
       <div class="tools">
+        <label class="field" for="chats-layout">
+          <span>Как показать список</span>
+          <select id="chats-layout">
+            <option value="">Все чаты</option>
+            <option value="folders">Папки Telegram</option>
+            <option value="spheres">Сферы</option>
+            <option value="activity">По активности</option>
+            <option value="kind">По виду</option>
+          </select>
+        </label>
         <input type="search" id="chats-q" placeholder="Поиск по названию или @имени" aria-label="Поиск чата"
                autocomplete="off" spellcheck="false" enterkeyhint="search">
         <div class="tools-row">
@@ -135,12 +148,50 @@
       <p class="status" id="chats-status" role="status" hidden></p>
       <p class="counter muted" id="chats-counter"></p>
       <ul class="chats" id="chats-list" aria-live="polite"></ul>
+      <div class="sections" id="chats-sections" hidden></div>
       <button type="button" class="secondary wide" id="chats-more" hidden></button>
       <button type="button" class="secondary wide" id="chats-refresh">Обновить список из Telegram</button>
 
       <p class="muted foot">Каждое включение и выключение чата отсюда бот согласований сообщит вам отдельным
         сообщением — так вы заметите, если чаты меняет кто-то другой. Стереть уже сохранённые сообщения чата,
-        включить сразу все группы или каналы и войти в аккаунт — на странице «Переписка» в браузере.</p>
+        включить сразу все чаты раздела, группы или каналы и войти в аккаунт — на странице «Переписка» в браузере.
+        Выключить все чаты раздела можно и здесь.</p>
+    </div>
+  </section>
+
+  <!-- экран «Сферы» (Р-82) -->
+  <section id="screen-spheres" role="tabpanel" aria-labelledby="tab-spheres" hidden>
+    <div class="title-row">
+      <h1>Сферы</h1>
+      <span class="count" id="sph-count"></span>
+    </div>
+    <p class="lead muted">Работа, личное, преподавание, проект по ЖК. Ассистент по умолчанию ищет в сфере, о которой
+      разговор, и помечает найденное сферами. То же, что раздел «Сферы» на странице «Переписка».</p>
+    <p class="muted" id="sph-loading">Загружаю сферы…</p>
+    <div class="panel" id="sph-failed" hidden>
+      <h2>Сферы не загрузились</h2>
+      <p id="sph-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="sph-retry">Повторить</button>
+    </div>
+    <div id="sph-body" hidden>
+      <div id="sph-offers"></div>
+      <ul class="sph-list" id="sph-list"></ul>
+      <p class="muted sph-empty" id="sph-empty" hidden>Сфер пока нет. Заведите первую или сделайте её из папки Telegram.</p>
+      <form class="panel sph-new" id="sph-new" autocomplete="off" novalidate>
+        <h2>Новая сфера</h2>
+        <label class="field" for="sph-new-title"><span>Название</span>
+          <input type="text" id="sph-new-title" maxlength="60" placeholder="Например: Работа РАЗУМ"></label>
+        <label class="field" for="sph-new-description"><span>Коротко, что в ней — по желанию</span>
+          <input type="text" id="sph-new-description" maxlength="300" placeholder="Например: стройка, продажи"></label>
+        <button type="submit" class="primary wide" id="sph-new-save">Завести сферу</button>
+      </form>
+      <h2 class="sub-h">Из папок Telegram</h2>
+      <p class="muted small">«Сделать сферу» относит к сфере все чаты папки; повторно — дополняет. «Предлагать новые» —
+        новые чаты папки появятся здесь вопросом «добавить в сферу?», сами они не добавляются.</p>
+      <p class="muted small" id="sph-folders-empty" hidden>Папок нет — или список чатов ещё не обновлялся из Telegram.</p>
+      <ul class="sph-list" id="sph-folders"></ul>
+      <p class="muted foot">Добавить чат в сферу — кнопкой «Сферы» в строке чата на экране «Чаты». Изменения сфер отсюда
+        записываются в журнал действий страницы с пометкой «из приложения». Какие чаты читаются, сферы не меняют.</p>
     </div>
   </section>
 </main>

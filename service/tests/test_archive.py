@@ -529,7 +529,7 @@ async def test_unfiltered_history_has_an_index_to_walk(conn):
         async with conn.transaction():
             await conn.execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_sort = off")
             plan = await conn.fetch("EXPLAIN " + archive._HISTORY[order],
-                                    None, None, None, None, None, None, None, 51)
+                                    None, None, None, None, None, None, None, 51, None)
         text = "\n".join(r[0] for r in plan)
         assert "messages_time" in text and "Sort" not in text, text
 

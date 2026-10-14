@@ -69,6 +69,10 @@ class DialogRow:
     last_message_at: datetime | None = None
     folder_id: int = 0
     pinned: bool = False
+    # Для правил папок Telegram (spheres.folder_members): снимок на момент загрузки.
+    is_contact: bool | None = None       # собеседник в контактах (только у личных чатов)
+    muted_until: datetime | None = None  # уведомления выключены до этого времени
+    unread: bool = False                 # есть непрочитанное или метка «непрочитано»
 
     @property
     def key(self) -> PeerKey:
@@ -156,9 +160,13 @@ def parse_page(client: Any, cursor: _Cursor, response: Any, *, self_id: int) -> 
         chat = normalize.chat_record(entity, self_id=self_id)
         if chat is None:
             continue
+        notify = getattr(d, "notify_settings", None)
         rows.append(DialogRow(chat=chat, top_message=int(d.top_message or 0),
                               last_message_at=getattr(message, "date", None),
-                              folder_id=int(getattr(d, "folder_id", None) or 0), pinned=bool(getattr(d, "pinned", False))))
+                              folder_id=int(getattr(d, "folder_id", None) or 0), pinned=bool(getattr(d, "pinned", False)),
+                              is_contact=bool(getattr(entity, "contact", False)) if isinstance(entity, types.User) else None,
+                              muted_until=getattr(notify, "mute_until", None),
+                              unread=bool(getattr(d, "unread_count", 0) or getattr(d, "unread_mark", False))))
     done = not added or len(dialogs) < request.limit or not isinstance(response, types.messages.DialogsSlice)
     if not done:
         # Не `messages[-1]`: закреплённые диалоги ломают порядок. Берётся последний диалог страницы,
@@ -221,6 +229,133 @@ async def fetch_all(
             return
 
 
+# --- папки Telegram ------------------------------------------------------------------------------
+#
+# Папки (messages.getDialogFilters) читаются той же фоновой загрузкой, что и список диалогов, одним
+# запросом после последней страницы: так «Обновить список из Telegram» обновляет и их. Это чтение —
+# запрос в перечне READ_REQUESTS (tg/client.py). Хранится описание папки: явные перечни чатов и
+# правила; состав сервис вычисляет сам по списку диалогов (`spheres.folder_members`).
+
+FOLDER_FLAGS = ("contacts", "non_contacts", "groups", "broadcasts", "bots",
+                "exclude_muted", "exclude_read", "exclude_archived")
+
+
+@dataclass
+class FolderRow:
+    """Папка Telegram, какой её вернул getDialogFilters."""
+
+    folder_id: int
+    title: str
+    kind: str                            # filter — обычная папка; chatlist — общая по ссылке
+    position: int
+    emoticon: str | None = None
+    pinned: list[str] = field(default_factory=list)     # 'user:2001', 'chat:3001', 'channel:4002'
+    include: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)
+    flags: list[str] = field(default_factory=list)
+
+
+def peer_ref(input_peer: Any, *, self_id: int) -> str | None:
+    """'класс:номер' для InputPeer из папки; None — то, что чатом не является."""
+    if isinstance(input_peer, types.InputPeerSelf):
+        return f"user:{self_id}"
+    if isinstance(input_peer, (types.InputPeerUser, types.InputPeerUserFromMessage)):
+        return f"user:{int(input_peer.user_id)}"
+    if isinstance(input_peer, types.InputPeerChat):
+        return f"chat:{int(input_peer.chat_id)}"
+    if isinstance(input_peer, (types.InputPeerChannel, types.InputPeerChannelFromMessage)):
+        return f"channel:{int(input_peer.channel_id)}"
+    return None
+
+
+def _title_text(title: Any) -> str:
+    """Название папки: в новых слоях — TextWithEntities, в старых — строка."""
+    text = getattr(title, "text", title)
+    return " ".join(str(text or "").replace("\x00", "").split())[:120]
+
+
+def parse_folders(response: Any, *, self_id: int) -> list[FolderRow]:
+    """Папки из ответа getDialogFilters. «Все чаты» (DialogFilterDefault) — не папка: пропускается."""
+    filters = getattr(response, "filters", response)
+    out: list[FolderRow] = []
+    for f in filters or ():
+        if not isinstance(f, (types.DialogFilter, types.DialogFilterChatlist)):
+            continue
+        def refs(items: Any) -> list[str]:
+            return [r for r in (peer_ref(p, self_id=self_id) for p in items or ()) if r]
+        chatlist = isinstance(f, types.DialogFilterChatlist)
+        out.append(FolderRow(
+            folder_id=int(f.id), title=_title_text(f.title) or f"Папка {f.id}", kind="chatlist" if chatlist else "filter",
+            position=len(out), emoticon=(getattr(f, "emoticon", None) or None),
+            pinned=refs(f.pinned_peers), include=refs(f.include_peers),
+            exclude=[] if chatlist else refs(f.exclude_peers),
+            flags=[] if chatlist else [name for name in FOLDER_FLAGS if getattr(f, name, None)]))
+    return out
+
+
+async def fetch_folders(client: Any, *, self_id: int, pacer: sync.Pacer, stop: asyncio.Event,
+                        on_wait: Callable[[int], Awaitable[None]], retries: int = TRANSIENT_RETRIES,
+                        retry_wait: float = TRANSIENT_WAIT) -> list[FolderRow] | None:
+    """Папки аккаунта одним запросом — с той же очередью и паузами, что страницы списка. FLOOD_WAIT —
+    ожидание и повтор; сбой связи — до `retries` повторов. Не получилось — None: прежние папки в базе
+    остаются, загрузка списка диалогов от этого не считается неудачной."""
+    failures = 0
+    while True:
+        await pacer.wait_flood(stop)
+        try:
+            response = await client(functions.messages.GetDialogFiltersRequest())
+        except sync.FLOOD as exc:
+            pacer.flood(exc.seconds)
+            await on_wait(int(exc.seconds))
+            continue
+        except (sync.Stopped, asyncio.CancelledError):
+            raise
+        except sync.FATAL:
+            raise
+        except sync.TRANSIENT:
+            failures += 1
+            if failures > retries:
+                return None
+            if await sync.interruptible_sleep(retry_wait, stop):
+                raise sync.Stopped() from None
+            continue
+        except Exception as exc:  # noqa: BLE001 — папки не главное: список диалогов уже загружен
+            logger.warning("папки Telegram не прочитаны (%s)", type(exc).__name__)
+            return None
+        finally:
+            pacer.note_request()
+        return parse_folders(response, self_id=self_id)
+
+
+async def save_folders(conn: asyncpg.Connection, account_id: int, folders: list[FolderRow]) -> None:
+    """Папки аккаунта целиком: новые и изменённые записываются, исчезнувшие — убираются (связи сфер с
+    ними остаются: на странице видно «папки больше нет»)."""
+    async with conn.transaction():
+        await conn.execute(
+            "DELETE FROM tg_folders WHERE account_id = $1 AND NOT (folder_id = ANY($2::int[]))",
+            account_id, [f.folder_id for f in folders])
+        for f in folders:
+            await conn.execute(
+                """INSERT INTO tg_folders AS t (account_id, folder_id, title, emoticon, kind, position, pinned,
+                                                include, exclude, flags)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   ON CONFLICT (account_id, folder_id) DO UPDATE
+                   SET title = EXCLUDED.title, emoticon = EXCLUDED.emoticon, kind = EXCLUDED.kind,
+                       position = EXCLUDED.position, pinned = EXCLUDED.pinned, include = EXCLUDED.include,
+                       exclude = EXCLUDED.exclude, flags = EXCLUDED.flags, updated_at = now()""",
+                account_id, f.folder_id, _clean(f.title), _clean(f.emoticon), f.kind, f.position, f.pinned,
+                f.include, f.exclude, f.flags)
+
+
+async def folders(conn: asyncpg.Connection, account_id: int) -> list[FolderRow]:
+    rows = await conn.fetch(
+        """SELECT folder_id, title, emoticon, kind, position, pinned, include, exclude, flags FROM tg_folders
+           WHERE account_id = $1 ORDER BY position, folder_id""", account_id)
+    return [FolderRow(folder_id=r["folder_id"], title=r["title"], kind=r["kind"], position=r["position"],
+                      emoticon=r["emoticon"], pinned=list(r["pinned"]), include=list(r["include"]),
+                      exclude=list(r["exclude"]), flags=list(r["flags"])) for r in rows]
+
+
 # --- база ----------------------------------------------------------------------------------------
 
 def search_text(chat: ChatRecord) -> str:
@@ -241,25 +376,30 @@ async def save_page(conn: asyncpg.Connection, account_id: int, load_id: int, row
     if rows:
         await conn.execute(
             """INSERT INTO tg_dialogs AS t (account_id, peer_class, tg_id, chat_type, title, username, is_bot, search,
-                                            top_message, last_message_at, folder_id, pinned, position, load_id)
+                                            top_message, last_message_at, folder_id, pinned, position, load_id,
+                                            is_contact, muted_until, unread)
                SELECT $1, r.peer_class, r.tg_id, r.chat_type, r.title, r.username, r.is_bot, r.search,
-                      r.top_message, r.last_message_at, r.folder_id, r.pinned, r.position, $2
+                      r.top_message, r.last_message_at, r.folder_id, r.pinned, r.position, $2,
+                      r.is_contact, r.muted_until, r.unread
                FROM unnest($3::text[], $4::bigint[], $5::text[], $6::text[], $7::text[], $8::boolean[], $9::text[],
-                           $10::bigint[], $11::timestamptz[], $12::int[], $13::boolean[], $14::int[])
+                           $10::bigint[], $11::timestamptz[], $12::int[], $13::boolean[], $14::int[],
+                           $15::boolean[], $16::timestamptz[], $17::boolean[])
                     AS r (peer_class, tg_id, chat_type, title, username, is_bot, search, top_message, last_message_at,
-                          folder_id, pinned, position)
+                          folder_id, pinned, position, is_contact, muted_until, unread)
                ON CONFLICT (account_id, peer_class, tg_id) DO UPDATE
                SET chat_type = EXCLUDED.chat_type, title = EXCLUDED.title, username = EXCLUDED.username,
                    is_bot = EXCLUDED.is_bot, search = EXCLUDED.search, top_message = EXCLUDED.top_message,
                    last_message_at = EXCLUDED.last_message_at, folder_id = EXCLUDED.folder_id,
                    pinned = EXCLUDED.pinned, position = EXCLUDED.position, load_id = EXCLUDED.load_id,
+                   is_contact = EXCLUDED.is_contact, muted_until = EXCLUDED.muted_until, unread = EXCLUDED.unread,
                    updated_at = now()""",
             account_id, load_id,
             [r.chat.peer_class for r in rows], [r.chat.tg_id for r in rows], [r.chat.type for r in rows],
             [_clean(r.chat.name) for r in rows], [_clean(r.chat.username) for r in rows],
             [r.chat.is_bot for r in rows], [_clean(search_text(r.chat)) or "" for r in rows],
             [r.top_message for r in rows], [r.last_message_at for r in rows], [r.folder_id for r in rows],
-            [r.pinned for r in rows], list(range(position, position + len(rows))))
+            [r.pinned for r in rows], list(range(position, position + len(rows))),
+            [r.is_contact for r in rows], [r.muted_until for r in rows], [r.unread for r in rows])
     if expected is not None:
         await conn.execute("UPDATE tg_dialog_lists SET expected = $2 WHERE account_id = $1", account_id, expected)
 
@@ -290,9 +430,11 @@ async def finish(conn: asyncpg.Connection, account_id: int, load_id: int, *, mar
 
 
 async def forget(conn: asyncpg.Connection, account_id: int) -> None:
-    """Список диалогов аккаунта больше не нужен (выход из аккаунта)."""
+    """Список диалогов аккаунта больше не нужен (выход из аккаунта). Папки Telegram — тоже; чаты в
+    сферах остаются: это решение владельца, а не сведения из Telegram."""
     await conn.execute("DELETE FROM tg_dialogs WHERE account_id = $1", account_id)
     await conn.execute("DELETE FROM tg_dialog_lists WHERE account_id = $1", account_id)
+    await conn.execute("DELETE FROM tg_folders WHERE account_id = $1", account_id)
 
 
 async def info(conn: asyncpg.Connection, account_id: int) -> dict[str, Any]:
@@ -315,10 +457,12 @@ def _row_chat(row: asyncpg.Record) -> ChatRecord:
 def row_dialog(row: asyncpg.Record) -> DialogRow:
     return DialogRow(chat=_row_chat(row), top_message=int(row["top_message"]),
                      last_message_at=row["last_message_at"], folder_id=int(row["folder_id"]),
-                     pinned=bool(row["pinned"]))
+                     pinned=bool(row["pinned"]), is_contact=row["is_contact"], muted_until=row["muted_until"],
+                     unread=bool(row["unread"]))
 
 
-_COLUMNS = "peer_class, tg_id, chat_type, title, username, is_bot, top_message, last_message_at, folder_id, pinned"
+_COLUMNS = ("peer_class, tg_id, chat_type, title, username, is_bot, top_message, last_message_at, folder_id, pinned, "
+            "is_contact, muted_until, unread")
 
 
 async def rows(conn: asyncpg.Connection, account_id: int, *, keys: Iterable[PeerKey] | None = None,
@@ -339,9 +483,14 @@ async def rows(conn: asyncpg.Connection, account_id: int, *, keys: Iterable[Peer
 
 async def page(conn: asyncpg.Connection, account_id: int, *, offset: int, limit: int,
                chat_types: Iterable[str] | None = None, needle: str = "",
-               only_enabled: bool = False) -> tuple[int, list[DialogRow]]:
-    """Страница списка для экрана выбора: (сколько прошло отбор, строки страницы)."""
+               only_enabled: bool = False, keys: Iterable[PeerKey] | None = None) -> tuple[int, list[DialogRow]]:
+    """Страница списка для экрана выбора: (сколько прошло отбор, строки страницы). `keys` — только эти
+    диалоги (раздел раскладки: папка, сфера, активность, вид — `spheres.sections`)."""
     where, args = ["d.account_id = $1"], [account_id]
+    if keys is not None:
+        keys = list(keys)
+        args += [[k[0] for k in keys], [k[1] for k in keys]]
+        where.append(f"(d.peer_class, d.tg_id) IN (SELECT * FROM unnest(${len(args) - 1}::text[], ${len(args)}::bigint[]))")
     if chat_types is not None:
         args.append(list(chat_types))
         where.append(f"d.chat_type = ANY(${len(args)}::text[])")

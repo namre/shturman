@@ -1,5 +1,5 @@
 // Браузерная проверка страницы настройки: ссылка → вход → бот согласований → способ «как вы» → ключи,
-// вход, чаты (и список большого аккаунта: загрузка в фоне, «подождите» от Telegram) → выгрузка → смена способа на «сотрудник»: бизнес-режим, аккаунт ассистента → «Дополнительно» →
+// вход, чаты (и список большого аккаунта: загрузка в фоне, «подождите» от Telegram; раскладки и сферы) → выгрузка → смена способа на «сотрудник»: бизнес-режим, аккаунт ассистента → «Дополнительно» →
 // попытки «дашборда» с соседнего порта → выход → вход по коду.
 // Запуск и стенд — README.md в этом каталоге. Печатает строки PASS/FAIL, код возврата 1 при FAIL.
 
@@ -438,6 +438,226 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
   await loadShot(page, "dialogs-done-desktop-light");
 }
 
+// --- раскладки списка чатов и сферы (Р-82) ------------------------------------------------------
+// У аккаунта — 4 000+ диалогов (после блока выше), у подставного Telegram — четыре папки, у диалогов —
+// разное время последнего сообщения; пульт заводит три сферы с чатами. Раскладки «Папки Telegram /
+// Сферы / По активности / По виду»: разделы со счётчиком, постранично внутри раздела, «Включить все»
+// с подтверждением, «Сделать сферу из папки», сферы чата в строке; раздел «Сферы»: завести, связать
+// папку — новый чат папки предлагается, а не добавляется; снимки в четырёх видах.
+{
+  const SPH_OUT = process.env.E2E_SPHERES_OUT || OUT;
+  mkdirSync(SPH_OUT, { recursive: true });
+  const seeded = await control("POST", "/spheres/seed?role=owner");
+  check("сферы: стенд завёл папки Telegram и сферы, список перечитан", seeded.folders === 4 && seeded.dialogs > 1000,
+        JSON.stringify(seeded));
+  async function chatsShot(p, name, selector = "#s-chats") {
+    await p.evaluate(() => { const t = document.getElementById("toast"); if (t) t.hidden = true;
+                             document.querySelector(".top").style.position = "static"; });
+    await p.locator(selector).screenshot({ path: path.join(SPH_OUT, name + ".png") });
+    await p.evaluate(() => { document.querySelector(".top").style.position = ""; });
+  }
+  const PREFIX = { folders: "folder:", spheres: "sphere:", activity: "activity:", kind: "kind:" };
+  async function openLayout(p, id) {
+    await p.click(`#chats-layout-${id}`);
+    await p.waitForSelector(`#chats-sections details.sect[data-section^="${PREFIX[id]}"]`, { timeout: 15000 });
+  }
+  async function openSection(p, title) {
+    const det = p.locator("#chats-sections details.sect", { has: p.locator(".sect-title", { hasText: title }) }).first();
+    if (!(await det.evaluate((d) => d.open))) await det.locator("summary").click();
+    await det.locator(".chatlist li").first().waitFor({ timeout: 15000 });
+    return det;
+  }
+  async function waitFor(test, timeout = 10000) {
+    const until = Date.now() + timeout;
+    while (Date.now() < until) {
+      if (await test()) return true;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return false;
+  }
+  async function sphereVariants(stage, prepare, selector = "#s-chats") {
+    const stored = await context.storageState();
+    for (const [name, options] of VARIANTS) {
+      const ctx = await browser.newContext({ ...options, storageState: stored });
+      const p = await ctx.newPage();
+      p.on("dialog", (d) => d.accept());
+      await p.goto(URL_PAGE);
+      await p.waitForSelector("#screen-app:not([hidden])");
+      await p.waitForSelector("#chats-list li");
+      await prepare(p);
+      await p.waitForTimeout(400);
+      await chatsShot(p, `${stage}-${name}`, selector);
+      const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      check(`сферы (${stage}, ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+      await ctx.close();
+    }
+  }
+
+  await page.reload();
+  await page.waitForSelector("#chats-list li");
+  await page.evaluate(() => document.getElementById("s-chats").scrollIntoView());
+  check("раскладки: переключатель «Все чаты / Папки Telegram / Сферы / По активности / По виду»",
+        (await page.locator("#chats-layout .tab").allTextContents()).join("|") === "Все чаты|Папки Telegram|Сферы|По активности|По виду");
+
+  // папки Telegram
+  await openLayout(page, "folders");
+  const folderTitles = await page.locator("#chats-sections .sect-title").allTextContents();
+  check("раскладка «Папки»: разделы — папки Telegram и «Не в папках»",
+        folderTitles.join("|") === "💼 Работа|🏗 Объекты|📰 Новости|🏠 Семья|Не в папках", folderTitles.join("|"));
+  check("раскладка «Папки»: список чатов скрыт, вместо него разделы", !(await page.isVisible("#chats-list")) && !(await page.isVisible("#chats-more")));
+  const work = await openSection(page, "Работа");
+  check("папка «Работа»: в разделе её чаты постранично", (await work.locator(".chatlist li").count()) === 20 &&
+        (await work.locator("button", { hasText: "Показать ещё" }).count()) === 1);
+  const objects = page.locator("#chats-sections details.sect", { has: page.locator(".sect-title", { hasText: "Объекты" }) });
+  check("папка с правилом «без звука»: сказано, что сервис видит не всё",
+        (await objects.locator(".hint").allTextContents()).join(" ").includes("общие настройки"));
+  const before = (await work.locator(".sect-count").textContent()).trim();
+  await work.locator("button", { hasText: "Включить все" }).click();         // подтверждение принимается само
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Включено чатов"), null, { timeout: 20000 });
+  const workAfter = page.locator("#chats-sections details.sect", { has: page.locator(".sect-title", { hasText: "Работа" }) }).first();
+  await page.waitForFunction(() => {
+    const d = [...document.querySelectorAll("#chats-sections details.sect")].find((x) => x.textContent.includes("Работа"));
+    return d && /читается (\d+) из \1$/.test(d.querySelector(".sect-count").textContent.trim());
+  }, null, { timeout: 15000 });
+  check("папка «Работа»: «Включить все» — все чаты раздела читаются", true,
+        before + " → " + (await workAfter.locator(".sect-count").textContent()).trim());
+  await chatsShot(page, "30-layout-folders-desktop-light");
+  await sphereVariants("30-layout-folders", async (p) => { await openLayout(p, "folders"); await openSection(p, "Работа"); });
+
+  // «Выключить все» на странице: каналы папки «Новости» включаются разом и разом выключаются
+  {
+    const countOf = async (title) => page.evaluate((t) => {
+      const d = [...document.querySelectorAll("#chats-sections details.sect")].find((x) => x.querySelector(".sect-title").textContent.includes(t));
+      return d ? d.querySelector(".sect-count").textContent.trim() : "";
+    }, title);
+    const newsSect = await openSection(page, "Новости");
+    await newsSect.locator("button", { hasText: "Включить все" }).click();
+    await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Включено чатов"), null, { timeout: 20000 });
+    await waitFor(async () => /читается (\d+) из \1$/.test(await countOf("Новости")), 15000);
+    const on = await countOf("Новости");
+    const newsAgain = page.locator("#chats-sections details.sect", { has: page.locator(".sect-title", { hasText: "Новости" }) }).first();
+    await newsAgain.locator("button", { hasText: "Выключить все" }).click();
+    await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Выключено чатов"), null, { timeout: 20000 });
+    const off = await waitFor(async () => /читается 0 из/.test(await countOf("Новости")), 15000);
+    const audit = (await control("GET", "/spheres/seen")).audit;
+    check("страница: «Выключить все» в разделе — ни один чат папки не читается, в журнале tg.bulk_off",
+          off && audit.some((r) => r.action === "tg.bulk_off"), on + " → " + (await countOf("Новости")));
+  }
+
+  // «Сделать сферу из папки»
+  const news = await openSection(page, "Новости");
+  await news.locator("button", { hasText: "Сделать сферу из папки" }).click();
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Сфера «Новости» заведена"), null, { timeout: 15000 });
+  check("«Сделать сферу из папки»: сфера заведена с чатами папки",
+        (await control("GET", "/spheres/seen")).spheres.some((s) => s.title === "Новости" && s.chats >= 25));
+
+  // сферы
+  await openLayout(page, "spheres");
+  const sphereTitles = await page.locator("#chats-sections .sect-title").allTextContents();
+  check("раскладка «Сферы»: разделы — сферы по порядку и «Без сферы»",
+        sphereTitles.join("|") === "Работа РАЗУМ|Личное|Преподавание|Новости|Без сферы", sphereTitles.join("|"));
+  const workSphere = await openSection(page, "Работа РАЗУМ");
+  const ivanRow = workSphere.locator(".chatlist li", { hasText: "Иван Петров" }).first();
+  check("строка чата: подписаны все его сферы", (await ivanRow.locator(".sph-chip").allTextContents()).join("|") === "Работа РАЗУМ|Личное");
+  await ivanRow.locator("button", { hasText: "Сферы" }).click();
+  await ivanRow.locator(".sph-pick label", { hasText: "Преподавание" }).locator("input").check();
+  await chatsShot(page, "31-chat-spheres-picker-desktop-light", "#chats-sections");
+  await ivanRow.locator(".sph-pick button", { hasText: "Сохранить" }).click();
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Сферы чата сохранены"), null, { timeout: 15000 });
+  await page.waitForFunction(() => [...document.querySelectorAll("#chats-sections .sect-title")].some((x) => x.textContent === "Преподавание"));
+  await chatsShot(page, "32-layout-spheres-desktop-light");
+  await sphereVariants("32-layout-spheres", async (p) => { await openLayout(p, "spheres"); await openSection(p, "Работа РАЗУМ"); });
+
+  // активность
+  await openLayout(page, "activity");
+  const activity = await page.locator("#chats-sections .sect-title").allTextContents();
+  check("раскладка «По активности»: за неделю, месяц, 3 месяца, давно молчат",
+        activity.join("|") === "За неделю|За месяц|За 3 месяца|Давно молчат", activity.join("|"));
+  const silent = await openSection(page, "Давно молчат");
+  const silentCount = (await silent.locator(".sect-count").textContent()).trim();
+  check("«Давно молчат» у большого аккаунта — тысячи чатов, постранично", /из [1-9]\s?\d{3}/.test(silentCount) &&
+        (await silent.locator("button", { hasText: "Показать ещё" }).count()) === 1, silentCount);
+  await chatsShot(page, "33-layout-activity-desktop-light");
+  await sphereVariants("33-layout-activity", async (p) => { await openLayout(p, "activity"); await openSection(p, "За неделю"); });
+
+  // вид
+  await openLayout(page, "kind");
+  check("раскладка «По виду»: личные, группы, каналы, боты",
+        (await page.locator("#chats-sections .sect-title").allTextContents()).join("|") === "Личные|Группы|Каналы|Боты");
+  await chatsShot(page, "34-layout-kind-desktop-light");
+
+  // раздел «Сферы»: завести, связать папку, новый чат папки предлагается
+  await page.click("#chats-layout-all");
+  await page.waitForSelector("#chats-list li");
+  await page.click("#spheres-details > summary");
+  await page.waitForSelector("#sph-list li.sph");
+  check("раздел «Сферы»: сферы с описанием, числом чатов и папкой",
+        (await page.textContent("#sph-list")).includes("стройка, продажи, совещания") &&
+        (await page.textContent("#sph-list")).includes("папка «Новости»"));
+  await page.fill("#sph-new-title", "Учёба");
+  await page.fill("#sph-new-description", "курсы и книги");
+  await page.click("#sph-new-save");
+  await page.waitForFunction(() => document.querySelector("#sph-list").textContent.includes("Учёба"));
+  check("раздел «Сферы»: новая сфера заведена", true);
+  const folderRow = page.locator("#sph-folders li", { hasText: "Работа" }).first();
+  await folderRow.locator("select").selectOption({ label: "Работа РАЗУМ" });
+  await folderRow.locator("button", { hasText: "Предлагать новые" }).click();
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("будут предлагаться"), null, { timeout: 15000 });
+  const linkedProposals = await page.locator("#sph-proposals .sph-offer").count();
+  await control("POST", "/spheres/folder-new?role=owner");
+  await page.click("#spheres-details > summary");
+  await page.click("#spheres-details > summary");
+  await page.waitForFunction(() => document.querySelector("#sph-proposals").textContent.includes("Новый Заказчик"), null, { timeout: 15000 });
+  const seenBefore = await control("GET", "/spheres/seen");
+  check("связанная папка: новый чат папки предложен, но в сферу сам не добавлен",
+        (await page.textContent("#sph-proposals")).includes("Добавить в сферу «Работа РАЗУМ»?") &&
+        seenBefore.spheres.find((s) => s.title === "Работа РАЗУМ").chats > 0, String(linkedProposals));
+  await page.evaluate(() => document.getElementById("s-spheres").scrollIntoView());
+  await chatsShot(page, "35-spheres-card-desktop-light", "#s-spheres");
+  await sphereVariants("35-spheres-card", async (p) => {
+    await p.click("#spheres-details > summary");
+    await p.waitForSelector("#sph-list li.sph");
+    await p.locator("#sph-list li.sph").first().locator("button", { hasText: "Чаты" }).click();
+    await p.waitForSelector("#sph-list .sph-chats li");
+  }, "#s-spheres");
+  // связанная папка предлагает всё, чего в сфере ещё нет: и прежние чаты папки, и новый
+  const workBefore = seenBefore.spheres.find((s) => s.title === "Работа РАЗУМ").chats;
+  const offered = Number((/Новые чаты в папке «Работа»: (\d+)/.exec(await page.textContent("#sph-proposals")) || [])[1]);
+  await page.locator("#sph-proposals button", { hasText: "Добавить в сферу" }).first().click();
+  await page.waitForFunction(() => !document.querySelector("#sph-proposals").textContent.includes("Новый Заказчик"), null, { timeout: 15000 });
+  const seenAfter = await control("GET", "/spheres/seen");
+  check("предложение принято: предложенные чаты добавлены в сферу",
+        offered > 0 && seenAfter.spheres.find((s) => s.title === "Работа РАЗУМ").chats === workBefore + offered,
+        `${workBefore} + ${offered}`);
+  check("журнал: сферы и массовое включение записаны без названий",
+        seenAfter.audit.some((r) => r.action === "tg.bulk_on") && seenAfter.audit.some((r) => r.action === "sphere.folder") &&
+        !JSON.stringify(seenAfter.audit).includes("Работа РАЗУМ") && !JSON.stringify(seenAfter.audit).includes("Иван"),
+        seenAfter.audit.map((r) => r.action).join(","));
+
+  // карточка «Сферы»: переименовать, поднять выше, удалить (чаты сферы остаются в архиве)
+  {
+    const named = (t) => page.locator("#sph-list li.sph", { has: page.locator(".sph-name", { hasText: t }) }).first();
+    const names = () => page.$$eval("#sph-list .sph-name", (n) => n.map((x) => x.textContent));
+    await named("Учёба").locator("button", { hasText: "Изменить" }).click();
+    await page.fill("#sph-edit-title", "Учёба и курсы");
+    await page.locator("#sph-list form.sph-edit button", { hasText: "Сохранить" }).click();
+    const renamed = await waitFor(async () => (await names()).includes("Учёба и курсы"), 10000);
+    const was = (await names()).indexOf("Учёба и курсы");
+    await named("Учёба и курсы").locator('button[aria-label^="Выше"]').click();
+    const moved = await waitFor(async () => (await names()).indexOf("Учёба и курсы") === was - 1, 10000);
+    check("карточка «Сферы»: переименование и порядок", renamed && moved && was > 0, (await names()).join("|"));
+    const news = (await control("GET", "/spheres/seen")).spheres.find((s) => s.title === "Новости");
+    await named("Новости").locator("button", { hasText: "Удалить" }).click();     // подтверждение принимается само
+    const gone = await waitFor(async () => !(await names()).includes("Новости"), 10000);
+    const seenGone = await control("GET", "/spheres/seen");
+    check("удаление сферы с чатами: сфера пропала из списка, в журнале sphere.delete",
+          gone && news && news.chats > 0 && !seenGone.spheres.some((s) => s.title === "Новости") &&
+          seenGone.audit.some((r) => r.action === "sphere.delete"));
+  }
+  await page.click("#spheres-details > summary");
+  await page.evaluate(() => document.getElementById("s-chats").scrollIntoView());
+}
+
 // --- выгрузка ----------------------------------------------------------------------------------
 const exportFile = path.join(OUT, "result.json");
 const msg = (id, ts, from, fromId, text) => ({ id, type: "message", date: "2026-09-12T10:00:00", date_unixtime: String(ts), from, from_id: "user" + fromId, text, text_entities: [{ type: "plain", text }] });
@@ -731,6 +951,13 @@ await shot(page, "27-app-done-desktop-light");
   await page.click("#mem-project-chats li:has-text('Ольга Смирнова') >> text=Убрать");
   await page.waitForFunction(() => document.querySelectorAll("#mem-project-chats li").length === 1);
   check("проекты: чат убран из проекта", true);
+  // сфера проекта (Р-82): одна, выбирается из сфер владельца
+  await page.selectOption("#mem-project-sphere", { label: "Работа РАЗУМ" });
+  await page.click("#mem-project-sphere-save");
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Сфера проекта сохранена"));
+  await page.waitForFunction(() => document.querySelector("#mem-project-sphere") &&
+    document.querySelector("#mem-project-sphere").selectedOptions[0].textContent === "Работа РАЗУМ");
+  check("проекты: сфера проекта сохранена", true);
 
   await page.click(".mem-back");
   await page.click("#mem-project-new");

@@ -37,6 +37,9 @@
     chatsAge: null, chatsBusy: 0, scans: {}, scanning: {}, exclude: {}, upload: null,
     signatures: {}, fastUntil: 0, lastState: 0, lastOverview: 0, optionsFor: null,
     messages: null, importOpened: false,
+    // раскладки списка чатов и сферы (Р-82): раскладка — только в памяти страницы
+    chatsLayout: "", sections: [], sectionOpen: {}, sectionItems: {}, sectionBusy: {},
+    sphereList: [], sph: null, sphOpen: {}, sphEdit: null,
     subUrl: ""                  // адрес входа в ChatGPT текущей попытки — только в памяти страницы
   };
 
@@ -305,6 +308,8 @@
     mem.personId = mem.projectId = null;
     mem.creating = false;
     if (memOpen()) showMemory(true);
+    refreshSpheres();
+    if ($("spheres-details").open) showSpheres();
     refresh().then(function () { refreshOverview(); });
     startLoop();
   }
@@ -1003,7 +1008,10 @@
     });
     var online = current.status === "running";
     note("chats-offline", "warn", online ? "" : "Этот аккаунт сейчас не подключён, поэтому список чатов недоступен. Его состояние — в шаге со входом в аккаунт.");
-    ["chats-options", "chats-counter", "chats-list"].forEach(function (id) { show(id, online); });
+    ["chats-options", "chats-counter", "chats-layout-box"].forEach(function (id) { show(id, online); });
+    show("chats-list", online && !ui.chatsLayout);
+    show("chats-sections", online && !!ui.chatsLayout);
+    drawLayouts();
     document.querySelector("#chats-body .toolbar").hidden = !online;
     show("chats-refresh", online);
     if (!online) {
@@ -1027,7 +1035,7 @@
   }
 
   function chatsQueryKey() {
-    return [ui.chatAccount, $("chats-q").value.trim(), $("chats-kind").value, $("chats-only").checked].join("|");
+    return [ui.chatAccount, ui.chatsLayout, $("chats-q").value.trim(), $("chats-kind").value, $("chats-only").checked].join("|");
   }
 
   /* Список чатов загружается из Telegram в фоне (Р-81): запрос страницы только запускает загрузку и
@@ -1095,6 +1103,7 @@
 
   function loadChats(reset, refreshList, polling) {
     if (ui.chatAccount === null || ui.chatsLoading) return;
+    if (ui.chatsLayout) { loadSections(refreshList, polling); return; }
     var key = chatsQueryKey(), offset = reset ? 0 : ui.chats.length;
     // при опросе — столько, сколько уже показано: «Показать ещё» не сбрасывается
     var limit = polling ? Math.min(200, Math.max(FIRST_CHATS, ui.chats.length)) : (reset ? FIRST_CHATS : MORE_CHATS);
@@ -1128,11 +1137,12 @@
     });
   }
 
-  function chatRow(item) {
+  function chatRow(item, onChange) {
     var kind = KIND_NAMES[item.kind] || "чат";
     var meta = [el("span", { text: kind })];
     if (item.username) meta.push(el("span", { text: "@" + item.username }));
     if (item.excluded) meta.push(el("span", { class: "badge warn", text: "не сохраняется" }));
+    sphereNames(item.spheres).forEach(function (name) { meta.push(el("span", { class: "badge sph-chip", text: name })); });
     var toggle = el("input", { type: "checkbox", checked: item.enabled, disabled: item.excluded });
     toggle.checked = !!item.enabled;
     toggle.addEventListener("change", function () {
@@ -1151,6 +1161,7 @@
         item.enabled = want;
         ui.chatsEnabled += want ? 1 : -1;
         drawCounter();
+        if (onChange) onChange(want ? 1 : -1);
         fast(10);
       });
     });
@@ -1170,24 +1181,73 @@
         });
       }
     });
-    return el("li", { class: "chat" + (item.excluded ? " is-excluded" : "") }, [
-      el("div", { class: "chat-main" }, [
-        el("span", { class: "chat-title", text: item.title || "Без названия" }),
-        el("span", { class: "chat-meta" }, meta)
-      ]),
-      el("label", { class: "chat-read" }, [toggle, el("span", { text: "читать" })]),
-      exclude
-    ]);
+    var row = el("li", { class: "chat" + (item.excluded ? " is-excluded" : "") });
+    var pick = ui.sphereList.length && !item.locked ? el("button", {
+      class: "btn ghost small-btn quiet", type: "button", text: "Сферы",
+      "aria-label": "Сферы чата " + (item.title || ""), "aria-expanded": "false",
+      onclick: function () { spherePicker(item, row, this); }
+    }) : null;
+    [el("div", { class: "chat-main" }, [
+      el("span", { class: "chat-title", text: item.title || "Без названия" }),
+      el("span", { class: "chat-meta" }, meta)
+    ]), el("label", { class: "chat-read" }, [toggle, el("span", { text: "читать" })]), pick, exclude].forEach(function (n) { if (n) row.appendChild(n); });
+    return row;
+  }
+
+  function sphereNames(ids) {
+    return (ids || []).map(function (id) {
+      var found = ui.sphereList.filter(function (sp) { return sp.id === id; })[0];
+      return found ? found.title : "";
+    }).filter(Boolean);
+  }
+
+  /* Сферы одного чата: флажки по всем сферам прямо под строкой чата. */
+  function spherePicker(item, row, button) {
+    var old = row.querySelector(".sph-pick");
+    if (old) { row.removeChild(old); button.setAttribute("aria-expanded", "false"); return; }
+    button.setAttribute("aria-expanded", "true");
+    var chosen = {};
+    (item.spheres || []).forEach(function (id) { chosen[id] = true; });
+    var box = el("div", { class: "sph-pick" }, [el("p", { class: "small", text: "В каких сферах этот чат — можно в нескольких:" })]);
+    var list = el("div", { class: "sph-pick-list" });
+    ui.sphereList.forEach(function (sp) {
+      var input = el("input", { type: "checkbox" });
+      input.checked = !!chosen[sp.id];
+      input.addEventListener("change", function () { if (input.checked) chosen[sp.id] = true; else delete chosen[sp.id]; });
+      list.appendChild(el("label", { class: "check" }, [input, el("span", { text: sp.title })]));
+    });
+    box.appendChild(list);
+    var save = el("button", { class: "btn small-btn", type: "button", text: "Сохранить" });
+    save.addEventListener("click", function () {
+      var ids = ui.sphereList.filter(function (sp) { return chosen[sp.id]; }).map(function (sp) { return sp.id; });
+      busy(save, true);
+      call("PUT", "spheres/chat", { account_id: ui.chatAccount, peer_class: item.peer_class, tg_id: item.tg_id, sphere_ids: ids }).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { toast(r.error, true); return; }
+        item.spheres = r.data.spheres;
+        toast(r.data.added.length || r.data.removed.length ? "Сферы чата сохранены." : "Ничего не изменилось.");
+        var fresh = chatRow(item, null);
+        row.parentNode.replaceChild(fresh, row);
+        refreshSpheres();
+        if (ui.chatsLayout === "spheres") loadChats(true);
+      });
+    });
+    box.appendChild(el("div", { class: "row" }, [save, el("button", { class: "btn ghost small-btn", type: "button", text: "Отмена",
+      onclick: function () { row.removeChild(box); button.setAttribute("aria-expanded", "false"); button.focus(); } })]));
+    row.appendChild(box);
   }
 
   function drawCounter() {
-    var words = "Выбрано для чтения: " + ui.chatsEnabled + " " + plural(ui.chatsEnabled, "чат", "чата", "чатов") +
-      ". Показано " + number(ui.chats.length) + " из " + number(ui.chatsTotal) + ".";
+    var words = "Выбрано для чтения: " + ui.chatsEnabled + " " + plural(ui.chatsEnabled, "чат", "чата", "чатов") + "." +
+      (ui.chatsLayout ? " Разделов: " + ui.sections.length + "." : " Показано " + number(ui.chats.length) + " из " + number(ui.chatsTotal) + ".");
     if (ui.chatsAge !== null && !(ui.chatsLoad && ui.chatsLoad.running)) words += " Список из Telegram обновлён " + ageWords(ui.chatsAge) + ".";
     text("chats-counter", words);
   }
 
   function drawChats() {
+    show("chats-list", !ui.chatsLayout);
+    show("chats-sections", !!ui.chatsLayout);
+    if (ui.chatsLayout) { show("chats-more", false); show("chats-bulk", false); drawCounter(); return; }
     var list = $("chats-list");
     list.textContent = "";
     ui.chats.forEach(function (item) { list.appendChild(chatRow(item)); });
@@ -1204,6 +1264,204 @@
     var kind = $("chats-kind").value, bulk = $("chats-bulk");
     show(bulk, !!kind && !$("chats-q").value.trim() && !$("chats-only").checked && ui.chatsTotal > 0);
     if (kind) text(bulk, "Читать все " + KIND_BULK[kind] + " (" + number(ui.chatsTotal) + ")");
+  }
+
+  /* ---- раскладки списка: папки Telegram, сферы, активность, вид (Р-82) */
+
+  var LAYOUTS = [["", "Все чаты"], ["folders", "Папки Telegram"], ["spheres", "Сферы"], ["activity", "По активности"], ["kind", "По виду"]];
+  var SECTION_FIRST = 20, SECTION_MORE = 30;
+  var EMPTY_LAYOUT = {
+    folders: "В Telegram нет папок — или список ещё не обновлялся. Нажмите «Обновить список из Telegram».",
+    spheres: "Сфер пока нет. Заведите их в разделе «Сферы» ниже на этой странице.",
+    activity: "Ничего не найдено.", kind: "Ничего не найдено."
+  };
+
+  function drawLayouts() {
+    renderIfChanged("chats-layout", [ui.chatsLayout], function () {
+      return LAYOUTS.map(function (l) {
+        return el("button", {
+          class: "tab", type: "button", role: "tab", id: "chats-layout-" + (l[0] || "all"),
+          "aria-selected": ui.chatsLayout === l[0] ? "true" : "false", text: l[1],
+          onclick: function () {
+            if (ui.chatsLayout === l[0]) return;
+            ui.chatsLayout = l[0];
+            ui.sectionItems = {};
+            ui.sections = [];
+            $("chats-sections").textContent = "";        // прежние разделы не показываем, пока грузятся новые
+            if (l[0]) $("chats-sections").appendChild(el("p", { class: "small waiting", text: "Раскладываю чаты…" }));
+            drawLayouts();
+            drawChats();
+            loadChats(true);
+          }
+        });
+      });
+    });
+  }
+
+  function filterQuery() {
+    return "&q=" + encodeURIComponent($("chats-q").value.trim()) + "&kind=" + encodeURIComponent($("chats-kind").value) +
+      ($("chats-only").checked ? "&only=enabled" : "");
+  }
+
+  function loadSections(refreshList, polling) {
+    var key = chatsQueryKey(), account = ui.chatAccount;
+    ui.chatsLoading = true;
+    ui.chatsKey = key;
+    call("GET", "tg/accounts/" + account + "/dialogs?offset=0&limit=1" + filterQuery() + (refreshList ? "&refresh=1" : "")).then(function (r) {
+      if (!r.ok) {
+        ui.chatsLoading = false;
+        if (!polling) note("chats-error", "warn", r.error);
+        ui.chatsKey = "";
+        return;
+      }
+      var was = !!(ui.chatsLoad && ui.chatsLoad.running);
+      ui.chatsLoad = r.data.load || null;
+      ui.chatsListLoaded = !!r.data.loaded;
+      ui.chatsAge = typeof r.data.age === "number" ? r.data.age : null;
+      ui.chatsEnabled = r.data.enabled_total;
+      if (!r.data.loaded) {
+        ui.chatsLoading = false;
+        ui.sections = [];
+        drawSections(); drawLoad(); drawCounter(); schedulePoll();
+        return;
+      }
+      return call("GET", "tg/accounts/" + account + "/sections?layout=" + ui.chatsLayout + filterQuery()).then(function (s) {
+        ui.chatsLoading = false;
+        if (key !== chatsQueryKey()) { loadChats(true); return; }
+        if (!s.ok) { if (!polling) note("chats-error", "warn", s.error); schedulePoll(); return; }
+        note("chats-error", "warn", "");
+        ui.sections = s.data.sections;
+        ui.sphereList = s.data.spheres;
+        drawSections();
+        drawLoad();
+        drawCounter();
+        ui.sections.forEach(function (sec) { if (ui.sectionOpen[sec.id]) loadSection(sec, true); });
+        if (was && ui.chatsLoad && !ui.chatsLoad.running && ui.chatsLoad.state === "done") toast("Список чатов обновлён из Telegram.");
+        schedulePoll();
+      });
+    });
+  }
+
+  function drawSections() {
+    var box = $("chats-sections");
+    box.textContent = "";
+    if (!ui.sections.length) {
+      if (ui.chatsListLoaded) box.appendChild(el("p", { class: "note info", text: EMPTY_LAYOUT[ui.chatsLayout] || "Ничего не найдено." }));
+      return;
+    }
+    ui.sections.forEach(function (sec) { box.appendChild(sectionNode(sec)); });
+  }
+
+  function sectionCount(sec) {
+    return "читается " + number(sec.enabled) + " из " + number(sec.total);
+  }
+
+  function sectionNode(sec) {
+    var det = el("details", { class: "sect", "data-section": sec.id });
+    det.open = !!ui.sectionOpen[sec.id];
+    var count = el("span", { class: "sect-count" + (sec.enabled ? " on" : ""), text: sectionCount(sec) });
+    var waiting = (sec.proposals || []).reduce(function (n, p) { return n + p.count; }, 0);
+    det.appendChild(el("summary", {}, [
+      el("span", { class: "sect-title" }, [(sec.emoticon ? sec.emoticon + " " : "") + sec.title]),
+      waiting ? el("span", { class: "badge warn", text: "новые: " + waiting }) : null,
+      count
+    ]));
+    var body = el("div", { class: "sect-body" });
+    det.appendChild(body);
+    sec._count = count;
+    sec._body = body;
+    drawSectionBody(sec);
+    det.addEventListener("toggle", function () {
+      ui.sectionOpen[sec.id] = det.open;
+      if (det.open && !ui.sectionItems[sec.id]) loadSection(sec, true);
+    });
+    return det;
+  }
+
+  function sectionChanged(sec, delta) {
+    sec.enabled += delta;
+    sec.can_enable = Math.max(0, sec.can_enable - delta);
+    if (sec._count) { sec._count.textContent = sectionCount(sec); sec._count.className = "sect-count" + (sec.enabled ? " on" : ""); }
+  }
+
+  function loadSection(sec, reset) {
+    if (ui.sectionBusy[sec.id]) return;
+    var have = ui.sectionItems[sec.id];
+    var offset = reset ? 0 : (have ? have.items.length : 0);
+    var limit = reset ? Math.max(SECTION_FIRST, have ? Math.min(200, have.items.length) : 0) : SECTION_MORE;
+    ui.sectionBusy[sec.id] = true;
+    call("GET", "tg/accounts/" + ui.chatAccount + "/dialogs?section=" + encodeURIComponent(sec.id) + "&offset=" + offset + "&limit=" + limit + filterQuery()).then(function (r) {
+      ui.sectionBusy[sec.id] = false;
+      if (!r.ok) { toast(r.error, true); return; }
+      var items = reset || !have ? r.data.items : have.items.concat(r.data.items);
+      ui.sectionItems[sec.id] = { items: items, total: r.data.total };
+      drawSectionBody(sec);
+    });
+  }
+
+  function bulkSection(sec, enabled, button) {
+    var depth = $("opt-depth"), depthText = depth.options[depth.selectedIndex] ? depth.options[depth.selectedIndex].textContent : "";
+    var n = enabled ? sec.can_enable : sec.enabled;
+    var question = enabled
+      ? "Читать все чаты раздела «" + sec.title + "» (" + n + ")?\n\nСервис загрузит их историю (глубина: " + depthText + ") и будет сохранять новые сообщения. Исключённые и служебные чаты останутся выключенными."
+      : "Выключить чтение всех чатов раздела «" + sec.title + "» (" + n + ")?\n\nУже сохранённые сообщения останутся в архиве.";
+    if (!confirm(question)) return;
+    var body = { section: sec.id, enabled: enabled, q: $("chats-q").value.trim(), kind: $("chats-kind").value, only: $("chats-only").checked };
+    act(button, "chats-error", "POST", "tg/accounts/" + ui.chatAccount + "/bulk", body, function (data) {
+      toast((enabled ? "Включено чатов: " : "Выключено чатов: ") + data.changed + (data.skipped ? ". Пропущено исключённых: " + data.skipped : "") + ".");
+      ui.sectionItems[sec.id] = null;
+      loadChats(true);
+    });
+  }
+
+  function folderTools(sec) {
+    var folderId = Number(sec.id.split(":")[1]);
+    var parts = [];
+    var made = (sec.spheres || [])[0];
+    var linked = (sec.spheres || []).filter(function (x) { return x.propose; })[0];
+    parts.push(el("button", { class: "btn ghost small-btn", type: "button",
+      text: made ? "Дополнить сферу «" + made.title + "»" : "Сделать сферу из папки",
+      onclick: function () { makeFromFolder(ui.chatAccount, folderId, this, function () { loadChats(true); }); } }));
+    if (linked) {
+      parts.push(el("span", { class: "small", text: "Новые чаты папки предлагаются в сферу «" + linked.title + "»." }));
+    } else if (ui.sphereList.length) {
+      var select = el("select", { "aria-label": "Сфера для новых чатов папки «" + sec.title + "»" },
+        ui.sphereList.map(function (sp) { return el("option", { value: String(sp.id), text: sp.title }); }));
+      if (made) select.value = String(made.id);
+      parts.push(el("div", { class: "sect-link" }, [el("span", { class: "sect-link-label", text: "Новые чаты папки предлагать в сферу" }),
+        select, el("button", { class: "btn ghost small-btn", type: "button", text: "Предлагать",
+        onclick: function () { linkFolder(Number(select.value), ui.chatAccount, folderId, true, this, function () { loadChats(true); }); } })]));
+    }
+    return el("div", { class: "row sect-folder" }, parts);
+  }
+
+  function drawSectionBody(sec) {
+    var body = sec._body;
+    if (!body) return;
+    body.textContent = "";
+    if (sec.description) body.appendChild(el("p", { class: "small", text: sec.description }));
+    (sec.notes || []).forEach(function (n) { body.appendChild(el("p", { class: "hint", text: n })); });
+    (sec.proposals || []).forEach(function (p) {
+      body.appendChild(proposalNode({ sphere_id: p.sphere_id, sphere_title: p.sphere_title, count: p.count, account_id: ui.chatAccount,
+                                      folder_id: Number(sec.id.split(":")[1]), folder_title: sec.title }, function () { loadChats(true); refreshSpheres(); }));
+    });
+    var actions = [];
+    if (sec.can_enable > 0) actions.push(el("button", { class: "btn small-btn", type: "button", text: "Включить все (" + number(sec.can_enable) + ")",
+      onclick: function () { bulkSection(sec, true, this); } }));
+    if (sec.enabled > 0) actions.push(el("button", { class: "btn ghost small-btn", type: "button", text: "Выключить все (" + number(sec.enabled) + ")",
+      onclick: function () { bulkSection(sec, false, this); } }));
+    if (actions.length) body.appendChild(el("div", { class: "row" }, actions));
+    if (sec.id.indexOf("folder:") === 0 && sec.id !== "folder:none") body.appendChild(folderTools(sec));
+    var got = ui.sectionItems[sec.id];
+    if (!got) { body.appendChild(el("p", { class: "small waiting", text: "Загружаю…" })); return; }
+    if (!got.items.length) { body.appendChild(el("p", { class: "mem-note", text: "В этом разделе нет чатов." })); return; }
+    var list = el("ul", { class: "chatlist" });
+    got.items.forEach(function (item) { list.appendChild(chatRow(item, function (delta) { sectionChanged(sec, delta); })); });
+    body.appendChild(list);
+    var left = got.total - got.items.length;
+    if (left > 0) body.appendChild(el("button", { class: "btn ghost", type: "button",
+      text: "Показать ещё " + Math.min(left, SECTION_MORE) + " (осталось " + number(left) + ")",
+      onclick: function () { loadSection(sec, false); } }));
   }
 
   function wireChats() {
@@ -1985,8 +2243,30 @@
     });
   }
 
+  function projectSphere(p) {
+    var select = el("select", { id: "mem-project-sphere" }, [el("option", { value: "", text: "Без сферы" })].concat(
+      ui.sphereList.map(function (sp) { return el("option", { value: String(sp.id), text: sp.title }); })));
+    select.value = p.sphere_id ? String(p.sphere_id) : "";
+    var save = el("button", { class: "btn ghost", id: "mem-project-sphere-save", type: "button", text: "Сохранить",
+      onclick: function () {
+        busy(save, true);
+        call("PUT", "memory/projects/" + p.id + "/sphere", { sphere_id: select.value ? Number(select.value) : null }).then(function (r) {
+          busy(save, false);
+          if (!r.ok) { toast(r.error, true); return; }
+          toast(r.data.changed ? "Сфера проекта сохранена." : "Ничего не изменилось.");
+          refreshSpheres();
+          showMemory(true);
+        });
+      } });
+    return memSection("Сфера проекта", ui.sphereList.length ? "Ассистент ищет по проекту в его сфере и помечает её в ответах. У проекта — не больше одной сферы."
+                                                             : "Сфер пока нет — заведите их в разделе «Сферы» на этой странице.", ui.sphereList.length ? [
+      el("div", { class: "mem-add" }, [el("div", { class: "field grow" }, [el("label", { for: "mem-project-sphere", text: "Сфера" }), select]), save])
+    ] : []);
+  }
+
   function projectMeta(p) {
     var parts = [];
+    if (p.sphere) parts.push("сфера «" + p.sphere + "»");
     parts.push(p.chats.length ? p.chats.length + " " + plural(p.chats.length, "чат", "чата", "чатов") : "без чатов");
     if (p.commitments_open) parts.push("открытых договорённостей: " + p.commitments_open);
     if (p.decisions) parts.push("решений: " + p.decisions);
@@ -2147,6 +2427,7 @@
     nodes.push(commitmentsSection(p));
     nodes.push(timelineSection(p));
     nodes.push(projectChats(p));
+    nodes.push(projectSphere(p));
     if (!archived) {
       var error = el("p", { class: "note warn mem-error", role: "alert", hidden: true });
       nodes.push(memSection("Проект закончился?", "В архиве страница останется, но перестанет обновляться.", [
@@ -2294,6 +2575,303 @@
     return nodes;
   }
 
+  /* ------------------------------------------------------------- сферы (Р-82) */
+
+  /* Список сфер нужен и списку чатов (подписи в строках, выбор сфер чата), и памяти (сфера проекта):
+     спрашивается при входе и после каждого изменения сфер. */
+  function refreshSpheres() {
+    return call("GET", "spheres", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      ui.sph = r.data;
+      ui.sphereList = r.data.spheres.map(function (sp) { return { id: sp.id, title: sp.title }; });
+      var waiting = r.data.proposals.reduce(function (n, p) { return n + p.count; }, 0);
+      pill("spheres", waiting ? "новые чаты: " + waiting : r.data.spheres.length ? "сфер: " + r.data.spheres.length : "", waiting ? "todo" : "");
+      if ($("spheres-details").open) drawSpheres();
+    });
+  }
+
+  function sphError(message) { note("sph-error", "warn", message || ""); }
+
+  function proposalNode(p, done) {
+    var names = (p.chats || []).map(function (c) { return c.title || "без названия"; }).slice(0, 8);
+    var add = el("button", { class: "btn small-btn", type: "button", text: "Добавить в сферу" });
+    var no = el("button", { class: "btn ghost small-btn", type: "button", text: "Не предлагать" });
+    function decide(accept, button) {
+      busy(add, true); busy(no, true);
+      call("POST", "spheres/" + p.sphere_id + "/proposals", { account_id: p.account_id, folder_id: p.folder_id, accept: accept }).then(function (r) {
+        busy(add, false); busy(no, false);
+        if (!r.ok) { toast(r.error, true); return; }
+        toast(accept ? "Добавлено в сферу: " + r.data.added + "." : "Больше не предложу: " + r.data.declined + ".");
+        refreshSpheres();
+        if (done) done();
+      });
+    }
+    add.addEventListener("click", function () { decide(true, add); });
+    no.addEventListener("click", function () { decide(false, no); });
+    return el("div", { class: "note info sph-offer" }, [
+      el("p", {}, [el("b", { text: "Новые чаты в папке «" + p.folder_title + "»: " + p.count + "." }),
+        " Добавить в сферу «" + p.sphere_title + "»?"]),
+      names.length ? el("p", { class: "small", text: names.join(", ") + (p.count > names.length ? " и ещё " + (p.count - names.length) : "") }) : null,
+      el("div", { class: "row" }, [add, no])
+    ]);
+  }
+
+  function makeFromFolder(account, folderId, button, done) {
+    busy(button, true);
+    call("POST", "spheres/folders/make", { account_id: account, folder_id: folderId }).then(function (r) {
+      busy(button, false);
+      if (!r.ok) { toast(r.error, true); return; }
+      toast((r.data.created ? "Сфера «" + r.data.sphere.title + "» заведена" : "Сфера «" + r.data.sphere.title + "» дополнена") +
+            ": добавлено чатов — " + r.data.added + ".");
+      refreshSpheres();
+      if (done) done();
+    });
+  }
+
+  function linkFolder(sphereId, account, folderId, link, button, done) {
+    busy(button, true);
+    call("POST", "spheres/" + sphereId + "/folders", { account_id: account, folder_id: folderId, link: link }).then(function (r) {
+      busy(button, false);
+      if (!r.ok) { toast(r.error, true); return; }
+      toast(link ? "Папка связана: новые чаты в ней будут предлагаться" + (r.data.proposed ? " (сейчас — " + r.data.proposed + ")." : ".") : "Папка отвязана.");
+      refreshSpheres();
+      if (done) done();
+    });
+  }
+
+  function loadSphereFolders() {
+    return call("GET", "spheres/folders").then(function (r) { if (r.ok) ui.sphFolders = r.data.folders; });
+  }
+
+  function drawSpheres() {
+    var data = ui.sph;
+    if (!data) return;
+    var offers = $("sph-proposals");
+    offers.textContent = "";
+    data.proposals.forEach(function (p) { offers.appendChild(proposalNode(p, null)); });
+    var list = $("sph-list");
+    list.textContent = "";
+    if (!data.spheres.length) list.appendChild(el("li", { class: "mem-note sph-empty", text: "Сфер пока нет. Заведите первую ниже или сделайте её из папки Telegram." }));
+    data.spheres.forEach(function (sp, i) { list.appendChild(sphereItem(sp, i, data.spheres)); });
+    drawSphereFolders();
+  }
+
+  function sphereMeta(sp) {
+    var parts = [sp.chats + " " + plural(sp.chats, "чат", "чата", "чатов")];
+    if (sp.projects) parts.push(sp.projects + " " + plural(sp.projects, "проект", "проекта", "проектов"));
+    sp.folders.forEach(function (f) {
+      parts.push("папка «" + (f.title || "№ " + f.folder_id) + "»" + (f.present ? "" : " — её больше нет в Telegram") + (f.propose ? ": новые предлагаются" : ""));
+    });
+    return parts.join(" · ");
+  }
+
+  function moveSphere(all, i, step, button) {
+    var ids = all.map(function (sp) { return sp.id; });
+    var j = i + step;
+    if (j < 0 || j >= ids.length) return;
+    var t = ids[i]; ids[i] = ids[j]; ids[j] = t;
+    busy(button, true);
+    call("PUT", "spheres/order", { ids: ids }).then(function (r) {
+      busy(button, false);
+      if (!r.ok) { toast(r.error, true); refreshSpheres(); return; }
+      refreshSpheres();
+    });
+  }
+
+  function sphereItem(sp, i, all) {
+    var li = el("li", { class: "sph", "data-sphere": String(sp.id) });
+    if (ui.sphEdit === sp.id) { li.appendChild(sphereEditForm(sp)); return li; }
+    li.appendChild(el("div", { class: "sph-head" }, [
+      el("div", { class: "sph-main" }, [
+        el("span", { class: "sph-name", text: sp.title }),
+        sp.description ? el("span", { class: "sph-desc", text: sp.description }) : null,
+        el("span", { class: "mem-meta", text: sphereMeta(sp) })
+      ]),
+      el("div", { class: "sph-order" }, [
+        el("button", { class: "btn ghost small-btn quiet", type: "button", text: "↑", "aria-label": "Выше: " + sp.title, disabled: i === 0,
+          onclick: function () { moveSphere(all, i, -1, this); } }),
+        el("button", { class: "btn ghost small-btn quiet", type: "button", text: "↓", "aria-label": "Ниже: " + sp.title, disabled: i === all.length - 1,
+          onclick: function () { moveSphere(all, i, 1, this); } })
+      ])
+    ]));
+    var open = !!ui.sphOpen[sp.id];
+    li.appendChild(el("div", { class: "row" }, [
+      el("button", { class: "btn ghost small-btn", type: "button", "aria-expanded": open ? "true" : "false",
+        text: open ? "Скрыть чаты" : "Чаты (" + sp.chats + ")",
+        onclick: function () { ui.sphOpen[sp.id] = !open; drawSpheres(); } }),
+      el("button", { class: "btn ghost small-btn", type: "button", text: "Изменить",
+        onclick: function () { ui.sphEdit = sp.id; drawSpheres(); } }),
+      el("button", { class: "btn ghost small-btn danger", type: "button", text: "Удалить",
+        onclick: function () {
+          if (!confirm("Удалить сферу «" + sp.title + "»?\n\nОна будет снята с чатов (" + sp.chats + ") и проектов (" + sp.projects + "). Сами чаты, сохранённые сообщения и проекты останутся.")) return;
+          var button = this;
+          busy(button, true);
+          call("DELETE", "spheres/" + sp.id).then(function (r) {
+            busy(button, false);
+            if (!r.ok) { toast(r.error, true); return; }
+            toast("Сфера удалена. Чаты и проекты остались.");
+            refreshSpheres();
+            if (ui.chatsLayout) loadChats(true);
+          });
+        } })
+    ]));
+    if (open) li.appendChild(sphereChats(sp));
+    return li;
+  }
+
+  function sphereEditForm(sp) {
+    var title = el("input", { type: "text", maxlength: "60", id: "sph-edit-title", value: sp.title });
+    var about = el("input", { type: "text", maxlength: "300", id: "sph-edit-description", value: sp.description || "" });
+    var save = el("button", { class: "btn small-btn", type: "submit", text: "Сохранить" });
+    var form = el("form", { class: "sph-edit", novalidate: true }, [
+      el("div", { class: "grid2" }, [
+        el("div", { class: "field" }, [el("label", { for: "sph-edit-title", text: "Название" }), title]),
+        el("div", { class: "field" }, [el("label", { for: "sph-edit-description", text: "Коротко, что в ней" }), about])
+      ]),
+      el("div", { class: "row" }, [save, el("button", { class: "btn ghost small-btn", type: "button", text: "Отмена",
+        onclick: function () { ui.sphEdit = null; drawSpheres(); } })])
+    ]);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      busy(save, true);
+      call("PUT", "spheres/" + sp.id, { title: title.value, description: about.value }).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { toast(r.error, true); return; }
+        ui.sphEdit = null;
+        toast("Сфера сохранена.");
+        refreshSpheres();
+      });
+    });
+    setTimeout(function () { title.focus(); }, 0);
+    return form;
+  }
+
+  function sphereChats(sp) {
+    var box = el("div", { class: "sph-chats" }, [el("p", { class: "small waiting", text: "Загружаю чаты…" })]);
+    call("GET", "spheres/" + sp.id + "/chats").then(function (r) {
+      box.textContent = "";
+      if (!r.ok) { box.appendChild(el("p", { class: "note warn", text: r.error })); return; }
+      var items = r.data.chats;
+      if (!items.length) box.appendChild(el("p", { class: "mem-note", text: "В сфере пока нет чатов. Добавьте их здесь, в строке чата в шаге «Какие чаты читать» или сделайте сферу из папки Telegram." }));
+      else box.appendChild(el("ul", { class: "mem-items" }, items.map(function (c) {
+        var meta = [c.enabled ? "читается" : c.excluded ? "не сохраняется" : "не читается"];
+        if (c.account_role === "assistant") meta.push("аккаунт ассистента");
+        return el("li", { class: "mem-chat" }, [
+          el("span", {}, [c.title || "без названия", el("span", { class: "mem-meta", text: " · " + meta.join(" · ") })]),
+          el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать из сферы чат " + (c.title || ""),
+            onclick: function () {
+              var button = this;
+              busy(button, true);
+              call("POST", "spheres/" + sp.id + "/chats", { account_id: c.account_id, chats: [{ peer_class: c.peer_class, tg_id: c.tg_id }], add: false }).then(function (x) {
+                busy(button, false);
+                if (!x.ok) { toast(x.error, true); return; }
+                toast("Чат убран из сферы.");
+                refreshSpheres();
+              });
+            } })
+        ]);
+      })));
+      box.appendChild(sphereAdd(sp));
+    });
+    return box;
+  }
+
+  /* Добавить чат в сферу: поиск по списку диалогов того аккаунта, что выбран в шаге «Какие чаты читать». */
+  function sphereAdd(sp) {
+    if (ui.chatAccount === null) return el("p", { class: "small", text: "Добавлять чаты можно, когда подключён аккаунт Telegram." });
+    var input = el("input", { type: "search", autocomplete: "off", placeholder: "Найти чат по названию", "aria-label": "Найти чат для сферы «" + sp.title + "»" });
+    var found = el("ul", { class: "mem-items sph-found" });
+    var timer = null;
+    input.addEventListener("input", function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        var q = input.value.trim();
+        found.textContent = "";
+        if (!q) return;
+        call("GET", "tg/accounts/" + ui.chatAccount + "/dialogs?offset=0&limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+          found.textContent = "";
+          if (!r.ok) { found.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+          if (!r.data.items.length) found.appendChild(el("li", { class: "mem-note", text: "Ничего не нашлось." }));
+          r.data.items.forEach(function (item) {
+            var inside = (item.spheres || []).indexOf(sp.id) >= 0;
+            found.appendChild(el("li", { class: "mem-chat" }, [
+              el("span", {}, [item.title || "без названия", el("span", { class: "mem-meta", text: " · " + (KIND_NAMES[item.kind] || "чат") })]),
+              inside ? el("span", { class: "badge ok", text: "уже в сфере" }) : el("button", { class: "btn ghost small-btn", type: "button", text: "Добавить",
+                onclick: function () {
+                  var button = this;
+                  busy(button, true);
+                  call("POST", "spheres/" + sp.id + "/chats", { account_id: ui.chatAccount, chats: [{ peer_class: item.peer_class, tg_id: item.tg_id }], add: true }).then(function (x) {
+                    busy(button, false);
+                    if (!x.ok) { toast(x.error, true); return; }
+                    toast("Чат добавлен в сферу.");
+                    refreshSpheres();
+                  });
+                } })
+            ]));
+          });
+        });
+      }, 300);
+    });
+    return el("div", { class: "field sph-add" }, [el("label", { text: "Добавить чат" }), input, found]);
+  }
+
+  function drawSphereFolders() {
+    var list = $("sph-folders");
+    list.textContent = "";
+    var folders = ui.sphFolders || [];
+    show("sph-folders-empty", !folders.length);
+    folders.forEach(function (f) {
+      var made = f.spheres[0];
+      var linked = f.spheres.filter(function (x) { return x.propose; })[0];
+      var parts = [el("button", { class: "btn ghost small-btn", type: "button",
+        text: made ? "Дополнить «" + made.title + "»" : "Сделать сферу",
+        onclick: function () { makeFromFolder(f.account_id, f.folder_id, this, function () { loadSphereFolders().then(drawSphereFolders); }); } })];
+      if (linked) {
+        parts.push(el("button", { class: "btn ghost small-btn quiet", type: "button", text: "Не предлагать новые",
+          onclick: function () { linkFolder(linked.id, f.account_id, f.folder_id, false, this, function () { loadSphereFolders().then(drawSphereFolders); }); } }));
+      } else if (ui.sphereList.length) {
+        var select = el("select", { "aria-label": "Сфера для новых чатов папки «" + f.title + "»" },
+          ui.sphereList.map(function (sp) { return el("option", { value: String(sp.id), text: sp.title }); }));
+        if (made) select.value = String(made.id);
+        parts.push(el("div", { class: "sect-link" }, [el("span", { class: "sect-link-label", text: "Новые чаты — в сферу" }),
+          select, el("button", { class: "btn ghost small-btn", type: "button", text: "Предлагать новые",
+          onclick: function () { linkFolder(Number(select.value), f.account_id, f.folder_id, true, this, function () { loadSphereFolders().then(drawSphereFolders); }); } })]));
+      }
+      var meta = f.count + " " + plural(f.count, "чат", "чата", "чатов") + (f.account_role === "assistant" ? " · аккаунт ассистента" : "");
+      if (made) meta += " · сфера «" + made.title + "»" + (linked ? ", новые предлагаются" : "");
+      list.appendChild(el("li", { class: "sph-folder" }, [
+        el("div", { class: "sph-main" }, [
+          el("span", { class: "sph-name", text: (f.emoticon ? f.emoticon + " " : "") + f.title }),
+          el("span", { class: "mem-meta", text: meta })
+        ].concat(f.notes.map(function (n) { return el("span", { class: "hint", text: n }); }))),
+        el("div", { class: "row" }, parts)
+      ]));
+    });
+  }
+
+  function showSpheres() {
+    return Promise.all([refreshSpheres(), loadSphereFolders()]).then(drawSpheres);
+  }
+
+  function wireSpheres() {
+    $("spheres-details").addEventListener("toggle", function () { if ($("spheres-details").open) showSpheres(); });
+    $("sph-new").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var save = $("sph-new-save");
+      busy(save, true);
+      sphError("");
+      call("POST", "spheres", { title: $("sph-new-title").value, description: $("sph-new-description").value }).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { sphError(r.error); return; }
+        $("sph-new-title").value = "";
+        $("sph-new-description").value = "";
+        toast("Сфера «" + r.data.sphere.title + "» заведена.");
+        ui.sphOpen[r.data.sphere.id] = true;
+        showSpheres();
+      });
+    });
+  }
+
   function wireMemory() {
     $("memory-details").addEventListener("toggle", function () {
       if (memOpen()) showMemory(true);
@@ -2321,7 +2899,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireMemory(); wireSession();
+  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireMemory(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.

@@ -2,7 +2,8 @@
 // решение → пункт ушёл; чужой пользователь, устаревшие и повторённые данные входа не проходят;
 // сессия приложения не открывает страницу настройки; рамка — только у web.telegram.org;
 // экран «Чаты» (Р-80): список из базы, поиск, отбор, включение с глубиной, «Не сохранять»,
-// список большого аккаунта (Р-81: загрузка в фоне, «подождите» от Telegram с отсчётом), аккаунт не подключён.
+// список большого аккаунта (Р-81: загрузка в фоне, «подождите» от Telegram с отсчётом), аккаунт не подключён;
+// раскладки списка и вкладка «Сферы» (Р-82).
 // Запуск и стенд — README.md в этом каталоге. Печатает строки PASS/FAIL, код возврата 1 при FAIL.
 //
 // Настоящего Telegram здесь нет: данные входа подписывает пульт стенда так же, как Telegram, и
@@ -630,6 +631,133 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
     await p.screenshot({ path: path.join(OUT, `${SHOT}chats-long-${tag}.png`), fullPage: false });
   }
   await ctx.close();
+}
+
+// --- 9. раскладки и сферы (Р-82) ---------------------------------------------------------------------
+// Папки Telegram у подставного Telegram, тысячи диалогов (после блока большого аккаунта), три сферы.
+// В приложении: раскладки со счётчиками, «Включить все» нет, «Выключить все» — с подтверждением и
+// сообщением владельцу в бот; сферы чата из строки; вкладка «Сферы»: завести, связать папку, новый
+// чат папки предлагается и принимается. Снимки — 360 и 390 пикселей, светлая и тёмная тема.
+{
+  const SPH_OUT = process.env.E2E_SPHERES_OUT || OUT;
+  mkdirSync(SPH_OUT, { recursive: true });
+  const spheresSeen = async () => (await fetch(CONTROL + "/spheres/seen")).json();
+  const seeded = await chatsControl("/spheres/seed?role=owner");
+  check("сферы: стенд завёл папки и сферы, список перечитан", seeded.folders === 4 && seeded.dialogs > 1000, JSON.stringify(seeded));
+  const PREFIX = { folders: "folder:", spheres: "sphere:", activity: "activity:", kind: "kind:" };
+  async function layout(p, value) {
+    await p.selectOption("#chats-layout", value);
+    await p.waitForSelector(`#chats-sections details.sect[data-section^="${PREFIX[value]}"]`, { timeout: 15000 });
+  }
+  async function openSection(p, title) {
+    const det = p.locator("#chats-sections details.sect", { has: p.locator(".sect-title", { hasText: title }) }).first();
+    await det.locator("summary").click();
+    await det.locator(".chats li.chat").first().waitFor({ timeout: 15000 });
+    return det;
+  }
+  async function wideOk(p) {
+    return p.evaluate(() => {
+      const wide = document.documentElement.scrollWidth <= window.innerWidth + 1;
+      const out = [...document.querySelectorAll("main button, main select, main input")]
+        .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+      return { wide, out };
+    });
+  }
+
+  const { ctx, p, errs } = await openChats(390, "light", THEME_LIGHT);
+  const options = await p.$$eval("#chats-layout option", (o) => o.map((x) => x.textContent));
+  check("приложение: раскладки «Все чаты / Папки Telegram / Сферы / По активности / По виду»",
+        options.join("|") === "Все чаты|Папки Telegram|Сферы|По активности|По виду", options.join("|"));
+  await layout(p, "folders");
+  const folders = await p.$$eval("#chats-sections .sect-title", (n) => n.map((x) => x.textContent));
+  check("приложение, «Папки»: папки Telegram и «Не в папках»",
+        folders.join("|") === "💼 Работа|🏗 Объекты|📰 Новости|🏠 Семья|Не в папках", folders.join("|"));
+  const work = await openSection(p, "Работа");
+  check("приложение: «Включить все» нет — только на странице", (await work.locator("button", { hasText: "Включить все" }).count()) === 0);
+  // «Стройка: чат» из папки уже читается (стенд) — «Выключить все» есть
+  const readBefore = Number((/читается (\d+)/.exec(await work.locator(".sect-count").textContent()) || [])[1]);
+  await work.locator("button", { hasText: "Выключить все" }).click();
+  await work.locator(".confirm button", { hasText: "Выключить все" }).click();
+  const off = await waitFor(async () => (await spheresSeen()).told.some((t) =>
+    t.includes(`выключено чтение всех чатов раздела «Работа»: ${readBefore}.`)), 10000) && readBefore > 0 &&
+    await waitFor(async () => /читается 0 из/.test(await work.locator(".sect-count").textContent()), 10000);
+  check("приложение: «Выключить все» — с подтверждением, владельцу сообщение в бот, в журнале «из приложения»",
+        off && (await spheresSeen()).audit.some((r) => r.action === "app.bulk_off"),
+        JSON.stringify((await spheresSeen()).told.slice(-1)));
+  await p.screenshot({ path: path.join(SPH_OUT, "app-layout-folders-390-light.png"), fullPage: false });
+
+  await layout(p, "spheres");
+  const sphereSections = await p.$$eval("#chats-sections .sect-title", (n) => n.map((x) => x.textContent));
+  check("приложение, «Сферы»: сферы и «Без сферы»", sphereSections.join("|") === "Работа РАЗУМ|Личное|Преподавание|Без сферы",
+        sphereSections.join("|"));
+  const workSphere = await openSection(p, "Работа РАЗУМ");
+  const ivan = workSphere.locator("li.chat", { hasText: "Иван Петров" }).first();
+  check("приложение: в строке чата — все его сферы", (await ivan.locator(".chip").allTextContents()).join("|") === "Работа РАЗУМ|Личное");
+  await ivan.locator("button.link", { hasText: "Сферы" }).click();
+  await ivan.locator(".pick label", { hasText: "Преподавание" }).locator("input").check();
+  await p.screenshot({ path: path.join(SPH_OUT, "app-chat-spheres-picker-390-light.png"), fullPage: false });
+  await ivan.locator(".pick button", { hasText: "Сохранить" }).click();
+  check("приложение: сферы чата сохранены", await waitFor(async () =>
+    (await spheresSeen()).audit.some((r) => r.action === "app.sphere_chats"), 10000));
+  await layout(p, "activity");
+  const activity = await p.$$eval("#chats-sections .sect-title", (n) => n.map((x) => x.textContent));
+  check("приложение, «По активности»", activity.join("|") === "За неделю|За месяц|За 3 месяца|Давно молчат", activity.join("|"));
+  check("приложение, раскладки: в консоли нет ошибок", realErrors(errs).length === 0, realErrors(errs).join(" | "));
+  await ctx.close();
+
+  // вкладка «Сферы»
+  {
+    const { ctx, p, errs } = await openApp(390, "light", THEME_LIGHT);
+    await p.click("#tab-spheres");
+    await p.waitForSelector("#sph-list li.sph");
+    const names = await p.$$eval("#sph-list .sph-name", (n) => n.map((x) => x.textContent));
+    check("приложение, «Сферы»: сферы по порядку", names.join("|") === "Работа РАЗУМ|Личное|Преподавание", names.join("|"));
+    await p.fill("#sph-new-title", "Учёба");
+    await p.fill("#sph-new-description", "курсы и книги");
+    await p.click("#sph-new-save");
+    await p.waitForFunction(() => document.querySelector("#sph-list").textContent.includes("Учёба"));
+    const row = p.locator("#sph-folders li", { hasText: "Работа" }).first();
+    await row.locator("select").selectOption({ label: "Работа РАЗУМ" });
+    await row.locator("button", { hasText: "Предлагать новые" }).click();
+    await waitFor(async () => (await p.locator("#sph-offers .offer").count()) > 0, 10000);
+    await chatsControl("/spheres/folder-new?role=owner");
+    await p.click("#tab-chats"); await p.click("#tab-spheres");
+    await p.waitForFunction(() => document.querySelector("#sph-offers").textContent.includes("Новый Заказчик"), null, { timeout: 15000 });
+    const before = (await spheresSeen()).spheres.find((s) => s.title === "Работа РАЗУМ").chats;
+    const offered = Number((/Новые чаты в папке «Работа»: (\d+)/.exec(await p.textContent("#sph-offers")) || [])[1]);
+    await p.screenshot({ path: path.join(SPH_OUT, "app-spheres-390-light.png"), fullPage: true });
+    await p.locator("#sph-offers button", { hasText: "Добавить" }).first().click();
+    const added = await waitFor(async () => (await spheresSeen()).spheres.find((s) => s.title === "Работа РАЗУМ").chats === before + offered, 10000);
+    check("приложение: связанная папка предложила новый чат, принят — в сфере", offered > 0 && added, `${before} + ${offered}`);
+    const audit = (await spheresSeen()).audit;
+    check("приложение: изменения сфер — в журнале «из приложения», без названий",
+          ["app.sphere_create", "app.sphere_folder", "app.sphere_chats"].every((a) => audit.some((r) => r.action === a)) &&
+          !JSON.stringify(audit).includes("Учёба") && !JSON.stringify(audit).includes("Иван"), audit.map((r) => r.action).join(","));
+    check("приложение, «Сферы»: в консоли нет ошибок", realErrors(errs).length === 0, realErrors(errs).join(" | "));
+    await ctx.close();
+  }
+
+  // вид на двух размерах телефона в обеих темах
+  for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark", THEME], [390, "dark", THEME]]) {
+    const tag = `${width}-${scheme}`;
+    const opened = await openChats(width, scheme, theme);
+    await layout(opened.p, "folders");
+    await openSection(opened.p, "Работа");
+    let ok = await wideOk(opened.p);
+    check(`приложение, «Папки» ${tag}: страница не шире экрана, кнопки не выходят за край`, ok.wide && ok.out === 0, JSON.stringify(ok));
+    await opened.p.screenshot({ path: path.join(SPH_OUT, `app-layout-folders-${tag}.png`), fullPage: false });
+    await layout(opened.p, "activity");
+    await openSection(opened.p, "За неделю");
+    await opened.p.screenshot({ path: path.join(SPH_OUT, `app-layout-activity-${tag}.png`), fullPage: false });
+    await opened.p.click("#tab-spheres");
+    await opened.p.waitForSelector("#sph-list li.sph");
+    await opened.p.locator("#sph-list li.sph").first().locator("button", { hasText: "Чаты" }).click();
+    await opened.p.waitForSelector("#sph-list .sph-chats li");
+    ok = await wideOk(opened.p);
+    check(`приложение, «Сферы» ${tag}: страница не шире экрана, кнопки не выходят за край`, ok.wide && ok.out === 0, JSON.stringify(ok));
+    await opened.p.screenshot({ path: path.join(SPH_OUT, `app-spheres-${tag}.png`), fullPage: true });
+    await opened.ctx.close();
+  }
 }
 
 await browser.close();

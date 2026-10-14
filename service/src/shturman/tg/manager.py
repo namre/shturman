@@ -895,7 +895,13 @@ class TgManager:
 
             await dl.fetch_all(rt.client, self_id=rt.self_id, pacer=rt.pacer, stop=rt.stop,
                                on_page=on_page, on_wait=on_wait)
+            # Папки Telegram — той же загрузкой, одним запросом после последней страницы (Р-82).
+            # Не получилось — прежние папки остаются, список диалогов всё равно считается загруженным.
+            found = await dl.fetch_folders(rt.client, self_id=rt.self_id, pacer=rt.pacer, stop=rt.stop,
+                                           on_wait=on_wait)
             async with self.pool.acquire() as conn:
+                if found is not None:
+                    await dl.save_folders(conn, account_id, found)
                 removed = await dl.finish(conn, account_id, load_id, mark_seen=load.mark_seen)
             load.mark_seen = False
             load.state, rt.dialogs_done_at = dl.DONE, time.monotonic()
@@ -972,10 +978,12 @@ class TgManager:
         self, account_id: int, *, offset: int = 0, limit: int = 100,
         chat_type: str | None = None, refresh: bool = False,
         chat_types: Any = None, query: str | None = None, only_enabled: bool = False, cached: bool = False,
+        keys: list[PeerKey] | None = None,
     ) -> dict[str, Any]:
         """Страница списка диалогов для экрана выбора — из базы, сразу. Отбор: один вид чата
         (`chat_type`), несколько видов (`chat_types`), подстрока названия или адреса (`query`),
-        только уже включённые (`only_enabled`). `total` — сколько диалогов прошло отбор.
+        только уже включённые (`only_enabled`), только названные диалоги (`keys` — раздел раскладки:
+        папка, сфера, активность, вид). `total` — сколько диалогов прошло отбор.
 
         `refresh` — кнопка «Обновить список из Telegram»: запускает загрузку в фоне (если она не
         идёт и список не обновлялся последние `DIALOGS_MIN_GAP` секунд). Без неё страница настройки
@@ -1005,7 +1013,7 @@ class TgManager:
                 running = rt.dialogs_load.running
                 known = await dl.info(conn, account_id)
                 total, rows = await dl.page(conn, account_id, offset=offset, limit=limit, chat_types=types_,
-                                            needle=needle, only_enabled=only_enabled)
+                                            needle=needle, only_enabled=only_enabled, keys=keys)
                 # Ход загрузки — тот, что был, когда читали список: дальше ещё запросы к базе.
                 status = self._load_status(rt, known)
                 if not running or rt.dialogs_load.running:

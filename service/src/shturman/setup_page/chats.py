@@ -9,7 +9,9 @@
     загрузка, запрос экрана её только запускает и сразу отвечает. Страница сама запускает обновление,
     когда список устарел; приложение (`cached=True`) — только по кнопке «Обновить список из Telegram».
     Включение и исключение ищут чат в этом же списке, в Telegram за ним не ходят;
-  * приложение включает и выключает чаты поштучно — «все группы разом» есть только на странице;
+  * приложение включает чаты поштучно — «все группы разом» и «Включить все» в разделе раскладки есть
+    только на странице; «Выключить все» в разделе (`bulk(enabled=False)`) — у обоих (Р-82);
+  * раскладки списка (папки Telegram, сферы, активность, вид — `sections`) у обоих одни и те же;
   * приложение не стирает уже сохранённые сообщения — `purge` только на странице.
 
 Чего здесь нет: журнала действий и сообщений владельцу — их пишет вызывающий маршрут, потому что
@@ -22,9 +24,10 @@ from typing import Any
 
 from starlette.requests import Request
 
-from .. import confirm, ingest_api, store
+from .. import confirm, control_peers, ingest_api, spheres, store
 from ..api_core import BadRequest
 from ..app import AppState
+from ..tg import dialogs as dialogs_mod
 from ..tg import sync
 from ..tg.manager import ROLE_NAMES, TgManager
 
@@ -83,25 +86,139 @@ async def enabled_total(state: AppState, account_id: int) -> int:
 
 async def list_dialogs(state: AppState, tg: TgManager, account_id: int, request: Request, *,
                        cached: bool = False) -> dict[str, Any]:
-    """Страница списка диалогов по параметрам запроса `?offset&limit&q&kind&only&refresh` —
-    с видом чата, отметкой служебных чатов, числом выбранных и ходом загрузки списка (`load`)."""
+    """Страница списка диалогов по параметрам запроса `?offset&limit&q&kind&only&refresh&section` —
+    с видом чата, отметкой служебных чатов, сферами чата, числом выбранных и ходом загрузки списка
+    (`load`). `section` — только чаты одного раздела раскладки (папка, сфера, активность, вид)."""
     kind = request.query_params.get("kind") or ""
     if kind and kind not in KINDS:
         raise BadRequest("параметр kind: personal, group или channel")
+    keys = None
+    section = request.query_params.get("section") or ""
+    if section:
+        async with state.ro_pool.acquire() as conn:
+            try:
+                found, _ = await spheres.section_keys(conn, account_id, section)
+            except spheres.SpheresError as exc:
+                raise BadRequest(exc.message, 404 if exc.code == "not_found" else 400, exc.code) from None
+        keys = found.keys
     out = await tg.list_dialogs(
         account_id,
         offset=query_int(request, "offset", 0, low=0, high=10_000_000),
         limit=query_int(request, "limit", 50, low=1, high=200),
         chat_types=KINDS.get(kind), query=(request.query_params.get("q") or "")[:200],
         only_enabled=request.query_params.get("only") == "enabled",
-        refresh=request.query_params.get("refresh") == "1", cached=cached,
+        refresh=request.query_params.get("refresh") == "1", cached=cached, keys=keys,
     )
+    async with state.ro_pool.acquire() as conn:
+        by_key = await spheres.spheres_of_keys(conn, account_id, [(i["peer_class"], i["tg_id"]) for i in out["items"]])
     for item in out["items"]:
         item["kind"] = next((name for name, types in KINDS.items() if item["type"] in types), "personal")
         # Служебные чаты Telegram (коды входа, @BotFather) исключены всегда: вернуть их нельзя.
         item["locked"] = store.is_blocked_peer(item["peer_class"], item["tg_id"], item["username"])
+        item["spheres"] = by_key.get((item["peer_class"], item["tg_id"]), [])
     out["enabled_total"] = await enabled_total(state, account_id)
     return out
+
+
+# --- раскладки списка (Р-82) ----------------------------------------------------------------------
+#
+# «Папки Telegram / Сферы / По активности / По виду» — разделы с отметкой «выбрано X из Y». Состав
+# раздела считает `spheres.sections` по списку диалогов в базе (в Telegram за этим не ходят); поиск,
+# вид и «только выбранные» действуют и на разделы — счётчики совпадают с тем, что видно в разделе.
+
+def _filters(request: Request) -> tuple[str, tuple[str, ...] | None, bool]:
+    kind = request.query_params.get("kind") or ""
+    if kind and kind not in KINDS:
+        raise BadRequest("параметр kind: personal, group или channel")
+    needle = (request.query_params.get("q") or "")[:200].strip().lstrip("@").casefold()
+    return needle, KINDS.get(kind), request.query_params.get("only") == "enabled"
+
+
+async def _states(conn: Any, account_id: int) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+    """Включённые и исключённые (в том числе служебные) диалоги аккаунта."""
+    enabled = {(r["peer_class"], int(r["tg_id"])) for r in await conn.fetch(
+        "SELECT peer_class, tg_id FROM tg_sync_chats WHERE account_id = $1 AND enabled", account_id)}
+    excluded = {(r["class"], int(r["tg_id"])) for r in await conn.fetch(
+        """SELECT p.class, p.tg_id FROM chats c JOIN peers p ON p.id = c.peer_id
+           WHERE c.account_id = $1 AND c.excluded""", account_id)}
+    protected = await control_peers.blocked_ids(conn)
+    return enabled, excluded | {("user", i) for i in protected}
+
+
+def _passes(d: Any, needle: str, types: tuple[str, ...] | None, only: bool, enabled: set) -> bool:
+    if types is not None and d.chat.type not in types:
+        return False
+    if needle and needle not in dialogs_mod.search_text(d.chat):
+        return False
+    return not only or d.key in enabled
+
+
+async def sections(state: AppState, tg: TgManager, account_id: int, request: Request) -> dict[str, Any]:
+    """Разделы раскладки `?layout=folders|spheres|activity|kind&q&kind&only` с числом чатов и выбранных."""
+    await tg.find_dialogs(account_id, [])     # списка нет вовсе — 409 «ещё не загружен»
+    layout = request.query_params.get("layout") or ""
+    needle, types, only = _filters(request)
+    async with state.ro_pool.acquire() as conn:
+        rows = await dialogs_mod.rows(conn, account_id)
+        try:
+            found = await spheres.sections(conn, account_id, layout, rows)
+        except spheres.SpheresError as exc:
+            raise BadRequest(exc.message) from None
+        enabled, excluded = await _states(conn, account_id)
+        listed = await spheres.list_spheres(conn)
+        offers = [p for p in await spheres.proposals(conn) if p["account_id"] == account_id]
+    by_key = {d.key: d for d in rows}
+    out = []
+    for s in found:
+        keys = [k for k in s.keys if _passes(by_key[k], needle, types, only, enabled)]
+        if not keys and (needle or types or only) and layout in ("activity", "kind"):
+            continue
+        item = {"id": s.id, "title": s.title, "total": len(keys), "enabled": sum(1 for k in keys if k in enabled),
+                "can_enable": sum(1 for k in keys if k not in enabled and k not in excluded
+                                  and not store.is_blocked_peer(k[0], k[1])),
+                "notes": s.notes, **s.extra}
+        if s.id.startswith("folder:") and s.id != "folder:none":
+            folder_id = int(s.id.split(":")[1])
+            item["proposals"] = [{"sphere_id": p["sphere_id"], "sphere_title": p["sphere_title"], "count": p["count"]}
+                                 for p in offers if p["folder_id"] == folder_id]
+        out.append(item)
+    return {"layout": layout, "sections": out,
+            "spheres": [{"id": s["id"], "title": s["title"]} for s in listed]}
+
+
+async def bulk(state: AppState, tg: TgManager, account_id: int, request: Request, data: dict[str, Any], *,
+               enabled: bool, since: Any = sync.ACCOUNT_DEFAULT) -> dict[str, Any]:
+    """«Включить все» / «Выключить все» в разделе — с теми же поиском и отбором, что видны на экране
+    (поля `q`, `kind`, `only` тела). Включение пропускает исключённые и служебные чаты и уже включённые;
+    выключение трогает только включённые. Возвращает, сколько изменено и сколько пропущено."""
+    section = data.get("section")
+    if not isinstance(section, str) or not section:
+        raise BadRequest("Не указан раздел.")
+    kind = data.get("kind") or ""
+    if kind and kind not in KINDS:
+        raise BadRequest("поле kind: personal, group или channel")
+    needle = str(data.get("q") or "")[:200].strip().lstrip("@").casefold()
+    only = data.get("only") is True
+    async with state.ro_pool.acquire() as conn:
+        try:
+            found, rows = await spheres.section_keys(conn, account_id, section)
+        except spheres.SpheresError as exc:
+            raise BadRequest(exc.message, 404 if exc.code == "not_found" else 400, exc.code) from None
+        on, excluded = await _states(conn, account_id)
+    by_key = {d.key: d for d in rows}
+    keys = [k for k in found.keys if _passes(by_key[k], needle, KINDS.get(kind), only, on)]
+    if enabled:
+        target = [k for k in keys if k not in on]
+        skipped = [k for k in target if k in excluded or store.is_blocked_peer(k[0], k[1])]
+        target = [k for k in target if k not in skipped]
+    else:
+        target, skipped = [k for k in keys if k in on], []
+    changed = 0
+    if target:
+        result = await tg.set_sync(account_id, enabled=enabled, chats=target, since=since)
+        changed = sum(1 for item in result if bool(item.get("enabled")) == enabled and not item.get("error"))
+    return {"section": found.id, "title": found.title, "changed": changed, "skipped": len(skipped),
+            "total": len(keys), "enabled_total": await enabled_total(state, account_id)}
 
 
 def peer_keys(raw: Any) -> list[tuple[str, int]]:

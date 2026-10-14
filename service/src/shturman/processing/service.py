@@ -167,6 +167,32 @@ async def processing_status(request: Request) -> JSONResponse:
 
 # --- обязательства ---------------------------------------------------------------------------------
 
+async def _sphere_scope(conn: Any, request: Request) -> Any:
+    """Параметр `spheres` (Р-82): сужение по сферам или None. Незнакомое название — 400 с перечнем."""
+    from .. import spheres
+    try:
+        return await spheres.resolve_scope(conn, spheres.query_names(request.query_params))
+    except spheres.SpheresError as exc:
+        raise BadRequest(exc.message, status=400, code=exc.code) from None
+
+
+async def _mark_commitments(conn: Any, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Сферы чата каждого обязательства — названиями (слова владельца, не чужой текст)."""
+    from .. import spheres
+    marks = await spheres.titles_by_chat(conn, [i["chat"]["id"] for i in items])
+    for item in items:
+        item["spheres"] = marks.get(item["chat"]["id"], [])
+    return items
+
+
+async def _mark_people(conn: Any, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from .. import spheres
+    marks = await spheres.titles_by_person(conn, [i["id"] for i in items])
+    for item in items:
+        item["spheres"] = marks.get(item["id"], [])
+    return items
+
+
 @handler
 async def list_commitments(request: Request) -> JSONResponse:
     view = request.query_params.get("view", "open")
@@ -182,11 +208,17 @@ async def list_commitments(request: Request) -> JSONResponse:
             person_id = await people.visible_id(conn, person_id)
             if person_id is None:
                 raise BadRequest("такого человека нет в реестре", status=404)
+        scope = await _sphere_scope(conn, request)
+        chat_ids = None
+        if scope is not None:
+            from .. import spheres
+            chat_ids = await spheres.chat_ids_in(conn, scope)
         items = await commitments.list_commitments(
             conn, view=view, today=_today(request), person_id=person_id,
             peer_id=_query_int(request, "peer_id"),
             chat_id=_query_int(request, "chat_id"), direction=direction,
-            limit=_query_int(request, "limit") or 100)
+            limit=_query_int(request, "limit") or 100, chat_ids=chat_ids)
+        items = await _mark_commitments(conn, items)
     return JSONResponse({"view": view, "commitments": items})
 
 
@@ -195,6 +227,8 @@ async def get_commitment(request: Request) -> JSONResponse:
     async with state_of(request).ro_pool.acquire() as conn:
         item = await commitments.get_commitment(
             conn, request.path_params["commitment_id"], today=_today(request), with_events=True)
+        if item is not None:
+            await _mark_commitments(conn, [item])
     if item is None:
         raise BadRequest("такого обязательства нет", status=404)
     return JSONResponse(item)
@@ -292,9 +326,14 @@ async def _need_visible(conn, person_id: int) -> None:
 @handler
 async def list_people(request: Request) -> JSONResponse:
     async with state_of(request).ro_pool.acquire() as conn:
+        scope = await _sphere_scope(conn, request)
+        limit = _query_int(request, "limit") or 50
         found = await people.search_people(
             conn, request.query_params.get("query"), chat_id=_query_int(request, "chat_id"),
-            limit=_query_int(request, "limit") or 50)
+            limit=limit if scope is None else min(500, limit * 3))
+        found = await _mark_people(conn, found)
+    if scope is not None:
+        found = [p for p in found if scope.allows(p["spheres"])][:limit]
     return JSONResponse({"people": found})
 
 
@@ -302,6 +341,8 @@ async def list_people(request: Request) -> JSONResponse:
 async def get_person(request: Request) -> JSONResponse:
     async with state_of(request).ro_pool.acquire() as conn:
         person = await people.get_person(conn, request.path_params["person_id"])
+        if person is not None:
+            await _mark_people(conn, [person])
     if person is None:
         raise BadRequest("такого человека нет в реестре", status=404)
     return JSONResponse(person)

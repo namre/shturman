@@ -67,3 +67,13 @@ def test_choice_roundtrip(store):
     saved = personas.save_choice(store, {"persona": "savelich", "tone": "full", "owner_address": "Иван Иванович"})
     assert personas.load_choice(store) == saved
     assert personas.load_choice(store)["tone"] == "full"
+
+
+def test_block_carries_the_soft_sphere_rule():
+    """Сферы (Р-82): правило мягкой границы — в блоке SOUL.md, который пишет мастер; принуждения в коде нет."""
+    block = personas.soul_block({})
+    assert "## Сферы" in block and "list_spheres" in block
+    assert "По умолчанию ищи в сфере, о которой идёт разговор" in block
+    assert "ищи везде и группируй ответ по сферам" in block
+    assert "только если владелец её назвал или попросил искать везде" in block
+    assert block.index("## Сферы") < block.index(personas.BLOCK_END)
