@@ -15,6 +15,8 @@ EXPECTED = {
     "commitments.decide", "people.merge", "people.split", "people.alias",
     "pages.owner_block", "pages.accept",
     "projects.create", "projects.chats", "projects.archive", "projects.accept", "facts.retract",
+    # сферы (Р-82): любое изменение через внутренний API ждёт владельца, в том числе «убрать» и «удалить»
+    "spheres.create", "spheres.update", "spheres.delete", "spheres.chats", "spheres.project",
 }
 
 

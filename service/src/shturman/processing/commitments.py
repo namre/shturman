@@ -151,9 +151,9 @@ async def get_commitment(
 async def list_commitments(
     conn: asyncpg.Connection, *, view: str = "open", today: date, person_id: int | None = None,
     peer_id: int | None = None, chat_id: int | None = None, direction: str | None = None, limit: int = 100,
-    project_id: int | None = None,
+    project_id: int | None = None, chat_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Выборка обязательств.
+    """Выборка обязательств. `chat_ids` — только из этих чатов (сужение по сферам); None — из всех.
 
     view: open — принятые и не закрытые; overdue — просроченные; today — срок сегодня;
     week — срок с сегодня до конца недели; next_week — срок с понедельника по воскресенье
@@ -198,6 +198,8 @@ async def list_commitments(
                             AND c.direction IN ('owner_owes', 'owed_to_owner')))""")
     if chat_id is not None:
         where.append(f"c.chat_id = {arg(chat_id)}")
+    if chat_ids is not None:
+        where.append(f"c.chat_id = ANY({arg(list(chat_ids))}::bigint[])")
     if direction is not None:
         where.append(f"c.direction = {arg(direction)}")
     if project_id is not None:

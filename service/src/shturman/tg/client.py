@@ -68,6 +68,10 @@ READ_REQUESTS: frozenset[type] = frozenset({
     functions.messages.GetChatsRequest,
     functions.channels.GetChannelsRequest,
     functions.messages.GetDialogsRequest,        # список чатов для экрана выбора
+    # Папки Telegram (их описание: названия, явные перечни чатов, правила) — для раскладки «Папки» и
+    # «Сделать сферу из папки» (Р-82). Только чтение: папки не меняются и не создаются, собеседники
+    # ничего не видят. Читается той же фоновой загрузкой, что список диалогов, одним запросом.
+    functions.messages.GetDialogFiltersRequest,
     functions.messages.GetHistoryRequest,        # история чата
     functions.messages.GetMessagesRequest,       # сообщения по номерам (сверка удалений)
     functions.channels.GetMessagesRequest,
@@ -284,7 +288,8 @@ class GuardedClient(TelegramClient):
             # Так запрашивает разницу цикл обновлений Telethon (client/updates.py: `self(get_diff)`).
             return await self._shturman_channels.run(request, lambda: super(GuardedClient, self).__call__(
                 request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold))
-        if isinstance(request, functions.messages.GetDialogsRequest):
+        if isinstance(request, (functions.messages.GetDialogsRequest, functions.messages.GetDialogFiltersRequest)):
+            # папки читаются той же загрузкой, что страницы списка, — с теми же паузами
             return await self._shturman_dialogs.run(lambda: super(GuardedClient, self).__call__(
                 request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold))
         return await super().__call__(request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold)

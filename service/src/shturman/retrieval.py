@@ -39,16 +39,18 @@ async def find(
     state: Any, conn: asyncpg.Connection, query: str, *,
     account_id: int | None = None, chat_id: int | None = None, sender_peer_id: int | None = None,
     since: datetime | None = None, until: datetime | None = None, limit: int = 20,
+    chat_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Ищет сообщения. Строка результата: id, tg_message_id, sent_at, sender_name, is_outgoing,
     text, chat_id, chat_title, chat_type, snippet, score. Исключённые чаты и удалённые
-    сообщения не участвуют. `state` — состояние сервиса (AppState).
+    сообщения не участвуют. `state` — состояние сервиса (AppState). `chat_ids` — только эти чаты
+    (сужение по сферам, `spheres.chat_ids_in`); None — все.
 
     `score` годится только для порядка внутри одного ответа: в гибридном поиске это сумма
     вкладов двух веток (слияние рангов), в полнотекстовом — ранг Postgres.
     """
     filters = dict(account_id=account_id, chat_id=chat_id, sender_peer_id=sender_peer_id,
-                   since=since, until=until, limit=limit)
+                   since=since, until=until, limit=limit, chat_ids=chat_ids)
     semantic = await _query_vector(state, query)
     if semantic is not None:
         vector, model = semantic

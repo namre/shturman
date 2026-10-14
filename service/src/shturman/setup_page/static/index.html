@@ -642,6 +642,10 @@
         <p class="gives"><b>Совет.</b> Начните с рабочих чатов. Чем меньше лишнего, тем точнее ассистент и тем меньше запросов к Telegram.</p>
         <div class="tabs" id="chats-accounts" role="tablist" aria-label="Аккаунт" hidden></div>
         <p class="note warn" id="chats-offline" role="status" hidden></p>
+        <div class="layouts" id="chats-layout-box">
+          <span class="layouts-label" id="chats-layout-label">Как показать список</span>
+          <div class="tabs" id="chats-layout" role="tablist" aria-labelledby="chats-layout-label"></div>
+        </div>
 
         <div class="toolbar">
           <div class="field grow search">
@@ -668,6 +672,7 @@
         <p class="counter" id="chats-counter" role="status"></p>
         <p class="note warn" id="chats-error" role="alert" hidden></p>
         <ul class="chatlist" id="chats-list"></ul>
+        <div class="sections" id="chats-sections" hidden></div>
         <div class="row">
           <button class="btn" id="chats-more" type="button" hidden>Показать ещё</button>
           <button class="btn ghost" id="chats-bulk" type="button" hidden></button>
@@ -704,7 +709,67 @@
           <dd>Чат исключается из архива совсем: его сообщения не сохранятся ни из аккаунта, ни из выгрузки. Пригодится для личного — например, семейного чата. Уже сохранённое из него можно сразу стереть.</dd>
           <dt>Узнают ли собеседники, что чат читается?</dt>
           <dd>Сервис ничего не пишет в чаты и не отмечает сообщения прочитанными.</dd>
+          <dt>Что такое «Папки Telegram», «Сферы», «По активности»?</dt>
+          <dd>Тот же список, разложенный по разделам: по вашим папкам в Telegram, по вашим сферам, по тому, когда в чате последний раз писали, или по виду чата. В каждом разделе видно, сколько чатов уже читается, и можно включить или выключить все чаты раздела разом. Исключённые и служебные чаты при этом не включаются.</dd>
+          <dt>Точно ли сервис знает, какие чаты в папке?</dt>
+          <dd>Почти. Явно добавленные в папку чаты — точно. Правила папки («контакты», «группы», «каналы», «боты», «архив») — тоже. Правила «без звука» и «прочитанные» — по состоянию на последнее обновление списка; общих настроек звука Telegram («все группы без звука») сервис не видит. Под такой папкой это сказано.</dd>
         </dl>
+      </details>
+    </section>
+
+    <!-- ============================================================ сферы (не шаг) -->
+    <!-- Рисует setup.js (раздел «сферы»): список, создание, чаты сферы, папки Telegram, предложения. -->
+    <section class="card memory" id="s-spheres" aria-labelledby="h-spheres">
+      <details id="spheres-details">
+        <summary>
+          <span class="memory-head">
+            <span class="card-head">
+              <span class="h2" id="h-spheres" role="heading" aria-level="2">Сферы</span>
+              <span class="pill" id="st-spheres"></span>
+            </span>
+            <span class="memory-lead">Разделите работу и жизнь: «Работа», «Личное», «Преподавание», проект по ЖК. Ассистент по умолчанию ищет в сфере, о которой разговор.</span>
+          </span>
+        </summary>
+        <div class="memory-body" id="spheres-body">
+          <p>Сфера — часть вашей работы или жизни, которую вы держите отдельно. Отнесите к ней чаты (один чат может быть в нескольких сферах) и проекты. Ассистент помечает всё найденное сферами и по умолчанию ищет в той, о которой вы говорите; в другую — только если вы её назовёте или попросите искать везде.</p>
+          <p class="gives"><b>Быстрее всего</b> — из папок Telegram: если чаты уже разложены по папкам, сделайте из папки сферу одной кнопкой.</p>
+          <div id="sph-proposals" aria-live="polite"></div>
+          <p class="note warn" id="sph-error" role="alert" hidden></p>
+          <ul class="sph-list" id="sph-list"></ul>
+          <form class="mem-form sph-new" id="sph-new" autocomplete="off" novalidate>
+            <h3 class="mem-form-title">Новая сфера</h3>
+            <div class="grid2">
+              <div class="field">
+                <label for="sph-new-title">Название</label>
+                <input id="sph-new-title" type="text" maxlength="60" placeholder="Например: Работа РАЗУМ">
+              </div>
+              <div class="field">
+                <label for="sph-new-description">Коротко, что в ней — по желанию</label>
+                <input id="sph-new-description" type="text" maxlength="300" placeholder="Например: стройка, продажи, совещания">
+              </div>
+            </div>
+            <div class="row"><button class="btn" id="sph-new-save" type="submit">Завести сферу</button></div>
+          </form>
+          <section class="mem-block" id="sph-folders-box">
+            <h4>Сферы из папок Telegram</h4>
+            <p class="small">«Сделать сферу» заводит сферу с названием папки и относит к ней все её чаты; повторное нажатие дополняет сферу новыми чатами папки. «Предлагать новые» — когда в папке появятся новые чаты, здесь и в приложении появится вопрос «добавить в сферу?»: сами они не добавляются.</p>
+            <p class="note" id="sph-folders-empty" hidden>Папок пока нет: они появятся после «Обновить список из Telegram» в шаге «Какие чаты читать» — если у вас в Telegram есть папки.</p>
+            <ul class="sph-folders" id="sph-folders"></ul>
+          </section>
+          <details class="faq">
+            <summary>Вопросы про сферы</summary>
+            <dl>
+              <dt>Что изменится для ассистента?</dt>
+              <dd>Всё, что он находит в архиве, помечено сферами чата. Он ищет в сфере, о которой вы говорите; если сфера не ясна — спросит или поищет везде и разложит ответ по сферам. Это правило для ассистента, а не замок: если вы попросите искать везде, он найдёт и в других сферах.</dd>
+              <dt>Что будет, если удалить сферу?</dt>
+              <dd>Сфера снимается с чатов и проектов. Сами чаты, сохранённые сообщения, проекты и их страницы остаются.</dd>
+              <dt>Чат может быть в двух сферах?</dt>
+              <dd>Да. Например, чат с партнёром — и в «Работе», и в «Личном». Ассистент найдёт его в обеих.</dd>
+              <dt>Что ещё появится у сфер?</dt>
+              <dd>Своя обработка (что извлекать: договорённости, людей, проекты, фото, голосовые), своя модель — в том числе запрет внешней модели, — сводки по сферам, строгая граница для ответов собеседникам, удаление и выгрузка сферы целиком. Это следующие шаги, сейчас их нет.</dd>
+            </dl>
+          </details>
+        </div>
       </details>
     </section>
 

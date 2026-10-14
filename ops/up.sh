@@ -122,7 +122,8 @@ want = {
     "skip_preflight": True,
     "tools": {
         "include": ["search_messages", "get_context", "list_chats", "get_chat_history", "find_person",
-                    "list_commitments", "get_commitment", "get_person_page", "search_pages"],
+                    "list_commitments", "get_commitment", "get_person_page", "search_pages",
+                    "list_projects", "get_project_page", "get_owner_profile", "list_spheres"],
         "resources": False,
         "prompts": False,
     },

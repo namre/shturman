@@ -14,6 +14,10 @@ SHTURMAN_TEST_DSN: база должна быть отдельной тесто�
 «подождите» от Telegram на середине загрузки (`POST /dialogs/big`), а `GET /dialogs/seen` говорит, какие
 страницы отдал подставной Telegram.
 
+Для сфер и раскладок списка чатов (Р-82) пульт заводит папки Telegram у подставного Telegram, разное
+время последнего сообщения и три сферы с чатами (`POST /spheres/seed`), добавляет в папку новый чат
+(`POST /spheres/folder-new`) и говорит, что стало со сферами и журналом (`GET /spheres/seen`).
+
 Для экрана «Память ассистента» пульт заводит (`POST /seed-memory`) переписку с двумя людьми и группу,
 страницу об одном человеке со сводкой и фактом — ответ «модели» подставляет сам стенд, — проект с
 решением и фактами, а ждущими решения — страницу о втором человеке, его договорённость, факт о
@@ -35,6 +39,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -110,6 +115,11 @@ def dialogs() -> list:
     for i in range(25):
         items.append(tg_fakes.channel(40_000 + i, f"Новости отрасли {i + 1}", broadcast=True))
     return items
+
+
+def normalize_key(entity) -> tuple[str, int]:
+    from shturman.tg import normalize
+    return normalize.entity_key(entity)
 
 
 def make_world(me) -> tg_fakes.World:
@@ -343,6 +353,101 @@ async def main() -> None:
         return JSONResponse({"calls": world.dialog_calls, "pages": world.dialog_pages, "dialogs": len(world.dialogs),
                              "stored": await conn.fetchval("SELECT count(*) FROM tg_dialogs")})
 
+    # --- сферы и папки Telegram (Р-82) ---
+
+    async def spheres_seed(request):
+        """Папки Telegram у подставного Telegram, разное время последнего сообщения (для раскладки «по
+        активности»), три сферы с чатами и сфера у проекта; список перечитывается из «Telegram» — с
+        папками. ?role=owner|assistant"""
+        from shturman import spheres
+        from shturman.tg import dialogs as dl
+
+        role = request.query_params.get("role", "owner")
+        world = worlds[role]
+        world.dialog_delay, world.dialog_fail = 0.0, {}
+        groups = [e for e in world.dialogs if getattr(e, "id", 0) in range(30_000, 30_035)]
+        channels = [e for e in world.dialogs if getattr(e, "id", 0) in range(40_000, 40_025)]
+        people = [e for e in world.dialogs if getattr(e, "id", 0) in range(20_000, 20_090)]
+        world.folders = [
+            tg_fakes.folder(2, "Работа", emoticon="💼", pinned=[tg_fakes.U_IVAN],
+                            include=[tg_fakes.C_SUPER, *people[:24], *groups[:12]]),
+            tg_fakes.folder(3, "Объекты", emoticon="🏗", groups=True, exclude_muted=True, exclude=[tg_fakes.G_FAMILY]),
+            tg_fakes.folder(4, "Новости", emoticon="📰", broadcasts=True),
+            tg_fakes.folder(5, "Семья", emoticon="🏠", include=[tg_fakes.U_MARIA, tg_fakes.G_FAMILY]),
+        ]
+        world.muted = {("chat", g.id) for g in groups[30:]}
+        world.unread = {("user", p.id) for p in people[:6]}
+        # время последнего сообщения убывает по списку, как у Telegram: свежие чаты наверху, тысячи старых внизу
+        now = datetime.now(timezone.utc)
+
+        def ago(i: int) -> timedelta:
+            if i < 8:
+                return timedelta(hours=i + 1)
+            if i < 40:
+                return timedelta(days=1, hours=4 * (i - 8))
+            if i < 90:
+                return timedelta(days=8, hours=8 * (i - 40))
+            if i < 160:
+                return timedelta(days=31, hours=16 * (i - 90))
+            return timedelta(days=100, hours=2 * (i - 160))
+
+        world.dates = {normalize_key(e): now - ago(i) for i, e in enumerate(world.dialogs)}
+        rt = state["app"].extras["tg"].runtimes[role]
+        await conn.execute("UPDATE tg_dialog_lists SET completed_at = completed_at - interval '1 hour'")
+        if not rt.dialogs_load.running:
+            state["app"].extras["tg"].start_dialogs(rt)
+        await asyncio.wait_for(rt.dialogs_load.done.wait(), 120)
+        app = state["app"]
+        async with app.pool.acquire() as c:
+            account = rt.account_id
+            work = await spheres.create_sphere(c, "Работа РАЗУМ", "стройка, продажи, совещания")
+            home = await spheres.create_sphere(c, "Личное", "семья, дом, дача")
+            teach = await spheres.create_sphere(c, "Преподавание", "ММА, магистратура 09.04.03")
+            await spheres.add_chats(c, work["id"], account, [("user", tg_fakes.IVAN), ("channel", tg_fakes.C_SUPER.id),
+                                                             *[("chat", g.id) for g in groups[:6]]])
+            await spheres.add_chats(c, home["id"], account, [("user", tg_fakes.MARIA), ("chat", tg_fakes.G_FAMILY.id),
+                                                             ("user", tg_fakes.IVAN)])
+            await spheres.add_chats(c, teach["id"], account, [("user", p.id) for p in people[60:66]])
+            project = await c.fetchval("SELECT id FROM projects WHERE status = 'active' ORDER BY id LIMIT 1")
+            if project is not None:
+                await spheres.set_project_sphere(c, project, work["id"])
+            stored = await c.fetchval("SELECT count(*) FROM tg_dialogs WHERE account_id = $1", account)
+            folders = len(await dl.folders(c, account))
+        return JSONResponse({"ok": True, "dialogs": stored, "folders": folders,
+                             "spheres": [work["id"], home["id"], teach["id"]]})
+
+    async def spheres_folder_new(request):
+        """В папке «Работа» появился новый чат (вверху списка) — список перечитывается из «Telegram»."""
+        role = request.query_params.get("role", "owner")
+        world = worlds[role]
+        newcomer = tg_fakes.user(29_001, "Новый", "Заказчик", contact=True)
+        if newcomer.id not in {getattr(e, "id", 0) for e in world.dialogs}:
+            world.dialogs.insert(0, newcomer)
+            world.dates[("user", newcomer.id)] = datetime.now(timezone.utc) - timedelta(minutes=5)
+            old = world.folders[0]
+            world.folders[0] = tg_fakes.types.DialogFilter(
+                id=old.id, title=old.title, emoticon=old.emoticon, pinned_peers=old.pinned_peers,
+                include_peers=[*old.include_peers, tg_fakes.input_peer(newcomer)], exclude_peers=old.exclude_peers)
+        rt = state["app"].extras["tg"].runtimes[role]
+        await conn.execute("UPDATE tg_dialog_lists SET completed_at = completed_at - interval '1 hour'")
+        if not rt.dialogs_load.running:
+            state["app"].extras["tg"].start_dialogs(rt)
+        await asyncio.wait_for(rt.dialogs_load.done.wait(), 120)
+        return JSONResponse({"ok": True})
+
+    async def spheres_seen(request):
+        """Сферы, чаты в них и журнал «sphere.*», «tg.bulk_*», «app.*» — для проверок сценария."""
+        rows = await conn.fetch("SELECT id, title FROM spheres ORDER BY position, id")
+        counts = {r["sphere_id"]: r["n"] for r in await conn.fetch(
+            "SELECT sphere_id, count(*) AS n FROM sphere_chats GROUP BY sphere_id")}
+        audit = await conn.fetch(
+            """SELECT action, outcome, detail FROM setup_audit
+               WHERE action LIKE 'sphere.%' OR action LIKE 'tg.bulk%' OR action LIKE 'app.sphere%' OR action LIKE 'app.bulk%'
+               ORDER BY id""")
+        return JSONResponse({"spheres": [{"id": r["id"], "title": r["title"], "chats": counts.get(r["id"], 0)} for r in rows],
+                             "enabled": await conn.fetchval("SELECT count(*) FROM tg_sync_chats WHERE enabled"),
+                             "audit": [dict(r) for r in audit]})
+
     async def dashboard_page(request):
         return HTMLResponse(DASHBOARD_PAGE)
 
@@ -356,7 +461,9 @@ async def main() -> None:
         Route("/last-code", last_code), Route("/business", business, methods=["POST"]), Route("/seen", seen),
         Route("/chatgpt/authorize", chatgpt_authorize, methods=["POST"]),
         Route("/seed-memory", seed_memory, methods=["POST"]),
-        Route("/dialogs/big", dialogs_big, methods=["POST"]), Route("/dialogs/seen", dialogs_seen)])
+        Route("/dialogs/big", dialogs_big, methods=["POST"]), Route("/dialogs/seen", dialogs_seen),
+        Route("/spheres/seed", spheres_seed, methods=["POST"]),
+        Route("/spheres/folder-new", spheres_folder_new, methods=["POST"]), Route("/spheres/seen", spheres_seen)])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

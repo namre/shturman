@@ -94,6 +94,11 @@ class World:
         self.dialog_pages: list[int] = []     # с какого места списка отдана каждая страница
         self.dialog_fail: dict[int, BaseException] = {}   # номер запроса списка → ошибка
         self.dialog_delay = 0.0               # сколько «думает» Telegram над страницей списка (стенды)
+        # Папки Telegram (Р-82): ответ messages.getDialogFilters — DialogFilter / DialogFilterChatlist.
+        self.folders: list[Any] = []
+        self.muted: set[tuple[str, int]] = set()      # чаты без звука (mute_until в будущем)
+        self.unread: set[tuple[str, int]] = set()     # чаты с непрочитанным
+        self.dates: dict[tuple[str, int], datetime] = {}   # время последнего сообщения диалога, если задано
         self.unknown: set[tuple[str, int]] = set()   # собеседники без ключа доступа
         self.fail: dict[type, list[BaseException]] = {}   # ошибки по классу запроса, по очереди
         self.lost: dict[tuple[str, int], BaseException] = {}   # чаты, к которым доступа больше нет
@@ -350,21 +355,35 @@ class FakeClient:
         for index, entity in enumerate(chunk, start):
             key = normalize.entity_key(entity)
             top = max(world.history.get(key, {0: None}))
+            if not top and key in world.dates and key[0] != "channel":
+                # У настоящего диалога номер последнего сообщения свой; в личных чатах и группах нумерация
+                # общая на аккаунт — одинаковый номер 0 у пустых диалогов слил бы их время в одно.
+                top = 9_000_000 + index
             p = peer(key)
+            muted = types.PeerNotifySettings(mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc)) \
+                if key in world.muted else types.PeerNotifySettings()
             dialogs.append(types.Dialog(
-                peer=p, top_message=top, read_inbox_max_id=0, read_outbox_max_id=0, unread_count=0,
+                peer=p, top_message=top, read_inbox_max_id=0, read_outbox_max_id=0,
+                unread_count=3 if key in world.unread else 0,
                 unread_mentions_count=0, unread_reactions_count=0, unread_poll_votes_count=0,
-                notify_settings=types.PeerNotifySettings(), pinned=key in world.pinned or None,
+                notify_settings=muted, pinned=key in world.pinned or None,
                 folder_id=1 if key in world.archived else None, pts=1 if key[0] == "channel" else None))
             # У настоящего диалога последнее сообщение есть всегда; у подставного без истории — номер 0.
             # Время убывает по списку: по нему Telegram (и сервис) отсчитывает следующую страницу.
-            messages.append(types.Message(id=top, peer_id=p, message="", date=DIALOGS_NOW - timedelta(minutes=index)))
+            # `world.dates` задаёт время явно (стенды раскладки «по активности»). Как и у Telegram, оно
+            # должно убывать по списку: сервис отсеивает диалоги новее смещения следующей страницы.
+            at = world.dates.get(key) or DIALOGS_NOW - timedelta(minutes=index)
+            messages.append(types.Message(id=top, peer_id=p, message="", date=at))
         users = [e for e in chunk if isinstance(e, types.User)]
         chats = [e for e in chunk if not isinstance(e, types.User)]
         if start == 0 and len(every) <= r.limit:
             return types.messages.Dialogs(dialogs=dialogs, messages=messages, chats=chats, users=users)
         return types.messages.DialogsSlice(count=len(every), dialogs=dialogs, messages=messages,
                                            chats=chats, users=users)
+
+    async def _GetDialogFiltersRequest(self, r: Any) -> Any:
+        """Папки Telegram: первой — «Все чаты» (DialogFilterDefault), как у настоящего Telegram."""
+        return types.messages.DialogFilters(filters=[types.DialogFilterDefault(), *self.world.folders])
 
     async def _SendMessageRequest(self, r: Any) -> Any:
         key = self._key(r.peer)
@@ -450,6 +469,21 @@ async def dialogs_loaded(manager: TgManager, account_id: int, *, refresh: bool =
         assert manager.start_dialogs(rt), "загрузка списка не началась"
     await asyncio.wait_for(rt.dialogs_load.done.wait(), timeout)
     assert rt.dialogs_load.state == "done", rt.dialogs_load.error
+
+
+def input_peer(entity: Any) -> Any:
+    """InputPeer сущности — так Telegram перечисляет чаты папки."""
+    return utils.get_input_peer(entity)
+
+
+def folder(fid: int, title: str, *, include: list[Any] = (), exclude: list[Any] = (), pinned: list[Any] = (),
+           emoticon: str | None = None, **flags: bool) -> types.DialogFilter:
+    """Папка Telegram: явные чаты (сущности) и правила (contacts, non_contacts, groups, broadcasts, bots,
+    exclude_muted, exclude_read, exclude_archived)."""
+    return types.DialogFilter(id=fid, title=types.TextWithEntities(title, []), emoticon=emoticon,
+                              pinned_peers=[input_peer(e) for e in pinned],
+                              include_peers=[input_peer(e) for e in include],
+                              exclude_peers=[input_peer(e) for e in exclude], **flags)
 
 
 async def wait_for(predicate: Any, timeout: float = 5.0) -> None:

@@ -270,7 +270,18 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
         # экран «Чаты» (Р-80, tests/setup_page/test_miniapp_chats.py)
         (miniapp.APP_API + "/chats", ["GET"]), (miniapp.APP_API + "/chats/{account_id:int}/dialogs", ["GET"]),
         (miniapp.APP_API + "/chats/{account_id:int}/sync", ["POST"]),
-        (miniapp.APP_API + "/chats/{account_id:int}/exclude", ["POST"])])
+        (miniapp.APP_API + "/chats/{account_id:int}/exclude", ["POST"]),
+        # раскладки и сферы (Р-82, tests/setup_page/test_spheres_page.py): массово — только выключить
+        (miniapp.APP_API + "/chats/{account_id:int}/sections", ["GET"]),
+        (miniapp.APP_API + "/chats/{account_id:int}/bulk", ["POST"]),
+        (miniapp.APP_API + "/spheres", ["GET"]), (miniapp.APP_API + "/spheres", ["POST"]),
+        (miniapp.APP_API + "/spheres/order", ["PUT"]), (miniapp.APP_API + "/spheres/chat", ["PUT"]),
+        (miniapp.APP_API + "/spheres/folders", ["GET"]), (miniapp.APP_API + "/spheres/folders/make", ["POST"]),
+        (miniapp.APP_API + "/spheres/{sphere_id:int}", ["PUT"]), (miniapp.APP_API + "/spheres/{sphere_id:int}", ["DELETE"]),
+        (miniapp.APP_API + "/spheres/{sphere_id:int}/chats", ["GET"]),
+        (miniapp.APP_API + "/spheres/{sphere_id:int}/chats", ["POST"]),
+        (miniapp.APP_API + "/spheres/{sphere_id:int}/folders", ["POST"]),
+        (miniapp.APP_API + "/spheres/{sphere_id:int}/proposals", ["POST"])])
     for route in routes:
         if route.path != APP_PATH:
             assert getattr(route.endpoint, "miniapp", False), route.path     # своя обёртка — своя сессия

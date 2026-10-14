@@ -1341,6 +1341,7 @@ async def chatgpt_remove(request: Request) -> JSONResponse:
 
 def routes() -> list[BaseRoute]:
     from . import memory, miniapp
+    from . import spheres as spheres_page
 
     account = API + "/tg/accounts/{account_id:int}"
     upload = API + "/imports/{import_id}"
@@ -1393,6 +1394,7 @@ def routes() -> list[BaseRoute]:
         Route(API + "/llm/chatgpt", chatgpt_remove, methods=["DELETE"]),
         *memory.routes(),
         *miniapp.routes(),
+        *spheres_page.routes(),
     ]
 
 

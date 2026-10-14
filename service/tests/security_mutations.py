@@ -138,6 +138,18 @@ MUTATIONS = (
              "    claimed = data.get(\"claimed\") is True\n",
              "tests/setup_page/test_setup_managed_bot.py::test_bot_with_other_address_needs_both_claim_code_and_claimed_mark",
              database=True),
+    # Раскладки и сферы (Р-82): из приложения массово — только выключить; изменение сфер через внутренний
+    # API ждёт нажатия владельца в боте согласований.
+    Mutation("miniapp_no_bulk_enable", "src/shturman/setup_page/spheres.py",
+             "    if enabled:\n        await page._log(request, \"app.bulk_on\"",
+             "    if False:\n        await page._log(request, \"app.bulk_on\"",
+             "tests/setup_page/test_spheres_page.py::test_in_the_app_enable_all_is_refused_and_disable_all_is_told_to_the_owner",
+             database=True),
+    Mutation("spheres_api_waits_for_owner", "src/shturman/spheres_service.py",
+             "        answer, result = await settle(conn, SPHERE_CHATS, {\"sphere_id\": sphere_id, \"add\": add, \"remove\": remove},\n                                      summary=summary)",
+             "        answer, result = await settle(conn, SPHERE_CHATS, {\"sphere_id\": sphere_id, \"add\": add, \"remove\": remove},\n                                      summary=None)",
+             "tests/processing/test_spheres_tools.py::test_sphere_changes_through_the_api_wait_for_the_owner",
+             database=True),
 )
 
 # Capture actual pytest phases and exception types, rather than treating a

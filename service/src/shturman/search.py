@@ -36,6 +36,7 @@ WHERE m.fts @@ q.query
   AND ($4::bigint IS NULL OR m.sender_peer_id = $4)
   AND ($5::timestamptz IS NULL OR m.sent_at >= $5)
   AND ($6::timestamptz IS NULL OR m.sent_at < $6)
+  AND ($8::bigint[] IS NULL OR m.chat_id = ANY($8))
 ORDER BY rank DESC, m.sent_at DESC
 LIMIT $7
 """
@@ -81,15 +82,17 @@ async def search(
     until: datetime | None = None,
     limit: int = 20,
     any_word: bool = False,
+    chat_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Ищет сообщения по словам с учётом русских словоформ. Исключённые чаты не участвуют.
 
     По умолчанию нужны все слова запроса (с поддержкой "фразы в кавычках", OR и -слово).
     any_word=True — достаточно любого слова; операторы запроса при этом не действуют.
+    `chat_ids` — только эти чаты (сужение по сферам); None — все.
     """
     rows = await conn.fetch(
         _SEARCH_ANY_WORD if any_word else _SEARCH,
-        query, account_id, chat_id, sender_peer_id, since, until, max(1, min(limit, 200)),
+        query, account_id, chat_id, sender_peer_id, since, until, max(1, min(limit, 200)), chat_ids,
     )
     return [dict(r) for r in rows]
 
@@ -103,7 +106,7 @@ async def thread(
 
 
 # Общие условия обеих веток: удалённое и исключённое не участвует, фильтры вызывающего — тоже.
-# Параметры: $3 аккаунт, $4 чат, $5 отправитель, $6 «не раньше», $7 «раньше».
+# Параметры: $3 аккаунт, $4 чат, $5 отправитель, $6 «не раньше», $7 «раньше», $12 перечень чатов (сферы).
 _FILTERS = """m.deleted_at IS NULL
       AND m.agent_visible
       AND NOT c.excluded
@@ -111,7 +114,8 @@ _FILTERS = """m.deleted_at IS NULL
       AND ($4::bigint IS NULL OR m.chat_id = $4)
       AND ($5::bigint IS NULL OR m.sender_peer_id = $5)
       AND ($6::timestamptz IS NULL OR m.sent_at >= $6)
-      AND ($7::timestamptz IS NULL OR m.sent_at < $7)"""
+      AND ($7::timestamptz IS NULL OR m.sent_at < $7)
+      AND ($12::bigint[] IS NULL OR m.chat_id = ANY($12))"""
 
 # Две ветки по $9 кандидатов каждая, затем слияние рангов (Reciprocal Rank Fusion): место
 # сообщения в ветке даёт 1 / ($10 + место), вклады веток складываются. Найденное обеими ветками
@@ -186,6 +190,7 @@ async def hybrid(
     since: datetime | None = None,
     until: datetime | None = None,
     limit: int = 20,
+    chat_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Гибридный поиск: слова и смысл, слияние рангов.
 
@@ -205,6 +210,6 @@ async def hybrid(
         await conn.execute(f"SET LOCAL hnsw.ef_search = {int(candidates)}")
         rows = await conn.fetch(
             _HYBRID, query, vector, account_id, chat_id, sender_peer_id, since, until,
-            model, candidates, RRF_K, limit,
+            model, candidates, RRF_K, limit, chat_ids,
         )
     return [dict(r) for r in rows]

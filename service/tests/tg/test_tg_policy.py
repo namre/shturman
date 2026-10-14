@@ -37,6 +37,9 @@ WRITES = [
     functions.auth.SendCodeRequest("+70000000000", 1, "x", types.CodeSettings()),
     functions.auth.AcceptLoginTokenRequest(b"token"),
     functions.account.DeleteAccountRequest("x"),
+    # папки Telegram читаются, но не меняются (Р-82)
+    functions.messages.UpdateDialogFilterRequest(2),
+    functions.messages.UpdateDialogFiltersOrderRequest([2]),
 ]
 READS = [
     functions.updates.GetStateRequest(),
@@ -44,6 +47,7 @@ READS = [
     functions.updates.GetChannelDifferenceRequest(CHANNEL, types.ChannelMessagesFilterEmpty(), 1, 100),
     functions.users.GetUsersRequest([types.InputUserSelf()]),
     functions.messages.GetDialogsRequest(None, 0, types.InputPeerEmpty(), 100, 0),
+    functions.messages.GetDialogFiltersRequest(),        # папки Telegram — только их описание (Р-82)
     functions.messages.GetHistoryRequest(PEER, 0, None, 0, 100, 0, 0, 0),
     functions.messages.GetMessagesRequest([types.InputMessageID(1)]),
     functions.channels.GetMessagesRequest(CHANNEL, [types.InputMessageID(1)]),
@@ -140,6 +144,9 @@ def test_allowlist_is_exactly_this_and_default_is_deny():
         "help.GetConfigRequest", "updates.GetStateRequest", "updates.GetDifferenceRequest",
         "updates.GetChannelDifferenceRequest", "users.GetUsersRequest", "messages.GetChatsRequest",
         "channels.GetChannelsRequest", "messages.GetDialogsRequest", "messages.GetHistoryRequest",
+        # папки Telegram: только чтение их описания, для раскладки «Папки» и сфер (Р-82). Изменить
+        # папку (UpdateDialogFilter, UpdateDialogFiltersOrder) по-прежнему нельзя — тест ниже
+        "messages.GetDialogFiltersRequest",
         "messages.GetMessagesRequest", "channels.GetMessagesRequest", "functions.PingRequest",
         "auth.LogOutRequest",
         # скачивание голосового для расшифровки (voice/): файл и перенос авторизации в его дата-центр

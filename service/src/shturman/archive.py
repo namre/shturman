@@ -97,6 +97,7 @@ WITH visible AS ({_VISIBLE_CHATS}), page AS (
       AND ($2::text[] IS NULL OR v.kind <> ALL($2))
       AND ($3::text IS NULL OR v.name ILIKE $4 OR v.username ILIKE $4 OR $3 <% v.name)
       AND ($6::text IS NULL OR v.account_role = $6 OR lower(v.account_label) = lower($6))
+      AND ($7::bigint[] IS NULL OR v.id = ANY($7))
     ORDER BY last.sent_at DESC NULLS LAST, v.id DESC
     LIMIT $5
 )
@@ -205,6 +206,7 @@ _HISTORY_FILTERS = """
   AND ($3::timestamptz IS NULL OR m.sent_at >= $3)
   AND ($4::timestamptz IS NULL OR m.sent_at < $4)
   AND ($5::boolean IS NULL OR ($5 AND m.is_outgoing IS TRUE) OR (NOT $5 AND m.is_outgoing IS NOT TRUE))
+  AND ($9::bigint[] IS NULL OR m.chat_id = ANY($9))
 """
 # Продолжение со следующей строки после (время, идентификатор) — устойчиво к новым сообщениям.
 _HISTORY = {
@@ -341,16 +343,17 @@ async def accounts(conn: asyncpg.Connection) -> list[dict[str, Any]]:
 async def list_chats(
     conn: asyncpg.Connection, *, limit: int = 50, kinds: Sequence[str] | None = None,
     exclude_kinds: Sequence[str] | None = None, query: str | None = None,
-    account: str | None = None,
+    account: str | None = None, chat_ids: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Видимые чаты, сначала с самой свежей перепиской. Строка: id, kind, name, username,
     account_label, account_role, last_message_at, message_count. Счётчик и время — только по
-    видимым сообщениям. `account` — роль (owner, assistant) или название аккаунта."""
+    видимым сообщениям. `account` — роль (owner, assistant) или название аккаунта. `chat_ids` —
+    только эти чаты (сужение по сферам); None — все."""
     query = (query or "").strip() or None
     rows = await _similar(
         conn, _LIST_CHATS, list(kinds) if kinds else None,
         list(exclude_kinds) if exclude_kinds else None, query, _like(query) if query else None,
-        limit, (account or "").strip() or None,
+        limit, (account or "").strip() or None, list(chat_ids) if chat_ids is not None else None,
     )
     return _chat_rows(rows)
 
@@ -453,13 +456,15 @@ async def history(
     conn: asyncpg.Connection, *, chat_id: int | None = None, sender_peer_id: int | None = None,
     after: datetime | None = None, before: datetime | None = None, from_me: bool | None = None,
     limit: int = 50, order: str = "desc", cursor: tuple[datetime, int] | None = None,
+    chat_ids: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Сообщения по фильтрам. `after` включительно, `before` — не включая. `cursor` — пара
-    (время, идентификатор) последней строки предыдущей страницы; порядок должен быть тем же."""
+    (время, идентификатор) последней строки предыдущей страницы; порядок должен быть тем же.
+    `chat_ids` — только эти чаты (сужение по сферам); None — все."""
     if order not in _HISTORY:
         raise ValueError("order: нужно asc или desc")
     cursor_at, cursor_id = cursor if cursor else (None, None)
     rows = await conn.fetch(_HISTORY[order], chat_id, sender_peer_id, after, before, from_me,
-                            cursor_at, cursor_id, limit)
+                            cursor_at, cursor_id, limit, list(chat_ids) if chat_ids is not None else None)
     return _message_rows(rows)
 

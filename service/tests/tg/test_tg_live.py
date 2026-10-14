@@ -365,7 +365,9 @@ async def test_owner_role_reads_with_allowed_requests_only(stage):
         await conn.execute("UPDATE tg_sync_chats SET reconciled_at = NULL")
     assert await stage.rt.history.reconcile_pass() == 1
     names = {type(r).__name__ for r in stage.client.requests}
-    assert names == {"GetUsersRequest", "GetDialogsRequest", "GetHistoryRequest", "GetMessagesRequest"}
+    # папки Telegram читаются той же загрузкой списка, что и диалоги (Р-82) — тоже только чтение
+    assert names == {"GetUsersRequest", "GetDialogsRequest", "GetDialogFiltersRequest", "GetHistoryRequest",
+                     "GetMessagesRequest"}
     assert not any("Read" in n or "Send" in n or "Typing" in n for n in names)
 
 

@@ -281,7 +281,9 @@ def _project_row(item: dict[str, Any]) -> dict[str, Any]:
     return {"id": item["id"], "title": item["title"], "status": item["status"],
             "chats": [clean_line(c["title"], 80) or "без названия" for c in item["chats"]],
             "commitments_open": item["commitments_open"], "facts": item["facts"], "decisions": item["decisions"],
-            "updated": (item["page"] or {}).get("updated")}
+            "updated": (item["page"] or {}).get("updated"),
+            # сфера проекта (Р-82): её название пишет владелец; менять — PUT …/projects/{id}/sphere (spheres.py)
+            "sphere_id": item.get("sphere_id"), "sphere": clean_line(item.get("sphere"), 60) or None}
 
 
 def _projects_error(exc: projects.ProjectsError) -> BadRequest:
