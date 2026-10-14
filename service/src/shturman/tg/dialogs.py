@@ -29,8 +29,8 @@
 отодвигает следующий запрос истории (`Pacer.note_request`), так что список и история не бьют
 Telegram вместе; FLOOD_WAIT, полученный одним, — ожидание и для другого.
 
-# Основано на LonamiWebs/Telethon (MIT), telethon/client/dialogs.py@v1.45.0 (`_DialogsIter`:
-#   смещения, признак конца, пропуск уже виденных и диалогов без сущности)
+# Основано на Lonami/Telethon (MIT; codeberg.org/Lonami/Telethon), telethon/client/dialogs.py@bad095b
+#   (тег v1.45.0; `_DialogsIter`: смещения, признак конца, пропуск уже виденных и диалогов без сущности)
 """
 
 from __future__ import annotations
