@@ -242,10 +242,11 @@ async def stage(pool, conn, config):  # noqa: F811
 
 
 class Gate:
-    """Telegram «думает»: страница списка отдаётся только по разрешению."""
+    """Telegram «думает»: страница списка отдаётся только по разрешению. `open` пропускает все
+    страницы, `budget` — ровно столько, сколько разрешено (без гонки между set и clear)."""
 
     def __init__(self, world):
-        self.world, self.open, self.served = world, asyncio.Event(), 0
+        self.world, self.open, self.served, self.budget = world, asyncio.Event(), 0, 0
         original = world.factory
 
         def factory(*args):
@@ -253,7 +254,10 @@ class Gate:
             answer = client._GetDialogsRequest
 
             async def slow(request):
-                await self.open.wait()
+                while not self.open.is_set() and self.budget <= 0:
+                    await asyncio.sleep(0.005)
+                if not self.open.is_set():
+                    self.budget -= 1
                 self.served += 1
                 return await answer(request)
 
@@ -281,9 +285,8 @@ async def test_refresh_answers_at_once_while_the_list_loads_and_a_second_one_sta
     assert len(rt.client.of(functions.messages.GetDialogsRequest)) == 1
 
     # первая страница пришла — видно уже загруженное и «N из ~M»
-    gate.open.set()
+    gate.budget = 1                                                           # ровно одна страница
     await wait_for(lambda: gate.served >= 1)
-    gate.open.clear()
     await wait_for(lambda: rt.dialogs_load.loaded == 100)
     partial = await manager.list_dialogs(account, limit=500)
     assert partial["load"] == {"state": "loading", "running": True, "loaded": 100, "expected": 250, "wait_seconds": None,
