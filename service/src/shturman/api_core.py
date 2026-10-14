@@ -244,10 +244,14 @@ async def overview(state: AppState) -> dict[str, Any]:
         from . import retry
         from .notify import service as notify_service
         notify = await notify_service.overview(conn)
+        from .rehearsal import service as rehearsal_service
+        rehearsal = await rehearsal_service.overview(conn)
         retried = await retry.overview(conn, media_days=state.config.media_days)
     out = dict(row)
     # Уведомления владельцу (Р-84): какие включены, сколько ждут и сколько ушло за сутки.
     out.update(notify)
+    # Репетиция ответов на основном аккаунте (Р-85): включена ли, сколько людей, карточки и оценки за 7 дней.
+    out.update(rehearsal)
     # Повтор того, что не получилось из-за сбоя модели (Р-84): сколько можно вернуть и сколько
     # возвращено последним повтором.
     out.update(retried)

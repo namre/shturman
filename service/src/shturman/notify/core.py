@@ -230,7 +230,8 @@ async def schedule(conn: asyncpg.Connection, s: Mapping[str, Any], chat_id: int,
     if s["mode"] == "digest":
         return next_slot(int(s["digest_minutes"]), local), False, True
     waiting = await conn.fetchval(
-        "SELECT min(due_at) FROM notify_items WHERE chat_id = $1 AND state = 'waiting' AND NOT quiet AND NOT digest",
+        """SELECT min(due_at) FROM notify_items
+           WHERE chat_id = $1 AND state = 'waiting' AND NOT quiet AND NOT digest AND NOT held_for_rehearsal""",
         chat_id)
     if waiting is not None:
         return waiting, False, False   # уже копится уведомление этого чата — в него же
@@ -412,15 +413,24 @@ class Notifier:
                 kind = "mention" if reason else None
             if kind is None:
                 return None
+            # Репетиция ответов (Р-85): о сообщении, на которое она готовит ответ, владелец узнает из её
+            # карточки — уведомление придерживается и уходит, только если репетиция не состоялась.
+            from ..rehearsal import core as rehearsal
+            hold = await rehearsal.notify_hold(conn, row) if kind == "personal" else None
             async with conn.transaction():
                 await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.notify'), $1::int)",
                                    chat_id % 2_000_000_000)
                 due, quiet, digest = await schedule(conn, s, chat_id, now, self.tz)
+                if hold == "hold":
+                    due = max(due, now + rehearsal.NOTIFY_HOLD)
                 added = await conn.fetchval(
-                    """INSERT INTO notify_items (message_id, chat_id, kind, reason, quiet, digest, due_at)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (message_id) DO NOTHING RETURNING id""",
-                    message_id, chat_id, kind, reason, quiet, digest, due)
-        if added is None:
+                    """INSERT INTO notify_items (message_id, chat_id, kind, reason, quiet, digest, due_at,
+                                                 held_for_rehearsal, state, dropped_reason)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                       ON CONFLICT (message_id) DO NOTHING RETURNING id""",
+                    message_id, chat_id, kind, reason, quiet, digest, due, hold == "hold",
+                    "dropped" if hold == "covered" else "waiting", "rehearsal" if hold == "covered" else None)
+        if added is None or hold == "covered":
             return None
         if due <= now:
             self.wake.set()

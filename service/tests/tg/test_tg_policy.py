@@ -84,6 +84,25 @@ def test_assistant_may_send_text_and_typing_and_nothing_else():
             policy.check(request_)
 
 
+@pytest.mark.parametrize("sending", [True, False])
+@pytest.mark.parametrize("login", [True, False])
+def test_owner_role_never_sends_whatever_the_switches(sending, login):
+    """Репетиция ответов (Р-85) работает на основном аккаунте: он остаётся только на чтение при любом
+    положении выключателей — главного выключателя отправки (`SHTURMAN_SENDING`), подготовки без
+    доставки и входа. Ни одного запроса отправки, «печатает…», правки, удаления, отметки прочитанным."""
+    policy = RequestPolicy("owner", sending=sending, login=login)
+    assert policy.can_send is False
+    for request_ in [*WRITES, *(cls.__new__(cls) for cls in tg_client.SEND_REQUESTS)]:
+        with pytest.raises(RequestNotAllowed):
+            policy.check(request_)
+    # перечень основного аккаунта — чтение (и вход, пока он идёт) и ничего больше
+    read = {f"{c.__module__.rsplit('.', 1)[-1]}.{c.__name__}" for c in tg_client.READ_REQUESTS}
+    login_names = {f"{c.__module__.rsplit('.', 1)[-1]}.{c.__name__}" for c in tg_client.LOGIN_REQUESTS}
+    assert _allowed(policy) == read | (login_names if login else set())
+    assert not _allowed(policy) & {"messages.SendMessageRequest", "messages.SetTypingRequest",
+                                   "messages.SendMediaRequest", "messages.ForwardMessagesRequest"}
+
+
 def test_login_requests_pass_only_while_logging_in():
     for role in ("owner", "assistant"):
         policy = RequestPolicy(role, login=True)

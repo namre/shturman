@@ -100,6 +100,8 @@ def on_callback(module: str) -> Callable[[CallbackHandler], CallbackHandler]:
     fn(conn, остальное, tg_id нажавшего) -> {"answer": "короткий текст-подсказка",
                                               "edit_text": "новый текст сообщения" | None,
                                               "remove_buttons": bool,
+                                              "buttons": [[{text, data}]] | None — заменить кнопки,
+                                                         не меняя текста (только свой бот сервиса),
                                               "after_commit": async-функция без аргументов | None}
     Нажатие приходит только от владельца: это проверено до вызова. `after_commit` выполняется
     после фиксации транзакции нажатия — для событий и фоновой работы, которым нужны уже
@@ -381,6 +383,11 @@ async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: i
             await after()
         except Exception as exc:  # нажатие уже разобрано и записано; сбой «после» его не отменяет
             logger.error("нажатие разобрано, но работа после него не выполнена (%s)", type(exc).__name__)
-    return {"answer": str(out.get("answer") or "")[:190], "edit_text": out.get("edit_text"),
-            "remove_buttons": bool(out.get("remove_buttons"))}
+    reply = {"answer": str(out.get("answer") or "")[:190], "edit_text": out.get("edit_text"),
+             "remove_buttons": bool(out.get("remove_buttons"))}
+    if out.get("buttons") is not None:
+        # Новые кнопки под тем же сообщением (текст не меняется): например, отметка выбранной оценки
+        # у карточки репетиции (rehearsal/). Только кнопки сервиса — каждая собрана `button()`.
+        reply["buttons"] = out["buttons"]
+    return reply
 

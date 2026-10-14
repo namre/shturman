@@ -165,6 +165,36 @@ MUTATIONS = (
              "    if not row[\"agent_visible\"]:\n        return HIDDEN_TEXT", "    if False:\n        return HIDDEN_TEXT",
              "tests/notify/test_notify_core.py::test_hidden_by_guard_is_told_without_text",
              database=True),
+    # Репетиция ответов на основном аккаунте (Р-85): основной аккаунт не отправляет ни при каком положении
+    # выключателей; под карточкой — только оценки; только люди из списка; включение через внутренний API
+    # ждёт владельца; скрытое защитой не уходит модели справкой; уведомление не приходит вторым сообщением.
+    Mutation("owner_role_never_sends", "src/shturman/tg/client.py",
+             "        return self.role == \"assistant\" and self.sending", "        return self.sending",
+             "tests/tg/test_tg_policy.py::test_owner_role_never_sends_whatever_the_switches"),
+    Mutation("rehearsal_card_only_ratings", "src/shturman/rehearsal/core.py",
+             "RATINGS = ((\"good\", \"Годится\"),", "RATINGS = ((\"send\", \"Отправить\"), (\"good\", \"Годится\"),",
+             "tests/rehearsal/test_rehearsal_core.py::test_listed_person_gets_one_card_with_ratings_and_nothing_is_sent",
+             database=True),
+    Mutation("rehearsal_listed_people_only", "src/shturman/rehearsal/core.py",
+             "    if int(row[\"peer_tg_id\"]) not in set(s[\"people\"]):\n        return \"not_listed\"",
+             "    if False:\n        return \"not_listed\"",
+             "tests/rehearsal/test_rehearsal_core.py::test_what_does_not_start_a_rehearsal[not_listed]",
+             database=True),
+    Mutation("rehearsal_enable_waits_for_owner", "src/shturman/rehearsal/settings.py",
+             "    if after[\"enabled\"] and not before[\"enabled\"]:\n        out.append(\"enabled\")",
+             "    if False:\n        out.append(\"enabled\")",
+             "tests/rehearsal/test_rehearsal_api.py::test_enabling_and_adding_people_wait_for_the_owner",
+             database=True),
+    Mutation("reply_context_hides_guarded", "src/shturman/outbox/autoreply.py",
+             "WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible\n",
+             "WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL\n",
+             "tests/rehearsal/test_rehearsal_core.py::test_hidden_by_guard_is_neither_a_trigger_nor_context",
+             database=True),
+    Mutation("rehearsal_holds_notification", "src/shturman/notify/core.py",
+             "                if hold == \"hold\":\n                    due = max(due, now + rehearsal.NOTIFY_HOLD)",
+             "                if False:\n                    due = max(due, now + rehearsal.NOTIFY_HOLD)",
+             "tests/rehearsal/test_rehearsal_core.py::test_listed_person_gets_one_card_with_ratings_and_nothing_is_sent",
+             database=True),
 )
 
 # Capture actual pytest phases and exception types, rather than treating a

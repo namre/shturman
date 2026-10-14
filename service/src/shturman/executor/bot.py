@@ -394,6 +394,14 @@ class Bot:
                                                  reply_markup=markup)
             elif remove:
                 await self.api.remove_keyboard(chat_id, message_id)
+            elif out.get("buttons"):
+                # Новые кнопки сервиса под тем же сообщением (отметка выбранной оценки у карточки
+                # репетиции). Только кнопки с префиксом сервиса — как у `_own_keyboard`.
+                markup = _own_keyboard({"inline_keyboard": [
+                    [{"text": b.get("text"), "callback_data": b.get("data")} for b in row if isinstance(b, dict)]
+                    for row in out["buttons"] if isinstance(row, list)]})
+                if markup is not None:
+                    await self.api.set_keyboard(chat_id, message_id, markup)
         except BotApiError as exc:    # «не изменено», сообщение удалено — решение уже принято
             if not (isinstance(exc, Refused) and exc.reason in ("not_modified", "message_not_found")):
                 logger.warning("бот согласований: карточка не обновлена (%s)", exc)

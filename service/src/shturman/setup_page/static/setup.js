@@ -311,6 +311,7 @@
     refreshSpheres();
     if ($("spheres-details").open) showSpheres();
     if ($("notify-details").open) showNotify(); else refreshNotify();
+    if ($("rehearsal-details").open) showRehearsal(); else refreshRehearsal();
     if ($("watch-details").open) showWatch(); else refreshWatch();
     refresh().then(function () { refreshOverview(); });
     startLoop();
@@ -3009,6 +3010,116 @@
     });
   }
 
+  /* ------------------------------------------------------- репетиция ответов (Р-85) */
+
+  var rh = { data: null, people: [], timer: null };
+
+  function refreshRehearsal() {
+    return call("GET", "rehearsal", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      rh.data = r.data;
+      var s = r.data.settings;
+      pill("rehearsal", !r.data.own_bot ? "нет бота" : !s.enabled ? "выключена" :
+           !s.people.length ? "никого в списке" : "включена · " + s.people.length + " " + plural(s.people.length, "человек", "человека", "человек"),
+           !r.data.own_bot ? "todo" : s.enabled && s.people.length ? "done" : "");
+    });
+  }
+
+  function drawRehearsal() {
+    var d = rh.data;
+    if (!d) return;
+    var s = d.settings;
+    show("rh-nobot", !d.own_bot);
+    show("rh-noaccount", d.own_bot && !d.main_account);
+    $("rh-enabled").checked = s.enabled;
+    $("rh-cap").value = String(s.daily_cap);
+    $("rh-pause").value = String(s.pause_seconds);
+    rh.people = d.people.slice();
+    drawRhPeople();
+    drawRhStats(d.stats);
+  }
+
+  function drawRhStats(st) {
+    var box = $("rh-stats");
+    box.textContent = "";
+    function tile(value, label, kind) {
+      box.appendChild(el("div", { class: "rh-tile" + (kind ? " " + kind : "") }, [
+        el("span", { class: "rh-num", text: number(value) }), el("span", { class: "rh-label", text: label })]));
+    }
+    tile(st.shown, plural(st.shown, "карточка", "карточки", "карточек"));
+    tile(st.good, "годится", "ok");
+    tile(st.almost, "почти", "mid");
+    tile(st.bad, "не годится", "bad");
+    tile(st.unrated, "без оценки");
+    var parts = [];
+    if (st.shown) {
+      parts.push("Ассистент предложил ответ — " + number(st.reply) + ", не стал бы отвечать — " + number(st.decline) +
+                 ", спросил бы вас — " + number(st.ask_owner) + (st.need_source ? ", не хватило сведений — " + number(st.need_source) : "") + ".");
+    } else {
+      parts.push("Карточек пока не было.");
+    }
+    if (st.limited) parts.push("Не уложилось в предел или паузу: " + number(st.limited) + ".");
+    if (st.failed) parts.push("Не получилось (модель не ответила): " + number(st.failed) + ".");
+    parts.push("Сегодня уже: " + number(st.asked_24h) + " из " + number(rh.data.settings.daily_cap) + ".");
+    text("rh-stats-note", parts.join(" "));
+  }
+
+  function drawRhPeople() {
+    var list = $("rh-people");
+    list.textContent = "";
+    if (!rh.people.length) list.appendChild(el("li", { class: "mem-chat mem-note", text: "Пока никого. Найдите человека ниже." }));
+    rh.people.forEach(function (p, i) {
+      list.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", {}, [personName(p), el("span", { class: "mem-meta", text: " · № " + p.tg_id })]),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать " + personName(p),
+          onclick: function () { rh.people.splice(i, 1); drawRhPeople(); } })
+      ]));
+    });
+  }
+
+  function searchRhPeople() {
+    var q = $("rh-people-q").value.trim(), found = $("rh-people-found");
+    found.textContent = "";
+    if (!q) return;
+    call("GET", "notify/people?limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+      found.textContent = "";
+      if (!r.ok) { found.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+      if (!r.data.items.length) found.appendChild(el("li", { class: "mem-chat mem-note", text: "Ничего не нашлось среди ваших личных чатов." }));
+      r.data.items.forEach(function (p) {
+        var chosen = rh.people.some(function (x) { return x.tg_id === p.tg_id; });
+        found.appendChild(el("li", { class: "mem-chat" }, [
+          el("span", {}, [personName(p), p.username && p.name ? el("span", { class: "mem-meta", text: " · @" + p.username }) : null]),
+          chosen ? el("span", { class: "badge ok", text: "выбран" }) : el("button", { class: "btn ghost small-btn", type: "button", text: "Добавить",
+            onclick: function () { rh.people.push(p); drawRhPeople(); searchRhPeople(); } })
+        ]));
+      });
+    });
+  }
+
+  function showRehearsal() { return refreshRehearsal().then(drawRehearsal); }
+
+  function wireRehearsal() {
+    $("rehearsal-details").addEventListener("toggle", function () { if ($("rehearsal-details").open) showRehearsal(); });
+    $("rh-people-q").addEventListener("input", function () { clearTimeout(rh.timer); rh.timer = setTimeout(searchRhPeople, 300); });
+    $("rehearsal-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var save = $("rehearsal-save");
+      var body = { enabled: $("rh-enabled").checked, people: rh.people.map(function (p) { return p.tg_id; }),
+                   daily_cap: Math.round(Number($("rh-cap").value)), pause_seconds: Math.round(Number($("rh-pause").value)) };
+      busy(save, true);
+      note("rehearsal-error", "warn", "");
+      call("PUT", "rehearsal", body).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { note("rehearsal-error", "warn", r.error); return; }
+        rh.data = r.data;
+        drawRehearsal();
+        refreshRehearsal();
+        toast(!body.enabled ? "Репетиция выключена." : body.people.length ? "Репетиция включена. Ничего не отправляется." :
+              "Репетиция включена, но в списке никого — добавьте людей.");
+      });
+    });
+  }
+
   /* ------------------------------------------------------- наблюдатель (Р-84) */
 
   var wt = { data: null, editing: null, hits: [], hitsRule: null, chatTimer: null };
@@ -3296,7 +3407,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireWatch(); wireRetry(); wireMemory(); wireSession();
+  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireWatch(); wireRetry(); wireMemory(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.

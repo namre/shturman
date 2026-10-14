@@ -294,6 +294,11 @@ class BotApi:
             "link_preview_options": {"is_disabled": True},
         })
 
+    async def set_keyboard(self, chat_id: int, message_id: int, reply_markup: dict[str, Any]) -> None:
+        """Меняет кнопки под сообщением, не трогая текста."""
+        await self.call("editMessageReplyMarkup", {
+            "chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup})
+
     async def remove_keyboard(self, chat_id: int, message_id: int) -> None:
         await self.call("editMessageReplyMarkup", {
             "chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}})
