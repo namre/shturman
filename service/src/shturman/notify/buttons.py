@@ -133,7 +133,7 @@ async def _prepare(conn: asyncpg.Connection, item: Any) -> dict[str, Any]:
 
 
 async def prepare_reply(conn: asyncpg.Connection, message_id: int, *, personal: bool) -> dict[str, Any]:
-    """«Подготовить ответ» — у уведомления и у карточки разбора входящих (Р-90): разовая репетиция или
+    """«Подготовить ответ» — у уведомления и у карточки разбора входящих (Р-92): разовая репетиция или
     черновик только для просмотра, по способу работы. Ничего не отправляет."""
     from .. import halt
     from ..executor import owner_views

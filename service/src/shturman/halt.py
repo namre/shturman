@@ -13,7 +13,7 @@
   | наблюдатель | `outbox/watcher.py` | срабатывания не разбираются, сообщения не уходят |
   | подтверждения действий от ассистента и внутреннего API | `confirm.request` | новые отклоняются сразу, с причиной |
   | «Подготовить ответ» у уведомления | `notify/buttons.py` | отказ |
-  | разбор входящих (Р-90) | `triage/core.py` (`active`, `prepare`, ответ модели, обход) | не разбирает, карточек и напоминаний нет; сообщения — обычным уведомлением «Вам написали» |
+  | разбор входящих (Р-92) | `triage/core.py` (`active`, `prepare`, ответ модели, обход) | не разбирает, карточек и напоминаний нет; сообщения — обычным уведомлением «Вам написали» |
 
 Вторая линия — триггеры базы (миграция 0035): пока флаг стоит, в `reply_tasks`, `outbox_drafts`,
 `rehearsal_items`, `triage_items`, `watch_hits`, `pending_actions` (кроме карточек «Продолжить» и входа по коду) не
@@ -199,7 +199,7 @@ async def _cancel_waiting(conn: asyncpg.Connection) -> dict[str, int]:
         from .rehearsal import core as rehearsal
         await rehearsal.release_notify(conn, row["chat_id"], row["trigger_message_id"])
         counts["rehearsals"] += 1
-    # Разбор входящих (Р-90): начатые разборы снимаются, их сообщения уходят обычным уведомлением.
+    # Разбор входящих (Р-92): начатые разборы снимаются, их сообщения уходят обычным уведомлением.
     from .triage import core as triage
     counts["triage"] = await triage.stop_now(conn)
     await conn.execute("DELETE FROM executor_state WHERE key = 'prompt'")

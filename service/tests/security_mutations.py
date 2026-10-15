@@ -248,7 +248,7 @@ MUTATIONS = (
              "    decision = check_switch(rules)",
              "tests/test_halt.py::test_every_point_where_the_assistant_acts_refuses_while_stopped[send_check]",
              database=True),
-    # Разбор входящих (Р-90): включает только нажатие в самом боте; скрытое защитой не уходит модели ни
+    # Разбор входящих (Р-92): включает только нажатие в самом боте; скрытое защитой не уходит модели ни
     # поводом, ни справкой; разбираемое не приходит второй раз пересылкой; ночью будит только «срочно» от
     # важных — слово «срочно» в чужом тексте прав не даёт.
     Mutation("triage_enable_only_bot_press", "src/shturman/triage/service.py",

@@ -145,7 +145,7 @@ def pending_line(total: int, counts: dict[str, int], later: int) -> str:
 
 
 def triage_line(counts: dict[str, Any]) -> str:
-    """Разбор входящих (Р-90) одной строкой: вкл/выкл и числа за сутки."""
+    """Разбор входящих (Р-92) одной строкой: вкл/выкл и числа за сутки."""
     if not counts.get("triage_enabled"):
         return f"Разбор входящих: выкл — включается {words.IN_SETUP_PAGE}, раздел «Уведомления»."
     shown = int(counts.get("triage_shown_24h") or 0) + int(counts.get("triage_reminded_24h") or 0)

@@ -336,7 +336,7 @@ async def retry_post(request: Request) -> JSONResponse:
 
 def routes() -> list[BaseRoute]:
     from . import miniapp
-    from . import triage as triage_page   # блок «Разбор входящих» той же карточки «Уведомления» (Р-90)
+    from . import triage as triage_page   # блок «Разбор входящих» той же карточки «Уведомления» (Р-92)
 
     return [
         *triage_page.routes(),

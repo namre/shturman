@@ -506,7 +506,7 @@ details.sect[open] > :not(summary) { margin-top: 4px; }
 .nt-quiet-times .field { flex-direction: row; align-items: center; gap: 8px; font-weight: 400; }
 .nt-quiet-times input { width: auto; min-width: 120px; }
 .nt-quiet-times input[disabled] { opacity: 0.55; }
-/* Разбор входящих (Р-90) — блок внутри карточки «Уведомления» */
+/* Разбор входящих (Р-92) — блок внутри карточки «Уведомления» */
 .triage { display: flex; flex-direction: column; gap: 12px; margin-top: 8px; padding-top: 18px; border-top: 1px solid var(--line); }
 .triage .card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .triage p { margin: 0; }
