@@ -352,16 +352,52 @@ _cron_lock = threading.Lock()
 
 
 def _cron_context() -> dict[str, Any]:
-    from hermes_cli.config import get_env_value_prefer_dotenv
-    from hermes_time import get_timezone_name
+    from hermes_cli.config import get_env_value_prefer_dotenv, read_raw_config
 
-    timezone = get_timezone_name()
+    # Время задач считает планировщик шлюза, а он при нескольких профилях берёт пояс только
+    # из `timezone` в config.yaml профиля (Р-90). Процесс дашборда видит ещё и HERMES_TIMEZONE
+    # (hermes_time.get_timezone_name() здесь отдал бы её) — поэтому смотрим config.yaml.
+    configured = cron_jobs.config_zone(read_raw_config())
+    expected = (os.environ.get("HERMES_TIMEZONE") or "").strip()
+    state = cron_jobs.zone_state(expected, configured)
     return {
-        # Время задач считается по этим часам. Пусто — по часам сервера.
-        "timezone": timezone or None,
-        "timezone_configured": bool(timezone),
+        # Пояс шлюза. Пусто — по часам сервера.
+        "timezone": configured or None,
+        "timezone_configured": bool(configured),
+        "timezone_expected": expected or None,          # SHTURMAN_TIMEZONE → HERMES_TIMEZONE контейнера
+        "timezone_state": state,
+        "timezone_warning": cron_jobs.zone_warning(state, expected, configured),
         "home_channel_set": bool((get_env_value_prefer_dotenv("TELEGRAM_HOME_CHANNEL") or "").strip()),
     }
+
+
+def _ensure_gateway_zone(context: dict[str, Any]) -> dict[str, Any]:
+    """Пояс из окружения — в config.yaml профиля, если там пусто или другой (Р-90).
+
+    Штатная функция Hermes — та же, что у `hermes config set timezone …`. Шлюз читает пояс при
+    запуске, поэтому до перезапуска Hermes он считает по-прежнему: запись отмечается в хранилище
+    плагина (`./ops/up.sh` по ней перезапустит Hermes), а вызов получает предупреждение.
+    """
+    if context["timezone_state"] not in ("missing", "differs"):
+        return context
+    import contextlib
+    import io
+    import time
+
+    from hermes_cli.config import set_config_value
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            set_config_value("timezone", context["timezone_expected"])
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — Hermes отказал (например, управляемые настройки)
+        logger.warning("shturman: часовой пояс не записан в config.yaml (%s)", type(exc).__name__)
+    updated = _cron_context()
+    if updated["timezone_state"] == "same":
+        _store().write(cron_jobs.TZ_STATE, {"written_at": time.time(), "zone": updated["timezone"]})
+        updated["timezone_written"] = True
+        updated["timezone_warning"] = cron_jobs.zone_warning(
+            "written", updated["timezone_expected"], updated["timezone"])
+    return updated
 
 
 def _cron_status_sync() -> dict[str, Any]:
@@ -392,6 +428,10 @@ def _cron_install_sync(morning_at: Optional[str] = None, weekly_at: Optional[str
             raise HTTPException(
                 status_code=409,
                 detail="Сначала привяжите бота в мастере настройки: сводке пока некуда приходить.")
+        # Не заводим молча по UTC: пояс из окружения — в config.yaml профиля, а что осталось
+        # сделать (перезапуск, пояс не задан) — в timezone_warning ответа.
+        if create:
+            context = _ensure_gateway_zone(context)
         created = []
         for spec in create:
             try:

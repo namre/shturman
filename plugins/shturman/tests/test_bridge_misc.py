@@ -116,6 +116,97 @@ def test_plan_creates_both_jobs_once():
     assert cron_jobs.plan(both)[0] == []
 
 
+# --- часовой пояс шлюза (Р-90) ---
+
+@pytest.mark.parametrize("want, have, state", [
+    ("", "", "none"), (None, "Europe/Moscow", "none"), ("  ", "UTC", "none"),
+    ("Europe/Moscow", "", "missing"), ("Europe/Moscow", None, "missing"),
+    ("Europe/Moscow", "Europe/Moscow", "same"), (" Europe/Moscow ", "Europe/Moscow", "same"),
+    ("Europe/Moscow", "UTC", "differs"),
+    ("Mars/Base", "", "invalid"), ("../../etc/passwd", "UTC", "invalid"),
+])
+def test_zone_state(want, have, state):
+    assert cron_jobs.zone_state(want, have) == state
+
+
+def test_config_zone_and_expected_zone():
+    assert cron_jobs.config_zone({"timezone": " Asia/Novosibirsk "}) == "Asia/Novosibirsk"
+    assert cron_jobs.config_zone({"timezone": 3}) == "" and cron_jobs.config_zone(None) == ""
+    assert cron_jobs.expected_zone("Europe/Moscow", "UTC") == "Europe/Moscow"
+    assert cron_jobs.expected_zone("Mars/Base", "UTC") == "UTC"            # неизвестный — берём пояс шлюза
+    assert cron_jobs.expected_zone("", "") == ""
+
+
+def _job(next_run_at, expr="27 8 * * *", **extra):
+    return {"id": "a1", "name": "shturman:morning-brief", "enabled": True,
+            "schedule": {"kind": "cron", "expr": expr}, "next_run_at": next_run_at, **extra}
+
+
+def test_schedule_drift_catches_the_pilot_case():
+    """Пилот 2026-10-15: шлюз пересчитал сводку по UTC — 08:27+00:00, то есть 11:27 по Москве."""
+    assert cron_jobs.schedule_drift(_job("2026-10-16T08:27:00+00:00"), "Europe/Moscow") == "offset"
+    assert cron_jobs.schedule_drift(_job("2026-10-16T08:27:00+03:00"), "Europe/Moscow") == "ok"
+    # Без пояса шлюз считает по часам сервера (в контейнере — UTC): тогда та же запись «верна».
+    assert cron_jobs.schedule_drift(_job("2026-10-16T08:27:00+00:00"), "") == "ok"
+    assert cron_jobs.schedule_drift(_job("2026-10-16T09:27:00+03:00"), "Europe/Moscow") == "off-schedule"
+
+
+def test_schedule_drift_weekly_and_edge_cases():
+    friday = "2026-10-16T17:47:00+03:00"                        # 16.10.2026 — пятница
+    assert cron_jobs.schedule_drift(_job(friday, "47 17 * * 5"), "Europe/Moscow") == "ok"
+    assert cron_jobs.schedule_drift(_job(friday, "47 17 * * 1"), "Europe/Moscow") == "off-schedule"
+    assert cron_jobs.schedule_drift(_job("2026-10-18T17:47:00+03:00", "47 17 * * 7"), "Europe/Moscow") == "ok"
+    assert cron_jobs.schedule_drift(_job(friday, "47 17 * * 1-5"), "Europe/Moscow") == "ok"   # диапазон не проверяем
+    assert cron_jobs.schedule_drift(_job(friday, "*/5 17 * * *"), "Europe/Moscow") == "ok"
+    assert cron_jobs.schedule_drift(_job(None), "Europe/Moscow") == "no-next"
+    assert cron_jobs.schedule_drift(_job(None, enabled=False), "Europe/Moscow") == "paused"
+    assert cron_jobs.schedule_drift(_job(None, state="paused"), "Europe/Moscow") == "paused"
+    assert cron_jobs.schedule_drift(_job("вчера"), "Europe/Moscow") == "unchecked"
+    assert cron_jobs.schedule_drift(_job("2026-10-16T08:27:00"), "Europe/Moscow") == "unchecked"
+    assert cron_jobs.schedule_drift({"enabled": True, "schedule": {"kind": "interval", "minutes": 5},
+                                     "next_run_at": friday}, "Europe/Moscow") == "unchecked"
+
+
+def test_local_run_and_ours():
+    assert cron_jobs.local_run("2026-10-16T08:27:00+00:00", "Europe/Moscow") == "пт 16.10 11:27"
+    assert cron_jobs.local_run("2026-10-16T08:27:00+03:00", "Europe/Moscow") == "пт 16.10 08:27"
+    assert cron_jobs.local_run(None, "Europe/Moscow") == "" and cron_jobs.local_run("x", "UTC") == ""
+    jobs = [{"name": "shturman:morning-brief"}, {"name": "чужая"}, {"name": None}, "мусор"]
+    assert [j["name"] for j in cron_jobs.ours(jobs)] == ["shturman:morning-brief"]
+
+
+def test_zone_warning_and_restart_pending():
+    assert cron_jobs.zone_warning("same", "Europe/Moscow", "Europe/Moscow") is None
+    assert cron_jobs.zone_warning("none", "", "Europe/Moscow") is None
+    assert "UTC" in cron_jobs.zone_warning("none", "", "")
+    assert "./ops/up.sh" in cron_jobs.zone_warning("missing", "Europe/Moscow", "")
+    assert "часам сервера" in cron_jobs.zone_warning("missing", "Europe/Moscow", "")
+    assert "поясу UTC" in cron_jobs.zone_warning("differs", "Europe/Moscow", "UTC")
+    assert "перезапуск" in cron_jobs.zone_warning("written", "Europe/Moscow", "Europe/Moscow")
+    assert "Mars/Base" in cron_jobs.zone_warning("invalid", "Mars/Base", "")
+    assert cron_jobs.restart_pending(200.0, 100.0) is True
+    assert cron_jobs.restart_pending(50, 100.0) is False
+    assert cron_jobs.restart_pending(None, 100.0) is False and cron_jobs.restart_pending(True, 0.0) is False
+    assert cron_jobs.restart_pending(200, None) is False
+
+
+def test_ops_scripts_call_only_existing_cron_functions():
+    """ops/up.sh и ops/doctor.sh зовут функции cron_jobs внутри контейнера Hermes — имена должны быть."""
+    root = PLUGIN.parents[1]
+    used = set()
+    for script in ("up.sh", "doctor.sh"):
+        used |= set(re.findall(r"cron_jobs\.(\w+)", (root / "ops" / script).read_text(encoding="utf-8"))) - {"py"}
+    assert {"zone_state", "config_zone", "schedule_drift", "ours", "expected_zone"} <= used
+    assert all(hasattr(cron_jobs, name) for name in used), used - set(dir(cron_jobs))
+
+
+def test_dashboard_reads_the_gateway_zone_from_config_yaml():
+    """Процесс дашборда видит HERMES_TIMEZONE, а шлюз при нескольких профилях — нет (Р-90)."""
+    source = (PLUGIN / "dashboard" / "plugin_api.py").read_text(encoding="utf-8")
+    assert "get_timezone_name()\n" not in source and "from hermes_time import" not in source
+    assert "read_raw_config" in source and 'set_config_value("timezone"' in source
+
+
 # --- скиллы ---
 
 @pytest.mark.parametrize("name", ["morning-brief", "weekly-review"])

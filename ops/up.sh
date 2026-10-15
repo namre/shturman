@@ -7,8 +7,12 @@
 #   hermes      — Hermes, сервис переписки, база; плагин и архив подключаются к Hermes: запись
 #                 mcp_servers.shturman в настройках Hermes и токен архива в .env профиля Hermes
 #                 (data/hermes/.env — штатной функцией Hermes внутри контейнера, значение
-#                 не печатается; при изменении Hermes перезапускается);
-#   standalone  — только сервис переписки и база. Шаги Hermes пропускаются, его образ
+#                 не печатается; при изменении Hermes перезапускается); часовой пояс владельца
+#                 (HERMES_TIMEZONE контейнера) — в timezone config.yaml профиля командой
+#                 `hermes config set timezone` (Р-90: многопрофильный шлюз переменную не читает;
+#                 при изменении Hermes перезапускается), а задачи shturman:*, посчитанные
+#                 по другому поясу, пересчитываются `hermes cron edit <id> --schedule <та же запись>`;
+#   standalone — только сервис переписки и база. Шаги Hermes пропускаются, его образ
 #                 не скачивается, а оставшийся от прежнего режима контейнер убирается.
 # В режиме с Hermes, если адрес дашборда задан, а адреса страницы настройки переписки в .env ещё
 # нет, скрипт дописывает адрес по умолчанию: то же имя, порт 8443 (./ops/set-setup-url.sh --help).
@@ -19,7 +23,8 @@
 # профиль relay), скрипт собирает и запускает и контейнер frpc — только в режиме с Hermes.
 # Если адрес дашборда или адрес страницы настройки записан в .env не как адрес (например, без
 # https://) или как https-адрес с IP закрытой сети либо в необычной записи (docs/deployment.md,
-# «Без домена»), скрипт останавливается до перезапуска и называет строку. Из .env читаются только несекретные строки: режим, профили, эти два
+# «Без домена»), скрипт останавливается до перезапуска и называет строку; так же — при неизвестном часовом
+# поясе SHTURMAN_TIMEZONE. Из .env читаются только несекретные строки: режим, профили, пояс, эти два
 # адреса и — только на «задана ли и пуста ли» — строка адреса API своей модели.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
@@ -85,6 +90,15 @@ for name in SHTURMAN_PUBLIC_URL SHTURMAN_SETUP_URL; do
     exit 1
   fi
 done
+
+# Часовой пояс владельца (Р-90): с неизвестным именем сервис переписки не запускается, а Hermes считает
+# по UTC. Строка не секретная; её пишет ./ops/init-env.sh --auto --timezone, но могли вписать вручную.
+owner_tz="$(env_get SHTURMAN_TIMEZONE)"
+if [ -n "$owner_tz" ] && ! tz_valid "$owner_tz"; then
+  echo "SHTURMAN_TIMEZONE в .env — неизвестный часовой пояс «$owner_tz»: с ним сервис переписки не запустится." >&2
+  echo "Запишите пояс заново: ./ops/init-env.sh --auto --timezone Europe/Moscow (или свой, например Asia/Yekaterinburg) — и повторите ./ops/up.sh. Ничего не перезапущено." >&2
+  exit 1
+fi
 
 # Адрес API своей модели контейнер получает, только когда строка SHTURMAN_LLM_BASE_URL есть в .env
 # (compose.yaml): адрес из окружения страница настройки менять не даёт. Строка без значения значит
@@ -182,6 +196,83 @@ else:
     from hermes_cli.config import invalidate_env_cache
     invalidate_env_cache()
     print("changed" if load_env().get(name) == want else "failed")' 2>/dev/null | tail -n 1
+}
+# Часовой пояс шлюза — в config.yaml профиля (/opt/data/config.yaml, Р-90). Пояс владельца контейнер
+# получает переменной HERMES_TIMEZONE (из SHTURMAN_TIMEZONE, compose.yaml), но шлюз Hermes, когда
+# обслуживает несколько профилей, переменную не читает (hermes_time._env_timezone) и считает
+# расписание по `timezone` из config.yaml, а без него — по часам сервера (UTC): утренняя сводка
+# на 08:27 приходила в 11:27 по Москве. Пояс записывается штатной командой `hermes config set
+# timezone …`; сравнение — внутри контейнера, функциями плагина (shturman_core/cron_jobs.py).
+# Пояса в окружении нет — ничего не делаем: пусть решает Hermes. Пояс может записать и сам плагин,
+# когда заводит задачи (отметка в его хранилище, cron_jobs.TZ_STATE); шлюз читает пояс только при
+# запуске, поэтому запись новее запуска контейнера — тоже повод перезапустить Hermes (pending).
+# Вывод: none | same <пояс> | pending <пояс> | changed <пояс> | invalid <пояс> | failed. Пояс не секретный.
+tz_py='
+import os, sys
+sys.path.insert(0, "/opt/data/plugins/shturman")
+from shturman_core import cron_jobs
+from hermes_cli.config import read_raw_config
+want = (os.environ.get("HERMES_TIMEZONE") or "").strip()
+have = cron_jobs.config_zone(read_raw_config())
+started = float(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else None
+try:
+    from shturman_core.state import Store
+    written = Store().read(cron_jobs.TZ_STATE).get("written_at")
+except Exception:
+    written = None
+pending = "yes" if cron_jobs.restart_pending(written, started) else "no"
+print(cron_jobs.zone_state(want, have), want or "-", pending)'
+tz_sync() {
+  local st zone pending started
+  started="$(date -d "$(hermes_started)" +%s 2>/dev/null || true)"
+  read -r st zone pending <<EOF_TZ
+$(hx /opt/hermes/.venv/bin/python -c "$tz_py" "$started" 2>/dev/null | tail -n 1)
+EOF_TZ
+  case "$st" in
+    none) echo none ;;
+    same) if [ "$pending" = yes ]; then echo "pending $zone"; else echo "same $zone"; fi ;;
+    invalid) echo "invalid $zone" ;;
+    missing|differs)
+      hx hermes config set timezone "$zone" > /dev/null 2>&1 || true
+      read -r st zone pending <<EOF_TZ
+$(hx /opt/hermes/.venv/bin/python -c "$tz_py" "$started" 2>/dev/null | tail -n 1)
+EOF_TZ
+      if [ "$st" = same ]; then echo "changed $zone"; else echo failed; fi ;;
+    *) echo failed ;;
+  esac
+}
+# Задачи «Штурмана» (shturman:*), у которых следующий запуск посчитан не по поясу владельца (обычно по UTC,
+# до записи пояса; без пояса в окружении — по поясу шлюза) или не лежит на их расписании, пересчитываются штатной командой
+# `hermes cron edit <id> --schedule <та же запись>`: Hermes заново считает next_run_at. Остальные
+# задачи и выключенные не трогаются. Печатаются только имена задач. Вывод — строки «id<TAB>запись<TAB>имя».
+cron_drifted() {
+  hx /opt/hermes/.venv/bin/python -c '
+import sys
+sys.path.insert(0, "/opt/data/plugins/shturman")
+from shturman_core import cron_jobs
+from hermes_cli.config import read_raw_config
+import os
+from cron.jobs import list_jobs
+zone = cron_jobs.expected_zone(os.environ.get("HERMES_TIMEZONE"), cron_jobs.config_zone(read_raw_config()))
+for job in cron_jobs.ours(list_jobs(include_disabled=True)):
+    if cron_jobs.schedule_drift(job, zone) in ("offset", "off-schedule"):
+        expr = str((job.get("schedule") or {}).get("expr") or "").strip()
+        if expr and job.get("id"):
+            print(job["id"], expr, job.get("name"), sep="\t")' 2>/dev/null
+}
+cron_resync() {
+  local id expr name bad=0
+  while IFS="$(printf '\t')" read -r id expr name; do
+    [ -n "$id" ] || continue
+    if hx hermes cron edit "$id" --schedule "$expr" > /dev/null 2>&1; then
+      echo "Расписание задачи $name пересчитано по поясу Hermes."
+    else
+      echo "Не удалось пересчитать расписание задачи $name — hermes cron edit $id --schedule \"$expr\"" >&2; bad=$((bad + 1))
+    fi
+  done <<EOF_CRON
+$(cron_drifted)
+EOF_CRON
+  return "$bad"
 }
 wait_service() {
   for _ in $(seq 1 45); do
@@ -308,6 +399,15 @@ case "$(mcp_key_sync)" in
   missing) echo "В окружении контейнера Hermes нет токена архива (SHTURMAN_MCP_TOKEN в .env пуст?) — архив не будет доступен ассистенту. ./ops/init-env.sh --auto, затем ./ops/up.sh" >&2 ;;
   *) echo "не удалось записать токен архива в .env профиля Hermes" >&2; exit 1 ;;
 esac
+tz_result="$(tz_sync)"
+case "$tz_result" in
+  none) ;;
+  "same "*) ;;
+  "pending "*) echo "Часовой пояс ${tz_result#pending } записан в настройки Hermes после его запуска — перезапускаю Hermes, чтобы шлюз считал сводки по нему."; restart=yes ;;
+  "changed "*) echo "Часовой пояс ${tz_result#changed } записан в настройки Hermes (timezone в config.yaml) — Hermes перезапустится, и сводки пойдут по этому поясу."; restart=yes ;;
+  "invalid "*) echo "В окружении Hermes неизвестный часовой пояс (SHTURMAN_TIMEZONE в .env) — в настройки Hermes он не записан. Исправьте строку на имя вида Europe/Moscow и повторите ./ops/up.sh" >&2 ;;
+  *) echo "не удалось записать часовой пояс в настройки Hermes (hermes config set timezone …) — сводки пойдут по часам сервера; смотрите ./ops/doctor.sh, строка hermes-tz" >&2; exit 1 ;;
+esac
 # Hermes читает плагин при запуске и держит его в памяти. Если файлы плагина изменились с прошлого
 # запуска (обновление репозитория), а контейнер Hermes при этом не перезапускался, он продолжает
 # исполнять прежний код: прежний мастер и прежний перечень маршрутов прохода к сервису — в том
@@ -327,6 +427,8 @@ if wait_dashboard; then
   # Отпечаток кода плагина, с которым Hermes сейчас работает (секретов в нём нет).
   mkdir -p local
   printf '%s\n' "$plugin_now" > "$PLUGIN_MARK"
+  # После перезапуска шлюз считает по записанному поясу; задачи, посчитанные по прежнему, — заново.
+  cron_resync || echo "Часть задач по расписанию не пересчитана — проверьте строку cron-schedule ниже." >&2
   finish
 fi
 echo "Дашборд не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-hermes" >&2

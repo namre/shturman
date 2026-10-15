@@ -7,14 +7,24 @@ plugin_api штатной функцией Hermes (`cron.scheduler.create_job_wi
 в собственном каталоге скиллов (`tools/blueprints.py:100-116`, вызывается при установке скилла
 из каталога), а скиллы плагина туда не копируются. Поэтому задачи заводятся явным вызовом.
 
-Время указано по часам, настроенным в Hermes (`timezone` в config.yaml или HERMES_TIMEZONE);
-если часовой пояс не задан, Hermes считает по часам сервера.
+Время задач — по часовому поясу, которым считает планировщик шлюза Hermes, а это `timezone`
+в config.yaml профиля (Р-90). Переменная HERMES_TIMEZONE для шлюза в многопрофильном режиме
+(в Hermes 0.21.5 он включён по умолчанию) не действует: `hermes_time._env_timezone()` при
+`agent.secret_scope.is_multiplex_active()` её не читает, и без `timezone` в config.yaml шлюз
+считает по часам сервера (в контейнере — UTC). Вне шлюза — в дашборде, в `hermes cron …` из
+терминала — переменная действует, поэтому задача, созданная из дашборда, получает верный первый
+запуск, а после первого прогона шлюз пересчитывает его по UTC. Поэтому пояс из окружения
+контейнера (`HERMES_TIMEZONE` ← `SHTURMAN_TIMEZONE`) записывается в config.yaml профиля:
+`./ops/up.sh` (функция tz_sync) и плагин при заведении задач. Проверка — строки `hermes-tz`
+и `cron-schedule` в `./ops/doctor.sh`. Функции ниже — без зависимостей от Hermes.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 SKILL_NAMESPACE = "shturman"
 MCP_SERVER = "shturman"          # под этим именем архив подключён к Hermes как MCP-сервер
@@ -88,3 +98,149 @@ def plan(existing: Iterable[Mapping[str, Any]], *, times: Mapping[str, str] | No
         else:
             create.append(job_spec(job, at=(times or {}).get(job["key"]), weekday=weekday))
     return create, present
+
+
+# ------------------------------------------------ часовой пояс шлюза (Р-90)
+
+NAME_PREFIX = "shturman:"
+
+
+def zone_valid(name: str | None) -> bool:
+    """Известен ли пояс базе часовых поясов (IANA)."""
+    if not isinstance(name, str) or not name.strip():
+        return False
+    try:
+        ZoneInfo(name.strip())
+    except Exception:  # noqa: BLE001 — неизвестное имя, путь вместо имени и прочее
+        return False
+    return True
+
+
+def config_zone(raw_config: Mapping[str, Any] | None) -> str:
+    """`timezone` из config.yaml профиля так, как его читает Hermes (`hermes_time`); пусто — не задан."""
+    value = (raw_config or {}).get("timezone")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def zone_state(expected: str | None, configured: str | None) -> str:
+    """Сравнение пояса из окружения контейнера (`HERMES_TIMEZONE`) с `timezone` профиля.
+
+    none — пояса в окружении нет: решает Hermes, ничего не трогаем; invalid — в окружении
+    неизвестный пояс, записывать нельзя; same — совпадают; missing — в config.yaml пусто;
+    differs — в config.yaml другой.
+    """
+    want = (expected or "").strip()
+    have = (configured or "").strip()
+    if not want:
+        return "none"
+    if not zone_valid(want):
+        return "invalid"
+    if not have:
+        return "missing"
+    return "same" if have == want else "differs"
+
+
+# Запись плагина в своём хранилище (Store) о том, когда он сам записал пояс в config.yaml: шлюз читает
+# пояс при запуске и держит в памяти, поэтому `./ops/up.sh` перезапускает Hermes, если запись новее
+# запуска контейнера, а `./ops/doctor.sh` предупреждает об этом.
+TZ_STATE = "timezone"
+
+
+def zone_warning(state: str, expected: str | None, configured: str | None) -> str | None:
+    """Предупреждение для мастера и вызова `cron/install`; None — всё в порядке."""
+    want, have = (expected or "").strip(), (configured or "").strip()
+    if state == "same" or (state == "none" and have):
+        return None
+    if state == "none":
+        return ("Часовой пояс в Hermes не задан: сводки пойдут по часам сервера (обычно UTC). "
+                "Задайте SHTURMAN_TIMEZONE в .env (docs/setup.md) и запустите ./ops/up.sh.")
+    if state == "invalid":
+        return (f"Часовой пояс «{want}» из SHTURMAN_TIMEZONE неизвестен — в настройки Hermes он не записан, "
+                "сводки пойдут по часам сервера. Исправьте строку (вид Europe/Moscow) и запустите ./ops/up.sh.")
+    if state == "written":
+        return (f"Часовой пояс {want} записан в настройки Hermes (timezone в config.yaml). Шлюз Hermes "
+                "начнёт считать расписание по нему после перезапуска: запустите ./ops/up.sh — он перезапустит "
+                "Hermes и пересчитает время сводок.")
+    return (f"Шлюз Hermes считает расписание по {('поясу ' + have) if have else 'часам сервера (UTC)'}, "
+            f"а не по {want}: в config.yaml профиля другой пояс или его нет. Запустите ./ops/up.sh — "
+            "он запишет пояс, перезапустит Hermes и пересчитает время сводок.")
+
+
+def restart_pending(written_at: Any, started_at: float | None) -> bool:
+    """Пояс записан плагином после запуска контейнера Hermes — шлюз ещё считает по прежнему."""
+    if isinstance(written_at, bool) or not isinstance(written_at, (int, float)) or started_at is None:
+        return False
+    return written_at >= started_at
+
+
+def expected_zone(expected: str | None, configured: str | None) -> str:
+    """Пояс, по которому задачам положено стоять: из окружения, если он известен, иначе из config.yaml."""
+    want = (expected or "").strip()
+    return want if zone_valid(want) else (configured or "").strip()
+
+
+def ours(jobs: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Задачи «Штурмана» — по имени `shturman:…`."""
+    return [j for j in jobs if isinstance(j, Mapping) and str(j.get("name") or "").startswith(NAME_PREFIX)]
+
+
+def _cron_field_ok(field: str, value: int, *, weekday: bool = False) -> bool | None:
+    """Совпадает ли значение с полем cron. None — поле сложнее числа и списка чисел: не проверяем."""
+    if field == "*":
+        return True
+    parts = field.split(",")
+    if not all(p.isdigit() for p in parts):
+        return None
+    numbers = {int(p) for p in parts}
+    if weekday and 7 in numbers:
+        numbers.add(0)
+    return value in numbers
+
+
+def schedule_drift(job: Mapping[str, Any], zone: str | None) -> str:
+    """Стоит ли следующий запуск задачи на её расписании по поясу шлюза.
+
+    ok — смещение `next_run_at` совпадает со смещением пояса, а час и минута по нему — с записью
+    cron; offset — смещение другое (задачу пересчитали по другому поясу, обычно по UTC);
+    off-schedule — смещение то же, а время не по расписанию; no-next — включённая задача без
+    следующего запуска; paused — задача выключена или на паузе (не проверяется);
+    unchecked — расписание не cron или запись не разобрать. Пустой `zone` — пояс сервера (UTC).
+    """
+    if not job.get("enabled", True) or job.get("state") == "paused":
+        return "paused"
+    schedule = job.get("schedule")
+    if not isinstance(schedule, Mapping) or schedule.get("kind") != "cron":
+        return "unchecked"
+    fields = str(schedule.get("expr") or "").split()
+    raw = job.get("next_run_at")
+    if not raw:
+        return "no-next"
+    try:
+        moment = datetime.fromisoformat(str(raw))
+        tz = ZoneInfo(zone.strip()) if zone and zone.strip() else ZoneInfo("UTC")
+    except Exception:  # noqa: BLE001
+        return "unchecked"
+    if moment.tzinfo is None or len(fields) != 5:
+        return "unchecked"
+    local = moment.astimezone(tz)
+    if moment.utcoffset() != local.utcoffset():
+        return "offset"
+    checks = (_cron_field_ok(fields[0], local.minute), _cron_field_ok(fields[1], local.hour),
+              _cron_field_ok(fields[4], local.isoweekday() % 7, weekday=True))
+    return "off-schedule" if False in checks else "ok"
+
+
+_WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+
+def local_run(raw: Any, zone: str | None) -> str:
+    """Следующий запуск по поясу шлюза для людей: «пт 16.10 08:27». Пусто — не разобрать."""
+    try:
+        moment = datetime.fromisoformat(str(raw))
+        tz = ZoneInfo(zone.strip()) if zone and zone.strip() else ZoneInfo("UTC")
+    except Exception:  # noqa: BLE001
+        return ""
+    if moment.tzinfo is None:
+        return ""
+    local = moment.astimezone(tz)
+    return f"{_WEEKDAYS[local.weekday()]} {local:%d.%m %H:%M}"

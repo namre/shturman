@@ -250,7 +250,30 @@ jobs:
           if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
           if grep -q 'записан не как' out.txt; then echo "адрес http:// принимается, как и раньше"; cat out.txt; exit 1; fi
           test -e docker-called
+          rm -f docker-called
+          # Неизвестный часовой пояс ./ops/up.sh тоже останавливает до Docker (Р-90).
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_TIMEZONE=Mars/Base\n' > .env
+          code=0; PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1 || code=$?
+          [ "$code" -eq 1 ] && grep -q 'неизвестный часовой пояс' out.txt && test ! -e docker-called
           rm -rf stub docker-called out.txt
+          # Часовой пояс владельца (Р-90): --timezone пишет или заменяет одну строку, неизвестный —
+          # отказ без изменений, без ключа строка не появляется.
+          printf 'SHTURMAN_MODE=hermes\nPOSTGRES_PASSWORD=x\n' > .env
+          grep -q -- '--timezone' <<< "$(./ops/init-env.sh --help)"
+          ./ops/init-env.sh --auto > /dev/null
+          if grep -q '^SHTURMAN_TIMEZONE=' .env; then echo "без --timezone строка не пишется"; exit 1; fi
+          grep -q 'записан пояс: Asia/Yekaterinburg' <<< "$(./ops/init-env.sh --auto --timezone Asia/Yekaterinburg)"
+          before="$(sha256sum .env)"
+          grep -q 'без изменений' <<< "$(./ops/init-env.sh --auto --timezone Asia/Yekaterinburg)"
+          [ "$before" = "$(sha256sum .env)" ]
+          ./ops/init-env.sh --auto --timezone=Europe/Astrakhan > /dev/null
+          [ "$(grep -c '^SHTURMAN_TIMEZONE=' .env)" -eq 1 ] && grep -qx 'SHTURMAN_TIMEZONE=Europe/Astrakhan' .env
+          for bad in Mars/Base ../../etc/passwd 'Europe/Moscow; id' ''; do
+            code=0; ./ops/init-env.sh --auto --timezone "$bad" > /dev/null 2>&1 || code=$?
+            [ "$code" -eq 2 ] || { echo "пояс «$bad»: код $code вместо 2"; exit 1; }
+          done
+          grep -qx 'SHTURMAN_TIMEZONE=Europe/Astrakhan' .env
+          test "$(stat -c '%a' .env)" = "600"
           # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
           # профиль и не трогает ни чужой, ни профиль Hermes. Запуск стека здесь подменён.
           printf '#!/bin/sh\nexit 0\n' > ops/up.sh
