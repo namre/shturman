@@ -62,6 +62,7 @@ MODULES = (
     "shturman.outbox.service",
     "shturman.notify.service",     # уведомления владельцу «вам написали», «вас упомянули» (Р-84)
     "shturman.rehearsal.service",  # репетиция ответов на основном аккаунте, без отправки (Р-85)
+    "shturman.triage.service",     # разбор входящих моделью вместо «Вам написали» (Р-92)
     "shturman.replies.service",    # продолжение задач после Telegram-решений владельца
     "shturman.remote_mcp",
     "shturman.setup_page.service",  # последним: страница настройки пользуется остальными модулями

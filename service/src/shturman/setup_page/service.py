@@ -793,7 +793,9 @@ async def page_overview(request: Request) -> JSONResponse:
             "guard_hidden", "guard_released", "guard_unchecked", "embeddings_enabled", "embeddings_model",
             "embeddings_embedded", "embeddings_left", "embeddings_problem", "sending",
             "voice_enabled", "voice_problem", "voice_pending", "voice_done", "voice_failed", "voice_skipped",
-            "media_enabled", "media_pending", "media_asking", "media_done", "media_failed", "media_skipped")
+            "media_enabled", "media_pending", "media_asking", "media_done", "media_failed", "media_skipped",
+            # разбор входящих (Р-92) — строка в карточке «Сейчас»
+            "triage_enabled", "triage_analyzed_24h", "triage_shown_24h", "triage_reminded_24h", "triage_waiting")
     # audit_key — входы, смена ключей и аккаунтов: их не вытеснить из вида потоком мелких действий.
     return JSONResponse({"archive": {k: counts[k] for k in keep if k in counts}, "audit": log,
                          "audit_key": key_log, "now": await _now_state(state)})

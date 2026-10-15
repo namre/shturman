@@ -358,7 +358,18 @@ await page.waitForSelector("#chats-list .ask");
   await page.locator("#chats-list li:has(.ask)").scrollIntoViewIfNeeded();
   await page.locator("#chats-list li:has(.ask)").screenshot({ path: path.join(OUT, "chat-exclude-ask-desktop-light.png") });
 }
-await page.click('#chats-list .ask [data-ask="purge"]');
+// Список чатов может перерисоваться, пока подтверждение открыто (опрос состояния): тогда открыть его снова.
+for (let attempt = 0; attempt < 5; attempt++) {
+  try {
+    await page.click('#chats-list .ask [data-ask="purge"]', { timeout: 4000 });
+    break;
+  } catch {
+    if (!(await page.locator("#chats-list .ask").count())) {
+      await page.locator("#chats-list li button", { hasText: "Не сохранять" }).first().click();
+      await page.waitForSelector("#chats-list .ask");
+    }
+  }
+}
 await page.evaluate(() => { window.__manualAsk = false; });
 await page.waitForFunction(() => document.querySelector("#chats-list").textContent.includes("не сохраняется"));
 check("чаты: исключённый чат помечен, читать его нельзя", await page.locator("#chats-list li.is-excluded .chat-read input").first().isDisabled());
@@ -1387,6 +1398,177 @@ await shot(page, "27-app-done-desktop-light");
     await cardShot(p, `rehearsal-on-${name}`);
     const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     check(`вёрстка (репетиция; ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+    await ctx.close();
+  }
+}
+
+// --- разбор входящих (Р-92) -----------------------------------------------------------------------
+// Блок «Разбор входящих» в карточке «Уведомления»: выключен, что уходит модели и оценка объёма; «Включить
+// разбор…» только присылает карточку в бот, включает нажатие «Да, сделать» в боте; правило «важный» —
+// человек из поиска. Живые сообщения (пульт `POST /triage/live?case=…`, подставная модель отвечает готовым
+// выводом): срочное — карточка сразу, «спасибо» — тишина, вопрос — тишина и напоминание через 2 ч
+// (`POST /triage/remind`), обращение в группе — с сутью ветки. Пересылки «Вам написали» о них нет.
+// Снимки блока в четырёх видах и сообщений бота (макет чата Telegram) — в `E2E_TRIAGE_OUT`.
+{
+  const TR_OUT = process.env.E2E_TRIAGE_OUT || OUT;
+  mkdirSync(TR_OUT, { recursive: true });
+  const seen = async () => control("GET", "/triage/seen");
+  async function waitFor(test, timeout = 20000) {
+    const until = Date.now() + timeout;
+    while (Date.now() < until) { if (await test()) return true; await page.waitForTimeout(200); }
+    return false;
+  }
+  async function blockShot(p, name) {
+    await p.evaluate(() => { const t = document.getElementById("toast"); if (t) t.hidden = true;
+                             document.querySelector(".top").style.position = "static"; });
+    await p.locator("#triage-box").screenshot({ path: path.join(TR_OUT, name + ".png") });
+    await p.evaluate(() => { document.querySelector(".top").style.position = ""; });
+  }
+  // Сообщение бота как в чате Telegram: текст ровно как ушёл в Bot API и кнопки под ним. Только для снимка.
+  async function botShot(messages, name, dark = false) {
+    const ctx = await browser.newContext({ viewport: { width: 460, height: 400 }, deviceScaleFactor: 2, locale: "ru-RU" });
+    const p = await ctx.newPage();
+    const esc = (s) => String(s || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    const body = messages.map((m) => {
+      const rows = (m.buttons || []).map((row) => `<div class="row">${row.map((b) => `<span class="b">${esc(b)}</span>`).join("")}</div>`).join("");
+      return `<div class="msg"><div class="bubble">${esc(m.text)}</div>${rows ? `<div class="kbd">${rows}</div>` : ""}</div>`;
+    }).join("");
+    await p.setContent(`<!doctype html><meta charset="utf-8"><style>
+      body { margin: 0; padding: 14px; font: 15px/1.38 -apple-system, "Segoe UI", Roboto, sans-serif;
+             background: ${dark ? "#0e1621" : "#c8d8e6"}; color: ${dark ? "#f5f5f5" : "#000"}; }
+      .head { font-weight: 600; margin: 0 0 10px; color: ${dark ? "#8cb4d8" : "#2b5278"}; }
+      .msg { max-width: 420px; margin-bottom: 12px; }
+      .bubble { white-space: pre-wrap; overflow-wrap: anywhere; background: ${dark ? "#182533" : "#fff"};
+                border-radius: 12px 12px 12px 4px; padding: 8px 11px; box-shadow: 0 1px 1px rgba(0,0,0,.12); }
+      .kbd .row { display: flex; gap: 4px; margin-top: 4px; }
+      .kbd .b { flex: 1; text-align: center; padding: 8px 6px; border-radius: 8px; font-size: 14px;
+                background: ${dark ? "rgba(46,166,255,.18)" : "rgba(64,120,160,.55)"}; color: #fff; }
+    </style><div class="head">Бот согласований</div>${body}`);
+    await p.locator("body").screenshot({ path: path.join(TR_OUT, name + ".png") });
+    await ctx.close();
+  }
+  async function openNotify(p) {
+    await p.goto(URL_PAGE);
+    await p.waitForSelector("#screen-app:not([hidden])");
+    if (!(await p.evaluate(() => document.getElementById("notify-details").open))) await p.click("#notify-details > summary");
+    await p.waitForFunction(() => document.getElementById("st-triage").textContent !== "", null, { timeout: 10000 });
+  }
+
+  await control("POST", "/triage/seed");
+  await openNotify(page);
+  check("разбор: блок «Разбор входящих» — внутри карточки «Уведомления»", await page.locator("#s-notify #triage-box").count() === 1);
+  check("разбор: по умолчанию выключен", (await page.textContent("#st-triage")) === "выключен", await page.textContent("#st-triage"));
+  const goes = await page.textContent("#tr-goes");
+  check("разбор: сказано, что уходит модели и чего не уходит", goes.includes("провайдеру вашей модели") &&
+        goes.includes("Скрытое защитой"), goes);
+  const estimate = await page.textContent("#tr-estimate");
+  check("разбор: оценка объёма за 7 дней и цена — из счётчиков", await page.isVisible("#tr-estimate") &&
+        estimate.includes("за последние 7 дней") && estimate.includes("$ в месяц"), estimate);
+  await blockShot(page, "triage-off-desktop-light");
+
+  await page.click("#tr-enable");
+  await page.waitForSelector("#tr-pending:not([hidden])");
+  await page.waitForFunction(() => document.getElementById("st-triage").textContent === "ждёт нажатия в боте",
+                             null, { timeout: 10000 }).catch(() => {});
+  check("разбор: «Включить…» со страницы не включает — карточка ждёт нажатия в боте",
+        (await page.textContent("#st-triage")) === "ждёт нажатия в боте" && !((await seen()).settings || {}).enabled);
+  await blockShot(page, "triage-pending-desktop-light");
+  const confirmCard = (await waitSent((m) => (m.text || "").includes("Включить разбор входящих"))).pop();
+  const yes = confirmCard && confirmCard.reply_markup.inline_keyboard.flat().find((b) => b.text === "Да, сделать");
+  check("разбор: в бот пришла карточка подтверждения с «Да, сделать» — что уходит модели, сколько, отправки нет",
+        !!yes && confirmCard.text.includes("Что уходит модели") && confirmCard.text.includes("Отправки нет"),
+        confirmCard ? confirmCard.text : "нет карточки");
+  if (confirmCard) {
+    await botShot([{ text: confirmCard.text, buttons: confirmCard.reply_markup.inline_keyboard.map((r) => r.map((b) => b.text)) }],
+                  "triage-enable-confirm-bot");
+  }
+  if (yes) await control("POST", "/bot/press?data=" + encodeURIComponent(yes.callback_data));
+  check("разбор: нажатие «Да, сделать» в боте включило разбор", await waitFor(async () => ((await seen()).settings || {}).enabled === true));
+  await openNotify(page);
+  check("разбор: на странице — «включён»", (await page.textContent("#st-triage")) === "включён");
+
+  await page.fill("#tr-people-q", "Петров");
+  await page.waitForSelector("#tr-people-found .tr-add button");
+  await page.click("#tr-people-found .tr-add button:has-text('Важный')");
+  await page.click("#triage-save");
+  check("разбор: Петров — важный (по номеру), правило сохранено сразу", await waitFor(async () => {
+    const s = (await seen()).settings; return s && s.important_people.length === 1 && s.important_people[0] === 5301; }),
+        JSON.stringify((await seen()).settings));
+
+  const plainBefore = (await seen()).notified.length;
+  await control("POST", "/triage/live?case=urgent");
+  check("разбор: срочное — карточка сразу", await waitFor(async () => (await seen()).cards.length === 1, 30000));
+  let s = await seen();
+  const urgent = s.cards[0] || { text: "", buttons: [] };
+  check("разбор: карточка — суть, а не пересказ; кнопки «Подготовить ответ», «Напомнить через час», «Не важно», «Не сообщать»",
+        urgent.text.startsWith("🔴 Срочно\nПетров: бетон не пришёл, просит решение до 14:00") &&
+        !urgent.text.includes("машина стоит") &&
+        JSON.stringify(urgent.buttons) === JSON.stringify([["Подготовить ответ"], ["Напомнить через час", "Не важно"],
+                                                           ["Не сообщать об этом чате"]]), urgent.text + " " + JSON.stringify(urgent.buttons));
+  await botShot([urgent], "triage-urgent-card-bot");
+  await botShot([urgent], "triage-urgent-card-bot-dark", true);
+
+  await control("POST", "/triage/live?case=thanks");
+  await control("POST", "/triage/live?case=question");
+  check("разбор: «спасибо» и обычный вопрос — тишина сразу", await waitFor(async () =>
+    (await seen()).items.filter((i) => i.state === "done").length === 3) && (await seen()).cards.length === 1,
+        JSON.stringify((await seen()).items));
+  await control("POST", "/triage/remind");
+  check("разбор: через 2 часа без ответа — напоминание", await waitFor(async () =>
+    (await seen()).cards.some((c) => c.text.startsWith("⏰ Иван Смирнов ждёт ответа 2 ч: просит смету по корпусу 3"))),
+        JSON.stringify((await seen()).cards.map((c) => c.text)));
+  s = await seen();
+  const reminder = s.cards.find((c) => c.text.startsWith("⏰ Иван")) || { text: "" };
+  await botShot([reminder], "triage-reminder-bot");
+
+  await control("POST", "/triage/live?case=group");
+  check("разбор: обращение в группе — с сутью ветки", await waitFor(async () =>
+    (await seen()).cards.some((c) => c.text.startsWith("🟠 Важно\n📣 В «Корпус 3» вас спросили: переносить ли заливку на завтра") &&
+                                     c.text.includes("О чём ветка: поставка бетона задерживается"))),
+        JSON.stringify((await seen()).items.slice(-1)) + " " + JSON.stringify((await seen()).cards.slice(-1)));
+  s = await seen();
+  const groupCard = s.cards.find((c) => c.text.includes("📣 В «Корпус 3»")) || { text: "" };
+  await botShot([groupCard], "triage-group-mention-bot");
+  check("разбор: прежняя пересылка «Вам написали» об этих сообщениях не пришла",
+        s.notified.length === plainBefore, JSON.stringify(s.notified.slice(plainBefore)));
+  check("журнал: запрос включения, включение в боте, правила — без имён и номеров людей",
+        ["triage.enable_request", "triage.enable", "triage.settings"].every((a) => s.audit.some((r) => r.action === a)) &&
+        !["Петров", "5301", "Иван", "бетон"].some((w) => JSON.stringify(s.audit).includes(w)), JSON.stringify(s.audit));
+
+  // Утренняя сводка: раздел «Ждут вашего ответа» строится из инструмента архива list_awaiting_reply. Здесь —
+  // ответ инструмента и та же строка в формате скилла (сводку пишет модель Hermes — на стенде её нет).
+  const mcp = await fetch(BASE.replace("localhost", "127.0.0.1") + "/mcp", { method: "POST",
+    headers: { "Authorization": "Bearer e2e-mcp-token-0123456789abcdef0123456789", "Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_awaiting_reply", arguments: {} } }) });
+  const awaiting = mcp.ok ? ((await mcp.json()).result || {}).structuredContent || {} : {};
+  const items = awaiting.items || [];
+  check("сводка: list_awaiting_reply отдаёт, кто ждёт ответа, без текста сообщений",
+        items.some((i) => i.who === "Иван Смирнов" && i.wants.includes("просит смету по корпусу 3")) &&
+        !JSON.stringify(awaiting).includes("Пришлёте смету"), JSON.stringify(awaiting).slice(0, 400));
+  const hoursOf = (m) => m >= 60 ? Math.floor(m / 60) + " ч" : m + " мин";
+  const strip = (w) => w.replace(/^\[untrusted\]\s*/, "").replace(/\s*\[\/untrusted\]$/, "");
+  const brief = ["Доброе утро. Четверг, 15 октября.", "", "Ждут вашего ответа",
+                 ...items.map((i) => `— ${i.who}${i.kind === "group" ? " в «" + i.chat + "»" : ""} (${hoursOf(i.waiting_minutes)}): ${strip(i.wants)}`)];
+  await botShot([{ text: brief.join("\n") }], "triage-morning-brief-sample");
+
+  await openNotify(page);
+  const stats = await page.textContent("#tr-stats");
+  check("разбор: на странице — за сутки разобрано, показано, ждут ответа", stats.includes("разобрано 4") &&
+        stats.includes("ждут ответа"), stats);
+  await blockShot(page, "triage-on-desktop-light");
+  const views = [["desktop-dark", { ...desktop, colorScheme: "dark" }], ["phone-light", phone],
+                 ["phone-dark", { ...phone, colorScheme: "dark" }],
+                 ["phone360-light", { ...phone, viewport: { width: 360, height: 740 } }]];
+  const stored = await context.storageState();
+  for (const [name, options] of views) {
+    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const p = await ctx.newPage();
+    await openNotify(p);
+    await p.waitForSelector("#tr-people li select");
+    await blockShot(p, `triage-on-${name}`);
+    const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    check(`вёрстка (разбор входящих; ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
     await ctx.close();
   }
 }

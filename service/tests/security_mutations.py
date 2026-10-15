@@ -39,6 +39,8 @@ class Mutation:
 CONTROLS = "tests/replies/test_controls.py::"
 AUTHORITY = "tests/test_authority.py::"
 CODE_LOGIN = "tests/setup_page/test_code_login.py::"
+TRIAGE = "tests/triage/test_triage_core.py::"
+TRIAGE_PAGE = "tests/triage/test_triage_page.py::"
 MUTATIONS = (
     Mutation("background_owner_context", "src/shturman/authority.py",
              "    context.run(_owner.set, None)", "    # mutation: retain inherited owner context",
@@ -192,8 +194,8 @@ MUTATIONS = (
              "tests/rehearsal/test_rehearsal_core.py::test_hidden_by_guard_is_neither_a_trigger_nor_context",
              database=True),
     Mutation("rehearsal_holds_notification", "src/shturman/notify/core.py",
-             "                if hold == \"hold\":\n                    due = max(due, now + rehearsal.NOTIFY_HOLD)",
-             "                if False:\n                    due = max(due, now + rehearsal.NOTIFY_HOLD)",
+             "        if hold == \"hold\":\n            due = max(due, now + rehearsal.NOTIFY_HOLD)",
+             "        if False:\n            due = max(due, now + rehearsal.NOTIFY_HOLD)",
              "tests/rehearsal/test_rehearsal_core.py::test_listed_person_gets_one_card_with_ratings_and_nothing_is_sent",
              database=True),
     # Вход на страницу по коду из бота (Р-88): код действует только в браузере, который его запросил,
@@ -245,6 +247,38 @@ MUTATIONS = (
              "    decision = await check_halt(conn)\n    if not decision.ok:\n        return decision\n    decision = check_switch(rules)",
              "    decision = check_switch(rules)",
              "tests/test_halt.py::test_every_point_where_the_assistant_acts_refuses_while_stopped[send_check]",
+             database=True),
+    # Разбор входящих (Р-92): включает только нажатие в самом боте; скрытое защитой не уходит модели ни
+    # поводом, ни справкой; разбираемое не приходит второй раз пересылкой; ночью будит только «срочно» от
+    # важных — слово «срочно» в чужом тексте прав не даёт.
+    Mutation("triage_enable_only_bot_press", "src/shturman/triage/service.py",
+             "    if principal.source != \"telegram\" or principal.action == \"telegram.miniapp\":\n        raise confirm.Refused(BOT_ONLY_TEXT",
+             "    if False:\n        raise confirm.Refused(BOT_ONLY_TEXT",
+             TRIAGE_PAGE + "test_enabling_is_only_a_press_in_the_bot",
+             database=True),
+    Mutation("triage_page_cannot_enable", "src/shturman/setup_page/triage.py",
+             "    if data.get(\"enabled\") is True:", "    if False:",
+             TRIAGE_PAGE + "test_enabling_is_only_a_press_in_the_bot",
+             database=True),
+    Mutation("triage_hidden_not_read", "src/shturman/triage/core.py",
+             "            if row is None or row[\"chat_id\"] != chat_id or not row[\"agent_visible\"] \\\n",
+             "            if row is None or row[\"chat_id\"] != chat_id \\\n",
+             TRIAGE + "test_what_does_not_go_to_the_model[hidden]",
+             database=True),
+    Mutation("triage_context_hides_guarded", "src/shturman/triage/core.py",
+             "WHERE m.chat_id = $1 AND m.kind = 'message' AND m.deleted_at IS NULL AND m.agent_visible\n",
+             "WHERE m.chat_id = $1 AND m.kind = 'message' AND m.deleted_at IS NULL\n",
+             TRIAGE + "test_hidden_message_is_not_context_either",
+             database=True),
+    Mutation("triage_no_double_forwarding", "src/shturman/notify/core.py",
+             "            if await triage.takes(conn, row):\n                return None",
+             "            if False:\n                return None",
+             TRIAGE + "test_personal_message_is_read_by_the_model_and_plain_forwarding_is_not_sent",
+             database=True),
+    Mutation("triage_night_only_important_urgent", "src/shturman/triage/core.py",
+             "    return urgency == \"urgent\" and level == \"important\"",
+             "    return urgency == \"urgent\"",
+             TRIAGE + "test_night_waits_for_morning_except_urgent_from_important",
              database=True),
     Mutation("bot_only_not_from_app", "src/shturman/confirm.py",
              "    if row[\"kind\"] in BOT_ONLY and principal.action == \"telegram.miniapp\":",

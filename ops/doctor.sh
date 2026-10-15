@@ -1177,6 +1177,21 @@ EOF3
     pass notify "уведомления владельцу: $n_words; за сутки отправлено: ${n_sent:-0}, ждут: ${n_wait:-0} (настройки — на странице настройки переписки)"
   fi
 
+  # Разбор входящих (Р-92): включает только владелец нажатием в боте согласований. Только признаки и числа.
+  t_done="$(num triage_analyzed_24h)"; t_shown="$(num triage_shown_24h)"; t_rem="$(num triage_reminded_24h)"
+  t_wait="$(num triage_waiting)"; t_failed="$(num triage_failed_24h)"
+  case "$st" in
+    *'"triage_enabled":true'*)
+      t_line="разбор входящих включён владельцем; за сутки разобрано: ${t_done:-0}, показано: $(( ${t_shown:-0} + ${t_rem:-0} )), ждут ответа: ${t_wait:-0}"
+      if [ "${t_failed:-0}" -gt 0 ]; then
+        warn triage "$t_line; сбоев модели за сутки: ${t_failed} — эти сообщения пришли обычными уведомлениями; проверьте модель (строка model)"
+      else
+        pass triage "$t_line, сбоев модели нет"
+      fi ;;
+    *'"triage_enabled":false'*)
+      pass triage "разбор входящих выключен — включает владелец: страница настройки переписки, «Уведомления», и нажатие в боте (docs/service.md)" ;;
+  esac
+
   # Повтор того, что не получилось из-за сбоя модели (Р-84): сколько можно вернуть и что вернул прошлый
   # повтор. Повтор запускает владелец (кнопка на странице) или оператор по его решению: shturman retry-failed.
   r_media="$(num retry_media_failed)"; r_req="$(num retry_requests_given_up)"

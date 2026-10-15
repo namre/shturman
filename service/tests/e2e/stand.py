@@ -23,6 +23,10 @@ SHTURMAN_TEST_DSN: база должна быть отдельной тесто�
 решением и фактами, а ждущими решения — страницу о втором человеке, его договорённость, факт о
 владельце и предложенный ассистентом проект.
 
+Для разбора входящих (Р-92) пульт заводит чаты (`POST /triage/seed`), шлёт живые сообщения, на которые
+подставная модель отвечает готовым выводом (`POST /triage/live?case=…`), прогоняет обход «через 2 часа»
+(`POST /triage/remind`) и говорит, что ушло владельцу (`GET /triage/seen`).
+
 Третий порт (порт сервиса + 2) — подставной «дашборд»: пустая страница и service worker на том же
 имени узла, что и страница настройки, но на другом порту. С неё сценарий делает то, что делал бы
 скрипт ассистента на адресе дашборда Hermes: `fetch` к API страницы, чтение `localStorage`,
@@ -662,6 +666,109 @@ async def main() -> None:
                 "FROM rehearsal_items ORDER BY id")],
             "audit": [dict(r) for r in rows]})
 
+    # --- разбор входящих (Р-92) ---
+
+    TRIAGE_CASES = {
+        # случай: (кто пишет, имя, вид чата, текст, ответ подставной модели)
+        "urgent": (5301, "Петров", "personal",
+                   "Евгений Сергеевич, бетон не пришёл, машина стоит у ворот, без вас не решить — ответьте до 14:00",
+                   {"needs_reply": True, "urgency": "urgent", "want": "бетон не пришёл, просит решение до 14:00",
+                    "due": "до 14:00", "thread": ""}),
+        "question": (5302, "Иван Смирнов", "personal", "Добрый день! Пришлёте смету по корпусу 3?",
+                     {"needs_reply": True, "urgency": "normal", "want": "просит смету по корпусу 3", "due": "",
+                      "thread": ""}),
+        "thanks": (5302, "Иван Смирнов", "personal", "Спасибо, получил!",
+                   {"needs_reply": False, "urgency": "normal", "want": "благодарит", "due": "", "thread": ""}),
+        "group": (5303, "Пётр Сидоров", "group", "Евгений, переносим заливку на завтра или ждём бетон?",
+                  {"needs_reply": True, "urgency": "important", "want": "переносить ли заливку на завтра",
+                   "due": "", "thread": "поставка бетона задерживается, бригада ждёт решения о заливке"}),
+    }
+
+    async def triage_live(request):
+        """Живое сообщение для разбора входящих: ?case=urgent|question|thanks|group. Подставная модель
+        отвечает на запрос разбора готовым выводом; ожидание пачки на стенде нулевое."""
+        from shturman import events, store
+        from shturman.records import ChatRecord, MessageRecord
+
+        app = state["app"]
+        app.extras["triage"].wait = 0
+        case = request.query_params["case"]
+        sender, name, kind, text, verdict = TRIAGE_CASES[case]
+        reply = json.dumps(verdict, ensure_ascii=False)
+
+        def for_triage(queue, make):
+            def answer(body):
+                dumped = json.dumps(body, ensure_ascii=False)
+                if text[:25] in dumped and "inbox_triage" in dumped:
+                    return make(body)
+                queue.insert(0, answer)          # не тот запрос — ждём своего
+                return None
+            return answer
+
+        llm.script.append(for_triage(llm.script, lambda body: exec_fakes.FakeLlm.completion(reply, body["model"])))
+        openai.responses_script.append(for_triage(openai.responses_script,
+                                                  lambda body: openai_fakes.completed(reply, body["model"])))
+        async with app.pool.acquire() as c:
+            account = await c.fetchval("SELECT id FROM accounts WHERE role = 'owner' ORDER BY id LIMIT 1")
+            owner_tg = await c.fetchval("SELECT tg_user_id FROM accounts WHERE id = $1", account)
+            if kind == "personal":
+                chat_id, _ = await store.ensure_chat(c, account, ChatRecord("user", sender, "personal_chat", name))
+                entities = []
+            else:
+                chat_id, _ = await store.ensure_chat(c, account, ChatRecord("channel", 5401, "private_supergroup",
+                                                                             "Корпус 3"))
+                entities = [{"type": "mention_name", "offset": 0, "length": 7, "text": "Евгений", "user_id": owner_tg}]
+            number = 300 + int(await c.fetchval("SELECT count(*) FROM messages WHERE chat_id = $1", chat_id))
+            record = MessageRecord(
+                tg_message_id=number, sent_at=datetime.now(timezone.utc), kind="message", sender_class="user",
+                sender_tg_id=sender, sender_name=name, text=text, entities=None, reply_to_tg_id=None,
+                forwarded_from=None, edited_at=None, media_type=None, media_path=None, service_action=None,
+                telegram_entities=entities, is_forwarded=False, telegram_via_bot=False, telegram_sender_bot=False)
+            result = await store.upsert_messages(c, [(chat_id, record, False)], source="session", owner_tg_id=owner_tg)
+            message_id = (result.new_ids or result.known_ids)[0]
+        app.events.publish(events.MESSAGE_LIVE, {"account_id": account, "chat_id": chat_id, "message_id": message_id,
+                                                  "source": "session", "outgoing": False, "edited": False,
+                                                  "via_bot": False})
+        await app.events.drain()
+        return JSONResponse({"ok": True, "message_id": message_id})
+
+    async def triage_seed(request):
+        """Личные чаты «Петров» и «Иван Смирнов» и группа «Корпус 3» у основного аккаунта — без сообщений:
+        чтобы владелец мог найти их в правилах разбора до первого сообщения."""
+        from shturman import store
+        from shturman.records import ChatRecord
+
+        async with state["app"].pool.acquire() as c:
+            account = await c.fetchval("SELECT id FROM accounts WHERE role = 'owner' ORDER BY id LIMIT 1")
+            for sender, name in ((5301, "Петров"), (5302, "Иван Смирнов")):
+                await store.ensure_chat(c, account, ChatRecord("user", sender, "personal_chat", name))
+            await store.ensure_chat(c, account, ChatRecord("channel", 5401, "private_supergroup", "Корпус 3"))
+        return JSONResponse({"ok": True})
+
+    async def triage_remind(request):
+        """Прошло больше двух часов рабочего времени: обход разбора с часами «через 2 ч 1 мин»."""
+        app = state["app"]
+        out = await app.extras["triage"].sweep(datetime.now(timezone.utc) + timedelta(minutes=121))
+        return JSONResponse(out)
+
+    TRIAGE_HEADS = ("🔴", "🟠", "💬 Ждёт", "📣 В ", "⏰")
+
+    async def triage_seen(request):
+        """Карточки разбора, ушедшие владельцу, прежние уведомления, настройки, строки разбора, журнал."""
+        cards = [p for p in telegram.calls("sendMessage") if str(p.get("text", "")).startswith(TRIAGE_HEADS)]
+        rows = await conn.fetch("SELECT action, outcome, detail FROM setup_audit WHERE action LIKE 'triage.%' ORDER BY id")
+        return JSONResponse({
+            "cards": [{"text": p["text"], "buttons": [[b["text"] for b in row] for row in
+                                                      (p.get("reply_markup") or {}).get("inline_keyboard", [])],
+                       "silent": bool(p.get("disable_notification"))} for p in cards],
+            "notified": [p.get("text", "") for p in telegram.calls("sendMessage")
+                         if str(p.get("text", "")).startswith(("💬 Вам написали", "📣 Вас упомянули", "🔔"))],
+            "settings": json.loads(await conn.fetchval("SELECT value::text FROM settings WHERE key = 'triage.settings'")
+                                   or "null"),
+            "items": [dict(r) for r in await conn.fetch(
+                "SELECT kind, state, urgency, needs_reply, show_state, wait_state FROM triage_items ORDER BY id")],
+            "audit": [dict(r) for r in rows]})
+
     async def dashboard_page(request):
         return HTMLResponse(DASHBOARD_PAGE)
 
@@ -683,7 +790,9 @@ async def main() -> None:
         Route("/notify/seed", notify_seed, methods=["POST"]),
         Route("/notify/watch-live", notify_watch_live, methods=["POST"]), Route("/notify/seen", notify_seen),
         Route("/rehearsal/live", rehearsal_live, methods=["POST"]),
-        Route("/rehearsal/press", rehearsal_press, methods=["POST"]), Route("/rehearsal/seen", rehearsal_seen)])
+        Route("/rehearsal/press", rehearsal_press, methods=["POST"]), Route("/rehearsal/seen", rehearsal_seen),
+        Route("/triage/seed", triage_seed, methods=["POST"]), Route("/triage/live", triage_live, methods=["POST"]),
+        Route("/triage/remind", triage_remind, methods=["POST"]), Route("/triage/seen", triage_seen)])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

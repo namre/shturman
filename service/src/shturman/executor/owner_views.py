@@ -144,6 +144,18 @@ def pending_line(total: int, counts: dict[str, int], later: int) -> str:
     return line
 
 
+def triage_line(counts: dict[str, Any]) -> str:
+    """Разбор входящих (Р-92) одной строкой: вкл/выкл и числа за сутки."""
+    if not counts.get("triage_enabled"):
+        return f"Разбор входящих: выкл — включается {words.IN_SETUP_PAGE}, раздел «Уведомления»."
+    shown = int(counts.get("triage_shown_24h") or 0) + int(counts.get("triage_reminded_24h") or 0)
+    line = (f"Разбор входящих: вкл, за сутки: {counts.get('triage_analyzed_24h') or 0} разобрано, {shown} показано, "
+            f"{counts.get('triage_waiting') or 0} ждут ответа.")
+    if counts.get("triage_failed_24h"):
+        line += f" Модель не ответила: {counts['triage_failed_24h']} — они пришли обычными уведомлениями."
+    return line
+
+
 async def status_text(conn: asyncpg.Connection, state: Any) -> str:
     from ..rehearsal import settings as rehearsal_settings
     from ..api_core import overview
@@ -178,6 +190,7 @@ async def status_text(conn: asyncpg.Connection, state: Any) -> str:
     if counts.get("voice_enabled") and counts.get("voice_problem"):
         voice = "включена, но сейчас не работает"
     lines.append(f"Расшифровка голосовых: {voice}.")
+    lines.append(triage_line(counts))
     lines.append("")
     total, by_kind, later = await pending(conn, state)
     lines.append(pending_line(total, by_kind, later))

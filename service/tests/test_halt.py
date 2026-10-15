@@ -137,7 +137,7 @@ async def test_stop_cancels_what_waits_and_keeps_settings(env, own_bot, approval
     await env.conn.execute("INSERT INTO executor_state (key, value) VALUES ('prompt', '{\"kind\": \"reply\"}')")
 
     result = await stop(env)
-    assert result["counts"] == {"questions": 1, "tasks": 0, "drafts": 1, "actions": 1, "rehearsals": 0}
+    assert result["counts"] == {"questions": 1, "tasks": 0, "drafts": 1, "actions": 1, "rehearsals": 0, "triage": 0}
     assert await env.conn.fetchval("SELECT status FROM reply_tasks") == "cancelled"
     assert await env.conn.fetchval("SELECT status FROM outbox_drafts") == "rejected"
     assert await approvals.status(action) == "rejected"
