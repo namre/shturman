@@ -200,6 +200,7 @@ if [ -n "$relay_name" ]; then
 fi
 
 c=shturman-hermes
+# c — имя контейнера Hermes для hpy и проверок ниже: не используйте c как временную переменную.
 # Под тем же пользователем, под которым работает Hermes: файлы, созданные от root, он не прочитает.
 hpy() { docker exec -u "$(id -u):$(id -g)" "$c" /opt/hermes/.venv/bin/python "$@" 2>/dev/null; }
 
@@ -344,11 +345,12 @@ else warn wizard "мастер настройки не завершён"; fi
 tab="$(printf '\t')"
 tz_started="$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$c" 2>/dev/null)" +%s 2>/dev/null || true)"
 tz_state=unknown; tz_want=""; tz_have=""; tz_zone=""; tz_pending=no; tz_jobs=""; tz_listed=no
-while IFS="$tab" read -r k a b c d; do
+# Поля строки — f1…f4: имя c занято контейнером Hermes (hpy и проверки ниже).
+while IFS="$tab" read -r k f1 f2 f3 f4; do
   case "$k" in
-    tz) tz_state="$a"; tz_want="$b"; tz_have="$c"; tz_zone="$d" ;;
-    pending) tz_pending="$a" ;;
-    job) tz_jobs="$tz_jobs$a$tab$b$tab$c$tab$d"$'\n' ;;
+    tz) tz_state="$f1"; tz_want="$f2"; tz_have="$f3"; tz_zone="$f4" ;;
+    pending) tz_pending="$f1" ;;
+    job) tz_jobs="$tz_jobs$f1$tab$f2$tab$f3$tab$f4"$'\n' ;;
     listed) tz_listed=yes ;;
   esac
 done <<EOF_TZ
