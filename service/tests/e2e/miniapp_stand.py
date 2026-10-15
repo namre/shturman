@@ -40,6 +40,15 @@
   POST /spheres/folder-new?role=…            в папке «Работа» появился новый чат
   GET  /spheres/seen                         сферы и число чатов в них, сообщения «Из приложения…», журнал
                                              app.sphere_* и app.bulk_*
+  Пакет 2 (Р-87…Р-89):
+  POST /pack2/seed                           личный чат основного аккаунта (для поиска во вкладке «Репетиция»)
+  POST /pack2/ask                            «Вопрос ассистента» уходит карточкой в бот (после /seed-all); проверка
+                                             «переписка не изменилась» на стенде с этого момента не делается
+  GET  /bot/sent                             что бот прислал владельцу: текст и кнопки (для снимков)
+  POST /bot/press?data=…                     владелец нажал кнопку под сообщением бота
+  POST /bot/reply?text=…[&to=…]             владелец ответил на сообщение бота (ForceReply; по умолчанию — на последнее)
+
+E2E_SETUP_ORIGIN — «внешний адрес» страницы (https): с ним в приложении есть «Открыть настройки в браузере».
 """
 
 from __future__ import annotations
@@ -334,7 +343,8 @@ async def main() -> None:
         dsn=DSN, api_token="e2e-api-token-0123456789abcdef0123456789",
         mcp_token="e2e-mcp-token-0123456789abcdef0123456789", host="127.0.0.1", port=PORT, data_dir=data_dir,
         allowed_hosts=(f"127.0.0.1:{PORT}", f"localhost:{PORT}"), bot_token=TOKEN, timezone="Europe/Moscow",
-        tg_api_id=1234567, tg_api_hash="0123456789abcdef0123456789abcdef")
+        tg_api_id=1234567, tg_api_hash="0123456789abcdef0123456789abcdef",
+        setup_origin=os.environ.get("E2E_SETUP_ORIGIN") or None)
     telegram = exec_fakes.FakeTelegram()
     executor_service.TEST_OVERRIDES.update(bot_transport=telegram.transport(), poll=0, idle=0.2)
     gate = build_app(config, migrate=False)
@@ -369,6 +379,46 @@ async def main() -> None:
 
     async def clear_all(request):
         return JSONResponse(await _clear_all(conn))
+
+    # --- пакет 2 (Р-87…Р-89) ---
+
+    async def pack2_seed(request):
+        chat, _ = await store.ensure_chat(conn, seeded["owner_account"],
+                                          ChatRecord("user", 5101, "personal_chat", "Анна Ким"))
+        return JSONResponse({"chat": chat})
+
+    async def pack2_ask(request):
+        from shturman.replies import workflow
+
+        # Задача стенда синтетическая (автоответ не настроен, отпечаток сообщения — заглушка): проверку
+        # «переписка не изменилась» стенд не проходит. Здесь проверяется путь ответа, а не она
+        # (её проверяют tests/replies) — поэтому на стенде задача считается действующей.
+        async def still_valid(conn_, state_, task_):
+            return True
+        workflow.valid = still_valid
+        task_id = await conn.fetchval("SELECT id FROM reply_tasks WHERE status = 'waiting_owner' ORDER BY id DESC LIMIT 1")
+        task = await workflow.get(conn, task_id)
+        await workflow.notify_waiting(conn, task, "owner", task["owner_question"])
+        return JSONResponse({"task": task_id})
+
+    async def bot_sent(request):
+        return JSONResponse([{"method": name, "text": params.get("text"), "reply_markup": params.get("reply_markup"),
+                              "message_id": params.get("message_id")}
+                             for name, params in telegram.requests
+                             if name in ("sendMessage", "editMessageText", "editMessageReplyMarkup")])
+
+    async def bot_press(request):
+        telegram.press(request.query_params["data"])
+        await asyncio.sleep(0.6)
+        return JSONResponse({"ok": True})
+
+    async def bot_reply(request):
+        telegram.push(message={"message_id": 900, "date": int(time.time()), "from": exec_fakes.OWNER_USER,
+                               "chat": exec_fakes.private(exec_fakes.OWNER_USER), "text": request.query_params["text"],
+                               "reply_to_message": {"message_id": int(request.query_params.get("to")
+                                                                     or telegram.last_message_id())}})
+        await asyncio.sleep(0.6)
+        return JSONResponse({"ok": True})
 
     # --- экран «Чаты» ---
 
@@ -530,6 +580,10 @@ async def main() -> None:
                 "SELECT action, outcome, detail FROM setup_audit WHERE action = 'app.notify' ORDER BY id")]})
 
     control = Starlette(routes=[Route("/notify/seen", notify_seen),
+                                Route("/pack2/seed", pack2_seed, methods=["POST"]),
+                                Route("/pack2/ask", pack2_ask, methods=["POST"]),
+                                Route("/bot/sent", bot_sent), Route("/bot/press", bot_press, methods=["POST"]),
+                                Route("/bot/reply", bot_reply, methods=["POST"]),
                                 Route("/spheres/seed", spheres_seed, methods=["POST"]),
                                 Route("/spheres/folder-new", spheres_folder_new, methods=["POST"]),
                                 Route("/spheres/seen", spheres_seen),

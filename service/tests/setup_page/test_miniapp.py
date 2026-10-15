@@ -283,7 +283,14 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
         (miniapp.APP_API + "/spheres/{sphere_id:int}/folders", ["POST"]),
         (miniapp.APP_API + "/spheres/{sphere_id:int}/proposals", ["POST"]),
         # уведомления (Р-84, tests/setup_page/test_notify_page.py): только сузить и время
-        (miniapp.APP_API + "/notify", ["GET"]), (miniapp.APP_API + "/notify", ["PUT"])])
+        (miniapp.APP_API + "/notify", ["GET"]), (miniapp.APP_API + "/notify", ["PUT"]),
+        # пакет 2 (tests/setup_page/test_pack2_app.py): ответ на вопрос ассистента, «Остановить всё» и
+        # «Продолжить» (только карточкой в бот), вкладка «Репетиция»
+        (miniapp.APP_API + "/approvals/answer", ["POST"]),
+        (miniapp.APP_API + "/halt", ["GET"]), (miniapp.APP_API + "/halt", ["POST"]),
+        (miniapp.APP_API + "/halt/resume", ["POST"]),
+        (miniapp.APP_API + "/rehearsal", ["GET"]), (miniapp.APP_API + "/rehearsal", ["PUT"]),
+        (miniapp.APP_API + "/rehearsal/people", ["GET"])])
     for route in routes:
         if route.path != APP_PATH:
             assert getattr(route.endpoint, "miniapp", False), route.path     # своя обёртка — своя сессия
@@ -633,9 +640,9 @@ def test_audit_knows_every_app_action():
 
     source = (resources.files("shturman.setup_page") / "miniapp.py").read_text(encoding="utf-8")
     used = set(re.findall(r'_log\(request, "([a-z_.]+)"', source))
-    assert used == {"app.login", "app.login_failed", "app.logout", "app.decide",
+    assert used == {"app.login", "app.login_failed", "app.logout", "app.decide", "app.answer",
                     "app.sync_on", "app.sync_off", "app.chat_exclude", "app.chat_include"}
-    assert used <= set(audit.ACTIONS) and {"app.login", "app.decide"} <= audit.IMPORTANT
+    assert used <= set(audit.ACTIONS) and {"app.login", "app.decide", "app.answer"} <= audit.IMPORTANT
     assert {"app.sync_on", "app.sync_off", "app.chat_exclude", "app.chat_include"} <= audit.IMPORTANT
     assert approvals.REF.fullmatch("sh:ob:s:12:" + "a" * 22)
 

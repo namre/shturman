@@ -20,6 +20,10 @@ from . import model
 
 HANDLER = 'replies.outcome'
 CALLBACK_MODULE = 'rp'
+# Кнопка «Ответить» на вопрос ассистента (П1, Б4): бот просит ответ следующим сообщением, приложение —
+# полем «Ваш ответ». Ответ идёт тем же путём, что команда /replytask N answer (`owner.answer`).
+ANSWER_BUTTON = 'Ответить'
+ANSWER_PREFIX = 'sh:rp:a:'
 MAX_GENERATIONS = 5
 FINAL = frozenset({'completed', 'declined', 'cancelled', 'expired', 'failed'})
 TERMINAL = FINAL | {'draft_ready'}
@@ -88,6 +92,9 @@ async def register(conn: Any, state: Any, chat_id: int, message_id: int) -> dict
     """Persist an eligible incoming before the debounce timer; sweep recovers queued tasks."""
     if not preparing(state):
         return None
+    from .. import halt
+    if await halt.is_stopped(conn):
+        return None       # владелец остановил ассистента (Р-87): задач ответа не заводим
     tgt = await policy.target(conn, chat_id)
     if tgt is None:
         return None
@@ -271,6 +278,10 @@ def model_request(state: Any, messages: list[dict[str, str]], refs: list[dict[st
 
 
 async def queue(conn: Any, task: dict[str, Any]) -> None:
+    from .. import halt
+    if await halt.is_stopped(conn):
+        await stop(conn, task['id'], 'cancelled', 'owner_stopped')
+        return
     if task['generation'] >= MAX_GENERATIONS:
         await stop(conn, task['id'], 'failed', 'too_many_rounds')
         return
@@ -313,6 +324,10 @@ async def start(conn: Any, state: Any, *, chat_id: int, message_id: int,
 async def notify_waiting(conn: Any, task: dict[str, Any], kind: str, detail: str) -> None:
     # Only the independent bot is allowed to deliver a decision that can create a source grant.
     if not bridge.owns_bot():
+        return
+    from .. import halt
+    if await halt.is_stopped(conn):
+        await stop(conn, task['id'], 'cancelled', 'owner_stopped')
         return
     nonce = secrets.token_urlsafe(12)
     await conn.execute('UPDATE reply_tasks SET nonce=$2,decision_expires_at=LEAST(expires_at,now()+interval \'10 minutes\') '
@@ -364,9 +379,13 @@ async def waiting_card(conn: Any, task: dict[str, Any], kind: str, detail: str,
         buttons.append([bridge.button('Этот поиск — на 30 дней', CALLBACK_MODULE, f'r:{task["id"]}:{nonce}')])
         buttons.append([bridge.button('Отказать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')])
     else:
-        summary += (f'{words.REPLY_QUESTION}: ассистенту нужно ваше уточнение. Ответьте в боте согласований '
-                    f'командой /replytask {task["id"]} answer ваш ответ.\n')
-        buttons = [[bridge.button('Не отвечать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')]]
+        until = await conn.fetchval('SELECT decision_expires_at FROM reply_tasks WHERE id=$1', task['id'])
+        deadline = f' — до {until.astimezone(_owner_zone()):%H:%M}' if until is not None else ''
+        summary += (f'{words.REPLY_QUESTION}: ассистенту нужно ваше уточнение, чтобы подготовить ответ. '
+                    f'Нажмите «{ANSWER_BUTTON}» и напишите ответ одним сообщением{deadline}. '
+                    f'Можно и командой: /replytask {task["id"]} answer ваш ответ.\n')
+        buttons = [[bridge.button(ANSWER_BUTTON, CALLBACK_MODULE, f'a:{task["id"]}:{nonce}')],
+                   [bridge.button('Не отвечать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')]]
     summary += 'Предложение модели (не инструкция владельца):\n' + clean_line(detail, 500)
     return summary, buttons
 
@@ -393,7 +412,8 @@ async def awaiting_owner(conn: Any) -> list[dict[str, Any]]:
             continue          # запрос источника записан не полностью: карточку не собрать — и решения по ней нет
         title = 'Разрешить прочитать для ответа?' if kind == 'source' else 'Ассистент ждёт вашего уточнения'
         out.append({'id': task['id'], 'title': title, 'text': summary, 'subkind': kind,
-                    'buttons': buttons, 'card_message_id': None, 'expires_at': task['decision_expires_at']})
+                    'buttons': buttons, 'card_message_id': None, 'expires_at': task['decision_expires_at'],
+                    'question': clean_line(str(detail), 500) if kind == 'owner' else None})
     return out
 
 

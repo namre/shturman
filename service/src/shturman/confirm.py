@@ -134,9 +134,18 @@ def required() -> bool:
 CARD_WARNING = ("Запрос пришёл не из этого бота — от ассистента, из его настроек или с сервера. "
                 "Если вы этого не просили — нажмите «Нет».")
 
+# Действия, которые подтверждают только нажатием в самом боте согласований, но не в приложении
+# «Штурман»: войти в приложение может и держатель токена бота (Р-80), а нажатие в боте подделать
+# нельзя. Это ослабления, которые владелец просит сам: «Продолжить» после остановки (Р-87) и вход
+# на страницу по коду при боте, созданном через посредника (Р-88).
+BOT_ONLY = frozenset({"halt.resume", "setup.code_login"})
+BOT_ONLY_NOTE = "Подтвердить можно только кнопкой под этой карточкой в боте согласований — не в приложении."
+BOT_ONLY_CARD = ("Вы попросили об этом сами — в «Настройках Штурмана» или в приложении «Штурман». "
+                 "Если не просили — нажмите «Нет».")
 
-def _card(summary: str) -> str:
-    return "Подтвердите действие\n\n" + summary.strip() + "\n\n" + CARD_WARNING
+
+def _card(summary: str, kind: str | None = None) -> str:
+    return "Подтвердите действие\n\n" + summary.strip() + "\n\n" + (BOT_ONLY_CARD if kind in BOT_ONLY else CARD_WARNING)
 
 
 def _done(value: "str | Done | None") -> Done:
@@ -230,6 +239,26 @@ async def request(conn: asyncpg.Connection, kind: str, summary: str, payload: di
         raise KeyError(f"нет обработчика для действия {kind}")
     if authority.is_owner():
         return await apply_owner(conn, kind, payload)
+    # Владелец остановил ассистента (Р-87): новые просьбы подтвердить действие от ассистента и
+    # внутреннего API отклоняются сразу, с причиной. Решения самого владельца (выше) — как раньше.
+    from . import halt
+    if await halt.is_stopped(conn):
+        raise Refused(halt.STOPPED_TEXT, halt.STATUS, halt.CODE)
+    return await _enqueue(conn, kind, summary, payload)
+
+
+async def request_card(conn: asyncpg.Connection, kind: str, summary: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Всегда карточка в боте — даже когда просит сам владелец со страницы или из приложения.
+
+    Для ослаблений, которые по решению владельца требуют нажатия именно в боте согласований
+    (`BOT_ONLY`: «Продолжить» после остановки, вход по коду при боте от посредника). Само по себе
+    ничего не применяет."""
+    if kind not in _appliers:
+        raise KeyError(f"нет обработчика для действия {kind}")
+    return await _enqueue(conn, kind, summary, payload)
+
+
+async def _enqueue(conn: asyncpg.Connection, kind: str, summary: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not bridge.owns_bot():
         raise NoOwner()
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -266,7 +295,7 @@ async def request(conn: asyncpg.Connection, kind: str, summary: str, payload: di
             kind, summary, body, nonce, float(TTL),
         )
         await bridge.notify_owner(
-            conn, _card(summary), buttons=_card_buttons(row["id"], nonce),
+            conn, _card(summary, kind), buttons=_card_buttons(row["id"], nonce),
             handler=CARD_HANDLER, context={"action_id": row["id"]},
         )
     return _waiting(row, duplicate=False)
@@ -282,13 +311,15 @@ async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
     (`setup_page/approvals.py`): тот же текст карточки и те же кнопки с той же случайной меткой.
     Решение приходит обратно данными кнопки в `_pressed` — тем же путём, что нажатие в боте."""
     rows = await conn.fetch(
-        """SELECT id, summary, nonce, card_message_id, expires_at FROM pending_actions
+        """SELECT id, kind, summary, nonce, card_message_id, expires_at FROM pending_actions
            WHERE status = 'pending' AND expires_at > now() ORDER BY id""")
     # В приложении заголовок «Подтверждение действия» уже есть, поэтому текст — само описание, а
-    # предупреждение — отдельной строкой ниже (в боте это одна карточка `_card`).
-    return [{"id": r["id"], "title": f"Действие № {r['id']}", "text": r["summary"].strip(), "note": CARD_WARNING,
-             "buttons": _card_buttons(r["id"], r["nonce"]), "card_message_id": r["card_message_id"],
-             "expires_at": r["expires_at"]} for r in rows]
+    # предупреждение — отдельной строкой ниже (в боте это одна карточка `_card`). Действия `BOT_ONLY`
+    # видны без кнопок: подтверждают их только в самом боте.
+    return [{"id": r["id"], "title": f"Действие № {r['id']}", "text": r["summary"].strip(),
+             "note": BOT_ONLY_NOTE if r["kind"] in BOT_ONLY else CARD_WARNING,
+             "buttons": [] if r["kind"] in BOT_ONLY else _card_buttons(r["id"], r["nonce"]),
+             "card_message_id": r["card_message_id"], "expires_at": r["expires_at"]} for r in rows]
 
 
 @bridge.on_result(CARD_HANDLER)
@@ -328,6 +359,8 @@ async def _pressed(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[st
     if choice == "n":
         await conn.execute("UPDATE pending_actions SET status = 'rejected', decided_at = now() WHERE id = $1", row["id"])
         return {"answer": "Отклонено.", "edit_text": "Отклонено:\n" + row["summary"], "remove_buttons": True}
+    if row["kind"] in BOT_ONLY and principal.action == "telegram.miniapp":
+        return {"answer": "Подтвердить можно только в боте согласований.", "edit_text": None, "remove_buttons": False}
     fn = _appliers.get(row["kind"])
     payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
     token = _from_card.set(True)

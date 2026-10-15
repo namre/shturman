@@ -1283,17 +1283,22 @@ await shot(page, "27-app-done-desktop-light");
         !after.notified.slice(notifiedBefore).some((t) => t.includes("Завтра в 10")), JSON.stringify(after.notified));
 
   await control("POST", "/rehearsal/press?rating=almost");
-  check("репетиция: оценка «Почти» сохранена и отмечена на кнопке", await waitFor(async () => {
+  check("репетиция: оценка «Почти» сохранена и отмечена на кнопке; ниже — «Не писать свой вариант»", await waitFor(async () => {
     const s = await seen();
-    return s.items.some((i) => i.rating === "almost") &&
-           s.marked.some((m) => JSON.stringify(m) === JSON.stringify(["Годится", "✓ Почти — поправил бы", "Не годится"]));
+    return s.items.some((i) => i.rating === "almost") && s.marked.some((m) => JSON.stringify(m) ===
+      JSON.stringify(["Годится", "✓ Почти — поправил бы", "Не годится", "Не писать свой вариант"]));
   }), JSON.stringify((await seen()).marked));
+  // Р-89: после «Почти» бот просит свой вариант (поле ответа); ответ на эту просьбу сохраняется у карточки
+  check("репетиция: бот просит «Напишите, как ответили бы вы» с полем ответа", await waitFor(async () =>
+    (await control("GET", "/bot/sent")).some((m) => (m.text || "").includes("как ответили бы вы") && m.reply_markup && m.reply_markup.force_reply)));
+  await control("POST", "/bot/reply?text=" + encodeURIComponent("Доброе утро! Да, буду в 10, смету привезу."));
+  check("репетиция: свой вариант сохранён у карточки", await waitFor(async () => (await seen()).items.some((i) => i.variant)));
   const final = await seen();
   check("репетиция: собеседнику ничего — ни сообщения бота, ни черновика, ни задачи ответа",
         final.business_sent === 0 && final.drafts === 0 && final.tasks === 0, JSON.stringify(final));
   check("журнал: репетиция и оценка записаны — без имён, номеров людей и текста",
         final.audit.some((r) => r.action === "rehearsal.settings") && final.audit.some((r) => r.action === "rehearsal.rate") &&
-        !["Анна", "5101", "Завтра", "смету"].some((w) => JSON.stringify(final.audit).includes(w)), JSON.stringify(final.audit));
+        !["Анна", "5101", "Завтра", "смету", "привезу"].some((w) => JSON.stringify(final.audit).includes(w)), JSON.stringify(final.audit));
 
   await page.goto(URL_PAGE);
   await page.waitForSelector("#screen-app:not([hidden])");
@@ -1458,20 +1463,88 @@ check("выход стирает ключ из хранилища страниц
 check("выход: сессия закрыта на сервере — прежний ключ больше не действует",
       (await page.request.get(API + "/state", { headers: { "X-Shturman-Session": KEY } })).status() === 401);
 check("бот согласований настроен и владелец привязан — предлагается вход по коду", await page.isVisible("#login-code-send"));
+check("вход по коду: кнопка «Получить код в боте»", (await page.textContent("#login-code-send")).includes("Получить код в боте"));
 await shot(page, "12-login-code-offer-desktop-light");
 await page.click("#login-code-send");
 await page.waitForSelector("#login-code:not([hidden])");
-await page.fill("#login-code-input", "00000000");
+{
+  // Р-88: код привязан к браузеру cookie попытки — её не видит скрипт страницы, она уходит только на маршруты кода.
+  const attempt = (await page.context().cookies()).find((c) => c.name === "__Secure-shturman-code");
+  check("вход по коду: cookie попытки — HttpOnly, Secure, SameSite=Strict, только путь маршрутов кода",
+        !!attempt && attempt.httpOnly && attempt.secure && attempt.sameSite === "Strict" &&
+        attempt.path === "/shturman-setup/api/login/code", JSON.stringify(attempt || {}));
+  check("вход по коду: скрипт страницы cookie попытки не видит", !(await page.evaluate(() => document.cookie)).includes("shturman-code"));
+}
+await page.fill("#login-code-input", "000000");
 await page.click("#login-code-submit");
 await page.waitForSelector("#login-code-error:not([hidden])");
 check("вход по коду: неверный код не пускает", (await page.textContent("#login-code-error")).includes("не подошёл"));
 await shot(page, "13-login-code-desktop-light");
 const { code } = await control("GET", "/last-code");
-await page.fill("#login-code-input", code);
+check("вход по коду: в боте — 6 цифр", /^\d{6}$/.test(code || ""), code);
+{
+  // Тот же код в другом браузере (без cookie попытки) не действует и попытку владельца не тратит.
+  const ctx = await browser.newContext(desktop);
+  const other = await ctx.newPage();
+  await other.goto(URL_PAGE);
+  const got = await other.evaluate(async ([api, c]) => {
+    const r = await fetch(api + "/login/code", { method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Shturman-Setup": "1" }, body: JSON.stringify({ code: c }) });
+    return r.json();
+  }, [API, code]);
+  check("вход по коду: в другом браузере тот же код не действует", got.code === "none", JSON.stringify(got));
+  await ctx.close();
+}
+await page.fill("#login-code-input", code.slice(0, 3) + " " + code.slice(3));
 await page.click("#login-code-submit");
 await page.waitForSelector("#screen-app:not([hidden])");
 const KEY2 = await storedKey();
 check("вход по коду: код из бота пускает, ключ сессии новый", !!KEY2 && KEY2 !== KEY);
+check("вход по коду: после входа cookie попытки стёрта",
+      !(await page.context().cookies()).some((c) => c.name === "__Secure-shturman-code"));
+{
+  const sent = await control("GET", "/bot/sent");
+  const msg = sent.filter((m) => (m.text || "").includes("Код входа")).pop();
+  const labels = msg ? msg.reply_markup.inline_keyboard.flat().map((b) => b.text) : [];
+  check("сообщение с кодом: предупреждение и кнопки «Это не я», «Выйти на всех устройствах»",
+        !!msg && msg.text.includes("Никому не сообщайте код, даже ассистенту") &&
+        labels.includes("Это не я") && labels.includes("Выйти на всех устройствах"), msg ? msg.text : "нет сообщения");
+}
+
+// --- «Остановить всё» (Р-87): сразу; «Продолжить» — только нажатием в боте ------------------------
+async function waitSent(pred) {
+  // сообщения бота уходят очередью заданий — ждём нужное до 8 секунд
+  for (let i = 0; i < 40; i++) {
+    const found = (await control("GET", "/bot/sent")).filter(pred);
+    if (found.length) return found;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return [];
+}
+check("в шапке — кнопка «Остановить всё»", await page.isVisible("#halt-stop"));
+await page.click("#halt-stop");
+await page.waitForSelector("#halt-banner:not([hidden])");
+check("остановлено сразу: полоса «Остановлено …», кнопки «Остановить всё» больше нет",
+      (await page.textContent("#halt-banner")).includes("Остановлено") && !(await page.isVisible("#halt-stop")));
+await shot(page, "16-halt-banner-desktop-light", false);
+{
+  check("после остановки владельцу в бот — что остановлено и как продолжить",
+        (await waitSent((m) => (m.text || "").startsWith("⏸ Ассистент остановлен"))).length > 0);
+}
+await page.click("#halt-resume");
+await page.waitForFunction(() => (document.querySelector("#halt-note").textContent || "").includes("ждёт в боте"));
+check("«Продолжить…» со страницы остановку не снимает — ждёт нажатия в боте", await page.isVisible("#halt-banner"));
+await shot(page, "17-halt-resume-pending-desktop-light", false);
+{
+  const card = (await waitSent((m) => (m.text || "").includes("Продолжить работу ассистента"))).pop();
+  const yes = card && card.reply_markup.inline_keyboard.flat().find((b) => b.text === "Да, сделать");
+  check("в бот пришла карточка «Продолжить» с кнопкой «Да, сделать»", !!yes);
+  if (yes) await control("POST", "/bot/press?data=" + encodeURIComponent(yes.callback_data));
+  await page.reload();
+  await page.waitForSelector("#screen-app:not([hidden])");
+  await page.waitForTimeout(500);
+  check("нажатие в боте сняло остановку", !(await page.isVisible("#halt-banner")) && await page.isVisible("#halt-stop"));
+}
 
 // --- «выйти везде» командой ---------------------------------------------------------------------
 check("команда setup-logout-all завершает сессии", /Завершено сессий страницы настройки: [1-9]/.test(cli("setup-logout-all")));

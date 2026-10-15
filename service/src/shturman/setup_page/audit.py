@@ -34,10 +34,13 @@ DETAIL_LIMIT = 300
 # с незнакомым видом не делается (тест проверяет, что все виды из маршрутов здесь есть).
 ACTIONS = {
     "login.link": "Вход по ссылке",
-    "login.code": "Вход по коду от бота",
-    "login.code_sent": "Код входа отправлен в бота",
+    "login.code": "Вход по коду из бота",
+    "login.code_sent": "Запрошен код входа",
     "login.failed": "Неудачная попытка входа",
     "login.code_locked": "Вход по коду закрыт после неверных попыток",
+    # Вход по коду из бота (code_login.py, Р-88): «Это не я» и включение и выключение. Ни кодов, ни адресов.
+    "login.code_denied": "«Это не я» под кодом входа: ждущие коды погашены",
+    "login.code_setting": "Изменён вход по коду из бота",
     "logout": "Выход",
     "logout.all": "Выход на всех устройствах",
     "setup.scenario": "Выбран способ подключения",
@@ -131,6 +134,17 @@ ACTIONS = {
     # номеров людей, ни текста сообщения и предложенного ответа.
     "rehearsal.settings": "Изменена репетиция ответов",
     "rehearsal.rate": "Оценка ответа в репетиции",
+    # Свой вариант владельца после «Почти» (Р-89): номер карточки и число знаков, без текста.
+    "rehearsal.variant": "Записан ваш вариант ответа в репетиции",
+    # «Остановить всё» и «Продолжить» (halt.py, Р-87): откуда и что отменено — числами.
+    "halt.stop": "Ассистент остановлен",
+    "halt.stop_again": "Повторная остановка ассистента",
+    "halt.resume_request": "Запрошено «Продолжить» — ждёт нажатия в боте",
+    "halt.resume": "Ассистент продолжил работу — подтверждено в боте",
+    # Ответ на вопрос ассистента из приложения (П1): номер задачи и число знаков, без текста.
+    "app.answer": "Из приложения в Telegram: ответ на вопрос ассистента",
+    # «Не сообщать об этом чате» под уведомлением в боте (Р-89): номер чата.
+    "notify.mute": "Не сообщать об этом чате (кнопка в боте)",
 }
 
 
@@ -139,13 +153,17 @@ ACTIONS = {
 # не входят намеренно: их может слать посторонний, и они не должны вытеснять остальное.
 IMPORTANT = frozenset({
     "login.link", "login.code", "logout.all", "setup.scenario", "setup.media",
+    # вход по коду: кто сказал «Это не я» и кто включал и выключал вход по коду — из вида не убрать
+    "login.code_denied", "login.code_setting",
+    # остановка ассистента и её снятие — главный выключатель владельца
+    "halt.stop", "halt.stop_again", "halt.resume_request", "halt.resume",
     "bot.token", "bot.token_removed", "bot.bind_link", "bot.managed_start", "bot.bind_refused",
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
     # заметки владельца ассистент читает как его собственные слова: их правку не вытеснить из вида
     "memory.owner_block", "memory.profile_block", "memory.owner_fact_accept",
     # вход в приложение и решения в нём — то же, что вход на страницу и нажатие в боте
-    "app.login", "app.decide",
+    "app.login", "app.decide", "app.answer",
     # выбор чатов из приложения: войти в него может и держатель токена бота согласований (Р-80) —
     # потоком мелких действий эти записи из вида не убрать
     "app.sync_on", "app.sync_off", "app.chat_exclude", "app.chat_include", "app.bulk_off", "app.bulk_on",
@@ -181,6 +199,15 @@ async def write(pool: asyncpg.Pool, action: str, outcome: str = OK, detail: str 
                                action, outcome, detail[:DETAIL_LIMIT])
     except Exception as exc:  # noqa: BLE001
         logger.error("журнал страницы настройки: запись не сделана (%s)", type(exc).__name__)
+
+
+async def write_conn(conn: asyncpg.Connection, action: str, outcome: str = OK, detail: str = "") -> None:
+    """То же, что `write`, но тем соединением, что уже есть, — в его транзакции (нажатия в боте:
+    запись появляется вместе с самим действием или не появляется вовсе)."""
+    if action not in ACTIONS:
+        raise KeyError(f"неизвестный вид действия для журнала: {action}")
+    await conn.execute("INSERT INTO setup_audit (action, outcome, detail) VALUES ($1, $2, $3)",
+                       action, outcome, detail[:DETAIL_LIMIT])
 
 
 # Коды причин в подробностях — словами (С5, Р-86). В базе код остаётся как есть (по нему ищет тот,

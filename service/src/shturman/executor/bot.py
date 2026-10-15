@@ -38,7 +38,7 @@ from ..api_core import BadRequest
 from ..app import AppState
 from ..sanitize import clean_line
 from ..outbox.text import split_text
-from . import binding, menu_button, owner_chat
+from . import binding, menu_button, owner_chat, prompts
 from .botapi import BotApi, BotApiError, NeverLeft, OutcomeUnknown, Refused
 
 logger = logging.getLogger("shturman.executor.bot")
@@ -282,6 +282,21 @@ class Bot:
                 await self._say(chat_id, result.get("text", "Готово."), buttons=result.get("buttons"))
                 self.wake()
             return
+        if text.strip():
+            # Ответ на просьбу «напишите следующим сообщением» (prompts.py): вопрос ассистента или свой
+            # вариант у репетиции. Только текст владельца в его личном чате — это проверено выше.
+            replied = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
+            async with self.state.pool.acquire() as conn:
+                prompt = await prompts.take(conn, reply_to=_id(replied.get("message_id")) if replied else None)
+                result = None
+                if prompt is not None:
+                    result = await owner_chat.handle_prompt(conn, self.state, prompt, text, bot_id=self.bot_id,
+                                                            user_id=user_id, chat_id=chat_id)
+            if result is not None:
+                self._hint_at = self._clock()
+                await self._say(chat_id, result.get("text", "Готово."), buttons=result.get("buttons"))
+                self.wake()
+                return
         now = self._clock()
         if self._hint_at is not None and now - self._hint_at < HINT_EVERY:
             return
@@ -336,6 +351,18 @@ class Bot:
                         buttons=owner_chat.menu_buttons(self.state))
         await self.sync_menu()        # кнопка «Штурман» — новому владельцу, прежнему — обычная
         self.wake()                   # карточки, ждавшие владельца, можно отправлять
+
+    async def _ask(self, chat_id: int, prompt: dict[str, Any]) -> None:
+        """Просьба написать текст следующим сообщением (ForceReply) — и запомнить её (prompts.py)."""
+        try:
+            message_id = await self.api.send_message(
+                chat_id, bridge.fit_message(prompt["text"]), no_preview=True,
+                force_reply=str(prompt.get("placeholder") or "Ваш ответ"))
+        except BotApiError as exc:
+            logger.warning("бот согласований: просьба написать ответ не отправлена (%s)", exc)
+            return
+        async with self.state.pool.acquire() as conn:
+            await prompts.remember(conn, prompt, message_id)
 
     async def _say(self, chat_id: int, text: str, *, buttons: Any = None) -> None:
         try:
@@ -394,6 +421,9 @@ class Bot:
         if isinstance(reply, dict) and isinstance(reply.get("text"), str):
             # Ответ на кнопку меню (owner_chat.on_menu): новым сообщением в этот же личный чат владельца.
             await self._say(chat_id, reply["text"], buttons=reply.get("buttons"))
+        prompt = out.get("prompt")
+        if isinstance(prompt, dict) and isinstance(prompt.get("text"), str):
+            await self._ask(chat_id, prompt)
         new_text, remove = out.get("edit_text"), bool(out.get("remove_buttons"))
         try:
             if isinstance(new_text, str) and new_text.strip():

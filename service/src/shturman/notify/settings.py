@@ -34,6 +34,7 @@ DIGEST_MINUTES = (15, 30, 60)
 GAP_RANGE = (1, 240)            # «сразу»: не чаще раза на чат за N минут
 MAX_PEOPLE = 200
 MAX_SPHERES = 50
+MAX_MUTED = 500
 _TIME = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 DEFAULTS: dict[str, Any] = {
@@ -49,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "quiet": True,
     "quiet_from": "23:00",
     "quiet_to": "08:00",
+    "muted_chats": [],          # чаты, о которых не сообщать (номера chats.id): «Не сообщать об этом чате»
 }
 FIELDS = frozenset(DEFAULTS)
 # Время и частота: не расширение и не сужение (см. шапку).
@@ -78,6 +80,8 @@ def validate(data: Mapping[str, Any]) -> dict[str, Any]:
             value = _ids(value, key, MAX_PEOPLE)
         elif key == "spheres":
             value = _ids(value, key, MAX_SPHERES)
+        elif key == "muted_chats":
+            value = _ids(value, key, MAX_MUTED)
         elif key in ("groups", "preview", "quiet"):
             if not isinstance(value, bool):
                 raise ValueError(f"поле {key}: true или false")
@@ -155,6 +159,8 @@ def widening(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[str]:
         out.append("aliases")
     if after["preview"] and not before["preview"]:
         out.append("preview")
+    if set(before["muted_chats"]) - set(after["muted_chats"]):
+        out.append("muted")          # вернуть чат в уведомления — расширение
     return out
 
 
@@ -186,6 +192,8 @@ def describe(s: Mapping[str, Any], *, sphere_titles: Mapping[int, str] | None = 
     lines.append("• как присылать: " + (f"сразу, не чаще раза на чат за {s['gap_minutes']} мин"
                                          if s["mode"] == "instant" else f"пачкой раз в {s['digest_minutes']} мин"))
     lines.append("• тихие часы: " + (f"{s['quiet_from']}–{s['quiet_to']}" if s["quiet"] else "нет"))
+    if s["muted_chats"]:
+        lines.append(f"• не сообщать о чатах: {len(s['muted_chats'])}")
     return lines
 
 
@@ -200,4 +208,6 @@ def audit_detail(s: Mapping[str, Any]) -> str:
               f"текст: {'да' if s['preview'] else 'нет'}",
               f"{s['mode']} {s['gap_minutes'] if s['mode'] == 'instant' else s['digest_minutes']} мин",
               f"тихие: {s['quiet_from']}–{s['quiet_to']}" if s["quiet"] else "тихие: нет"]
+    if s["muted_chats"]:
+        parts.append(f"без уведомлений чатов: {len(s['muted_chats'])}")
     return "; ".join(parts)

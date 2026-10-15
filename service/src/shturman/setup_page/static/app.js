@@ -22,6 +22,11 @@
  * из Telegram». Загрузка идёт в фоне (Р-81): экран показывает её ход, а если Telegram велит
  * подождать — отсчёт; потом загрузка продолжится сама, с того же места.
  *
+ * Пакет 2 ревизии удобства: ответ на «Вопрос ассистента» полем «Ваш ответ» (П1), «Остановить всё» и
+ * «Продолжить…» (Р-87: остановка сразу, продолжение — только нажатием в боте), кнопка «Открыть
+ * настройки в браузере» (П4: web_app_open_link, адрес «Настроек Штурмана» отдаёт сервер) и вкладка
+ * «Репетиция» (Р-89: включить, люди, последние карточки и оценки за 7 дней).
+ *
  * Всё, что приходит с сервера, выводится только через textContent: в карточках и названиях чатов
  * чужой текст.
  */
@@ -41,7 +46,10 @@
   var listTimer = null;
   var listShown = false;                         // список уже был на экране хотя бы раз
   var signedIn = false;                          // на экране — разделы, а не вход или его неудача
-  var tab = "approvals";                         // открытый раздел: approvals | chats | spheres | notify
+  var tab = "approvals";                         // открытый раздел: approvals | chats | spheres | rehearsal | notify
+  var TABS = ["approvals", "chats", "spheres", "rehearsal", "notify"];
+  var halt = { stopped: false };                 // «Остановить всё»: из списка согласований (и GET halt)
+  var setupUrl = null;                           // адрес «Настроек Штурмана» — для кнопки «Открыть настройки в браузере»
 
   function $(id) { return document.getElementById(id); }
   function show(id, on) { $(id).hidden = !on; }
@@ -197,22 +205,22 @@
       show(id, id === name);
     });
     show("tabs", signedIn);
-    show("screen-approvals", signedIn && tab === "approvals");
-    show("screen-chats", signedIn && tab === "chats");
-    show("screen-spheres", signedIn && tab === "spheres");
-    show("screen-notify", signedIn && tab === "notify");
+    TABS.forEach(function (one) { show("screen-" + one, signedIn && tab === one); });
     show("refresh", signedIn && tab === "approvals");
+    show("halt-stop", signedIn && !halt.stopped);
+    show("halt-banner", signedIn && halt.stopped);
   }
 
   function openTab(name) {
-    tab = name === "chats" || name === "spheres" || name === "notify" ? name : "approvals";
+    tab = TABS.indexOf(name) >= 0 ? name : "approvals";
     try { sessionStorage.setItem(TAB_NAME, tab); } catch (e) { /* не страшно */ }
-    ["approvals", "chats", "spheres", "notify"].forEach(function (one) {
+    TABS.forEach(function (one) {
       $("tab-" + one).setAttribute("aria-selected", one === tab ? "true" : "false");
     });
     if (signedIn) screen("main");
     if (tab === "chats") { chatsOpened(); schedulePoll(); }
     if (tab === "spheres" && signedIn) loadSpheres(false);
+    if (tab === "rehearsal" && signedIn) loadRehearsal(false);
     if (tab === "notify" && signedIn) loadNotify(false);
   }
 
@@ -314,6 +322,7 @@
     if (item.note) node.appendChild(el("div", "note", item.note));
     var until = deadline(item.expires_at);
     if (until) node.appendChild(el("div", "note", "Ждёт решения до " + until + "."));
+    if (item.answer) node.appendChild(answerBox(item));
     var actions = el("div", "actions");
     (item.actions || []).forEach(function (action) {
       var button = el("button", action.primary ? "primary" : "secondary", action.label);
@@ -325,7 +334,69 @@
     return node;
   }
 
+  // Сколько осталось до срока — словами: «осталось 12 мин», «осталось меньше минуты».
+  function leftWords(value) {
+    var at = new Date(value).getTime();
+    if (!value || isNaN(at)) return "";
+    var minutes = Math.floor((at - Date.now()) / 60000);
+    if (minutes < 0) return "Срок вышел — ассистент, скорее всего, уже не ждёт ответа.";
+    if (minutes < 1) return "Осталось меньше минуты.";
+    if (minutes < 60) return "Осталось " + minutes + " мин.";
+    var hours = Math.floor(minutes / 60);
+    return "Осталось " + hours + " ч " + (minutes % 60) + " мин.";
+  }
+
+  // «Вопрос ассистента»: поле «Ваш ответ» и кнопка «Ответить» — тот же путь на сервере, что кнопка
+  // «Ответить» в боте и команда /replytask N answer (replies.owner.answer).
+  function answerBox(item) {
+    var box = el("form", "answer");
+    box.setAttribute("novalidate", "");
+    var id = "answer-" + item.id;
+    var label = el("label", "field-label", "Ваш ответ");
+    label.setAttribute("for", id);
+    var input = el("textarea");
+    input.id = id;
+    input.maxLength = item.answer.max || 2000;
+    input.rows = 3;
+    input.placeholder = "Одним сообщением — ассистент передаст его по смыслу";
+    var left = el("div", "left", leftWords(item.expires_at));
+    var send = el("button", "primary", "Ответить");
+    send.type = "submit";
+    box.appendChild(label);
+    box.appendChild(input);
+    box.appendChild(left);
+    box.appendChild(send);
+    box.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var text = input.value.trim();
+      if (!text) { toast("Напишите ответ — пустой ассистенту не передать."); input.focus(); return; }
+      if (busy) return;
+      busy = true;
+      send.disabled = true;
+      request("POST", "approvals/answer", { ref: item.answer.ref, text: text }).then(function (got) {
+        busy = false;
+        send.disabled = false;
+        if (got.status === 401) { sessionLost(got.data); return; }
+        if (got.status !== 200) { toast(got.data.error || "Ответ не передан. Попробуйте ещё раз."); load(); return; }
+        input.value = "";
+        toast(got.data.answer || "Ответ передан ассистенту.");
+        load();
+      }, function () {
+        busy = false;
+        send.disabled = false;
+        toast("Нет связи с сервером. Ответ не передан — попробуйте ещё раз.");
+      });
+    });
+    return box;
+  }
+
   function render(data) {
+    drawHalt(data.halt || { stopped: false });
+    setupUrl = typeof data.setup_url === "string" && data.setup_url.indexOf("https://") === 0 ? data.setup_url : null;
+    Array.prototype.forEach.call(document.querySelectorAll(".open-setup"), function (b) { b.hidden = !setupUrl; });
+    // Список обновляется раз в минуту: пока владелец пишет ответ, карточки не перерисовываем.
+    var active = document.activeElement;
+    if (listShown && active && active.tagName === "TEXTAREA" && active.value.trim() && active.closest(".answer")) return;
     var items = data.items || [];
     var list = $("list");
     while (list.firstChild) list.removeChild(list.firstChild);
@@ -344,6 +415,7 @@
     if (first || !signedIn) screen("main");
     if (first && tab === "chats") chatsOpened();
     if (first && tab === "spheres") loadSpheres(false);
+    if (first && tab === "rehearsal") loadRehearsal(false);
     if (first && tab === "notify") loadNotify(false);
     if (first) refreshSphereList();
   }
@@ -522,7 +594,7 @@
     if (a.status !== "running") {
       $("chats-offline-text").textContent = (a.role === "owner" ? "Ваш аккаунт" : "Аккаунт помощника") +
         (a.label ? " «" + a.label + "»" : "") + " сейчас не подключён, поэтому список его чатов недоступен. " +
-        "Войдите в него или снимите его с паузы в «Настройках Штурмана» в браузере.";
+        "Войдите в него или снимите его с паузы в «Настройках Штурмана».";
       chatsPanel("chats-offline");
       return;
     }
@@ -1445,19 +1517,254 @@
     });
   }
 
+  /* ------------------------------------------------------------ «Остановить всё» (Р-87) */
+
+  // Остановить — сразу, одним нажатием: это ужесточение. Продолжить — только нажатием в боте
+  // согласований: отсюда уходит лишь просьба, и в боте появляется карточка подтверждения.
+  function sinceWords(value) {
+    var at = new Date(value);
+    if (!value || isNaN(at.getTime())) return "";
+    var words = deadline(value);                         // «сегодня в 14:30», «15 октября в 9:05»
+    if (words.indexOf("сегодня в ") === 0) return "с " + words.slice(10);
+    if (words.indexOf("завтра") === 0) return "";
+    return (at.getDate() === 2 ? "со " : "с ") + words;
+  }
+
+  function drawHalt(h) {
+    halt = h || { stopped: false };
+    show("halt-stop", signedIn && !halt.stopped);
+    show("halt-banner", signedIn && halt.stopped);
+    if (!halt.stopped) return;
+    $("halt-since").textContent = sinceWords(halt.since) +
+      (halt.via === "bot" ? " (в боте)" : halt.via === "page" ? " (в «Настройках Штурмана»)" : "");
+    $("halt-reading").textContent = halt.reading_paused
+      ? "Чтение переписки тоже на паузе."
+      : "Переписка по-прежнему собирается в архив.";
+    show("halt-reading-box", Boolean(halt.reading_paused));
+    show("halt-reading-stop", !halt.reading_paused);
+    if (halt.resume_pending === undefined) {
+      // кто ждёт подтверждения — только в GET halt; подробности не обязательны
+      request("GET", "halt").then(function (got) {
+        if (got.status === 200 && got.data.stopped) drawHalt(got.data);
+      }, function () { /* не страшно */ });
+      return;
+    }
+    if (halt.resume_pending) {
+      haltNote("Подтверждение «Продолжить» ждёт в боте согласований — нажмите там «Да, сделать».");
+      $("halt-resume").textContent = "Прислать подтверждение ещё раз";
+    } else {
+      haltNote("");
+      $("halt-resume").textContent = "Продолжить…";
+    }
+  }
+
+  function haltNote(text) {
+    $("halt-note").textContent = text;
+    show("halt-note", Boolean(text));
+  }
+
+  function haltCall(path, body, button, done) {
+    if (busy) return;
+    busy = true;
+    button.disabled = true;
+    request("POST", path, body).then(function (got) {
+      busy = false;
+      button.disabled = false;
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200 && got.status !== 202) { toast(got.data.error || "Не получилось. Попробуйте ещё раз."); return; }
+      drawHalt(got.data);
+      if (got.data.note) haltNote(got.data.note);
+      toast(done);
+      load();
+    }, function () {
+      busy = false;
+      button.disabled = false;
+      toast("Нет связи с сервером. Ничего не изменилось — попробуйте ещё раз.");
+    });
+  }
+
+  function wireHalt() {
+    $("halt-stop").addEventListener("click", function () {
+      haltCall("halt", { reading: false }, this, "Остановлено. Подробности — в боте согласований.");
+    });
+    $("halt-reading-stop").addEventListener("click", function () {
+      haltCall("halt", { reading: true }, this, "Чтение переписки тоже остановлено.");
+    });
+    $("halt-resume").addEventListener("click", function () {
+      haltCall("halt/resume", { reading: $("halt-reading-resume").checked }, this,
+        "Карточка «Продолжить» — в боте согласований. Продолжится после вашего нажатия там.");
+    });
+  }
+
+  /* ------------------------------------------------------------ «Открыть настройки в браузере» (П4) */
+
+  // Ссылка открывается во внешнем браузере (Telegram: openLink). Адрес — только от сервера и только
+  // https; ключа или входа в нём нет: в «Настройках Штурмана» вход по коду из бота или по ссылке.
+  function openSetup() {
+    if (!setupUrl) return;
+    if (window.TelegramWebviewProxy || (window.external && "notify" in window.external) || inFrame) {
+      postEvent("web_app_open_link", { url: setupUrl });
+    } else {
+      window.open(setupUrl, "_blank", "noopener");
+    }
+  }
+
+  /* ------------------------------------------------------------ «Репетиция» (Р-89) */
+
+  // Включить и добавить человека отсюда можно сразу (владелец так решил), но каждое изменение сервер
+  // пишет в журнал и сообщает в бот с командой, которой его вернуть. Предел и пауза — только на странице.
+  var rh = { data: null, loaded: false, timer: null };
+
+  function rhPanel(name) {
+    ["rh-loading", "rh-failed", "rh-unavailable", "rh-body"].forEach(function (id) { show(id, id === name); });
+  }
+
+  function loadRehearsal(quiet) {
+    if (!quiet && !rh.loaded) rhPanel("rh-loading");
+    return request("GET", "rehearsal").then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) {
+        $("rh-failed-text").textContent = got.data.error || "Сервер не ответил. Попробуйте ещё раз через минуту.";
+        rhPanel("rh-failed");
+        return;
+      }
+      rh.data = got.data;
+      rh.loaded = true;
+      drawRehearsal();
+    }, function () {
+      $("rh-failed-text").textContent = "Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.";
+      rhPanel("rh-failed");
+    });
+  }
+
+  function personName(p) { return p.name || (p.username ? "@" + p.username : "без имени"); }
+
+  function drawRehearsal() {
+    var d = rh.data;
+    if (!d.available) {
+      $("rh-unavailable-text").textContent = d.unavailable_text || "";
+      rhPanel("rh-unavailable");
+      $("rh-count").textContent = "";
+      return;
+    }
+    rhPanel("rh-body");
+    var s = d.settings;
+    show("rh-halted", Boolean(halt.stopped));
+    $("rh-enabled").checked = Boolean(s.enabled);
+    $("rh-cap").textContent = "Не больше " + s.daily_cap + " " + plural(s.daily_cap, "карточки", "карточек", "карточек") +
+      " в сутки. Только личные чаты вашего основного аккаунта.";
+    var list = $("rh-people");
+    clear(list);
+    (d.people || []).forEach(function (p) {
+      var li = el("li");
+      li.appendChild(el("span", "who", personName(p)));
+      li.appendChild(button("secondary", "Убрать", function () {
+        savePeople(s.people.filter(function (id) { return id !== p.tg_id; }), this,
+          "Убрано: " + personName(p) + ".");
+      }));
+      list.appendChild(li);
+    });
+    show("rh-people-empty", !(d.people || []).length);
+    $("rh-count").textContent = s.enabled ? "включена" : "выключена";
+    var st = d.stats || {};
+    $("rh-stats").textContent = "Карточек: " + (st.shown || 0) + ". Оценки: годится — " + (st.good || 0) +
+      ", почти — " + (st.almost || 0) + ", не годится — " + (st.bad || 0) + ", без оценки — " + (st.unrated || 0) +
+      ". Ваших вариантов: " + (st.variants || 0) + ".";
+    var recent = $("rh-recent");
+    clear(recent);
+    (d.recent || []).forEach(function (r) {
+      var li = el("li");
+      li.appendChild(el("div", null, (r.who || "Собеседник") + (r.outcome_text ? " — ассистент " + r.outcome_text : "")));
+      var meta = [deadline(r.at)];
+      meta.push(r.rating_text ? "ваша оценка: " + r.rating_text : "без оценки");
+      if (r.on_demand) meta.push("по вашей просьбе");
+      li.appendChild(el("div", "meta", meta.join(" · ")));
+      if (r.variant) {
+        li.appendChild(el("div", "meta", "Как ответили бы вы:"));
+        li.appendChild(el("div", "variant", r.variant));
+      }
+      recent.appendChild(li);
+    });
+    show("rh-recent-empty", !(d.recent || []).length);
+    drawFound(rh.found || []);
+  }
+
+  function drawFound(items) {
+    rh.found = items;
+    var list = $("rh-found");
+    clear(list);
+    if (!rh.data) return;
+    var have = rh.data.settings.people;
+    items.filter(function (p) { return have.indexOf(p.tg_id) < 0; }).slice(0, 8).forEach(function (p) {
+      var li = el("li");
+      li.appendChild(el("span", "who", personName(p)));
+      li.appendChild(button("primary", "Добавить", function () {
+        if (have.length >= ((rh.data.limits || {}).people || 50)) { toast("Список уже полный."); return; }
+        savePeople(have.concat([p.tg_id]), this, "Добавлено: " + personName(p) + ". Бот сообщит об изменении.");
+      }));
+      list.appendChild(li);
+    });
+  }
+
+  function saveRehearsal(body, b, done) {
+    if (busy) return;
+    busy = true;
+    if (b) b.disabled = true;
+    request("PUT", "rehearsal", body).then(function (got) {
+      busy = false;
+      if (b) b.disabled = false;
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) { toast(got.data.error || "Не получилось. Попробуйте ещё раз."); loadRehearsal(true); return; }
+      rh.data = got.data;
+      drawRehearsal();
+      toast(done);
+    }, function () {
+      busy = false;
+      if (b) b.disabled = false;
+      toast("Нет связи с сервером.");
+      loadRehearsal(true);
+    });
+  }
+
+  function savePeople(people, b, done) { saveRehearsal({ people: people }, b, done); }
+
+  function wireRehearsal() {
+    $("rh-retry").addEventListener("click", function () { loadRehearsal(false); });
+    $("rh-enabled").addEventListener("change", function () {
+      var on = this.checked;
+      saveRehearsal({ enabled: on }, this, on ? "Репетиция включена. Бот сообщит об изменении." : "Репетиция выключена.");
+    });
+    $("rh-q").addEventListener("input", function () {
+      var q = this.value.trim();
+      clearTimeout(rh.timer);
+      if (!q) { drawFound([]); return; }
+      rh.timer = setTimeout(function () {
+        request("GET", "rehearsal/people?q=" + encodeURIComponent(q)).then(function (got) {
+          if (got.status === 200 && $("rh-q").value.trim() === q) drawFound(got.data.items || []);
+        }, function () { /* попробует при следующей букве */ });
+      }, 300);
+    });
+  }
+
   /* ------------------------------------------------------------ запуск */
 
   $("refresh").addEventListener("click", function () { load(); });
   $("tab-approvals").addEventListener("click", function () { openTab("approvals"); });
   $("tab-chats").addEventListener("click", function () { openTab("chats"); });
   $("tab-spheres").addEventListener("click", function () { openTab("spheres"); });
+  $("tab-rehearsal").addEventListener("click", function () { openTab("rehearsal"); });
   $("tab-notify").addEventListener("click", function () { openTab("notify"); });
   wireChats();
   wireSpheres();
   wireNotify();
+  wireHalt();
+  wireRehearsal();
+  Array.prototype.forEach.call(document.querySelectorAll(".open-setup"), function (b) {
+    b.addEventListener("click", openSetup);
+  });
   try {
     var saved = sessionStorage.getItem(TAB_NAME);
-    tab = saved === "chats" || saved === "spheres" || saved === "notify" ? saved : "approvals";
+    tab = TABS.indexOf(saved) >= 0 ? saved : "approvals";
   } catch (e) { tab = "approvals"; }
   openTab(tab);
   $("retry").addEventListener("click", function () {
@@ -1472,6 +1779,7 @@
     // Список чатов — из базы сервиса, без запроса к Telegram: можно перечитать при возвращении.
     if (tab === "chats" && chats.opened && !chats.loading) loadAccounts(true);
     if (tab === "spheres") loadSpheres(true);
+    if (tab === "rehearsal") loadRehearsal(true);
     if (tab === "notify") loadNotify(true);
   });
 

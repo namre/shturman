@@ -136,6 +136,8 @@ async def personal_candidate(conn: asyncpg.Connection, row: Mapping[str, Any]) -
 
 async def personal_allowed(conn: asyncpg.Connection, row: Mapping[str, Any], s: Mapping[str, Any]) -> bool:
     """Подходит ли личное сообщение под настройку «от кого»."""
+    if row["chat_id"] in set(s["muted_chats"]):
+        return False        # «Не сообщать об этом чате»
     if s["personal"] == "all":
         return True
     if s["personal"] == "people":
@@ -170,6 +172,8 @@ async def group_reason(conn: asyncpg.Connection, row: Mapping[str, Any], s: Mapp
         return None
     if row["excluded"] or row["kind"] != "message" or row["deleted_at"] is not None:
         return None
+    if row["chat_id"] in set(s["muted_chats"]):
+        return None         # «Не сообщать об этом чате»
     if row["is_outgoing"] is not False or row["edited_at"] is not None or row["is_forwarded"] is not False:
         return None
     if row["telegram_via_bot"] is not False or row["telegram_sender_bot"] is not False:
@@ -231,7 +235,8 @@ async def schedule(conn: asyncpg.Connection, s: Mapping[str, Any], chat_id: int,
         return next_slot(int(s["digest_minutes"]), local), False, True
     waiting = await conn.fetchval(
         """SELECT min(due_at) FROM notify_items
-           WHERE chat_id = $1 AND state = 'waiting' AND NOT quiet AND NOT digest AND NOT held_for_rehearsal""",
+           WHERE chat_id = $1 AND state = 'waiting' AND NOT quiet AND NOT digest AND NOT held_for_rehearsal
+             AND NOT reminder""",
         chat_id)
     if waiting is not None:
         return waiting, False, False   # уже копится уведомление этого чата — в него же
@@ -324,12 +329,13 @@ def compose_chat(rows: Sequence[Mapping[str, Any]], kind: str, s: Mapping[str, A
     """Уведомление об одном чате: первое сообщение и «…и ещё N»."""
     first, last = rows[0], rows[-1]
     sphere = (" · " + ", ".join(textlib.one_line(t, 40) for t in sphere_titles)) if sphere_titles else ""
+    remind = ["⏰ Напоминаю: вы ещё не ответили"] if any(r.get("reminder") for r in rows) else []
     if kind == "personal":
-        lines = [f"💬 Вам написали: {_place(rows, kind)}",
+        lines = remind + [f"💬 Вам написали: {_place(rows, kind)}",
                  f"Личный чат{sphere} · {_clock(first['sent_at'], tz, now)}"]
     else:
         reason = REASON_WORDS.get(first.get("reason") or "", "обращение")
-        lines = [f"📣 Вас упомянули в {_place(rows, kind)}",
+        lines = remind + [f"📣 Вас упомянули в {_place(rows, kind)}",
                  f"{_who(first)}{sphere} · {_clock(first['sent_at'], tz, now)} · {reason}"]
     text = body(first, s)
     if text:
@@ -459,7 +465,7 @@ class Notifier:
                        WHERE state = 'waiting' AND due_at < $1""", end)
                 return 0
             items = await conn.fetch(
-                """SELECT id, message_id, chat_id, kind, reason, quiet, digest FROM notify_items
+                """SELECT id, message_id, chat_id, kind, reason, quiet, digest, reminder FROM notify_items
                    WHERE state = 'waiting' AND due_at <= $1 ORDER BY id FOR UPDATE""", now)
             if not items:
                 return 0
@@ -478,12 +484,12 @@ class Notifier:
                     stale.append(item["id"])
                 elif (item["kind"] == "personal" and not (s["personal"] != "off"
                                                           and await personal_allowed(conn, row, s))) \
-                        or (item["kind"] == "mention" and not s["groups"]):
+                        or (item["kind"] == "mention" and (not s["groups"] or row["chat_id"] in set(s["muted_chats"]))):
                     disabled.append(item["id"])
                 else:
                     keep.append({**dict(row), "item_id": item["id"], "reason": item["reason"],
                                  "item_kind": item["kind"], "batch": item["quiet"] or item["digest"],
-                                 "quiet": item["quiet"]})
+                                 "quiet": item["quiet"], "reminder": item["reminder"]})
             await self._drop(conn, gone, "gone")
             await self._drop(conn, stale, "stale")
             await self._drop(conn, disabled, "disabled")
@@ -513,7 +519,12 @@ class Notifier:
             batched = {c: r for c, r in by_chat.items() if c not in single}
             for chat_id, chat_rows in single.items():
                 text = compose_chat(chat_rows, chat_rows[0]["item_kind"], s, tz, now, titles.get(chat_id, []))
-                sent += await self._send(conn, text, [r["item_id"] for r in chat_rows], now)
+                # Кнопки (Б14): «Подготовить ответ» — к последнему сообщению чата, «Напомнить» и «Не
+                # сообщать» — к нему же (notify/buttons.py).
+                from . import buttons as notify_buttons
+                keys = await notify_buttons.attach(conn, chat_rows[-1]["item_id"],
+                                                   personal=chat_rows[0]["item_kind"] == "personal")
+                sent += await self._send(conn, text, [r["item_id"] for r in chat_rows], now, buttons=keys)
             if batched:
                 order = sorted(batched.items(), key=lambda kv: kv[1][-1]["sent_at"], reverse=True)
                 groups = [(rows_[0]["item_kind"], rows_, titles.get(chat_id, [])) for chat_id, rows_ in order]
@@ -522,10 +533,14 @@ class Notifier:
                 sent += await self._send(conn, text, [r["item_id"] for _, rows_ in order for r in rows_], now)
         return sent
 
-    async def _send(self, conn: asyncpg.Connection, text: str, ids: list[int], now: datetime) -> int:
-        job_id = await bridge.notify_owner(conn, text, dedup_key=f"notify:{min(ids)}")
+    async def _send(self, conn: asyncpg.Connection, text: str, ids: list[int], now: datetime, *,
+                    buttons: list[list[dict[str, str]]] | None = None) -> int:
+        # Повтор («Напомнить через час») — новое задание: прежний ключ уже использован.
+        reminder = await conn.fetchval("SELECT bool_or(reminder) FROM notify_items WHERE id = ANY($1::bigint[])", ids)
+        key = f"notify:{min(ids)}" + (f":remind:{int(now.timestamp())}" if reminder else "")
+        job_id = await bridge.notify_owner(conn, text, buttons=buttons, dedup_key=key)
         await conn.execute(
-            """UPDATE notify_items SET state = 'sent', sent_at = $2, job_id = $3
+            """UPDATE notify_items SET state = 'sent', sent_at = $2, job_id = $3, reminder = false
                WHERE id = ANY($1::bigint[])""", ids, now, job_id)
         return 1
 

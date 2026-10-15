@@ -90,7 +90,8 @@ async def test_login_sets_no_cookie_and_the_session_key_is_issued_exactly_once(s
     for r in seen:
         assert r.status_code == 200 and key not in r.text and "set-cookie" not in r.headers, r.url
     assert (await owner.get("/session")).json() == {
-        "authenticated": True, "code_login": False, "via": "link", "expires_at": response.json()["expires_at"]}
+        "authenticated": True, "code_login": False, "code_login_off": None, "via": "link",
+        "expires_at": response.json()["expires_at"]}
     dump = await conn.fetchval(
         """SELECT string_agg(t, ' ') FROM (SELECT x::text AS t FROM setup_sessions x
              UNION ALL SELECT a::text FROM setup_audit a UNION ALL SELECT l::text FROM setup_links l) q""")
@@ -109,7 +110,7 @@ async def test_cookie_alone_gives_nothing_not_even_with_the_real_key_in_it(stand
         try:
             same_origin = {"Origin": SETUP, "Sec-Fetch-Site": "same-origin", "X-Shturman-Setup": "1"}
             assert (await guest.get(API + "/session", headers=same_origin)).json() == {
-                "authenticated": False, "code_login": False}
+                "authenticated": False, "code_login": False, "code_login_off": None}
             for path in ("/state", "/overview", "/imports"):
                 got = await guest.get(API + path, headers=same_origin)
                 assert got.status_code == 401 and key not in got.text
@@ -381,7 +382,7 @@ async def test_status_tells_the_wizard_where_the_page_is_and_why_not(stand):
     status = (await s.api.get("/api/status")).json()["setup"]
     assert (status["enabled"], status["reason"], status["origin"], status["origin_set"]) == (True, "no_origin", None, False)
     assert set(status) == {"enabled", "origin_set", "origin", "reason", "tg_keys", "accounts", "own_bot", "owner_bound",
-                           "business_connected", "own_model", "socket"}
+                           "business_connected", "own_model", "socket", "code_login"}
 
 
 # =================================================================================================

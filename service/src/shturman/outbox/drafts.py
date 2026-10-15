@@ -437,6 +437,9 @@ async def create(
     cleaned = textlib.clean_outgoing(text)
     text_hash = textlib.content_hash(cleaned)
     async with conn.transaction():
+        halted = await policy.check_halt(conn)
+        if not halted.ok:
+            raise refuse(halted)
         rules = await policy.load(conn, state.config)
         decision = policy.check_switch(rules)
         if not decision.ok and not prepare_only:
@@ -523,6 +526,9 @@ async def create_autoreply(
     prepare_only: bool = False, task_id: int | None = None, sources: list[dict[str, Any]] | None = None,
 ) -> int | None:
     """Bound autonomous reply, or a pending card when only preparation is authorized."""
+    halted = await policy.check_halt(conn)
+    if not halted.ok:
+        raise Refused(halted)
     binding = await _task_binding(conn, tgt, task_id, sources)
     cleaned = textlib.clean_outgoing(text)
     if task_id is not None and not prepare_only:
@@ -678,6 +684,11 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
     if mod is None:
         return {"answer": policy.REASONS["service_stopped"] + " Попробуйте позже.",
                 "edit_text": None, "remove_buttons": False}
+    halted = await policy.check_halt(conn)
+    if not halted.ok:
+        # Черновик остаётся ждать: после «Продолжить» кнопку можно нажать снова.
+        return {"answer": "Пока нельзя: ассистент остановлен. Продолжить — /resume.", "edit_text": None,
+                "remove_buttons": False}
     rules = await policy.load(conn, mod.state.config)
     decision = policy.check_switch(rules)
     if decision.ok:
@@ -761,6 +772,9 @@ async def _give_up(conn: asyncpg.Connection, draft_id: int) -> None:
 async def _presend(conn: asyncpg.Connection, mod: runtime.Outbox, rules: dict[str, Any],
                    row: Mapping[str, Any], tgt: Target) -> Decision:
     """Последняя проверка перед отправкой: за время ожидания всё могло измениться."""
+    decision = await policy.check_halt(conn)
+    if not decision.ok:
+        return decision
     decision = await _task_guard(conn, mod.state, row)
     if not decision.ok:
         return decision
@@ -846,6 +860,12 @@ async def _send_session(mod: runtime.Outbox, row: Mapping[str, Any], tgt: Target
     sent = 0
     for index, part in enumerate(parts):
         tg = mod.tg
+        async with pool.acquire() as conn:
+            halted = not (await policy.check_halt(conn)).ok
+        if halted:
+            # Владелец остановил ассистента между частями длинного сообщения (Р-87): дальше не шлём.
+            outcome = ("failed", "assistant_stopped", policy.REASONS["assistant_stopped"])
+            break
         if mod.state.config.sending is not True:
             # Последняя проверка выключателя — прямо перед обращением к Telegram.
             outcome = ("failed", "sending_disabled", policy.REASONS["sending_disabled"])

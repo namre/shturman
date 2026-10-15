@@ -96,8 +96,9 @@ async def test_card_goes_through_the_approvals_bot_and_rating_marks_the_button(s
         return [p for p in s.telegram.calls("editMessageReplyMarkup") if p.get("message_id") == message_id
                 and p["reply_markup"]["inline_keyboard"]]
     [edit] = await exec_fakes.until(marked)
+    # после «Почти» бот просит свой вариант (Б14): под карточкой ещё «Не писать свой вариант»
     assert [row[0]["text"] for row in edit["reply_markup"]["inline_keyboard"]] == \
-        ["Годится", "✓ Почти — поправил бы", "Не годится"]
+        ["Годится", "✓ Почти — поправил бы", "Не годится", "Не писать свой вариант"]
     assert await conn.fetchval("SELECT rating FROM rehearsal_items WHERE id = $1", item_id) == "almost"
     # собеседнику — ничего: ни от бота в бизнес-режиме, ни черновиком
     assert s.telegram.sent(business=True) == []

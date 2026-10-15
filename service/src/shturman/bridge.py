@@ -389,5 +389,12 @@ async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: i
         # Новые кнопки под тем же сообщением (текст не меняется): например, отметка выбранной оценки
         # у карточки репетиции (rehearsal/). Только кнопки сервиса — каждая собрана `button()`.
         reply["buttons"] = out["buttons"]
+    if isinstance(out.get("prompt"), dict):
+        # Просьба написать текст следующим сообщением (ForceReply): «Ответить» на вопрос ассистента,
+        # свой вариант после «Почти» у репетиции. Отправляет и запоминает её только бот сервиса
+        # (`executor/bot.py`); приложение такую кнопку не нажимает (у него своё поле ввода).
+        reply["prompt"] = out["prompt"]
+    if out.get("reply") is not None:
+        reply["reply"] = out["reply"]
     return reply
 

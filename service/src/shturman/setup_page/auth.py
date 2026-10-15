@@ -1,4 +1,4 @@
-"""Вход на страницу настройки: одноразовая ссылка, код от бота согласований, сессии.
+"""Вход на страницу настройки: одноразовая ссылка, код из бота согласований, сессии.
 
 Здесь только правила и записи в базу. Отправку кода в Telegram передаёт снаружи вызывающий
 (`send`), поэтому модуль проверяется без сети.
@@ -15,17 +15,25 @@
   посторонний мог бы не пускать владельца. Ограничено только число одновременно «думающих»
   отказов (см. `service.py`).
 
-Код от бота согласований — когда владелец к боту привязан
-  * 8 цифр, 5 минут; в базе — HMAC кода с ключом из каталога данных (ключа в базе нет);
-  * действующий код новым не заменяется: посторонний, запрашивая коды, не обесценит тот, что
-    владелец сейчас вводит, и владельцу приходит не больше одного сообщения в 5 минут;
-  * после неудачной отправки — новая попытка не раньше чем через минуту;
-  * 5 неверных кодов подряд — вход по коду закрывается на 1, 5, 15, 60 минут; счётчик новым
-    кодом не обнуляется. Счётчик один на всех, а не «на адрес»: адресу клиента за прокси
-    верить нельзя. Цена — посторонний может на время закрыть вход по коду; выход — новая ссылка;
-  * о закрытии входа владельцу уходит одно сообщение за период блокировки (`verify_code`
-    возвращает `locked_now` не чаще).
-  Правила те же, что у входа в дашборд по коду от бота Hermes (plugins/shturman, auth.py).
+Код из бота согласований (Р-88) — когда бот настроен, владелец привязан и вход по коду включён
+  * 6 цифр, 5 минут, срабатывает один раз; в базе — HMAC кода с ключом из каталога данных (ключа в
+    базе нет); сравнение — за постоянное время;
+  * код привязан к браузеру, который его запросил: случайный идентификатор попытки (256 бит) лежит у
+    браузера в cookie `__Secure-shturman-code` (`HttpOnly; Secure; SameSite=Strict`, путь — только
+    `/shturman-setup/api/login/code`), в базе — его SHA-256. Тот же код в другом браузере не работает.
+    Это единственная cookie страницы: сессию по-прежнему держит заголовок (ниже), а `shield.py`
+    пропускает только эту cookie и только на этом пути. Две cookie с этим именем — отказ: соседний
+    порт того же имени мог подложить свою;
+  * не больше `REQUEST_LIMIT` (3) запросов кода за 15 минут — на всех, а не на браузер: адресу
+    клиента за прокси верить нельзя. Новый запрос из того же браузера гасит его прежнюю попытку;
+  * 5 неверных попыток на код — код погашен, и вход по коду на паузе: 1, 5, 15 минут, час, 6 часов,
+    сутки; удачный вход начинает паузы заново. О паузе владельцу уходит одно сообщение за период;
+  * запрос без привязанного владельца или при выключенном входе по коду заводит такую же попытку,
+    но код никуда не уходит и не сработает: ответ снаружи тот же («одинаковый ответ»);
+  * «Это не я» в сообщении с кодом гасит все ждущие попытки (`cancel_codes`), «Выйти на всех
+    устройствах» там же — все сессии (`revoke_all`);
+  * вход по ссылке и «выйти везде» тоже гасят ждущие попытки. Цена паузы — посторонний может на
+    время закрыть вход по коду; выход — ссылка с сервера.
 
 Сессия — без cookie
   * ключ сессии: случайный, 256 бит; в базе — его SHA-256. Сервер отдаёт ключ один раз, в ответе
@@ -63,10 +71,13 @@ LINK_TTL = 30 * 60
 SESSION_MAX = 7 * 24 * 3600
 SESSION_HEADER = "x-shturman-session"
 CODE_TTL = 5 * 60
-CODE_DIGITS = 8
-CODE_RETRY = 60
+CODE_DIGITS = 6
 CODE_MAX_ATTEMPTS = 5
-LOCK_STEPS = (60, 5 * 60, 15 * 60, 60 * 60)
+REQUEST_WINDOW = 15 * 60        # секунд: окно, в котором считаются запросы кода
+REQUEST_LIMIT = 3               # запросов кода за окно — на всех
+LOCK_STEPS = (60, 5 * 60, 15 * 60, 60 * 60, 6 * 3600, 24 * 3600)
+CODE_COOKIE = "__Secure-shturman-code"
+CODE_PATH = "/shturman-setup/api/login/code"     # путь cookie: запрос кода и ввод кода, и только они
 LOCK_NOTICE_EVERY = 15 * 60     # и не чаще раза в 15 минут, пока блокировки ещё короткие
 CODE_STATE = "login_code"
 
@@ -116,6 +127,7 @@ async def redeem_link(conn: asyncpg.Connection, token: Any) -> bool:
         # Прежние сессии гаснут: если одну из них увели, новая ссылка с сервера её отзывает.
         await conn.execute("UPDATE setup_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
         await conn.execute("DELETE FROM setup_state WHERE key = $1", CODE_STATE)
+        await cancel_codes(conn, "link")
     return True
 
 
@@ -166,6 +178,7 @@ async def revoke_all(conn: asyncpg.Connection) -> int:
         done = await conn.execute("UPDATE setup_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
         await conn.execute("DELETE FROM setup_links WHERE used_at IS NULL")
         await conn.execute("UPDATE miniapp_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
+        await cancel_codes(conn, "logout_all")
     return int(done.split()[-1])
 
 
@@ -175,16 +188,23 @@ async def cleanup(conn: asyncpg.Connection) -> None:
     await conn.execute(
         """DELETE FROM setup_sessions
            WHERE expires_at < now() - interval '1 day' OR revoked_at < now() - interval '1 day'""")
+    # Попытки входа по коду хранятся неделю и сутки: столько показывает `./ops/doctor.sh`.
+    await conn.execute("DELETE FROM setup_codes WHERE created_at < now() - interval '8 days'")
 
 
-# --- код от бота согласований ---
+# --- код из бота согласований (Р-88) ---
 
 def _digest(code: str, key: bytes) -> str:
     return hmac.new(key, code.encode("ascii"), hashlib.sha256).hexdigest()
 
 
+def new_code() -> str:
+    return "".join(secrets.choice("0123456789") for _ in range(CODE_DIGITS))
+
+
 async def _locked_state(conn: asyncpg.Connection) -> dict[str, Any]:
-    """Состояние входа по коду под блокировкой строки. Вызывать внутри транзакции."""
+    """Общее состояние входа по коду (пауза после неверных попыток) под блокировкой строки.
+    Вызывать внутри транзакции."""
     await conn.execute(
         "INSERT INTO setup_state (key, value) VALUES ($1, '{}'::jsonb) ON CONFLICT (key) DO NOTHING", CODE_STATE)
     raw = await conn.fetchval("SELECT value FROM setup_state WHERE key = $1 FOR UPDATE", CODE_STATE)
@@ -197,81 +217,130 @@ async def _save_state(conn: asyncpg.Connection, data: dict[str, Any]) -> None:
                        CODE_STATE, json.dumps(data))
 
 
-Send = Callable[[str], Awaitable[None]]
+@dataclass(frozen=True)
+class CodeAttempt:
+    """Итог запроса кода. `result`: sent — попытка заведена (код ушёл владельцу либо, если отправить
+    некому, не ушёл — снаружи одно и то же); limited — запросов за 15 минут уже `REQUEST_LIMIT`;
+    locked — вход по коду на паузе после неверных попыток. `attempt` — значение для cookie браузера."""
+    result: str
+    attempt: str | None = None
+    code: str | None = None
+    code_id: int | None = None
+    nonce: str | None = None
+    retry_after: int | None = None
+    left: int | None = None
 
 
-async def request_code(conn: asyncpg.Connection, key: bytes, send: Send | None) -> str:
-    """Готовит код входа и отправляет его владельцу через `send(код)`.
+async def start_code(conn: asyncpg.Connection, key: bytes, *, previous: str | None = None) -> CodeAttempt:
+    """Заводит попытку входа по коду: код и случайный идентификатор попытки для cookie браузера.
 
-    Возвращает: sent — отправлен новый код; reused — прежний ещё действует, новый не создаётся;
-    no_owner — отправить некому (бота нет или владелец к нему не привязан); locked — вход по
-    коду временно закрыт; wait — недавняя отправка не удалась, повторить можно через минуту;
-    send_failed — Telegram сообщение не принял.
-    """
-    if send is None:
-        return "no_owner"
+    Отправку делает вызывающий (`deliver_code` после неё): попытка без доставки не срабатывает.
+    previous — идентификатор прежней попытки этого браузера из его cookie: она снимается."""
     moment = int(now())
     async with conn.transaction():
         data = await _locked_state(conn)
         if int(data.get("lock_until", 0)) > moment:
-            return "locked"
-        if data.get("digest") and int(data.get("expires_at", 0)) > moment:
-            return "reused"
-        if moment - int(data.get("attempt_at", 0)) < CODE_RETRY and not data.get("digest"):
-            return "wait"
-        data["attempt_at"] = moment
-        data.pop("digest", None)
-        code = "".join(secrets.choice("0123456789") for _ in range(CODE_DIGITS))
-        try:
-            await send(code)
-        except Exception:  # noqa: BLE001 — причина не важна и в журнал не идёт: в ней может быть код
-            await _save_state(conn, data)
-            return "send_failed"
-        data["digest"] = _digest(code, key)
-        data["expires_at"] = moment + CODE_TTL
-        # Счётчик неверных попыток новым кодом не обнуляется: иначе перебор шёл бы по четыре
-        # попытки на каждый свежий код без единой блокировки.
-        await _save_state(conn, data)
-    return "sent"
+            return CodeAttempt("locked", retry_after=int(data["lock_until"]) - moment)
+        recent = await conn.fetch(
+            """SELECT created_at FROM setup_codes WHERE created_at > now() - make_interval(secs => $1)
+               ORDER BY created_at""", float(REQUEST_WINDOW))
+        if len(recent) >= REQUEST_LIMIT:
+            wait = await conn.fetchval(
+                "SELECT ceil(extract(epoch FROM $1::timestamptz + make_interval(secs => $2) - now()))::int",
+                recent[0]["created_at"], float(REQUEST_WINDOW))
+            return CodeAttempt("limited", retry_after=max(1, int(wait or 1)), left=0)
+        if well_formed(previous):
+            await conn.execute(
+                """UPDATE setup_codes SET cancelled_at = now(), cancel_reason = 'superseded'
+                   WHERE attempt_hash = $1 AND used_at IS NULL AND cancelled_at IS NULL""", token_hash(previous))
+        attempt, code, nonce = new_token(), new_code(), secrets.token_urlsafe(9)
+        code_id = await conn.fetchval(
+            """INSERT INTO setup_codes (attempt_hash, code_digest, nonce, expires_at)
+               VALUES ($1, $2, $3, now() + make_interval(secs => $4)) RETURNING id""",
+            token_hash(attempt), _digest(code, key), nonce, float(CODE_TTL))
+    return CodeAttempt("sent", attempt=attempt, code=code, code_id=code_id, nonce=nonce,
+                       left=REQUEST_LIMIT - len(recent) - 1)
 
 
-async def verify_code(conn: asyncpg.Connection, key: bytes, code: Any) -> str:
-    """ok | wrong | expired | locked | locked_now | locked_again | none (код не запрашивали).
+async def mark_delivered(conn: asyncpg.Connection, code_id: int, message_id: int | None) -> None:
+    """Код ушёл владельцу в бот: только теперь попытка может сработать."""
+    await conn.execute(
+        """UPDATE setup_codes SET delivered = true, message_id = $2
+           WHERE id = $1 AND used_at IS NULL AND cancelled_at IS NULL""", code_id, message_id)
 
-    locked_now — эта попытка стала пятой неверной: вход закрыт, владельцу стоит сообщить.
-    locked_again — вход закрыт этой попыткой, но о блокировке владельцу сообщали только что:
-    второе сообщение не нужно. Сообщение уходит не чаще раза за период блокировки."""
+
+async def verify_code(conn: asyncpg.Connection, key: bytes, attempt: Any, code: Any) -> tuple[str, int | None]:
+    """Проверяет код в браузере, который его запросил. Возвращает (итог, номер попытки):
+
+    ok — вход; wrong — код не подошёл (ещё можно); none — попытки нет, она погашена, использована или
+    заведена в другом браузере; expired — срок вышел; locked — вход по коду на паузе; locked_now —
+    эта неверная попытка стала пятой: код погашен, вход по коду на паузе, владельцу стоит сообщить;
+    locked_again — то же, но о паузе владельцу сообщали только что."""
     digits = "".join(ch for ch in str(code) if ch in "0123456789")[:CODE_DIGITS * 2]
     moment = int(now())
     async with conn.transaction():
         data = await _locked_state(conn)
         if int(data.get("lock_until", 0)) > moment:
-            return "locked"
-        if not data.get("digest"):
-            return "none"
-        if int(data.get("expires_at", 0)) <= moment:
-            data.pop("digest", None)
+            return "locked", None
+        if not well_formed(attempt):
+            return "none", None
+        row = await conn.fetchrow("SELECT * FROM setup_codes WHERE attempt_hash = $1 FOR UPDATE", token_hash(attempt))
+        if row is None or row["used_at"] is not None or row["cancelled_at"] is not None:
+            return "none", None
+        if await conn.fetchval("SELECT $1::timestamptz <= now()", row["expires_at"]):
+            await conn.execute("UPDATE setup_codes SET cancelled_at = now(), cancel_reason = 'expired' WHERE id = $1",
+                               row["id"])
+            return "expired", row["id"]
+        # Сравнение — за постоянное время; недоставленный код не срабатывает никогда.
+        matches = hmac.compare_digest(_digest(digits if len(digits) == CODE_DIGITS else "x", key),
+                                      str(row["code_digest"]))
+        if matches and row["delivered"] and len(digits) == CODE_DIGITS:
+            await conn.execute("UPDATE setup_codes SET used_at = now(), tries = tries + 1 WHERE id = $1", row["id"])
+            data.pop("lock_level", None)        # удачный вход: следующие паузы — снова с минуты
             await _save_state(conn, data)
-            return "expired"
-        if len(digits) == CODE_DIGITS and hmac.compare_digest(_digest(digits, key), str(data["digest"])):
-            await _save_state(conn, {})          # код одноразовый; счётчики сброшены
-            return "ok"
-        attempts = int(data.get("attempts", 0)) + 1
-        data["attempts"] = attempts
-        if attempts < CODE_MAX_ATTEMPTS:
-            await _save_state(conn, data)
-            return "wrong"
+            return "ok", row["id"]
+        tries = int(row["tries"]) + 1
+        if tries < CODE_MAX_ATTEMPTS:
+            await conn.execute("UPDATE setup_codes SET tries = $2 WHERE id = $1", row["id"], tries)
+            return "wrong", row["id"]
+        await conn.execute(
+            """UPDATE setup_codes SET tries = $2, cancelled_at = now(), cancel_reason = 'tries' WHERE id = $1""",
+            row["id"], tries)
         level = int(data.get("lock_level", 0))
         period = LOCK_STEPS[min(level, len(LOCK_STEPS) - 1)]
         data["lock_until"] = moment + period
         data["lock_level"] = level + 1
-        data["attempts"] = 0
-        data.pop("digest", None)
-        # Сообщение владельцу — одно на период: следующее не раньше, чем через длину этой
-        # блокировки после предыдущего. Иначе тот, кто раз за разом запрашивает код и вводит
-        # пять неверных, слал бы владельцу сообщение на каждый круг.
+        # Сообщение владельцу — одно на период: следующее не раньше, чем через длину этой паузы.
         notify = moment >= int(data.get("lock_notice_until", 0))
         if notify:
             data["lock_notice_until"] = moment + max(period, LOCK_NOTICE_EVERY)
         await _save_state(conn, data)
-    return "locked_now" if notify else "locked_again"
+    return ("locked_now" if notify else "locked_again"), row["id"]
+
+
+async def tries_left(conn: asyncpg.Connection, code_id: int | None) -> int | None:
+    if code_id is None:
+        return None
+    tries = await conn.fetchval("SELECT tries FROM setup_codes WHERE id = $1", code_id)
+    return None if tries is None else max(0, CODE_MAX_ATTEMPTS - int(tries))
+
+
+async def lock_left(conn: asyncpg.Connection) -> int:
+    """Сколько секунд ещё длится пауза входа по коду (0 — паузы нет)."""
+    raw = await conn.fetchval("SELECT value FROM setup_state WHERE key = $1", CODE_STATE)
+    value = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    return max(0, int(value.get("lock_until", 0)) - int(now())) if isinstance(value, dict) else 0
+
+
+async def cancel_codes(conn: asyncpg.Connection, reason: str) -> int:
+    """Гасит все ждущие попытки входа по коду («Это не я», выход везде, вход по ссылке, выключение)."""
+    done = await conn.execute(
+        """UPDATE setup_codes SET cancelled_at = now(), cancel_reason = $1
+           WHERE used_at IS NULL AND cancelled_at IS NULL""", reason)
+    return int(done.split()[-1])
+
+
+async def logins_by_code(conn: asyncpg.Connection, days: int = 7) -> int:
+    """Сколько входов по коду за `days` суток — для `./ops/doctor.sh` (строка setup-code-login)."""
+    return int(await conn.fetchval(
+        "SELECT count(*) FROM setup_codes WHERE used_at > now() - make_interval(days => $1)", days))

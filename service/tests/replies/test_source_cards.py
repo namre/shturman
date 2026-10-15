@@ -11,6 +11,13 @@ from shturman.sources import broker
 from shturman.sources.registry import Connector
 
 
+@pytest.fixture(autouse=True)
+def _running(monkeypatch):
+    """Подставное соединение без базы: ассистент не остановлен (Р-87), лишнего запроса к нему нет."""
+    from shturman import halt
+    monkeypatch.setattr(halt, 'is_stopped', AsyncMock(return_value=False))
+
+
 def request(kind='external', sid='travel'):
     return broker.canonical_source_spec({
         'kind': kind, 'source_id': sid, 'query': 'билет Казань',

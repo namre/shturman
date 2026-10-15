@@ -61,6 +61,12 @@ RATINGS = (("good", "Годится"), ("almost", "Почти — поправи
 RATING_WORDS = dict(RATINGS)
 CODES = {code[0]: code for code, _ in RATINGS}
 NOTIFY_HOLD = timedelta(minutes=3)   # дольше уведомление о сообщении не придерживается
+ON_DEMAND_AGE = timedelta(hours=24)  # «Подготовить ответ» у уведомления — на сообщение не старше суток
+SKIP_VARIANT = "Не писать свой вариант"
+VARIANT_MAX = 2000
+VARIANT_PROMPT = ("Напишите, как ответили бы вы, — одним сообщением. Ваш вариант сохранится рядом с оценкой "
+                  "(30 дней, как сама карточка) и будет виден в приложении «Штурман», вкладка «Репетиция». "
+                  f"Не хотите — «{SKIP_VARIANT}» под карточкой.")
 KEEP = timedelta(days=30)            # сколько хранятся строки репетиции (в них нет текста)
 SWEEP_EVERY = 60.0
 QUEUED_STUCK = 60                    # секунд: строка «ждёт пачку» дольше — её разбирает обход
@@ -174,10 +180,15 @@ async def people_names(conn: asyncpg.Connection, ids: list[int]) -> list[dict[st
 
 # --- кнопки и карточка --------------------------------------------------------------------------------
 
-def rating_buttons(item_id: int, nonce: str, chosen: str | None = None) -> list[list[dict[str, str]]]:
-    """Три кнопки оценки, по одной в строке; выбранная — с галочкой. Отправки среди них нет."""
-    return [[bridge.button(("✓ " if code == chosen else "") + label, CALLBACK_MODULE, f"{code[0]}:{item_id}:{nonce}")]
+def rating_buttons(item_id: int, nonce: str, chosen: str | None = None, *,
+                   asking: bool = False) -> list[list[dict[str, str]]]:
+    """Три кнопки оценки, по одной в строке; выбранная — с галочкой. Отправки среди них нет.
+    asking — бот ждёт свой вариант владельца: ещё кнопка «Не писать свой вариант»."""
+    rows = [[bridge.button(("✓ " if code == chosen else "") + label, CALLBACK_MODULE, f"{code[0]}:{item_id}:{nonce}")]
             for code, label in RATINGS]
+    if asking:
+        rows.append([bridge.button(SKIP_VARIANT, CALLBACK_MODULE, f"k:{item_id}:{nonce}")])
+    return rows
 
 
 def _plural(n: int, one: str, few: str, many: str) -> str:
@@ -196,7 +207,10 @@ async def compose_card(conn: asyncpg.Connection, item: Mapping[str, Any], row: M
     titles = (await spheres.titles_by_chat(conn, [item["chat_id"]])).get(item["chat_id"], [])
     sphere = (" · " + ", ".join(textlib.one_line(t, 40) for t in titles)) if titles else ""
     who = textlib.one_line(row["chat_title"], 60) or textlib.one_line(row["sender_name"], 60) or "собеседник"
-    lines = ["🎭 Репетиция ответа — ничего не отправлено",
+    head = "🎭 Репетиция ответа — ничего не отправлено"
+    if item.get("on_demand"):
+        head += "\nПо вашей просьбе — кнопкой «Подготовить ответ» под уведомлением."
+    lines = [head,
              f"💬 Вам написали: {who}",
              f"Личный чат{sphere} · {notify_core._clock(row['sent_at'], tz, now)}",
              notify_core.body(row, {"preview": True})]
@@ -307,6 +321,8 @@ class Rehearsal:
             s = await rs.load(conn)
             if not s["enabled"]:
                 return None
+            if await conn.fetchval("SELECT shturman_halted()"):
+                return None       # владелец остановил ассистента (Р-87)
             settings = await autoreply.load(conn)
             row = await message_row(conn, message_id)
             if row is None or row["chat_id"] != chat_id or row["account_id"] != payload.get("account_id"):
@@ -348,8 +364,11 @@ class Rehearsal:
             if item is None or item["state"] != "queued":
                 return "gone"
             chat_id, trigger = item["chat_id"], item["trigger_message_id"]
+            on_demand = bool(item["on_demand"])
+            if await conn.fetchval("SELECT shturman_halted()"):
+                return await _skip(conn, item, "stopped")
             # В том же чате ждёт сообщение новее — эту пачку закроет его карточка.
-            if await conn.fetchval(
+            if not on_demand and await conn.fetchval(
                     """SELECT EXISTS (SELECT 1 FROM rehearsal_items r JOIN messages m ON m.id = r.trigger_message_id
                        JOIN messages t ON t.id = $2
                        WHERE r.chat_id = $1 AND r.state = 'queued' AND r.id <> $3 AND (m.sent_at, m.id) > (t.sent_at, t.id))""",
@@ -358,7 +377,8 @@ class Rehearsal:
             s = await rs.load(conn)
             settings = await autoreply.load(conn)
             row = await message_row(conn, trigger)
-            code = await why_not(conn, row, s, max_age=float(settings["max_age_seconds"]))
+            s, max_age = _for_item(s, settings, item)
+            code = await why_not(conn, row, s, max_age=max_age)
             if code is not None:
                 return await _skip(conn, item, "stale" if code == "stale" else "gone")
             if await handled_by_autoreply(conn, self.state, chat_id, trigger):
@@ -368,7 +388,7 @@ class Rehearsal:
                    WHERE n.chat_id = t.chat_id AND n.kind = 'message' AND n.deleted_at IS NULL
                      AND (n.sent_at, n.id) > (t.sent_at, t.id)
                    ORDER BY n.sent_at DESC, n.id DESC LIMIT 1""", trigger)
-            if newer is not None:
+            if newer is not None and (newer["is_outgoing"] or not on_demand):
                 return await _skip(conn, item, "answered" if newer["is_outgoing"] else "newer")
             used = await conn.fetchrow(
                 """SELECT count(*) FILTER (WHERE asked_at > now() - interval '24 hours') AS day,
@@ -382,15 +402,16 @@ class Rehearsal:
                               "До конца суток новые сообщения из списка репетиции приходят обычными уведомлениями. "
                               "Предел меняется в «Настройках Штурмана», раздел «Репетиция ответов».", silent=True)
                 return await _skip(conn, item, "daily_cap")
-            if used["recent"]:
+            if used["recent"] and not on_demand:     # о разовой репетиции владелец попросил сам — без паузы
                 return await _skip(conn, item, "pause")
             # Сообщения пачки до этого — под этой карточкой: их строки закрываются, а в карточке
             # говорится, сколько сообщений подряд она покрывает. Пачка — сообщения, на которые репетиция
             # уже заводилась и которые закрыло это, более новое (после вашего последнего ответа и после
             # прошлой карточки в этом чате). Старые сообщения чата без репетиции — только справка.
-            await conn.execute(
-                """UPDATE rehearsal_items SET state = 'skipped', reason = 'newer', updated_at = now()
-                   WHERE chat_id = $1 AND state = 'queued' AND id <> $2""", chat_id, item_id)
+            if not on_demand:
+                await conn.execute(
+                    """UPDATE rehearsal_items SET state = 'skipped', reason = 'newer', updated_at = now()
+                       WHERE chat_id = $1 AND state = 'queued' AND id <> $2""", chat_id, item_id)
             covered = 1 + await conn.fetchval(
                 """SELECT count(*) FROM rehearsal_items r JOIN messages n ON n.id = r.trigger_message_id
                    JOIN messages t ON t.id = $1
@@ -466,6 +487,11 @@ async def _ready(conn: asyncpg.Connection, job: dict[str, Any], result: dict[str
     mod = current()
     s = await rs.load(conn)
     row = await message_row(conn, item["trigger_message_id"])
+    if row is not None:
+        s, _ = _for_item(s, {"max_age_seconds": 0}, item, peer=int(row["peer_tg_id"]))
+    if await conn.fetchval("SELECT shturman_halted()"):
+        await _skip(conn, item, "stopped")      # владелец остановил ассистента, пока модель думала (Р-87)
+        return
     # Пока модель думала, мир мог измениться: удалено, изменено, скрыто защитой, чат исключён,
     # человека убрали из списка, репетицию выключили, бота не стало — карточки не будет.
     if mod is None or row is None or row["deleted_at"] is not None or row["excluded"] or not row["agent_visible"] \
@@ -537,11 +563,18 @@ async def _rated(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str,
     code, _, tail = rest.partition(":")
     raw_id, _, nonce = tail.partition(":")
     rating = CODES.get(code)
-    if rating is None or not raw_id.isdigit():
+    if (rating is None and code != "k") or not raw_id.isdigit():
         return {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
     item = await conn.fetchrow("SELECT * FROM rehearsal_items WHERE id = $1 FOR UPDATE", int(raw_id))
     if item is None or item["state"] != "shown" or not hmac.compare_digest(item["nonce"], nonce):
         return {"answer": "Эта карточка уже недоступна.", "edit_text": None, "remove_buttons": True}
+    if code == "k":
+        # «Не писать свой вариант»: просьба в боте снимается, оценка остаётся.
+        await conn.execute(
+            """DELETE FROM executor_state WHERE key = 'prompt' AND value->>'kind' = 'variant'
+               AND (value->>'id')::bigint = $1""", item["id"])
+        return {"answer": "Хорошо, без своего варианта.", "edit_text": None, "remove_buttons": False,
+                "buttons": rating_buttons(item["id"], item["nonce"], chosen=item["rating"])}
     before = item["rating"]
     await conn.execute("UPDATE rehearsal_items SET rating = $2, rated_at = now(), updated_at = now() WHERE id = $1",
                        item["id"], rating)
@@ -553,9 +586,98 @@ async def _rated(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str,
             await audit.write(mod.pool, "rehearsal.rate",
                               detail=f"карточка № {item['id']}; оценка: {rating}" + (f"; была: {before}" if before else ""))
 
-    return {"answer": f"Оценка сохранена: {RATING_WORDS[rating]}. Её можно изменить.", "edit_text": None,
-            "remove_buttons": False, "buttons": rating_buttons(item["id"], item["nonce"], chosen=rating),
-            "after_commit": journal}
+    out = {"answer": f"Оценка сохранена: {RATING_WORDS[rating]}. Её можно изменить.", "edit_text": None,
+           "remove_buttons": False, "buttons": rating_buttons(item["id"], item["nonce"], chosen=rating),
+           "after_commit": journal}
+    if rating == "almost":
+        # Свой вариант (Б14): бот попросит написать, как ответили бы вы, — следующим сообщением.
+        out["buttons"] = rating_buttons(item["id"], item["nonce"], chosen=rating, asking=True)
+        out["prompt"] = {"kind": "variant", "id": item["id"], "nonce": item["nonce"], "text": VARIANT_PROMPT,
+                         "placeholder": "Как ответили бы вы"}
+    return out
+
+
+async def save_variant(conn: asyncpg.Connection, item_id: int, nonce: str, text: str) -> dict[str, Any]:
+    """Свой вариант владельца после «Почти — поправил бы». Только текст владельца: хранится у строки
+    репетиции, удаляется вместе с ней (30 дней). В обучение стиля не идёт — только хранение и показ."""
+    text = (text or "").strip()
+    if not text:
+        return {"ok": False, "text": "Вариант пустой — ничего не записано."}
+    if len(text) > VARIANT_MAX:
+        return {"ok": False, "text": f"Вариант длиннее {VARIANT_MAX} знаков — сократите и нажмите «Почти» ещё раз."}
+    item = await conn.fetchrow("SELECT * FROM rehearsal_items WHERE id = $1 FOR UPDATE", item_id)
+    if item is None or item["state"] != "shown" or not hmac.compare_digest(item["nonce"], nonce):
+        return {"ok": False, "text": "Эта карточка уже недоступна — вариант не записан."}
+    await conn.execute("UPDATE rehearsal_items SET owner_variant = $2, owner_variant_at = now(), updated_at = now() "
+                       "WHERE id = $1", item_id, text)
+    from ..setup_page import audit
+    await audit.write_conn(conn, "rehearsal.variant", detail=f"карточка № {item_id}; знаков: {len(text)}")
+    return {"ok": True, "text": "Записал ваш вариант. Он виден в приложении «Штурман», вкладка «Репетиция»; "
+                                "хранится 30 дней вместе с карточкой. Ничего не отправлено."}
+
+
+def _for_item(s: Mapping[str, Any], settings: Mapping[str, Any], item: Mapping[str, Any], *,
+              peer: int | None = None) -> tuple[dict[str, Any], float]:
+    """Настройки для этой строки. Разовая репетиция (`on_demand`, «Подготовить ответ» у уведомления):
+    владелец попросил сам — список людей и выключатель не нужны, сообщение — не старше суток."""
+    s = dict(s)
+    if not item["on_demand"]:
+        return s, float(settings["max_age_seconds"])
+    s["enabled"] = True
+    peer_id = peer if peer is not None else item["peer_tg_id"]
+    if peer_id is not None and int(peer_id) not in set(s["people"]):
+        s["people"] = list(s["people"]) + [int(peer_id)]
+    return s, ON_DEMAND_AGE.total_seconds()
+
+
+async def request_once(state: Any, message_id: int) -> dict[str, Any]:
+    """«Подготовить ответ» у уведомления, способ «Через ваш аккаунт»: разовая репетиция для этого
+    сообщения — даже если человека нет в списке и репетиция выключена. Ничего не отправляется; входит
+    в дневной предел репетиции. Возвращает {ok, text} — ответ владельцу словами."""
+    mod = current()
+    if mod is None or not bridge.owns_bot():
+        return {"ok": False, "text": "Репетиция сейчас недоступна: сервис репетиции не запущен или нет бота согласований."}
+    async with state.pool.acquire() as conn:
+        if await conn.fetchval("SELECT shturman_halted()"):
+            from .. import halt
+            return {"ok": False, "text": "Ассистент остановлен — ответ не готовится. Продолжить — /resume."}
+        row = await message_row(conn, message_id)
+        s = await rs.load(conn)
+        probe = {"on_demand": True, "peer_tg_id": int(row["peer_tg_id"]) if row is not None else None}
+        relaxed, max_age = _for_item(s, {"max_age_seconds": 0}, probe)
+        code = await why_not(conn, row, relaxed, max_age=max_age)
+        if code is not None:
+            words = {"stale": "сообщение старше суток — репетиция на него не готовится.",
+                     "hidden": "сообщение скрыто защитой — репетиция на него не готовится.",
+                     "no_text": "в сообщении нет текста — отвечать не на что."}
+            return {"ok": False, "text": "Не получилось: " + words.get(code, "это сообщение для репетиции не подходит "
+                                                                           "(только личные сообщения людей вашему аккаунту).")}
+        used = await conn.fetchval(
+            "SELECT count(*) FROM rehearsal_items WHERE asked_at > now() - interval '24 hours'")
+        if used >= s["daily_cap"]:
+            return {"ok": False, "text": f"Дневной предел репетиции — {s['daily_cap']} карточек — исчерпан. Предел "
+                                         "меняется в «Настройках Штурмана», раздел «Репетиция ответов»."}
+        existing = await conn.fetchrow("SELECT id, state FROM rehearsal_items WHERE trigger_message_id = $1", message_id)
+        if existing is not None and existing["state"] in ("queued", "preparing"):
+            return {"ok": True, "text": "Ответ на это сообщение уже готовится — карточка придёт сюда."}
+        if existing is not None and existing["state"] == "shown":
+            return {"ok": False, "text": "Репетиция на это сообщение уже была — карточка выше в этом чате."}
+        if existing is not None:
+            item_id = existing["id"]
+            await conn.execute(
+                """UPDATE rehearsal_items SET state = 'queued', reason = NULL, on_demand = true, job_id = NULL,
+                          updated_at = now() WHERE id = $1""", item_id)
+        else:
+            item_id = await conn.fetchval(
+                """INSERT INTO rehearsal_items (account_id, chat_id, trigger_message_id, peer_tg_id, nonce, on_demand)
+                   VALUES ($1, $2, $3, $4, $5, true) RETURNING id""",
+                row["account_id"], row["chat_id"], message_id, int(row["peer_tg_id"]), secrets.token_urlsafe(12))
+    outcome = await mod.prepare(item_id)
+    if outcome != "preparing":
+        reasons = {"answered": "вы уже ответили в этом чате.", "daily_cap": "дневной предел репетиции исчерпан.",
+                   "stopped": "ассистент остановлен."}
+        return {"ok": False, "text": "Не получилось: " + reasons.get(outcome, "сообщение изменилось или удалено.")}
+    return {"ok": True, "text": "Готовлю, что ответил бы ассистент, — пришлю карточкой репетиции. Ничего не отправляется."}
 
 
 @bridge.on_owner_change
@@ -583,7 +705,9 @@ async def stats(conn: asyncpg.Connection, days: int = 7) -> dict[str, int]:
                   count(*) FILTER (WHERE state = 'shown' AND rating IS NULL) AS unrated,
                   count(*) FILTER (WHERE state = 'skipped' AND reason = ANY($2::text[])) AS limited,
                   count(*) FILTER (WHERE state = 'failed') AS failed,
-                  count(*) FILTER (WHERE state IN ('queued', 'preparing')) AS in_progress
+                  count(*) FILTER (WHERE state IN ('queued', 'preparing')) AS in_progress,
+                  count(*) FILTER (WHERE owner_variant IS NOT NULL) AS variants,
+                  count(*) FILTER (WHERE on_demand AND state = 'shown') AS on_demand
            FROM rehearsal_items WHERE created_at > now() - make_interval(days => $1)""", days, list(LIMITED))
     out = {key: int(value) for key, value in dict(row).items()}
     out["asked_24h"] = int(await conn.fetchval(

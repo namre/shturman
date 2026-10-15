@@ -190,7 +190,8 @@ async def test_status_reports_only_flags_about_the_setup_page(stand, conn):
     empty = (await s.api.get("/api/status")).json()["setup"]
     assert empty == {"enabled": True, "origin_set": True, "origin": "https://assistant.example.com", "reason": None,
                      "tg_keys": False, "accounts": 0, "own_bot": False,
-                     "owner_bound": False, "business_connected": False, "own_model": False, "socket": "off"}
+                     "owner_bound": False, "business_connected": False, "own_model": False, "socket": "off",
+                     "code_login": {"enabled": False, "reason": "no_bot", "logins_7d": 0}}
     await s.page.login(conn)
     await save_bot(s)
     await bind_owner(s)
@@ -200,11 +201,14 @@ async def test_status_reports_only_flags_about_the_setup_page(stand, conn):
     assert raw.json()["setup"] == {"enabled": True, "origin_set": True, "origin": "https://assistant.example.com",
                                    "reason": None, "tg_keys": True, "accounts": 0, "own_bot": True,
                                    "owner_bound": True, "business_connected": False, "own_model": True,
-                                   "socket": "off"}
+                                   "socket": "off", "code_login": {"enabled": True, "reason": None, "logins_7d": 0}}
     # ни значений, ни имён через внутренний API не видно
     for secret in (TOKEN, LLM_KEY, "0123456789abcdef0123456789abcdef", "Евгений", "shturman_soglasovaniya_bot"):
         assert secret not in raw.text
     # только признаки и числа; адрес страницы — не секрет; ключа сессии страницы здесь нет
-    assert all(isinstance(v, (bool, int)) for k, v in raw.json()["setup"].items() if k not in ("origin", "reason", "socket"))
+    assert all(isinstance(v, (bool, int)) for k, v in raw.json()["setup"].items()
+               if k not in ("origin", "reason", "socket", "code_login"))
+    assert all(isinstance(v, (bool, int, type(None))) for v in raw.json()["setup"]["code_login"].values()
+               if not isinstance(v, str) or v in ("managed", "off", "no_bot", "no_owner", "no_socket"))
     assert s.page.key not in raw.text
     assert ORIGIN

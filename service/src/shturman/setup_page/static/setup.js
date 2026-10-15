@@ -203,7 +203,11 @@
 
   /* Возвращает {ok, status, data, error}. Не бросает. При устаревшем входе показывает экран входа. */
   function call(method, path, body, quiet) {
-    var options = { method: method, credentials: "omit", cache: "no-store", redirect: "error", referrerPolicy: "no-referrer", headers: headers(body !== undefined) };
+    // Cookie браузер не шлёт и не принимает — кроме маршрутов входа по коду: там cookie попытки (Р-88)
+    // привязывает код к этому браузеру. Её путь — только эти маршруты, а скрипту она не видна (HttpOnly).
+    var withAttempt = path.indexOf("login/code") === 0;
+    var options = { method: method, credentials: withAttempt ? "same-origin" : "omit", cache: "no-store", redirect: "error",
+                    referrerPolicy: "no-referrer", headers: headers(body !== undefined) };
     if (body !== undefined) options.body = JSON.stringify(body);
     return fetch(API + path, options).then(function (res) {
       return res.text().then(function (raw) {
@@ -244,14 +248,29 @@
 
   var LOGIN_VIEWS = ["login-link", "login-start", "login-code", "login-nolink", "login-message"];
   var CODE_REASONS = {
-    wrong: "Код не подошёл. Проверьте цифры и попробуйте ещё раз.",
-    expired: "Срок действия кода вышел. Запросите новый.",
-    none: "Этот код уже использован или не запрашивался. Запросите новый.",
-    locked: "Слишком много неверных попыток. Вход по коду временно закрыт — попробуйте позже или войдите по новой ссылке.",
-    no_owner: "Код прислать некому: бот согласований не настроен. Войдите по одноразовой ссылке — попросите её у того, кто обслуживает ваш сервер.",
-    wait: "Недавняя отправка не удалась. Попробуйте ещё раз через минуту.",
-    send_failed: "Не удалось отправить код: бот сейчас не может написать вам в Telegram. Попробуйте через минуту."
+    wrong: "Код не подошёл. Проверьте цифры в сообщении бота.",
+    expired: "Код устарел — он действует 5 минут. Запросите новый.",
+    none: "Этот код здесь не действует: он погашен, уже использован или запрошен в другом браузере. Запросите новый в этом браузере.",
+    locked: "Слишком много неверных попыток: вход по коду на время приостановлен. Попробуйте позже или войдите по ссылке.",
+    limited: "Больше трёх кодов за 15 минут запросить нельзя. Возьмите последний код из бота или подождите.",
+    port: "Здесь вход по коду недоступен. Войдите по одноразовой ссылке — попросите её у того, кто обслуживает ваш сервер."
   };
+  /* Почему вход по коду выключен (session.code_login_off) — строка на экране «Нужна ссылка входа». */
+  var CODE_OFF = {
+    managed: "Вход по коду из бота выключен: бот согласований создан «в одно нажатие» через посредника, и его держатель " +
+             "технически может читать сообщения бота — а значит и коды. Включить можно после входа по ссылке: «Бот согласований» → " +
+             "«Вход на эту страницу по коду из бота», подтверждение — кнопкой в боте.",
+    off: "Вход по коду из бота выключен вами. Включить — после входа по ссылке: «Бот согласований» → «Вход на эту страницу по коду из бота».",
+    port: "Здесь вход по коду недоступен: страница открыта не по своему внешнему адресу (например, через туннель SSH). Войдите по ссылке."
+  };
+
+  function waitWords(seconds) {
+    seconds = Number(seconds) || 0;
+    if (seconds < 90) return "через минуту";
+    var minutes = Math.ceil(seconds / 60);
+    if (minutes < 90) return "через " + minutes + " мин";
+    return "через " + Math.ceil(minutes / 60) + " ч";
+  }
 
   function loginView(name) {
     LOGIN_VIEWS.forEach(function (id) { show(id, id === name); });
@@ -273,6 +292,8 @@
       if (r.ok && key) saveKey("");                  // сервер ключа не признал: стираем
       var canCode = r.ok && r.data.code_login;
       if (message) { loginMessage(message, true); return; }
+      var off = r.ok ? CODE_OFF[r.data.code_login_off] : "";
+      note("login-code-off", "info", off || "");
       loginView(canCode ? "login-start" : "login-nolink");
     });
   }
@@ -305,18 +326,20 @@
       busy(button, true);
       call("POST", "login/code/request", {}, true).then(function (r) {
         busy(button, false);
-        var result = r.ok ? r.data.result : "";
-        if (result === "sent" || result === "reused") {
+        var result = r.data && (r.data.result || r.data.code) || "";
+        if (r.ok && result === "sent") {
           loginView("login-code");
-          text("login-code-lead", result === "sent"
-            ? "Бот согласований отправил вам код в Telegram. Он действует 5 минут."
-            : "Код уже был отправлен и ещё действует. Возьмите последний код из чата с ботом согласований.");
+          var left = r.data.left;
+          text("login-code-lead", "Бот согласований отправил вам код в Telegram. Он действует 5 минут и только в этом браузере." +
+            (left === 0 ? " Это последний код на ближайшие 15 минут." : ""));
           error.hidden = true;
           input.value = "";
           input.focus();
           return;
         }
-        loginMessage(CODE_REASONS[result] || r.error || GENERIC[0], result !== "no_owner" && result !== "locked");
+        var reason = CODE_REASONS[result] || r.error || GENERIC[0];
+        if ((result === "locked" || result === "limited") && r.data.retry_after) reason += " Снова — " + waitWords(r.data.retry_after) + ".";
+        loginMessage(reason, result !== "port");
       });
     }
     $("login-code-send").addEventListener("click", function () { requestCode(this); });
@@ -324,25 +347,27 @@
     $("login-message-retry").addEventListener("click", function () { loginScreen(""); });
 
     input.addEventListener("input", function () {
-      var digits = input.value.replace(/\D/g, "").slice(0, 8);
-      input.value = digits.length > 4 ? digits.slice(0, 4) + " " + digits.slice(4) : digits;
+      var digits = input.value.replace(/\D/g, "").slice(0, 6);
+      input.value = digits.length > 3 ? digits.slice(0, 3) + " " + digits.slice(3) : digits;
       error.hidden = true;
     });
     $("login-code-form").addEventListener("submit", function (event) {
       event.preventDefault();
       var digits = input.value.replace(/\D/g, ""), button = $("login-code-submit");
-      if (digits.length !== 8) { error.textContent = "В коде восемь цифр."; error.hidden = false; return; }
+      if (digits.length !== 6) { error.textContent = "В коде шесть цифр."; error.hidden = false; return; }
       busy(button, true);
       call("POST", "login/code", { code: digits }, true).then(function (r) {
         busy(button, false);
         input.value = "";
         if (r.ok && r.data.key) { saveKey(r.data.key); startApp(); return; }
         var reason = r.data.code;
-        if (reason === "locked" || reason === "none" || reason === "expired") {
-          loginMessage(CODE_REASONS[reason], reason !== "locked");
+        if (reason === "locked" || reason === "none" || reason === "expired" || reason === "port") {
+          loginMessage(CODE_REASONS[reason] + (reason === "locked" && r.data.retry_after ? " Снова — " + waitWords(r.data.retry_after) + "." : ""),
+                       reason !== "locked" && reason !== "port");
           return;
         }
-        error.textContent = CODE_REASONS[reason] || r.error;
+        error.textContent = (CODE_REASONS[reason] || r.error) +
+          (reason === "wrong" && r.data.left ? " Осталось попыток: " + r.data.left + "." : "");
         error.hidden = false;
         input.focus();
       });
@@ -413,6 +438,8 @@
     renderChats(S.tg);
     renderImports(S.imports);
     renderBot(S.bot);
+    renderHalt(S.halt || {});
+    renderCodeLogin(S.code_login || {}, S.bot);
     renderBusiness(S.bot);
     renderLlm(S.llm);
     renderMedia(S.media || {});
@@ -638,11 +665,103 @@
     note("bind-refused", "danger", !b.owner_bound && b.bind_refused_at
       ? "Ссылку привязки открыли в другом аккаунте Telegram, не в том, которым создан бот (" + when(b.bind_refused_at) + "). Все ссылки привязки отменены. Если это были не вы — ссылку могли подсмотреть; получите новую и откройте её только в своём аккаунте." : "");
     note("bind-done", "ok", b.owner_bound ? "Владелец привязан" + (b.owner_name ? ": " + b.owner_name : "") + "." : "");
+    // С14: где решения дальше — приложение «Штурман» в чате с ботом (если у страницы есть внешний адрес https)
+    show("bind-app", !!(b.owner_bound && S && S.app_available));
     show("bind-link-box", !!ui.bind);
     show("shot-start", !!ui.bind);
     show("bind-go", !ui.bind);
     text("bind-go", b.owner_bound ? "Привязать другой аккаунт" : "Показать ссылку привязки");
     if (b.bind_paused) note("bind-error", "warn", "Бот получил много неверных кодов привязки и на 10 минут перестал их принимать. Подождите и выдайте ссылку заново.");
+  }
+
+  /* «Остановить всё» (Р-87): кнопка в шапке — сразу; «Продолжить…» — карточка в бот согласований,
+   * и только нажатие там снимает остановку. Пока остановлено — полоса под шапкой. */
+  function renderHalt(h) {
+    var stopped = !!h.stopped;
+    show("halt-stop", !stopped);
+    show("halt-banner", stopped);
+    if (!stopped) { text("halt-note", ""); return; }
+    text("halt-since", h.since ? "с " + when(h.since) + (h.via === "app" ? " (из приложения)" : h.via === "bot" ? " (в боте)" : "") : "");
+    text("halt-reading", h.reading_paused
+      ? "Чтение переписки тоже на паузе (аккаунтов: " + h.reading_paused + ")."
+      : "Переписка по-прежнему собирается в архив, уведомления о новых сообщениях приходят.");
+    show("halt-reading-stop", !h.reading_paused);
+    show("halt-reading-box", !!h.reading_paused);
+    var list = $("halt-resumes");
+    list.textContent = "";
+    (h.resumes || []).forEach(function (line) { list.appendChild(el("li", { text: line.replace(/^•\s*/, "") })); });
+    if (h.resume_pending) {
+      text("halt-note", "Подтверждение «Продолжить» ждёт в боте согласований — нажмите там «Да, сделать». Здесь продолжить нельзя: так ассистент не снимет остановку сам.");
+      text("halt-resume", "Отправить подтверждение ещё раз");
+    } else {
+      text("halt-note", "Продолжить можно только нажатием в боте согласований: кнопка «Продолжить…» пришлёт туда подтверждение.");
+      text("halt-resume", "Продолжить…");
+    }
+  }
+
+  function wireHalt() {
+    $("halt-stop").addEventListener("click", function () {
+      var button = this;
+      busy(button, true);
+      call("POST", "halt", { reading: false }).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { toast(r.error, true); return; }
+        toast("Остановлено. Подробности — в боте согласований.");
+        refresh();
+      });
+    });
+    $("halt-reading-stop").addEventListener("click", function () {
+      var button = this;
+      busy(button, true);
+      call("POST", "halt", { reading: true }).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { toast(r.error, true); return; }
+        toast("Чтение переписки остановлено: все аккаунты на паузе.");
+        refresh();
+      });
+    });
+    $("halt-resume").addEventListener("click", function () {
+      var button = this;
+      busy(button, true);
+      call("POST", "halt/resume", { reading: $("halt-reading-resume").checked }).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { toast(r.error, true); return; }
+        toast("Подтвердите «Продолжить» в боте согласований — карточка уже там.");
+        refresh();
+      });
+    });
+  }
+
+  /* Вход на страницу по коду из бота (Р-88): включён ли, почему нет, выключить — сразу, включить при
+   * боте от посредника — только нажатием в боте. */
+  function renderCodeLogin(c, b) {
+    var visible = !!(b && b.configured && b.owner_bound);
+    show("code-login", visible);
+    if (!visible) return;
+    text("code-login-state", c.enabled
+      ? "Включён: «Получить код в боте» на экране входа. Код приходит сюда, в бот согласований, и работает 5 минут только в браузере, где его запросили." +
+        (c.logins_7d ? " Входов по коду за 7 дней: " + c.logins_7d + "." : "")
+      : "Выключен: входить можно только по одноразовой ссылке с сервера.");
+    note("code-login-why", "info", !c.enabled && c.origin === "managed"
+      ? "Бот создан «в одно нажатие» через посредника: его держатель технически может читать сообщения бота — и коды входа. Поэтому вход по коду по умолчанию выключен. Включайте, только если доверяете посреднику; подтверждение — кнопкой в боте."
+      : "");
+    text("code-login-toggle", c.enabled ? "Выключить вход по коду" : c.needs_bot_press ? "Включить… (подтверждение в боте)" : "Включить вход по коду");
+    $("code-login-toggle").dataset.enable = c.enabled ? "0" : "1";
+    note("code-login-note", "info", c.enable_pending ? "Включение ждёт вашего нажатия в боте согласований." : "");
+  }
+
+  function wireCodeLogin() {
+    $("code-login-toggle").addEventListener("click", function () {
+      var button = this, enable = button.dataset.enable === "1";
+      busy(button, true);
+      call("PUT", "code-login", { enabled: enable }).then(function (r) {
+        busy(button, false);
+        if (!r.ok && r.status !== 202) { toast(r.error, true); return; }
+        toast(r.status === 202 ? "Подтвердите включение в боте согласований — карточка уже там." :
+              enable ? "Вход по коду включён." : "Вход по коду выключен. Ждущие коды погашены.");
+        refresh();
+      });
+    });
   }
 
   /* Бот в одно нажатие через бот-менеджер посредника (bot_setup.py). Страница видит только ссылку
@@ -3126,6 +3245,7 @@
         el("input", { type: "checkbox", value: String(sp.id), checked: s.spheres.indexOf(sp.id) >= 0 }), el("span", { text: sp.title })]));
     });
     show("nt-spheres-empty", !d.spheres.length);
+    drawNtMuted(d);
     drawNtPeople();
     ntToggle();
     var st = d.status;
@@ -3143,6 +3263,30 @@
   }
 
   function personName(p) { return p.name || (p.username ? "@" + p.username : "№ " + p.tg_id); }
+
+  /* «Не сообщать об этом чате» (кнопка под уведомлением в боте, Б14): вернуть — только здесь. */
+  function drawNtMuted(d) {
+    var muted = d.muted || [], list = $("nt-muted");
+    show("nt-muted-box", muted.length > 0);
+    list.textContent = "";
+    muted.forEach(function (c) {
+      list.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", { text: c.title || "Чат № " + c.id }),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Вернуть", "aria-label": "Снова сообщать о чате " + (c.title || c.id),
+          onclick: function () {
+            var rest = d.settings.muted_chats.filter(function (id) { return id !== c.id; }), button = this;
+            busy(button, true);
+            call("PUT", "notify", { muted_chats: rest }).then(function (r) {
+              busy(button, false);
+              if (!r.ok) { toast(r.error, true); return; }
+              nt.data = r.data;
+              drawNotify();
+              toast("Снова сообщаю об этом чате.");
+            });
+          } })
+      ]));
+    });
+  }
 
   function drawNtPeople() {
     var list = $("nt-people");
@@ -3601,7 +3745,7 @@
     $("logout-all").addEventListener("click", function () {
       ask(this, "Завершить все входы в «Настройки Штурмана» — на всех устройствах?", {
         yes: "Выйти везде", danger: true,
-        note: "Войти снова можно будет по коду от бота согласований или по новой ссылке от того, кто обслуживает сервер."
+        note: "Войти снова можно будет по коду из бота согласований или по новой ссылке от того, кто обслуживает сервер."
       }).then(function (ok) {
         if (ok) call("POST", "logout-all", {}, true).then(function () { saveKey(""); loginScreen(""); });
       });
@@ -3619,7 +3763,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireWatch(); wireRetry(); wireMemory(); wireSession();
+  wireLogin(); wireHalt(); wireCodeLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireWatch(); wireRetry(); wireMemory(); wireSession();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.
