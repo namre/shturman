@@ -117,6 +117,10 @@ async def list_dialogs(state: AppState, tg: TgManager, account_id: int, request:
         item["locked"] = store.is_blocked_peer(item["peer_class"], item["tg_id"], item["username"])
         item["spheres"] = by_key.get((item["peer_class"], item["tg_id"]), [])
     out["enabled_total"] = await enabled_total(state, account_id)
+    # Сколько всего чатов у аккаунта в Telegram (в сохранённом списке) — для строки «Читается N из M» (С11).
+    async with state.ro_pool.acquire() as conn:
+        out["dialogs_total"] = int(await conn.fetchval(
+            "SELECT count(*) FROM tg_dialogs WHERE account_id = $1", account_id))
     return out
 
 

@@ -257,6 +257,22 @@ for (const [width, scheme, theme] of [[390, "dark", THEME], [390, "light", THEME
   });
   check(`${tag}: карточка отличается от фона страницы`, contrast.page !== contrast.card || contrast.border !== "0px",
         JSON.stringify(contrast));
+  // П5: текст карточек, вкладок и кнопок — не ниже 4,5:1 к своему фону (цвета темы Telegram поправлены app.js)
+  const low = await p.evaluate(() => {
+    function rgb(s) { const x = s.match(/[\d.]+/g); return x ? x.map(Number) : [0, 0, 0, 1]; }
+    function lum([r, g, b]) { const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); }
+    function bgOf(el) { while (el) { const c = rgb(getComputedStyle(el).backgroundColor); if ((c[3] ?? 1) > 0.5) return c; el = el.parentElement; } return [255, 255, 255]; }
+    const out = [];
+    for (const el of document.querySelectorAll("body *")) {
+      const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+      if (!r.width || !r.height || st.visibility === "hidden" || el.closest("[disabled]")) continue;
+      if (![...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) continue;
+      const a = lum(rgb(st.color)), b = lum(bgOf(el)), ratio = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+      if (ratio < 4.5) out.push(`${ratio.toFixed(2)} «${el.textContent.trim().slice(0, 30)}»`);
+    }
+    return out;
+  });
+  check(`${tag}: контраст текста не ниже 4,5:1 (содержимое карточек, вкладки, кнопки)`, low.length === 0, low.slice(0, 6).join("; "));
   check(`${tag}: в консоли нет ошибок`, errs.length === 0, errs.join(" | "));
   await p.screenshot({ path: path.join(OUT, `${SHOT}list-${tag}.png`), fullPage: true });
   if (width === 390) {
@@ -555,7 +571,16 @@ async function layoutOk(p) {
   let rows = await rowsOf(p);
   const counter = await p.textContent("#chats-counter");
   check("«Чаты»: первые 20 чатов, счётчик выбранных и «Показать ещё»",
-        rows.length === 20 && counter.includes("Выбрано для чтения: 2 чата") && await p.isVisible("#chats-more"), counter);
+        rows.length === 20 && /^Читается 2 чата из \d+ в вашем Telegram/.test(counter) && await p.isVisible("#chats-more"), counter);
+  {
+    // С10: переключатель «Читать» и флажки — нажимается вся подпись не ниже 44 px; видимый флажок — от 24 px
+    const small = await p.evaluate(() => [...document.querySelectorAll("#screen-chats .switch, #screen-chats label.check")]
+      .filter((l) => l.offsetParent !== null)
+      .filter((l) => { const box = l.querySelector('input[type="checkbox"]'); const b = box.getBoundingClientRect();
+                       return l.getBoundingClientRect().height < 44 || (!l.classList.contains("switch") && (b.width < 24 || b.height < 24)); })
+      .map((l) => l.textContent.trim() + " " + Math.round(l.getBoundingClientRect().height)));
+    check("«Чаты»: цели касания — строки переключателей и флажков не ниже 44 px", small.length === 0, small.slice(0, 4).join("; "));
+  }
   check("«Чаты»: служебный чат Telegram помечен и не включается",
         rows.some((r) => r.title === "Telegram" && r.disabled && r.meta.includes("служебный")));
   const depth = await p.$eval("#chats-depth", (s) => s.value);
@@ -564,8 +589,8 @@ async function layoutOk(p) {
 
   // «Показать ещё»
   await p.click("#chats-more");
-  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 50);
-  check("«Чаты»: «Показать ещё» догружает следующие", (await rowsOf(p)).length === 50);
+  await p.waitForFunction(() => document.querySelectorAll("#chats-list li.chat").length === 40);
+  check("«Чаты»: «Показать ещё» догружает следующие 20 — как на странице", (await rowsOf(p)).length === 40);
 
   // поиск
   await p.fill("#chats-q", "иван");
@@ -589,7 +614,7 @@ async function layoutOk(p) {
   check("«Чаты»: запись в журнале «из приложения», без названия",
         seen.audit.some((a) => a.action === "app.sync_on" && a.outcome === "ok" && a.detail.includes("глубина: 3 месяца"))
         && !JSON.stringify(seen.audit).includes("Иван"), JSON.stringify(seen.audit));
-  check("«Чаты»: счётчик выбранных обновился", (await p.textContent("#chats-counter")).includes("Выбрано для чтения: 3 чата"));
+  check("«Чаты»: счётчик выбранных обновился", (await p.textContent("#chats-counter")).startsWith("Читается 3 чата"));
   await p.screenshot({ path: path.join(OUT, `${SHOT}chats-enabled-390-light.png`), fullPage: false });
 
   // вид чатов и «только выбранные»
@@ -849,8 +874,14 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
     await p.click("#sph-new-save");
     await p.waitForFunction(() => document.querySelector("#sph-list").textContent.includes("Учёба"));
     const row = p.locator("#sph-folders li", { hasText: "Работа" }).first();
-    await row.locator("select").selectOption({ label: "Работа РАЗУМ" });
-    await row.locator("button", { hasText: "Предлагать новые" }).click();
+    // С12: одна кнопка «Связать со сферой…», сферы по умолчанию нет, «Предлагать новые» — флажок внутри
+    await row.locator("button", { hasText: "Связать со сферой…" }).click();
+    check("приложение, «Сферы»: у папки сферы по умолчанию нет, «Связать» недоступна",
+          (await row.locator(".folder-pick select").inputValue()) === "" &&
+          await row.locator(".folder-pick button", { hasText: /^Связать$/ }).isDisabled() &&
+          await row.locator(".folder-pick input[type=checkbox]").isChecked());
+    await row.locator(".folder-pick select").selectOption({ label: "Работа РАЗУМ" });
+    await row.locator(".folder-pick button", { hasText: /^Связать$/ }).click();
     await waitFor(async () => (await p.locator("#sph-offers .offer").count()) > 0, 10000);
     await chatsControl("/spheres/folder-new?role=owner");
     await p.click("#tab-chats"); await p.click("#tab-spheres");
