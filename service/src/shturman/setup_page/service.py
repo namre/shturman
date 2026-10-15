@@ -4,10 +4,11 @@
   GET    /shturman-setup/static/{файл}                  её стили и скрипты
 
   Без входа (только чтобы войти):
-  GET    /shturman-setup/api/session                    вошёл ли браузер; можно ли войти по коду от бота
+  GET    /shturman-setup/api/session                    вошёл ли браузер; можно ли войти по коду из бота
   POST   /shturman-setup/api/login/link                 вход по одноразовой ссылке: {token}
-  POST   /shturman-setup/api/login/code/request         прислать код в бота согласований
-  POST   /shturman-setup/api/login/code                 вход по коду: {code}
+  POST   /shturman-setup/api/login/code/request         прислать код в бота согласований; ставит cookie
+                                                        попытки (единственная cookie страницы, Р-88)
+  POST   /shturman-setup/api/login/code                 вход по коду: {code} — только в браузере с этой cookie
 
   После входа:
   POST   /shturman-setup/api/logout                     завершить эту сессию
@@ -52,6 +53,8 @@
   GET    /shturman-setup/api/memory/…                   экран «Память ассистента» — маршруты в `memory.py`
   GET|PUT /shturman-setup/api/notify…, …/watch…, …/retry   уведомления, наблюдатель, повтор после сбоя (Р-84) —
                                                         маршруты в `notify.py`
+  GET|POST /shturman-setup/api/halt, …/halt/resume      «Остановить всё» и «Продолжить» (Р-87) — `halt.py`
+  GET|PUT  /shturman-setup/api/code-login               вход по коду из бота: включён ли (Р-88) — `code_login.py`
 
   Mini App бота согласований — своя узкая роль и свой ключ сессии, маршруты в `miniapp.py`:
   GET    /shturman-setup/app/                           приложение (единственное, что можно открыть в рамке
@@ -105,6 +108,7 @@ from ..tg import service as tg_service
 from ..tg.manager import KEEP, ROLE_NAMES, TgError, TgManager
 from . import PREFIX, apply, audit, auth, bot_setup, chats, shield, summary
 from . import secrets_store as ss
+from ..words import SETUP_PAGE as SETUP_PAGE_WORDS
 
 logger = logging.getLogger("shturman.setup")
 
@@ -353,13 +357,40 @@ async def _failed_login(request: Request, how: str) -> None:
         await _log(request, "login.failed", audit.REFUSED, how)
 
 
+def _via_proxy(request: Request, state: AppState) -> bool:
+    """Запрос пришёл через сокет обратного прокси (Р-76), а не на порт сервиса.
+
+    С Hermes на сервере (задан адрес дашборда) вход по коду — только так: порт сервиса слушает и
+    локальный адрес хоста, а контейнер Hermes живёт в сети хоста — через порт код мог бы запросить и
+    ввести процесс ассистента. Сокет доступен только прокси (его каталог в Hermes не подключён). Без
+    Hermes (режим «только архив») порт и туннель SSH — обычный путь владельца."""
+    return request.scope.get("client") is None or not state.config.dashboard_origin
+
+
+async def _code_login(state: AppState, request: Request | None = None) -> tuple[bool, str | None]:
+    """Можно ли войти по коду из бота: (да/нет, почему нет). Почему нет — только когда бот и владелец
+    есть: «managed» (бот от посредника, по умолчанию выключено), «off» (выключил владелец),
+    «port» (запрос пришёл на порт сервиса, а не через прокси — при Hermes так нельзя)."""
+    from . import code_login
+    owner, _ = await _bound_owner(state)
+    if owner is None:
+        return False, None
+    if request is not None and not _via_proxy(request, state):
+        return False, "port"
+    bot, _ = _runtime_bot(state)
+    async with state.ro_pool.acquire() as conn:
+        found = await code_login.setting(conn, bot.bot_id if bot is not None else None)
+    return found["enabled"], found["reason"]
+
+
 @endpoint(public=True)
 async def session_info(request: Request) -> JSONResponse:
     state = state_of(request)
     session = await _session(request)
-    owner, _ = await _bound_owner(state)
-    # Без входа — только то, без чего не войти: есть ли кому прислать код. Версию не сообщаем.
-    out: dict[str, Any] = {"authenticated": session is not None, "code_login": owner is not None}
+    enabled, reason = await _code_login(state, request)
+    # Без входа — только то, без чего не войти: есть ли кому прислать код и, если вход по коду выключен,
+    # почему (тогда страница пишет, как его включить). Версию не сообщаем.
+    out: dict[str, Any] = {"authenticated": session is not None, "code_login": enabled, "code_login_off": reason}
     if session is not None:
         out.update(via=session.via, expires_at=session.expires_at.isoformat())
     return JSONResponse(out)
@@ -378,50 +409,88 @@ async def login_link(request: Request) -> JSONResponse:
         await _failed_login(request, "ссылка не подошла")
         raise BadRequest("Эта ссылка уже использована или устарела. Попросите того, кто обслуживает ваш сервер, "
                          "выдать новую.", 401, "link_invalid")
-    await _log(request, "login.link", detail="прежние сессии завершены")
+    await _log(request, "login.link", detail="по ссылке; прежние сессии завершены")
     _tell_owner(state, "Выполнен вход в «Настройки Штурмана» по одноразовой ссылке. "
                        "Если это были не вы — нажмите там «Выйти на всех устройствах» или попросите того, кто "
                        "обслуживает сервер, завершить все входы.")
     return _signed_in(*created)
 
 
-CODE_TEXT = ("Код входа на страницу настройки Штурмана: {code}\n"
-             "Действует 5 минут. Никому его не сообщайте. Если вы не запрашивали код, ничего делать не нужно.")
-LOCK_TEXT = ("Кто-то несколько раз подряд ввёл неверный код входа на страницу настройки Штурмана. "
-             "Вход по коду временно закрыт. Если это были не вы, ничего делать не нужно: "
-             "без кода из этого чата войти нельзя.")
+LOCK_TEXT = ("Кто-то пять раз подряд ввёл неверный код входа в «Настройки Штурмана». Код погашен, вход по "
+             "коду на время приостановлен. Если это были не вы, ничего делать не нужно: без кода из этого "
+             "чата и без браузера, в котором его запросили, войти нельзя.")
 
 
 @endpoint(public=True)
 async def login_code_request(request: Request) -> JSONResponse:
+    """Запрос кода. Ответ один и тот же, есть ли кому отправить код или нет (Р-88): попытка заводится в
+    обоих случаях и учитывается в пределе запросов, но без привязанного владельца и при выключенном
+    входе по коду код никуда не уходит и сработать не может."""
+    from . import code_login
     await _body(request)
-    state = state_of(request)
-    owner, api = await _bound_owner(state)
-    send = None
-    if owner is not None:
-        async def send(code: str) -> None:
-            await api.send_message(owner["chat_id"], CODE_TEXT.format(code=f"{code[:4]} {code[4:]}"),
-                                   no_preview=True)
+    state, page = state_of(request), _page(request)
+    if not _via_proxy(request, state):
+        raise BadRequest(PORT_REFUSED, 403, "port")
+    enabled, _ = await _code_login(state, request)
     async with state.pool.acquire() as conn:
-        result = await auth.request_code(conn, _page(request).key, send)
-    if result == "sent":
-        await _log(request, "login.code_sent")
-    return JSONResponse({"result": result})
+        found = await auth.start_code(conn, page.key, previous=code_login.attempt_cookie(request))
+    if found.result != "sent":
+        body = {"result": found.result, "retry_after": found.retry_after}
+        if found.result == "limited":
+            await _failed_login(request, "запросов кода больше трёх за 15 минут")
+        return JSONResponse(body, status_code=429)
+    if enabled:
+        owner, api = await _bound_owner(state)
+        try:
+            message_id = await api.send_message(
+                owner["chat_id"], code_login.message(found.code, request, state.config),
+                buttons=code_login.message_buttons(found.code_id, found.nonce), no_preview=True)
+        except (BotApiError, TypeError, KeyError) as exc:  # не дошло — попытка просто не сработает
+            logger.warning("страница настройки: код входа не отправлен (%s)", type(exc).__name__)
+        else:
+            async with state.pool.acquire() as conn:
+                await auth.mark_delivered(conn, found.code_id, message_id)
+    await _log(request, "login.code_sent")
+    response = JSONResponse({"result": "sent", "expires_in": auth.CODE_TTL, "left": found.left})
+    code_login.set_cookie(response, found.attempt)
+    return response
+
+
+PORT_REFUSED = ("Вход по коду — только по внешнему адресу страницы. Здесь (на порту сервиса, в том числе через "
+                "туннель SSH) войдите по одноразовой ссылке.")
+
+LOGIN_FAILED = {
+    "wrong": "Код не подошёл. Проверьте цифры в сообщении бота.",
+    "none": "Этот код здесь не действует: он погашен, уже использован или запрошен в другом браузере. "
+            "Запросите новый код в этом браузере.",
+    "expired": "Код устарел — он действует 5 минут. Запросите новый.",
+    "locked": "Слишком много неверных попыток: вход по коду на время приостановлен. Попробуйте позже или "
+              "войдите по ссылке.",
+}
 
 
 @endpoint(public=True)
 async def login_code(request: Request) -> JSONResponse:
+    from . import code_login
     data = await _body(request)
     state = state_of(request)
+    if not _via_proxy(request, state):
+        raise BadRequest(PORT_REFUSED, 403, "port")
     created = None
     async with state.pool.acquire() as conn:
-        result = await auth.verify_code(conn, _page(request).key, data.get("code") or "")
+        result, code_id = await auth.verify_code(conn, _page(request).key, code_login.attempt_cookie(request),
+                                                 data.get("code") or "")
         if result == "ok":
             created = await auth.create_session(conn, "code")
+        left = await auth.tries_left(conn, code_id) if result == "wrong" else None
+        wait = await auth.lock_left(conn) if result != "ok" else 0
     if created is not None:
-        await _log(request, "login.code")
-        _tell_owner(state, "Выполнен вход на страницу настройки Штурмана по коду из этого чата.")
-        return _signed_in(*created)
+        await _log(request, "login.code", detail="по коду из бота")
+        _tell_owner(state, f"Выполнен вход в «{SETUP_PAGE_WORDS}» по коду из этого чата. Если это были не вы — "
+                           "нажмите «Выйти на всех устройствах» под сообщением с кодом.")
+        response = _signed_in(*created)
+        code_login.set_cookie(response, None)          # попытка использована — cookie больше не нужна
+        return response
     if result in ("locked_now", "locked_again"):
         await _log(request, "login.code_locked", audit.REFUSED)
         if result == "locked_now":          # одно сообщение владельцу на период блокировки
@@ -429,7 +498,12 @@ async def login_code(request: Request) -> JSONResponse:
         result = "locked"
     elif result == "wrong":
         await _failed_login(request, "код не подошёл")
-    return JSONResponse({"error": "Войти не получилось.", "code": result}, status_code=401)
+    body: dict[str, Any] = {"error": LOGIN_FAILED.get(result, "Войти не получилось."), "code": result}
+    if left is not None:
+        body["left"] = left
+    if result == "locked":
+        body["retry_after"] = wait
+    return JSONResponse(body, status_code=401)
 
 
 @endpoint
@@ -686,10 +760,17 @@ async def media_save(request: Request) -> JSONResponse:
 @endpoint
 async def page_state(request: Request) -> JSONResponse:
     state, page = state_of(request), _page(request)
+    from . import code_login
+    from . import halt as halt_page
+    from ..executor import menu_button
     return JSONResponse({
         "version": __version__,
         "scenario": await _scenario_state(state),
         "origin_set": bool(state.config.setup_external),
+        # Приложение «Штурман» в Telegram есть, когда у страницы внешний адрес https (С14).
+        "app_available": bool(menu_button.app_url(state.config)),
+        "halt": await halt_page.view(state),
+        "code_login": await code_login.view(state),
         "sending": bool(state.config.sending),
         "bot": await _bot_state(state, page),
         "tg": await _tg_state(state, page),
@@ -1343,7 +1424,8 @@ async def chatgpt_remove(request: Request) -> JSONResponse:
 # --- сборка ------------------------------------------------------------------------------------
 
 def routes() -> list[BaseRoute]:
-    from . import memory, miniapp
+    from . import code_login, memory, miniapp
+    from . import halt as halt_page
     from . import notify as notify_page
     from . import rehearsal as rehearsal_page
     from . import spheres as spheres_page
@@ -1402,6 +1484,8 @@ def routes() -> list[BaseRoute]:
         *spheres_page.routes(),
         *notify_page.routes(),
         *rehearsal_page.routes(),
+        *halt_page.routes(),
+        *code_login.routes(),
     ]
 
 

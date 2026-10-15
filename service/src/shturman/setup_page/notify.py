@@ -88,6 +88,9 @@ async def notify_view(request: Request) -> dict[str, Any]:
         out["spheres"] = [{"id": r["id"], "title": r["title"]}
                           for r in await conn.fetch("SELECT id, title FROM spheres ORDER BY position, id")]
         out["describe"] = ns.describe(out["settings"], sphere_titles=titles)
+        # «Не сообщать об этом чате» (кнопка под уведомлением): чаты с названиями — вернуть можно здесь.
+        muted = await _chat_titles(conn, out["settings"]["muted_chats"])
+        out["muted"] = [muted.get(i) or {"id": i, "title": None} for i in out["settings"]["muted_chats"]]
     out["timezone"] = state.config.timezone
     return out
 
@@ -116,8 +119,9 @@ async def notify_put(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, **await notify_view(request)})
 
 
-@page.endpoint
-async def notify_people(request: Request) -> JSONResponse:
+async def people_search(request: Request) -> JSONResponse:
+    """Собеседники личных чатов основного аккаунта по имени — для уведомлений и репетиции (страница и
+    вкладка «Репетиция» приложения)."""
     q = " ".join((request.query_params.get("q") or "").casefold().split())[:80]
     limit = page._query_int(request, "limit", 30, low=1, high=100)
     async with state_of(request).ro_pool.acquire() as conn:
@@ -134,6 +138,9 @@ async def notify_people(request: Request) -> JSONResponse:
               "last_at": r["last_at"].isoformat() if r["last_at"] else None}
              for r in rows if not store.is_blocked_peer("user", r["tg_id"], r["username"])][:limit]
     return JSONResponse({"items": items})
+
+
+notify_people = page.endpoint(people_search)
 
 
 # --- приложение: смотреть и сужать ------------------------------------------------------------------

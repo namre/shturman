@@ -77,13 +77,18 @@ def _iso(value: Any) -> str | None:
 
 
 def _item(kind: str, kind_title: str, entry: dict[str, Any], *, note: str | None = None) -> dict[str, Any]:
+    from ..replies import workflow
+    # «Ответить» на вопрос ассистента (П1): в приложении это не кнопка, а поле «Ваш ответ» с кнопкой
+    # «Ответить» — ответ идёт своим маршрутом (`miniapp.approvals_answer`), но тем же путём на сервере.
+    answer = [b["data"] for row in entry["buttons"] for b in row if b["data"].startswith(workflow.ANSWER_PREFIX)]
     actions = [{"label": b["text"], "ref": b["data"], "primary": b["text"] in PRIMARY}
-               for row in entry["buttons"] for b in row]
+               for row in entry["buttons"] for b in row if not b["data"].startswith(workflow.ANSWER_PREFIX)]
     return {
         "key": f"{kind}:{entry['id']}", "kind": kind, "kind_title": kind_title, "id": entry["id"],
         "title": entry.get("title") or kind_title, "head": list(entry.get("head") or []),
         "text": entry.get("text") or "", "note": note or entry.get("note"), "actions": actions,
         "expires_at": _iso(entry.get("expires_at")),
+        "answer": {"ref": answer[0], "question": entry.get("question"), "max": 2000} if answer else None,
         # Только для сервера: каким сообщением в боте ушла карточка. В ответ приложению не идёт.
         "_card_message_id": entry.get("card_message_id"),
     }
@@ -156,6 +161,18 @@ def find(collected: dict[str, Any], ref: str) -> tuple[dict[str, Any], dict[str,
         for action in item["actions"]:
             if action["ref"] == ref:
                 return item, action
+    return None
+
+
+ANSWER_REF = re.compile(r"^sh:rp:a:(\d{1,18}):([A-Za-z0-9_-]{8,43})$")
+
+
+def find_answer(collected: dict[str, Any], ref: str) -> dict[str, Any] | None:
+    """Вопрос ассистента, на который сейчас можно ответить из приложения: `ref` — ровно то, что стоит
+    под его карточкой в боте как «Ответить» (с той же меткой)."""
+    for item in collected["items"]:
+        if item.get("answer") and item["answer"]["ref"] == ref:
+            return item
     return None
 
 

@@ -280,14 +280,20 @@ class BotApi:
     async def send_message(
         self, chat_id: int, text: str, *, buttons: list[list[tuple[str, str]]] | None = None,
         silent: bool = False, business_connection_id: str | None = None, reply_to: int | None = None,
-        no_preview: bool = False,
+        no_preview: bool = False, force_reply: str | None = None,
     ) -> int:
         """Обычный текст, без разметки: в сообщениях есть чужой текст, и разметка позволила бы
-        подделать вид сообщения. Возвращает номер отправленного сообщения."""
+        подделать вид сообщения. Возвращает номер отправленного сообщения.
+
+        force_reply — подсказка в поле ввода: Telegram откроет у владельца ответ на это сообщение
+        (ForceReply, Bot API 5.0+; сверено по core.telegram.org/bots/api, Bot API 10.3, 2026-10-15).
+        Кнопок под таким сообщением нет: у сообщения одна разметка."""
+        markup = keyboard(buttons) if force_reply is None else \
+            {"force_reply": True, "input_field_placeholder": force_reply[:64], "selective": True}
         out = await self.call("sendMessage", {
             "chat_id": chat_id, "text": text,
             "business_connection_id": business_connection_id,
-            "reply_markup": keyboard(buttons),
+            "reply_markup": markup,
             "disable_notification": True if silent else None,
             "reply_parameters": {"message_id": reply_to} if reply_to else None,
             "link_preview_options": {"is_disabled": True} if no_preview else None,

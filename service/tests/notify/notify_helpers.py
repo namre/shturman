@@ -92,7 +92,12 @@ async def sent(conn) -> list[str]:
     out = []
     for r in rows:
         p = r["payload"] if isinstance(r["payload"], dict) else json.loads(r["payload"])
-        assert p["buttons"] is None    # кнопок отправки и ответа у уведомления нет
+        # Кнопок отправки и ответа у уведомления нет: только «Подготовить ответ» (ничего не отправляет),
+        # «Напомнить через час» и «Не сообщать об этом чате» — все модуля уведомлений (Б14).
+        for row in p["buttons"] or []:
+            for b in row:
+                assert b["data"].startswith("sh:nt:") and b["text"] in (
+                    "Подготовить ответ", "Напомнить через час", "Не сообщать об этом чате"), b
         out.append(p["text"])
     return out
 

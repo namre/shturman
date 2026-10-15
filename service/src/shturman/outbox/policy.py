@@ -187,7 +187,15 @@ REASONS = {
     "outcome_unknown": "Ответ об отправке не пришёл: сообщение могло дойти, а могло и нет.",
     "cancelled": "Черновик отменён.",
     "service_stopped": "Сервис отправки не запущен.",
+    # Р-87: флаг «остановлено» сильнее любых правил и выключателя на сервере
+    "assistant_stopped": "Владелец остановил ассистента: пока он не нажмёт «Продолжить» в боте согласований, "
+                         "ассистент ничего не готовит и не отправляет.",
 }
+
+
+async def check_halt(conn: asyncpg.Connection) -> Decision:
+    """Владелец остановил ассистента (Р-87) — отказ любому действию ассистента, в том числе отправке."""
+    return deny("assistant_stopped") if await conn.fetchval("SELECT shturman_halted()") else ALLOW
 
 
 @dataclass(frozen=True)
@@ -507,8 +515,11 @@ async def check_send(
     channel: str, text: str, text_hash: str, origin: str = "agent",
     autoreply_daily_cap: int | None = None, draft_id: int | None = None, task_bound: bool = False,
 ) -> Decision:
-    """Полная проверка перед отправкой: выключатель, чат, канал, текст, частота. Первая причина
-    отказа — ответ."""
+    """Полная проверка перед отправкой: остановка, выключатель, чат, канал, текст, частота. Первая
+    причина отказа — ответ."""
+    decision = await check_halt(conn)
+    if not decision.ok:
+        return decision
     decision = check_switch(rules)
     if not decision.ok:
         return decision

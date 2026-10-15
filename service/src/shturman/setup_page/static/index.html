@@ -37,8 +37,8 @@
 
       <div id="login-start" hidden>
         <h1>Вход в «Настройки Штурмана»</h1>
-        <p class="lead">Бот согласований пришлёт вам одноразовый код в Telegram. Пароль не нужен.</p>
-        <div><button class="btn" id="login-code-send" type="button">Получить код в Telegram</button></div>
+        <p class="lead">Бот согласований пришлёт вам одноразовый код в Telegram. Он сработает только в этом браузере. Пароль не нужен.</p>
+        <div><button class="btn" id="login-code-send" type="button">Получить код в боте</button></div>
         <p class="small">Можно войти и по одноразовой ссылке: попросите её у того, кто обслуживает ваш сервер.</p>
         <details class="for-admin"><summary>Для того, кто обслуживает сервер</summary><p>Ссылку входа печатает команда <code>./ops/setup-link.sh</code></p></details>
       </div>
@@ -49,14 +49,14 @@
         <form id="login-code-form" autocomplete="off" novalidate>
           <label for="login-code-input">Код из Telegram</label>
           <input class="code" id="login-code-input" name="code" type="text" inputmode="numeric"
-                 autocomplete="one-time-code" maxlength="9" placeholder="0000 0000" aria-describedby="login-code-error">
+                 autocomplete="one-time-code" maxlength="7" placeholder="000 000" aria-describedby="login-code-error">
           <p class="note warn" id="login-code-error" role="alert" hidden></p>
           <div class="row actions">
             <button class="btn" id="login-code-submit" type="submit">Войти</button>
             <button class="link" id="login-code-resend" type="button">Код не пришёл</button>
           </div>
         </form>
-        <p class="small">Пока код действует, новый не отправляется. После пяти неверных попыток вход по коду на время закрывается.</p>
+        <p class="small">Код действует 5 минут и только в этом браузере. Никому его не сообщайте, даже ассистенту. После пяти неверных попыток код гаснет, и вход по коду ненадолго закрывается. Не больше трёх кодов за 15 минут.</p>
       </div>
 
       <div id="login-nolink" hidden>
@@ -67,6 +67,7 @@
         </ul>
         <details class="for-admin"><summary>Для того, кто обслуживает сервер</summary><p>Ссылку входа печатает команда <code>./ops/setup-link.sh</code></p></details>
         <p class="small">Откройте ссылку целиком, вместе с частью после знака «#». Она действует 30 минут и срабатывает один раз.</p>
+        <p class="note info" id="login-code-off" hidden></p>
       </div>
 
       <div id="login-message" hidden>
@@ -86,8 +87,23 @@
       <svg width="28" height="28" viewBox="0 0 36 36" fill="none" aria-hidden="true"><circle cx="18" cy="18" r="16" stroke="#E8EEF3" stroke-width="1.5"/><path d="M18 5l4 13-4 13-4-13z" fill="#F2B441"/><circle cx="18" cy="18" r="2" fill="#0F1D2E"/></svg>
       <span>Настройки Штурмана</span>
     </div>
-    <button class="top-btn" id="logout" type="button">Выйти</button>
+    <div class="top-actions">
+      <button class="top-btn stop" id="halt-stop" type="button" title="Сразу, без подтверждения. Продолжить — только нажатием в боте согласований">Остановить всё</button>
+      <button class="top-btn" id="logout" type="button">Выйти</button>
+    </div>
   </header>
+  <!-- «Остановить всё» (Р-87): пока остановлено — на видном месте, под шапкой -->
+  <div class="halt-banner" id="halt-banner" role="status" hidden>
+    <p class="halt-title"><b>⏸ Остановлено <span id="halt-since"></span></b></p>
+    <p>Ассистент ничего не делает сам: не готовит ответы и черновики, не задаёт вопросов, не просит подтверждений, репетиция и наблюдатель стоят, ничего не отправляется — даже если отправка включена на сервере. <span id="halt-reading"></span> Настройки не изменились: после «Продолжить» всё вернётся как было.</p>
+    <details class="halt-more"><summary>Что снова заработает</summary><ul id="halt-resumes"></ul></details>
+    <div class="row halt-row">
+      <button class="btn" id="halt-resume" type="button">Продолжить…</button>
+      <label class="check" id="halt-reading-box" hidden><input type="checkbox" id="halt-reading-resume"><span>и снова читать переписку</span></label>
+      <button class="btn ghost small-btn" id="halt-reading-stop" type="button" hidden>Ещё и перестать читать переписку</button>
+    </div>
+    <p class="small" id="halt-note" role="status"></p>
+  </div>
 
   <main id="main" tabindex="-1">
     <div class="intro">
@@ -222,6 +238,14 @@
             <p class="note info" id="bind-creator" hidden></p>
             <p class="note danger" id="bind-refused" role="alert" hidden></p>
             <p class="note ok" id="bind-done" hidden></p>
+            <p class="note info" id="bind-app" hidden>Кнопка «Штурман» внизу чата с ботом — решения и выбор чатов прямо в Telegram.</p>
+            <div id="code-login" class="box code-login" hidden>
+              <h3>Вход на эту страницу по коду из бота</h3>
+              <p id="code-login-state"></p>
+              <p class="note info" id="code-login-why" hidden></p>
+              <div class="row"><button class="btn ghost small-btn" id="code-login-toggle" type="button"></button></div>
+              <p class="note" id="code-login-note" role="status" hidden></p>
+            </div>
             <div id="bind-link-box" class="box" hidden>
               <p><b>Откройте ссылку в Telegram и нажмите «Запустить».</b> Она действует <span id="bind-minutes">15</span> минут и срабатывает один раз.</p>
               <div class="qr-row">
@@ -839,6 +863,11 @@
                 <label class="field" for="nt-quiet-to"><span>до</span><input id="nt-quiet-to" type="time" step="300"></label>
                 <span class="hint" id="nt-tz"></span>
               </div>
+            </fieldset>
+            <fieldset class="mem-fieldset" id="nt-muted-box" hidden>
+              <legend>Не сообщать о чатах</legend>
+              <p class="hint">Чаты, о которых вы попросили не сообщать кнопкой под уведомлением в боте. Вернуть — только здесь.</p>
+              <ul class="mem-items" id="nt-muted"></ul>
             </fieldset>
             <p class="note warn" id="notify-error" role="alert" hidden></p>
             <div class="row"><button class="btn" id="notify-save" type="submit">Сохранить</button><span class="hint" id="notify-stats"></span></div>

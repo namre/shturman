@@ -28,6 +28,13 @@ async def overview(conn: asyncpg.Connection, state: Any) -> dict[str, Any]:
                                   WHERE via = 'service' AND enabled)) AS business""")
     running = EXTRAS_KEY in state.extras
     reason = config.setup_reason
+    # Вход по коду из бота (Р-88): включён ли и сколько входов за 7 суток — без кодов и адресов.
+    from . import auth, code_login
+    code = await code_login.setting(conn, bot.bot_id if bot is not None else None)
+    logins = await auth.logins_by_code(conn)
+    # С Hermes вход по коду — только через сокет обратного прокси (service._via_proxy): без сокета
+    # снаружи он не работает.
+    no_socket = bool(config.dashboard_origin) and listen.state() != "listening"
     return {
         # Страницей можно пользоваться. false — модуль не запущен либо её внешний адрес совпал
         # с адресом дашборда Hermes (reason = same_origin): тогда снаружи она не отдаётся вовсе.
@@ -47,4 +54,10 @@ async def overview(conn: asyncpg.Connection, state: Any) -> dict[str, Any]:
         # Unix-сокет для обратного прокси (listen.py, Р-76): код состояния — listening, off,
         # dir_missing, dir_owner, dir_mode, not_socket, error. Пути и имён здесь нет.
         "socket": listen.state(),
+        # Вход по коду: enabled — можно ли войти (бот, владелец и сам выключатель); reason — почему нет:
+        # managed (бот от посредника, по умолчанию выключено), off (выключил владелец), no_bot.
+        "code_login": {"enabled": bool(code["enabled"] and owner_bound and not no_socket),
+                       "reason": ("no_bot" if code["reason"] == "no_bot" else "no_owner" if not owner_bound
+                                  else code["reason"] or ("no_socket" if no_socket else None)),
+                       "logins_7d": logins},
     }

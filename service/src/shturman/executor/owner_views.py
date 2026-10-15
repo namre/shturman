@@ -148,10 +148,19 @@ async def status_text(conn: asyncpg.Connection, state: Any) -> str:
     from ..rehearsal import settings as rehearsal_settings
     from ..api_core import overview
 
+    from .. import halt
     config = state.config
     mode = await work_mode(conn)
     counts = await overview(state)
     lines = ["Сейчас в Штурмане", ""]
+    stopped = await halt.current(conn)
+    if stopped["stopped"]:
+        # Остановлено (Р-87) — на самом видном месте: первой строкой.
+        lines[2:2] = ["⏸ Остановлено с " + halt.since_words(stopped, config)
+                      + ": ассистент ничего не делает сам — ни ответов, ни вопросов, ни отправки. "
+                        "Продолжить — /resume.", ""]
+        if stopped["paused_accounts"]:
+            lines.insert(3, f"Чтение переписки тоже на паузе (аккаунтов: {len(stopped['paused_accounts'])}).")
     lines.append("Способ работы: " + (words.MODES[mode] if mode else
                                       f"ещё не выбран — {words.IN_SETUP_PAGE}"))
     accounts = await _accounts(conn, state)

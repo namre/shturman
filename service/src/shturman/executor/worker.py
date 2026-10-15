@@ -101,11 +101,13 @@ class Outcome:
         return self.result is not None
 
 
-def parse_buttons(raw: Any) -> Buttons | None:
+def parse_buttons(raw: Any, *, app_url: str | None = None) -> Buttons | None:
     """Кнопки задания как строки пар (подпись, данные).
 
     Принимаются только кнопки сервиса (данные начинаются с «sh:»): только их нажатие бот
-    передаёт на разбор.
+    передаёт на разбор. Одно исключение — кнопка «Открыть «Штурман»» (`{"text", "app": true}`): она
+    открывает приложение по адресу, который знает сам сервис (`menu_button.app_url`), а не по адресу
+    из задания. Нет адреса — кнопки нет.
     """
     if raw is None or raw == []:
         return None
@@ -115,9 +117,13 @@ def parse_buttons(raw: Any) -> Buttons | None:
     for row in raw:
         if not isinstance(row, list) or not row or len(row) > MAX_BUTTONS_IN_ROW:
             raise ValueError("кнопки заданы неверно")
-        out: list[tuple[str, str]] = []
+        out: list[tuple[str, Any]] = []
         for item in row:
             text = item.get("text") if isinstance(item, dict) else None
+            if isinstance(item, dict) and item.get("app") is True and isinstance(text, str) and text.strip():
+                if app_url:
+                    out.append((text, {"web_app": app_url}))
+                continue
             data = item.get("data") if isinstance(item, dict) else None
             if not isinstance(text, str) or not text.strip() or not isinstance(data, str):
                 raise ValueError("кнопки заданы неверно")
@@ -125,8 +131,9 @@ def parse_buttons(raw: Any) -> Buttons | None:
                     or len(data.encode("utf-8")) > bridge.CALLBACK_DATA_LIMIT):
                 raise ValueError("данные кнопки не принадлежат сервису или длиннее 64 байт")
             out.append((text, data))
-        rows.append(out)
-    return rows
+        if out:
+            rows.append(out)
+    return rows or None
 
 
 def _text(payload: Mapping[str, Any], key: str = "text") -> str:
@@ -368,7 +375,8 @@ class Worker:
     async def _notify_owner(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
         text = bridge.fit_message(_text(payload))
         try:
-            buttons = parse_buttons(payload.get("buttons"))
+            from .menu_button import app_url
+            buttons = parse_buttons(payload.get("buttons"), app_url=app_url(self.state.config))
         except ValueError as exc:
             raise _Fail(str(exc), None) from None
         chat_id = await self._owner_chat()
@@ -434,12 +442,16 @@ class Worker:
             async with self.state.pool.acquire() as conn:
                 link = await conn.fetchrow(
                     "SELECT via, enabled, can_reply FROM business_connections WHERE id = $1", connection_id)
+                stopped = await conn.fetchval("SELECT shturman_halted()")
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — до Telegram дело не дошло
             return not_sent("подключение не удалось проверить")
         if link is None or link["via"] != "service" or not link["enabled"] or not link["can_reply"]:
             return not_sent("подключение не принадлежит боту согласований, выключено или без права отвечать")
+        if stopped:
+            # Владелец остановил ассистента (Р-87): даже согласованное раньше не уходит.
+            return not_sent("владелец остановил ассистента")
         try:
             message_id = await asyncio.wait_for(
                 self.api.send_message(chat_id, text, business_connection_id=connection_id, reply_to=reply_to),

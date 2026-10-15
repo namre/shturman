@@ -66,6 +66,9 @@ class Browser:
         self.origin = origin
         self.http = httpx.AsyncClient(transport=transport, base_url=origin)
         self.key = ""
+        # Cookie попытки входа по коду (Р-88): `Secure`, а стенд ходит по http — банка httpx её не
+        # вернёт, поэтому браузер держит её сам и шлёт только на путь входа по коду, как настоящий.
+        self.code_cookie: str | None = None
 
     def headers(self, **extra: str) -> dict[str, str]:
         out = {"Origin": self.origin, "X-Shturman-Setup": "1", "Sec-Fetch-Site": "same-origin"}
@@ -81,8 +84,15 @@ class Browser:
         return await self.http.get(API + path, headers=headers, **kw)
 
     async def send(self, method: str, path: str, body: Any = None, **kw: Any) -> httpx.Response:
-        return await self.http.request(method, API + path, json={} if body is None else body,
-                                       headers=self.headers(), **kw)
+        headers = self.headers()
+        if self.code_cookie and path.startswith("/login/code"):
+            headers["Cookie"] = f"{auth.CODE_COOKIE}={self.code_cookie}"
+        response = await self.http.request(method, API + path, json={} if body is None else body,
+                                           headers=headers, **kw)
+        for value in response.headers.get_list("set-cookie"):
+            if value.startswith(auth.CODE_COOKIE + "="):
+                self.code_cookie = value.split(";", 1)[0].split("=", 1)[1] or None
+        return response
 
     async def post(self, path: str, body: Any = None) -> httpx.Response:
         return await self.send("POST", path, body)

@@ -190,6 +190,23 @@ progress { width: 100%; height: 14px; accent-color: var(--accent); }
   border: 1px solid var(--navy-line); border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer;
 }
 .top-btn:hover { background: var(--navy-line); }
+.top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+/* «Остановить всё» (Р-87): заметная, но не пугающая — янтарная рамка на тёмной шапке. */
+.top-btn.stop { border-color: var(--amber); color: var(--amber); }
+.top-btn.stop:hover { background: var(--amber); color: var(--mark-ink); }
+.top-btn.stop[hidden] { display: none; }
+.halt-banner {
+  position: sticky; top: 60px; z-index: 4;
+  background: var(--warn-bg); color: var(--warn-ink); border-bottom: 3px solid var(--amber);
+  padding: 14px 24px; display: flex; flex-direction: column; gap: 8px;
+}
+.halt-banner[hidden] { display: none; }
+.halt-banner p { margin: 0; max-width: 1040px; }
+.halt-banner .halt-title { font-size: 18px; }
+.halt-banner .halt-row { align-items: center; gap: 12px; flex-wrap: wrap; }
+.halt-banner .halt-more summary { cursor: pointer; font-weight: 600; }
+.halt-banner .halt-more ul { margin: 6px 0 0; padding-left: 18px; }
+.code-login h3 { margin-top: 0; }
 
 main { max-width: 1040px; margin: 0 auto; padding: 32px 24px 72px; display: flex; flex-direction: column; gap: 24px; }
 main:focus { outline: none; }
@@ -643,6 +660,8 @@ textarea.wr-text { width: 100%; resize: vertical; font: inherit; }
   h1 { font-size: 26px; }
   h2 { font-size: 20px; }
   .top { padding: 8px 16px; }
+  .top-btn { padding: 6px 10px; }
+  .halt-banner { padding: 12px 16px; top: 56px; }
   main { padding: 20px 14px 56px; gap: 18px; }
   .card, .card.step { padding: 18px 16px; }
   .card.step .num { width: 36px; height: 36px; font-size: 18px; }

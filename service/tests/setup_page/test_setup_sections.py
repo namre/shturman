@@ -180,7 +180,9 @@ async def test_removing_the_token_stops_the_bot(stand, conn):
     state = (await s.page.get("/state")).json()["bot"]
     assert state["configured"] is False and state["owner_bound"] is False
     assert not ss.SecretStore(s.config.data_dir).has(ss.BOT_TOKEN)
-    assert (await s.browser().post("/login/code/request")).json() == {"result": "no_owner"}
+    # бота нет — код никуда не уходит; ответ тот же, что при отправленном (Р-88)
+    assert (await s.browser().post("/login/code/request")).json()["result"] == "sent"
+    assert not [p for p in s.telegram.calls("sendMessage") if p["text"].startswith("🔐 Код входа")]
 
 
 # --- 2. ключи приложения ---

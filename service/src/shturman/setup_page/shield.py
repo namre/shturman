@@ -13,8 +13,14 @@ JavaScript (расширения дашборда). На одном origin с н
 в перечне ниже нет, и снаружи страница не отвечает вовсе.
 
 Чего порт НЕ разделяет — cookie: браузер шлёт их на любой порт того же имени, а скрипт соседнего
-порта может подложить свою. Поэтому страница не ставит и не читает cookie вообще (см. `auth.py`),
-а здесь заголовок `Set-Cookie` на всякий случай вырезается из любого ответа под префиксом.
+порта может подложить свою. Поэтому сессию страница держит не в cookie (см. `auth.py`), а здесь
+заголовок `Set-Cookie` вырезается из любого ответа под префиксом. Одно исключение (Р-88): cookie
+попытки входа по коду `__Secure-shturman-code` (`HttpOnly; Secure; SameSite=Strict`) — только в
+ответе на запрос и ввод кода (путь `/shturman-setup/api/login/code…`) и только с этим именем и этим
+путём. На адрес дашборда она не уходит: путь `/shturman-setup*` в блоке дашборда закрыт прокси; скрипт
+дашборда её не прочитает (`HttpOnly`); подложенная им вторая cookie с тем же именем делает вход по
+коду недействительным, а не чужим (`code_login.attempt_cookie`). Сама по себе она ничего не даёт —
+нужен ещё код из бота.
 
 Чему страница верит, а чему нет. Сервис стоит за обратным прокси, и до него доходят заголовки,
 которые мог вписать кто угодно:
@@ -52,6 +58,16 @@ from starlette.responses import JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import APP_PATH, PREFIX
+from .auth import CODE_COOKIE, CODE_PATH
+
+_CODE_COOKIE = (CODE_COOKIE + "=").encode()
+_CODE_COOKIE_TAIL = f"; Path={CODE_PATH}; HttpOnly; Secure; SameSite=Strict".encode()
+
+
+def _code_cookie(path: str, name: bytes, value: bytes) -> bool:
+    """Единственная cookie, которую страница может поставить: попытка входа по коду, на её пути."""
+    return (name.lower() == b"set-cookie" and (path == CODE_PATH or path == CODE_PATH + "/request")
+            and value.startswith(_CODE_COOKIE) and _CODE_COOKIE_TAIL in value and b"Domain" not in value)
 
 METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
 SCOPE_KEY = "shturman.setup"
@@ -164,7 +180,8 @@ class Shield:
             nonlocal swapped
             if message["type"] == "http.response.start":
                 kept = [(k, v) for k, v in message.get("headers", ())
-                        if k.lower() not in _OWN and not k.lower().startswith(_NEVER)]
+                        if (k.lower() not in _OWN and not k.lower().startswith(_NEVER))
+                        or _code_cookie(scope.get("path", ""), k, v)]
                 kind = dict((k.lower(), v) for k, v in kept).get(b"content-type", b"").lower()
                 if for_person and message["status"] >= 400 and kind.startswith(_SWAPPED_TYPES):
                     swapped = True

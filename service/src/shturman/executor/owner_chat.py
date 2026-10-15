@@ -24,11 +24,16 @@ from ..sources.registry import SourceError
 from . import binding, menu_button, owner_views
 
 MODULE = "oc"
+# «Остановить всё» (Х2, Р-87): кнопка главного меню и команды /pause, /stop. Пока остановлено, на
+# месте кнопки — «Продолжить» (сообщение со списком и подтверждением, `halt.resume_prompt`).
+PAUSE_BUTTON = "Пауза"
+RESUME_BUTTON = "Продолжить"
+OPEN_APP = "Открыть «Штурман»"
 # Главное меню. «Согласования» открывает приложение «Штурман», когда оно доступно (кнопка web_app —
 # только в ответах самого бота, `menu_buttons`); иначе — сводка того, что ждёт решения.
 MENU = [
     [("Сейчас", "status"), (words.APPROVALS, "approvals")],
-    [("Помощь", "help"), ("Ещё", "more")],
+    [(PAUSE_BUTTON, "pause"), ("Помощь", "help"), ("Ещё", "more")],
 ]
 MORE = [
     [("Черновики", "drafts"), ("Вопросы ассистента", "replytasks")],
@@ -40,7 +45,7 @@ MORE = [
 # Данные кнопок, которые принимает `on_menu`: нынешние меню и «Ещё» и кнопки прежних версий
 # (под старыми сообщениями они остаются и должны работать).
 MENU_COMMANDS = frozenset({c for rows in (MENU, MORE) for row in rows for _, c in row}
-                          | {"config", "replytasks", "sources", "groups"})
+                          | {"config", "replytasks", "sources", "groups", "resume", "pausereading"})
 
 START = ("Здесь — ваши решения по ассистенту: черновики ответов, подтверждения, вопросы. "
          "Решайте кнопками под карточками.")
@@ -49,7 +54,8 @@ START_NO_APP = f"Настроить, какие чаты читать, — {word
 
 HELP = f"""Как пользоваться ботом
 
-• Сюда приходят карточки: черновик ответа, подтверждение действия, вопрос ассистента, скрытое сообщение. Решайте кнопками под карточкой.
+• Сюда приходят карточки: черновик ответа, подтверждение действия, вопрос ассистента, скрытое сообщение. Решайте кнопками под карточкой. На вопрос ассистента — кнопка «Ответить», ответ — следующим сообщением.
+• «Пауза» (/pause) — остановить всё, что ассистент делает сам, сразу. Продолжить — /resume, с подтверждением кнопкой.
 • «Сейчас» — что работает и сколько ждёт решения.
 • «{words.APPROVALS}» — всё, что ждёт вашего решения, одним списком.
 • Подключение аккаунтов, выбор чатов и уведомления — {words.IN_SETUP_PAGE} в браузере.
@@ -59,6 +65,7 @@ HELP = f"""Как пользоваться ботом
 
 ADVANCED = """Все команды (для точной настройки)
 /menu — кнопки; /status — что работает; /config — настройки словами, /config json — как есть
+/pause (или /stop) — остановить ассистента; /pause all — и перестать читать переписку; /resume — продолжить
 /replytasks (или /tasks) — вопросы ассистента и ответы на сообщения
 /replytask НОМЕР answer ТЕКСТ — ответить ассистенту; /replytask НОМЕР cancel — отменить
 /sources — источники и разрешения; /sourcegrant JSON — разрешение для ответа
@@ -95,14 +102,28 @@ def _rows(rows: list[list[tuple[str, str]]]) -> Buttons:
     return [[(label, bridge.button(label, MODULE, command)["data"]) for label, command in row] for row in rows]
 
 
-def menu_buttons(state: Any = None) -> Buttons:
+def menu_buttons(state: Any = None, *, stopped: bool = False) -> Buttons:
     """Главное меню. С `state` и внешним адресом страницы настройки «Согласования» — кнопка, которая
-    открывает приложение «Штурман» (web_app); без них — обычная кнопка сводки."""
+    открывает приложение «Штурман» (web_app); без них — обычная кнопка сводки. Пока ассистент
+    остановлен, вместо «Пауза» — «Продолжить»."""
     rows = _rows(MENU)
     url = menu_button.app_url(state.config) if state is not None else None
     if url:
         rows[0][1] = (words.APPROVALS, {"web_app": url})
+    if stopped:
+        rows[1][0] = (RESUME_BUTTON, bridge.button(RESUME_BUTTON, MODULE, "resume")["data"])
     return rows
+
+
+def app_row(state: Any) -> list[tuple[str, Any]] | None:
+    """Строка с кнопкой «Открыть «Штурман»» (web_app) — когда приложение доступно."""
+    url = menu_button.app_url(state.config) if state is not None else None
+    return [(OPEN_APP, {"web_app": url})] if url else None
+
+
+async def _menu(conn: asyncpg.Connection, state: Any) -> Buttons:
+    from .. import halt
+    return menu_buttons(state, stopped=await halt.is_stopped(conn))
 
 
 def more_buttons() -> Buttons:
@@ -141,7 +162,7 @@ async def handle_message(conn: asyncpg.Connection, state: Any, text: str, *,
     if owner is None or owner["user_id"] != user_id or owner["chat_id"] != chat_id or chat_id != user_id:
         return None
     if not text.startswith("/"):
-        return {"text": NOT_COMMAND, "buttons": menu_buttons(state)}
+        return {"text": NOT_COMMAND, "buttons": await _menu(conn, state)}
     with authority.owner_context(user_id, chat_id=chat_id, action="telegram.command"):
         try:
             result = await handle_command(conn, state, text, user_id)
@@ -158,7 +179,7 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         return {"text": "Не удалось разобрать команду. /help — как пользоваться, /advanced — точный вид команд.",
                 "buttons": menu_buttons(state)}
     command, argument = match.group(1), (match.group(2) or "").strip()
-    menu = menu_buttons(state)
+    menu = await _menu(conn, state)
     if command in ("menu", "start"):
         return {"text": start_text(state), "buttons": menu}
     if command == "help":
@@ -176,7 +197,21 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         from ..replies import owner
         return await owner.handle_command(conn, state, text.replace("/tasks", "/replytasks", 1), user_id)
     if command == "status":
-        return {"text": await owner_views.status_text(conn, state), "buttons": menu}
+        buttons = list(menu)
+        row = app_row(state)
+        if row:
+            buttons = [row] + buttons
+        return {"text": await owner_views.status_text(conn, state), "buttons": buttons}
+    if command in ("pause", "stop"):
+        return await _pause(conn, state, argument)
+    if command == "pausereading":
+        return await _pause(conn, state, "all")
+    if command in ("resume", "continue"):
+        from .. import halt
+        prompt = await halt.resume_prompt(conn, state)
+        if prompt is None:
+            return {"text": "Ассистент работает — продолжать нечего. Остановить — /pause.", "buttons": menu}
+        return prompt
     if command == "rehearsal":
         return await _rehearsal(conn, state, argument)
     if command == "config":
@@ -320,6 +355,53 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
     return {"text": UNKNOWN, "buttons": menu}
 
 
+async def _pause(conn: asyncpg.Connection, state: Any, argument: str) -> dict[str, Any]:
+    """«Остановить всё» из бота: сразу, без подтверждения (ужесточение). `/pause all` — и перестать
+    читать переписку (все аккаунты на паузу)."""
+    from .. import halt
+    if argument not in ("", "all"):
+        raise ValueError("Так: /pause — остановить ассистента; /pause all — и перестать читать переписку.")
+    result = await halt.stop(state, via="bot", reading=argument == "all")
+    return {"text": halt.stopped_message(result, state.config), "buttons": stopped_buttons(state, result)}
+
+
+def stopped_buttons(state: Any, result: dict[str, Any]) -> Buttons:
+    """Кнопки под сообщением «Ассистент остановлен»: продолжить, перестать читать, открыть приложение."""
+    rows: Buttons = [[(RESUME_BUTTON + "…", bridge.button(RESUME_BUTTON, MODULE, "resume")["data"])]]
+    if not result["halt"].get("paused_accounts"):
+        rows.append([("Ещё и перестать читать переписку",
+                      bridge.button("Перестать читать", MODULE, "pausereading")["data"])])
+    app = app_row(state)
+    if app:
+        rows.append(app)
+    return rows
+
+
+async def handle_prompt(conn: asyncpg.Connection, state: Any, prompt: dict[str, Any], text: str, *,
+                        bot_id: int, user_id: int, chat_id: int) -> dict[str, Any] | None:
+    """Текст владельца в ответ на просьбу «напишите следующим сообщением» (prompts.py). Только бот
+    зовёт эту функцию — с номерами из настоящего обновления Telegram."""
+    owner = await binding.bound_owner(conn, bot_id)
+    if owner is None or owner["user_id"] != user_id or owner["chat_id"] != chat_id or chat_id != user_id:
+        return None
+    with authority.owner_context(user_id, chat_id=chat_id, action="telegram.reply"):
+        if prompt.get("kind") == "reply":
+            from ..replies import owner as replies_owner
+            if prompt.get("expired"):
+                return {"text": replies_owner.CLOSED}
+            async with conn.transaction():
+                out = await replies_owner.answer(conn, state, int(prompt["id"]), text, user_id,
+                                                 nonce=str(prompt.get("nonce") or ""), window=True)
+            return {"text": out["text"]}
+        if prompt.get("kind") == "variant":
+            from ..rehearsal import core as rehearsal
+            if prompt.get("expired"):
+                return {"text": "Время вышло — вариант не записан. Оценку можно поменять кнопками под карточкой."}
+            out = await rehearsal.save_variant(conn, int(prompt["id"]), str(prompt.get("nonce") or ""), text)
+            return {"text": out["text"]}
+    return None
+
+
 def _done(what: str, undo: str, menu: Buttons) -> dict[str, Any]:
     """Ответ на действие: что изменилось и как вернуть (Б8)."""
     return {"text": f"{what}\nВернуть: {undo}", "buttons": menu}
@@ -408,6 +490,6 @@ async def on_menu(conn: asyncpg.Connection, state: Any, rest: str, user_id: int)
         result = await handle_command(conn, state, "/" + rest, user_id)
     except (ValueError, confirm.Refused, drafts.Refused, SourceError) as exc:
         result = {"text": str(exc)}
-    buttons = result.get("buttons") or menu_buttons(state)
+    buttons = result.get("buttons") or await _menu(conn, state)
     return {"answer": "Готово.", "remove_buttons": False,
             "reply": {"text": result.get("text", "Готово."), "buttons": buttons}}

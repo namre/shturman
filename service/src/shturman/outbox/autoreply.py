@@ -389,6 +389,8 @@ async def on_message(mod: runtime.Outbox, payload: dict[str, Any]) -> None:
     if not workflow.preparing(mod.state):
         return
     async with mod.state.pool.acquire() as conn, conn.transaction():
+        if not (await policy.check_halt(conn)).ok:
+            return        # владелец остановил ассистента (Р-87)
         tgt = await policy.target(conn, chat_id)
         if tgt is None or tgt.account_id != payload.get("account_id") or not (await eligible(conn, tgt, message_id)).ok:
             return

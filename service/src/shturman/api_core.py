@@ -247,7 +247,11 @@ async def overview(state: AppState) -> dict[str, Any]:
         from .rehearsal import service as rehearsal_service
         rehearsal = await rehearsal_service.overview(conn)
         retried = await retry.overview(conn, media_days=state.config.media_days)
+        from . import halt
+        stopped = halt.public(await halt.current(conn))
     out = dict(row)
+    # «Остановить всё» (Р-87): остановлено ли, с какого времени, откуда, сколько аккаунтов на паузе.
+    out["stopped"] = stopped
     # Уведомления владельцу (Р-84): какие включены, сколько ждут и сколько ушло за сутки.
     out.update(notify)
     # Репетиция ответов на основном аккаунте (Р-85): включена ли, сколько людей, карточки и оценки за 7 дней.
@@ -320,6 +324,9 @@ def routes() -> list[BaseRoute]:
 @contextlib.asynccontextmanager
 async def lifespan(state: AppState) -> AsyncIterator[None]:
     import asyncio
+
+    from . import halt
+    halt.bind(state)
 
     async def reaper() -> None:
         while True:

@@ -383,6 +383,8 @@ async def on_message(mod: Any, payload: dict[str, Any]) -> None:
     if payload.get("outgoing") is True or not isinstance(chat_id, int) or not isinstance(message_id, int):
         return
     async with mod.state.pool.acquire() as conn:
+        if await conn.fetchval("SELECT shturman_halted()"):
+            return        # владелец остановил ассистента (Р-87): срабатывания не разбираются
         # Правило смотрит свои чаты и чаты своих сфер (Р-84); личные чаты сфер ниже отсекаются.
         rules = await conn.fetch(
             f"""SELECT * FROM watch_rules
@@ -478,7 +480,9 @@ async def _verdict(conn: asyncpg.Connection, job: dict[str, Any], result: dict[s
         hit["rule_id"])
     notify = (rule is not None and rule["enabled"] and msg is not None and not msg["excluded"]
               and sent["hour"] < rule["max_notifications_per_hour"]
-              and sent["day"] < rule["max_notifications_per_day"])
+              and sent["day"] < rule["max_notifications_per_day"]
+              # проверка, начатая до остановки (Р-87), сообщения владельцу уже не шлёт
+              and not await conn.fetchval("SELECT shturman_halted()"))
     await conn.execute(
         "UPDATE watch_hits SET status = 'relevant', reason = $2, notified = $3, decided_at = now() WHERE id = $1",
         hit_id, reason or None, notify)

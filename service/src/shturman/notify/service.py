@@ -23,6 +23,7 @@ from .. import bridge, confirm
 from ..api_core import BadRequest, body, handler, settle
 from ..app import AppState, state_of
 from ..events import MESSAGE_HELD, MESSAGE_LIVE
+from . import buttons as _buttons  # noqa: F401 — кнопки под уведомлениями (регистрация нажатий)
 from . import core
 from . import settings as ns
 
@@ -84,7 +85,8 @@ async def get_notify(request: Request) -> JSONResponse:
 
 
 WIDEN_WORDS = {"personal": "больше личных сообщений в уведомлениях", "groups": "уведомления о прямых обращениях в группах",
-               "aliases": "новые обращения по имени", "preview": "начало сообщения в тексте уведомления"}
+               "aliases": "новые обращения по имени", "preview": "начало сообщения в тексте уведомления",
+               "muted": "снова сообщать о чатах, о которых вы просили не сообщать"}
 
 
 @handler

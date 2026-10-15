@@ -310,12 +310,57 @@ def _sending(config: Any) -> str:
     return "on" if config.sending else "prepare_only" if getattr(config, "prepare_only", False) else "off"
 
 
+def setup_url(config: Any) -> str | None:
+    """Адрес «Настроек Штурмана» для кнопки «Открыть настройки в браузере» (П4) — без ключа и без входа:
+    там вход по коду из бота или по ссылке с сервера."""
+    origin = config.setup_external
+    return origin + page.PREFIX + "/" if isinstance(origin, str) and origin.startswith("https://") else None
+
+
 @endpoint
 async def approvals_list(request: Request) -> JSONResponse:
+    from .. import halt
+    from ..executor import owner_views
     state = state_of(request)
     async with state.ro_pool.acquire() as conn:
         collected = await approvals.collect(conn, state.config)
-    return JSONResponse({**approvals.public(collected), "sending": _sending(state.config)})
+        stopped = halt.public(await halt.current(conn))
+        mode = await owner_views.work_mode(conn)
+    return JSONResponse({**approvals.public(collected), "sending": _sending(state.config), "halt": stopped,
+                         "setup_url": setup_url(state.config), "mode": mode})
+
+
+@endpoint
+async def approvals_answer(request: Request) -> JSONResponse:
+    """Ответ на вопрос ассистента из приложения (П1): поле «Ваш ответ». Тот же путь на сервере, что у
+    команды /replytask N answer и кнопки «Ответить» в боте (`replies.owner.answer`): владелец из
+    Telegram, задача ждёт его, переписка не изменилась, окно ответа не вышло."""
+    from ..replies import owner as replies_owner
+    data = await page._body(request)
+    ref, text = data.get("ref"), data.get("text")
+    match = approvals.ANSWER_REF.fullmatch(ref) if isinstance(ref, str) else None
+    if match is None:
+        raise BadRequest("Такого вопроса нет.", 400, "bad_ref")
+    if not isinstance(text, str):
+        raise BadRequest("Напишите ответ.", 400, "empty")
+    session: AppSession = request.state.app_session
+    state = state_of(request)
+    async with state.pool.acquire() as conn:
+        item = approvals.find_answer(await approvals.collect(conn, state.config), ref)
+        if item is None:
+            await page._log(request, "app.answer", audit.REFUSED, "вопроса уже нет в списке")
+            raise BadRequest(replies_owner.CLOSED, 409, "gone")
+        with authority.miniapp_context(session.user_id, chat_id=session.chat_id):
+            async with conn.transaction():
+                out = await replies_owner.answer(conn, state, int(match.group(1)), text,
+                                                 session.user_id, nonce=match.group(2), window=True)
+    if not out["ok"]:
+        await page._log(request, "app.answer", audit.REFUSED, f"вопрос № {item['id']}; причина: {out['code']}")
+        raise BadRequest(out["text"], 409 if out["code"] in ("closed", "late", "changed", "answered", "stopped") else 400,
+                         out["code"])
+    approvals.wake(state)
+    await page._log(request, "app.answer", detail=f"вопрос № {item['id']}; знаков: {len(text.strip())}")
+    return JSONResponse({"ok": True, "answer": out["text"]})
 
 
 @endpoint
@@ -469,6 +514,7 @@ def routes() -> list[BaseRoute]:
         Route(APP_API + "/logout", logout, methods=["POST"]),
         Route(APP_API + "/approvals", approvals_list, methods=["GET"]),
         Route(APP_API + "/approvals/decide", approvals_decide, methods=["POST"]),
+        Route(APP_API + "/approvals/answer", approvals_answer, methods=["POST"]),
         Route(APP_API + "/chats", chats_accounts, methods=["GET"]),
         Route(account + "/dialogs", chats_dialogs, methods=["GET"]),
         Route(account + "/sync", chats_sync, methods=["POST"]),
