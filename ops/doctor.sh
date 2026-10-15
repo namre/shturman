@@ -24,6 +24,10 @@
 # (llm_jobs в /api/status: числа и виды ошибок, без текстов). Строка stopped (Р-87) — остановил ли
 # владелец ассистента кнопкой «Остановить всё» (WARN, пока остановлено); setup-code-login (Р-88) —
 # включён ли вход на страницу по коду из бота и сколько было таких входов за 7 суток, без кодов.
+# Строки hermes-tz и cron-schedule (Р-90): по какому поясу шлюз Hermes считает расписание (timezone
+# в config.yaml профиля) против ожидаемого (HERMES_TIMEZONE контейнера ← SHTURMAN_TIMEZONE) и стоит ли
+# следующий запуск задач shturman:* на их расписании по этому поясу; из задач — только имя, запись
+# расписания и время следующего запуска, без текста задачи.
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -318,6 +322,85 @@ elif has TELEGRAM_ALLOWED_USERS; then warn bot-owner "разрешённый п�
 else warn bot-owner "владелец не привязан — бот никому не ответит, войти можно только по ссылке (./ops/activation-link.sh)"; fi
 if [ "$wizard_done" = "yes" ]; then pass wizard "мастер настройки пройден"
 else warn wizard "мастер настройки не завершён"; fi
+
+# --- часовой пояс шлюза и расписание сводок (Р-90) ---
+# Шлюз Hermes, обслуживая несколько профилей, считает расписание по `timezone` из config.yaml
+# профиля, а не по HERMES_TIMEZONE контейнера; без него — по часам сервера (UTC). hermes-tz сверяет
+# одно с другим; cron-schedule — что у задач shturman:* следующий запуск посчитан по поясу шлюза
+# и лежит на их расписании — по поясу из окружения (SHTURMAN_TIMEZONE), а если его нет, по поясу
+# шлюза. Из задач печатаются только имя, запись расписания и время запуска.
+tab="$(printf '\t')"
+tz_started="$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$c" 2>/dev/null)" +%s 2>/dev/null || true)"
+tz_state=unknown; tz_want=""; tz_have=""; tz_zone=""; tz_pending=no; tz_jobs=""; tz_listed=no
+while IFS="$tab" read -r k a b c d; do
+  case "$k" in
+    tz) tz_state="$a"; tz_want="$b"; tz_have="$c"; tz_zone="$d" ;;
+    pending) tz_pending="$a" ;;
+    job) tz_jobs="$tz_jobs$a$tab$b$tab$c$tab$d"$'\n' ;;
+    listed) tz_listed=yes ;;
+  esac
+done <<EOF_TZ
+$(hpy -c '
+import os, sys
+sys.path.insert(0, "/opt/data/plugins/shturman")
+from shturman_core import cron_jobs
+from hermes_cli.config import read_raw_config
+want = (os.environ.get("HERMES_TIMEZONE") or "").strip()
+have = cron_jobs.config_zone(read_raw_config())
+zone = cron_jobs.expected_zone(want, have)
+print("tz", cron_jobs.zone_state(want, have), want or "-", have or "-", zone or "-", sep="\t")
+started = float(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else None
+try:
+    from shturman_core.state import Store
+    written = Store().read(cron_jobs.TZ_STATE).get("written_at")
+except Exception:
+    written = None
+print("pending", "yes" if cron_jobs.restart_pending(written, started) else "no", sep="\t")
+from cron.jobs import list_jobs
+for job in cron_jobs.ours(list_jobs(include_disabled=True)):
+    expr = str((job.get("schedule") or {}).get("expr") or "-")
+    print("job", job.get("name"), cron_jobs.schedule_drift(job, zone), expr,
+          cron_jobs.local_run(job.get("next_run_at"), zone) or "-", sep="\t")
+print("listed")' "$tz_started")
+EOF_TZ
+[ "$tz_want" = - ] && tz_want=""
+[ "$tz_have" = - ] && tz_have=""
+[ "$tz_zone" = - ] && tz_zone=""
+case "$tz_state:$tz_pending" in
+  same:yes|none:yes) warn hermes-tz "пояс $tz_have записан в config.yaml после запуска Hermes (это делает плагин, когда заводит сводки), а шлюз читает его только при запуске — пока считает по прежнему. ./ops/up.sh перезапустит Hermes" ;;
+  same:*) pass hermes-tz "шлюз Hermes считает расписание по поясу $tz_have (timezone в config.yaml совпадает с SHTURMAN_TIMEZONE)" ;;
+  none:*)
+    if [ -n "$tz_have" ]; then pass hermes-tz "шлюз Hermes считает расписание по поясу $tz_have (timezone в config.yaml; в окружении пояса нет)"
+    else warn hermes-tz "часовой пояс не задан ни в окружении Hermes, ни в его config.yaml — расписание по часам сервера (обычно UTC). Задайте SHTURMAN_TIMEZONE в .env (docs/setup.md) и запустите ./ops/up.sh"; fi ;;
+  missing:*) fail hermes-tz "шлюз Hermes считает расписание по часам сервера (UTC): в config.yaml профиля нет timezone, а переменную HERMES_TIMEZONE=$tz_want шлюз при нескольких профилях не читает — сводка придёт не в то время. ./ops/up.sh запишет пояс и перезапустит Hermes" ;;
+  differs:*) fail hermes-tz "шлюз Hermes считает расписание по поясу $tz_have, а ожидается $tz_want (SHTURMAN_TIMEZONE) — сводка придёт не в то время. ./ops/up.sh запишет пояс и перезапустит Hermes" ;;
+  invalid:*) fail hermes-tz "в окружении Hermes неизвестный часовой пояс «$tz_want» — исправьте SHTURMAN_TIMEZONE в .env (вид Europe/Moscow) и запустите ./ops/up.sh" ;;
+  *) warn hermes-tz "часовой пояс шлюза Hermes не проверен: в этой версии Hermes нет нужных функций либо контейнер не ответил — docker exec shturman-hermes hermes config show | grep timezone" ;;
+esac
+tz_ok=""; tz_bad=""
+while IFS="$tab" read -r name drift expr at; do
+  [ -n "$name" ] || continue
+  case "$name" in shturman:morning-brief) title="утренняя сводка" ;; shturman:weekly-review) title="обзор недели" ;; *) title="$name" ;; esac
+  case "$drift" in
+    ok) tz_ok="${tz_ok:+$tz_ok; }$title — $at" ;;
+    paused) tz_ok="${tz_ok:+$tz_ok; }$title — выключена" ;;
+    unchecked) tz_ok="${tz_ok:+$tz_ok; }$title — расписание «$expr» не проверено" ;;
+    offset) tz_bad="${tz_bad:+$tz_bad; }$name ($expr): следующий запуск $at по поясу ${tz_zone:-сервера} — посчитан по другому поясу" ;;
+    off-schedule) tz_bad="${tz_bad:+$tz_bad; }$name ($expr): следующий запуск $at по поясу ${tz_zone:-сервера} — не по расписанию" ;;
+    no-next) tz_bad="${tz_bad:+$tz_bad; }$name ($expr): включена, но следующего запуска нет" ;;
+  esac
+done <<EOF_JOBS
+$tz_jobs
+EOF_JOBS
+if [ -n "$tz_bad" ]; then
+  warn cron-schedule "$tz_bad. ./ops/up.sh пересчитает расписание (hermes cron edit <id> --schedule <та же запись>)"
+elif [ -n "$tz_ok" ]; then
+  pass cron-schedule "следующий запуск по поясу ${tz_zone:-сервера (UTC)}: $tz_ok"
+elif [ "$tz_listed" != yes ]; then
+  warn cron-schedule "расписание задач shturman:* не проверено: список задач Hermes прочитать не удалось — docker exec shturman-hermes hermes cron list --all"
+else
+  pass cron-schedule "задач сводок shturman:* в Hermes нет — их заводит плагин (POST /api/plugins/shturman/cron/install)"
+fi
 
 # --- бизнес-режим Telegram ---
 # Бизнес-режим подключается только к боту согласований сервиса (способ «ассистент — отдельный
