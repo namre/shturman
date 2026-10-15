@@ -21,6 +21,12 @@
 Текст берётся в момент отправки: расшифровка голосового, успевшая к этому времени, попадает
 в уведомление; скрытое защитой показывается без текста.
 
+Разбор входящих (Р-90, triage/). Когда владелец его включил, сообщения, которые разбирает модель
+(видимые ассистенту личные от людей и прямые обращения в группах), сюда не попадают: о них пишет
+разбор — только о срочном, важном и о вопросе без ответа. Разбор не состоялся (сбой модели, «Остановить
+всё», разбор выключили посреди) — `Notifier.fallback` ставит их обычным уведомлением. Скрытое защитой
+разбор не берёт: о нём — уведомление без текста, как раньше.
+
 Сообщение владельцу — обычное `notify.owner` (bridge.notify_owner): только когда у сервиса свой бот
 согласований. Чужой текст — одной строкой, без невидимых и управляющих символов, до 300 знаков, без
 разметки (сообщения бота уходят простым текстом).
@@ -380,6 +386,44 @@ def compose_digest(groups: Sequence[tuple[str, list[Mapping[str, Any]], list[str
 
 # --- работающие уведомления ---------------------------------------------------------------------------
 
+async def queue(conn: asyncpg.Connection, row: Mapping[str, Any], now: datetime,
+                tz: ZoneInfo) -> tuple[str | None, datetime | None]:
+    """Ставит уведомление о сообщении в очередь по настройкам: (вид, время отправки) или (None, None)."""
+    s = await ns.load(conn)
+    if s["personal"] == "off" and not s["groups"]:
+        return None, None
+    message_id, chat_id = row["id"], row["chat_id"]
+    kind, reason = None, None
+    if s["personal"] != "off" and await personal_candidate(conn, row) \
+            and await personal_allowed(conn, row, s):
+        kind = "personal"
+    elif s["groups"]:
+        reason = await group_reason(conn, row, s, await owner_ids(conn))
+        kind = "mention" if reason else None
+    if kind is None:
+        return None, None
+    # Репетиция ответов (Р-85): о сообщении, на которое она готовит ответ, владелец узнает из её
+    # карточки — уведомление придерживается и уходит, только если репетиция не состоялась.
+    from ..rehearsal import core as rehearsal
+    hold = await rehearsal.notify_hold(conn, row) if kind == "personal" else None
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.notify'), $1::int)",
+                           chat_id % 2_000_000_000)
+        due, quiet, digest = await schedule(conn, s, chat_id, now, tz)
+        if hold == "hold":
+            due = max(due, now + rehearsal.NOTIFY_HOLD)
+        added = await conn.fetchval(
+            """INSERT INTO notify_items (message_id, chat_id, kind, reason, quiet, digest, due_at,
+                                         held_for_rehearsal, state, dropped_reason)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+               ON CONFLICT (message_id) DO NOTHING RETURNING id""",
+            message_id, chat_id, kind, reason, quiet, digest, due, hold == "hold",
+            "dropped" if hold == "covered" else "waiting", "rehearsal" if hold == "covered" else None)
+    if added is None or hold == "covered":
+        return None, None
+    return kind, due
+
+
 class Notifier:
     """Одна на процесс сервиса (`state.extras["notify"]`)."""
 
@@ -404,43 +448,45 @@ class Notifier:
             return None   # писать некуда: без своего бота согласований уведомлений нет
         now = self.clock()
         async with self.pool.acquire() as conn:
-            s = await ns.load(conn)
-            if s["personal"] == "off" and not s["groups"]:
-                return None
             row = await conn.fetchrow(_ROWS, [message_id])
             if row is None or row["chat_id"] != chat_id or now - row["sent_at"] > MAX_AGE:
                 return None
-            kind, reason = None, None
-            if s["personal"] != "off" and await personal_candidate(conn, row) \
-                    and await personal_allowed(conn, row, s):
-                kind = "personal"
-            elif s["groups"]:
-                reason = await group_reason(conn, row, s, await owner_ids(conn))
-                kind = "mention" if reason else None
-            if kind is None:
+            # Разбор входящих (Р-90): сообщение, которое разбирает модель, пересылкой «Вам написали» не
+            # приходит — о нём владелец узнает карточкой разбора (или не узнает: «остальное — тишина»).
+            # Разбор выключен, ассистент остановлен, сообщение скрыто защитой — пересылка как раньше.
+            from ..triage import core as triage
+            if await triage.takes(conn, row):
                 return None
-            # Репетиция ответов (Р-85): о сообщении, на которое она готовит ответ, владелец узнает из её
-            # карточки — уведомление придерживается и уходит, только если репетиция не состоялась.
-            from ..rehearsal import core as rehearsal
-            hold = await rehearsal.notify_hold(conn, row) if kind == "personal" else None
-            async with conn.transaction():
-                await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.notify'), $1::int)",
-                                   chat_id % 2_000_000_000)
-                due, quiet, digest = await schedule(conn, s, chat_id, now, self.tz)
-                if hold == "hold":
-                    due = max(due, now + rehearsal.NOTIFY_HOLD)
-                added = await conn.fetchval(
-                    """INSERT INTO notify_items (message_id, chat_id, kind, reason, quiet, digest, due_at,
-                                                 held_for_rehearsal, state, dropped_reason)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                       ON CONFLICT (message_id) DO NOTHING RETURNING id""",
-                    message_id, chat_id, kind, reason, quiet, digest, due, hold == "hold",
-                    "dropped" if hold == "covered" else "waiting", "rehearsal" if hold == "covered" else None)
-        if added is None or hold == "covered":
+            kind, due = await queue(conn, row, now, self.tz)
+        if kind is None or due is None:
             return None
         if due <= now:
             self.wake.set()
         return kind
+
+    async def fallback(self, conn: asyncpg.Connection, message_ids: Sequence[int]) -> int:
+        """Разбор входящих этих сообщений не состоялся (сбой модели, остановка, разбор выключили): они
+        уходят обычным уведомлением, как без разбора, — владелец не теряет сигнал. Возвращает, сколько
+        поставлено. Вызывать можно внутри чужой транзакции: здесь — только вставки в очередь."""
+        if not message_ids or not bridge.owns_bot():
+            return 0
+        now = self.clock()
+        rows = sorted(await conn.fetch(_ROWS, list(message_ids)), key=lambda r: (r["sent_at"], r["id"]))
+        count, soon = 0, False
+        for row in rows:
+            if now - row["sent_at"] > STALE:
+                continue
+            kind, due = await queue(conn, row, now, self.tz)
+            if kind is not None and due is not None:
+                count += 1
+                soon = soon or due <= now
+        if soon:
+            try:
+                # С небольшой задержкой: вызывающая транзакция должна успеть закрыться.
+                asyncio.get_running_loop().call_later(0.1, self.wake.set)
+            except RuntimeError:
+                pass
+        return count
 
     async def _drop(self, conn: asyncpg.Connection, ids: Sequence[int], reason: str) -> None:
         if ids:

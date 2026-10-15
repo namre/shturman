@@ -13,15 +13,18 @@
   | наблюдатель | `outbox/watcher.py` | срабатывания не разбираются, сообщения не уходят |
   | подтверждения действий от ассистента и внутреннего API | `confirm.request` | новые отклоняются сразу, с причиной |
   | «Подготовить ответ» у уведомления | `notify/buttons.py` | отказ |
+  | разбор входящих (Р-90) | `triage/core.py` (`active`, `prepare`, ответ модели, обход) | не разбирает, карточек и напоминаний нет; сообщения — обычным уведомлением «Вам написали» |
 
 Вторая линия — триггеры базы (миграция 0035): пока флаг стоит, в `reply_tasks`, `outbox_drafts`,
-`rehearsal_items`, `watch_hits`, `pending_actions` (кроме карточек «Продолжить» и входа по коду) не
+`rehearsal_items`, `triage_items`, `watch_hits`, `pending_actions` (кроме карточек «Продолжить» и входа по коду) не
 добавляется ни строки, черновик не переходит в «согласован» и «отправляется», задание `business.send`
 не ставится — даже если какую-то точку код пропустил.
 
 Флаг сильнее настроек, а сами настройки не трогаются: после «Продолжить» возвращается ровно то, что
 было. Что продолжает работать: сбор переписки в архив, уведомления владельцу о новых сообщениях (это не
-действие ассистента), разбор договорённостей и памяти и их карточки, чтение архива ассистентом по MCP.
+действие ассистента; при включённом разборе входящих на время остановки возвращается прежняя пересылка
+«Вам написали» — владелец не теряет сигнал), разбор договорённостей и памяти и их карточки, чтение архива
+ассистентом по MCP.
 Отдельная галочка «И перестать читать переписку» ставит все аккаунты на паузу (той же паузой, что на
 странице); «Продолжить» её не снимает, если владелец не отметит это отдельно.
 
@@ -136,6 +139,10 @@ async def what_resumes(conn: asyncpg.Connection, state: Any, *, reading: bool | 
     auto = await conn.fetchval("SELECT count(*) FROM outbox_accounts WHERE autoreply_enabled")
     if auto:
         lines.append(f"• автоответ доверенным людям — включён у {words.counted(auto, 'аккаунта', 'аккаунтов', 'аккаунтов')}")
+    from .triage import settings as triage_settings
+    if (await triage_settings.load(conn))["enabled"]:
+        lines.append("• разбор входящих: снова пишу о срочном и важном и напоминаю о вопросах без ответа — "
+                     "вместо «Вам написали»")
     rules = await conn.fetchval("SELECT count(*) FROM watch_rules WHERE enabled")
     if rules:
         lines.append(f"• наблюдатель: {words.counted(rules, 'правило', 'правила', 'правил')} снова разбирают сообщения")
@@ -192,6 +199,9 @@ async def _cancel_waiting(conn: asyncpg.Connection) -> dict[str, int]:
         from .rehearsal import core as rehearsal
         await rehearsal.release_notify(conn, row["chat_id"], row["trigger_message_id"])
         counts["rehearsals"] += 1
+    # Разбор входящих (Р-90): начатые разборы снимаются, их сообщения уходят обычным уведомлением.
+    from .triage import core as triage
+    counts["triage"] = await triage.stop_now(conn)
     await conn.execute("DELETE FROM executor_state WHERE key = 'prompt'")
     return counts
 
@@ -217,7 +227,8 @@ async def stop(state: Any, *, via: str, reading: bool = False) -> dict[str, Any]
         halt = await current(conn)
     from .setup_page import audit
     detail = (f"откуда: {via}; вопросов: {counts['questions']}; задач ответа: {counts['tasks']}; "
-              f"черновиков: {counts['drafts']}; подтверждений: {counts['actions']}; репетиций: {counts['rehearsals']}"
+              f"черновиков: {counts['drafts']}; подтверждений: {counts['actions']}; репетиций: {counts['rehearsals']}; "
+              f"разборов входящих: {counts.get('triage', 0)}"
               + (f"; аккаунтов на паузу: {len(paused)}" if reading else ""))
     await audit.write(state.pool, "halt.stop" if not was else "halt.stop_again", detail=detail)
     logger.info("ассистент остановлен (%s)", via)
@@ -254,8 +265,8 @@ def stopped_message(result: dict[str, Any], config: Any) -> str:
     counts, halt = result["counts"], result["halt"]
     lines = ["⏸ Ассистент остановлен" + (" (уже был остановлен)" if result.get("already") else "") + ".",
              "Когда: " + since_words(halt, config) + ".", "",
-             "Остановлено: ответы и черновики, вопросы ассистента, репетиция, автоответ, наблюдатель, "
-             "просьбы подтвердить действия и отправка — даже если она включена на сервере. Настройки не "
+             "Остановлено: ответы и черновики, вопросы ассистента, репетиция, автоответ, наблюдатель, разбор "
+             "входящих, просьбы подтвердить действия и отправка — даже если она включена на сервере. Настройки не "
              "изменились: после «Продолжить» всё вернётся как было."]
     cancelled = [words.counted(counts["questions"], "вопрос ассистента", "вопроса ассистента", "вопросов ассистента"),
                  words.counted(counts["tasks"], "задача ответа", "задачи ответа", "задач ответа"),

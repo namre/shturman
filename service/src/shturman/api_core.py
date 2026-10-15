@@ -246,6 +246,8 @@ async def overview(state: AppState) -> dict[str, Any]:
         notify = await notify_service.overview(conn)
         from .rehearsal import service as rehearsal_service
         rehearsal = await rehearsal_service.overview(conn)
+        from .triage import service as triage_service
+        triage = await triage_service.overview(conn)
         retried = await retry.overview(conn, media_days=state.config.media_days)
         from . import halt
         stopped = halt.public(await halt.current(conn))
@@ -256,6 +258,9 @@ async def overview(state: AppState) -> dict[str, Any]:
     out.update(notify)
     # Репетиция ответов на основном аккаунте (Р-85): включена ли, сколько людей, карточки и оценки за 7 дней.
     out.update(rehearsal)
+    # Разбор входящих (Р-90): включён ли и за сутки — разобрано, показано, напоминаний, сбоев модели;
+    # сейчас ждут ответа и в работе. Только числа.
+    out.update(triage)
     # Повтор того, что не получилось из-за сбоя модели (Р-84): сколько можно вернуть и сколько
     # возвращено последним повтором.
     out.update(retried)

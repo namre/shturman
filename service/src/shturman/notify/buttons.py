@@ -86,20 +86,28 @@ async def _pressed(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[st
     return await _prepare(conn, item)
 
 
-async def _mute(conn: asyncpg.Connection, item: Any) -> dict[str, Any]:
+async def mute_chat(conn: asyncpg.Connection, chat_id: int) -> bool:
+    """«Не сообщать об этом чате»: чат — в `muted_chats` (и уведомления, и разбор входящих его больше
+    не показывают), ждущие уведомления чата снимаются. False — чат уже был в списке."""
     from .. import confirm
     from . import service as notify_service
     current = await ns.load(conn)
-    if item["chat_id"] in current["muted_chats"]:
-        return {"answer": "Об этом чате уже не сообщаю.", "edit_text": None, "remove_buttons": False}
+    if chat_id in current["muted_chats"]:
+        return False
     async with conn.transaction():
         await confirm.apply_owner(conn, notify_service.SETTINGS,
-                                  {"changes": {"muted_chats": current["muted_chats"] + [item["chat_id"]]}})
+                                  {"changes": {"muted_chats": current["muted_chats"] + [chat_id]}})
     await conn.execute(
         """UPDATE notify_items SET state = 'dropped', dropped_reason = 'disabled'
-           WHERE chat_id = $1 AND state = 'waiting'""", item["chat_id"])
+           WHERE chat_id = $1 AND state = 'waiting'""", chat_id)
     from ..setup_page import audit
-    await audit.write_conn(conn, "notify.mute", detail=f"чат № {item['chat_id']}; из бота")
+    await audit.write_conn(conn, "notify.mute", detail=f"чат № {chat_id}; из бота")
+    return True
+
+
+async def _mute(conn: asyncpg.Connection, item: Any) -> dict[str, Any]:
+    if not await mute_chat(conn, item["chat_id"]):
+        return {"answer": "Об этом чате уже не сообщаю.", "edit_text": None, "remove_buttons": False}
 
     left = [row for row in buttons(item["id"], item["nonce"], personal=item["kind"] == "personal")]
     left[-1] = [b for b in left[-1] if b["text"] != MUTE]
@@ -121,22 +129,28 @@ async def _remind(conn: asyncpg.Connection, item: Any) -> dict[str, Any]:
 
 
 async def _prepare(conn: asyncpg.Connection, item: Any) -> dict[str, Any]:
+    return await prepare_reply(conn, item["message_id"], personal=item["kind"] == "personal")
+
+
+async def prepare_reply(conn: asyncpg.Connection, message_id: int, *, personal: bool) -> dict[str, Any]:
+    """«Подготовить ответ» — у уведомления и у карточки разбора входящих (Р-90): разовая репетиция или
+    черновик только для просмотра, по способу работы. Ничего не отправляет."""
     from .. import halt
     from ..executor import owner_views
     state = _state()
     if state is None:
         return {**REFUSED, "answer": "Сервис сейчас не готов. Попробуйте через минуту."}
-    if item["kind"] != "personal":
+    if not personal:
         return {**REFUSED, "answer": "Подготовить ответ можно только на личное сообщение."}
     if await halt.is_stopped(conn):
         return {"answer": "Ассистент остановлен — ответ не готовится.", "edit_text": None, "remove_buttons": False,
                 "reply": {"text": "Ассистент остановлен: ответ не готовится. Продолжить — /resume."}}
     mode = await owner_views.work_mode(conn)
     if mode == "staff":
-        out = await request_draft(state, item["message_id"])
+        out = await request_draft(state, message_id)
     else:
         from ..rehearsal import core as rehearsal
-        out = await rehearsal.request_once(state, item["message_id"])
+        out = await rehearsal.request_once(state, message_id)
     return {"answer": "Готовлю." if out["ok"] else "Не получилось.", "edit_text": None, "remove_buttons": False,
             "reply": {"text": out["text"]}}
 
