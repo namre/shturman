@@ -189,6 +189,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .tabs {
   display: flex;
+  flex-wrap: wrap;            /* вкладок больше, чем влезает в строку на 360 px: вторая строка, а не обрезка */
   gap: 4px;
   padding: 4px;
   margin: 6px 0 4px;
@@ -622,3 +623,93 @@ details.sect[open] > summary::before { transform: rotate(45deg); }
 .rh-limits .small, .rh-limits .rh-used { margin: 0; }
 .rh-used { font-size: 14px; }
 .small { font-size: 13px; }
+
+/* ---------------------------------------------------------------- «Сейчас» и разделы «Согласований» (Р-94) */
+
+.now { padding: 12px 14px; margin: 8px 0 12px; }
+.now h2 { margin: 0 0 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px; }
+.chip-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: 40px; padding: 6px 12px; border-radius: 20px;
+  background: var(--quote); color: var(--text); font-weight: 600; border: 1px solid var(--sep);
+}
+.chip-n {
+  min-width: 22px; height: 22px; padding: 0 6px; border-radius: 11px; line-height: 22px; text-align: center;
+  background: var(--button); color: var(--button-text); font-size: 13px;
+}
+.now-none { margin: 0 0 8px; }
+.now-label { margin: 0 0 6px; font-size: 14px; }
+.now-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; width: 100%; text-align: left;
+  min-height: 44px; padding: 8px 12px; margin: 0 0 6px;
+  background: transparent; color: var(--text); border: 1px solid var(--sep);
+}
+.now-row-title { font-weight: 600; flex: 1 1 auto; }
+.now-row-value { flex: 0 0 auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.now-row-value.late { color: var(--danger); font-weight: 600; }
+.now-row-go { flex: 0 0 auto; color: var(--accent); font-size: 20px; line-height: 1; }
+.now-more > summary {
+  cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: 8px;
+  list-style: none; padding: 4px 0; font-size: 14px;
+}
+.now-more > summary::-webkit-details-marker { display: none; }
+.now-more > summary::before {
+  content: ""; flex: none; width: 7px; height: 7px; margin: 0 4px 0 2px;
+  border-right: 2px solid var(--accent); border-bottom: 2px solid var(--accent); transform: rotate(-45deg);
+}
+.now-more[open] > summary::before { transform: rotate(45deg); }
+.now-more > summary.warn { color: var(--danger); font-weight: 600; }
+.now-lines { margin: 2px 0 6px; }
+.now-line { display: flex; gap: 8px; margin: 4px 0; }
+.now-mark { flex: 0 0 16px; text-align: center; }
+.now-halt .stop { margin-top: 4px; }
+
+.soon {
+  background: var(--section);
+  border: 1px solid var(--sep);
+  border-left: 4px solid #F2B441;
+  border-radius: 12px;
+  padding: 8px 12px;
+  margin: 0 0 12px;
+}
+.soon-title { margin: 0 0 4px; font-weight: 600; font-size: 14px; }
+.soon-list { display: flex; flex-direction: column; gap: 6px; }
+.soon-item { text-align: left; background: transparent; color: var(--text); border: 1px solid var(--sep); min-height: 40px; }
+.soon-tag { font-size: 13px; color: var(--text); background: var(--quote); border-radius: 8px; padding: 0 8px; white-space: nowrap; }
+.soon-tag.hot { box-shadow: inset 0 0 0 2px #F2B441; font-weight: 600; }
+
+.groups { display: flex; flex-direction: column; gap: 12px; margin: 12px 0; }
+.grp .grp-body { display: flex; flex-direction: column; gap: 12px; padding-top: 12px; }
+.grp .card { border-radius: 12px; }
+
+/* ---------------------------------------------------------------- «Договорённости» (Р-94) */
+
+#cm-dirs button { align-items: center; text-align: center; min-height: 44px; }
+#cm-dirs .seg-label { font-weight: 600; }
+.cm-waiting { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 0 0 12px; }
+.link-btn {
+  background: none; color: var(--accent); text-decoration: underline; text-underline-offset: 3px;
+  padding: 4px 0; min-height: 36px; font-weight: 600;
+}
+.cm-group.late > summary .sect-title { color: var(--danger); }
+.cm-list { list-style: none; margin: 0; padding: 0; }
+.cm { padding: 12px 0; border-top: 1px solid var(--sep); overflow-wrap: anywhere; }
+.cm:first-child { border-top: 0; }
+.cm-what { font-weight: 600; }
+.cm-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; font-size: 14px; color: var(--text); margin-top: 2px; }
+.cm-due.late { color: var(--danger); font-weight: 600; }
+.cm .actions { margin-top: 8px; }
+.cm .actions button { min-height: 40px; }
+.cm .pick, .cm .confirm { margin-top: 10px; }
+.cm-date { align-items: flex-end; margin-top: 8px; }
+.cm-date .field { flex: 1 1 160px; min-width: 0; }
+.cm-date button { flex: 0 0 auto; }
+input[type="date"] {
+  font: inherit; font-size: 16px; color: var(--text); background: var(--section);
+  border: 1px solid var(--sep); border-radius: 10px; min-height: 42px; padding: 8px 12px; width: 100%; max-width: 100%;
+}
+.toast-btn {
+  margin-left: 8px; min-height: 32px; padding: 4px 12px; border-radius: 8px;
+  background: var(--bg); color: var(--text); font-weight: 600;
+}

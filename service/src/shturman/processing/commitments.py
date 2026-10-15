@@ -445,26 +445,62 @@ async def reschedule(
     due = dates.resolve_due_expression(wording, now, tz)
     if not due.resolved:
         return _result(False, error=dates.REASON_TEXT[due.reason], code=due.reason.value)
+    return await _new_due(conn, commitment_id, expression=clean_text(wording, 80), due=due,
+                          allowed=("open", "proposed"), actor=actor, today=today,
+                          expected_fingerprint=expected_fingerprint)
+
+
+async def _new_due(
+    conn: asyncpg.Connection, commitment_id: int, *, expression: str, due: dates.Resolution,
+    allowed: Iterable[str], actor: str, today: date | None, expected_fingerprint: str | None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     async with conn.transaction():
         row = await _locked(conn, commitment_id)
         if row is None or not await is_visible(conn, commitment_id):
             return _result(False, error="Такой договорённости нет.", code="not_found")
         if expected_fingerprint is not None and fingerprint(row) != expected_fingerprint:
             return _result(False, error="Содержание изменилось. Подтвердите новый срок.", code="changed_meanwhile")
-        if row["status"] not in ("open", "proposed"):
+        if row["status"] not in allowed:
             return _result(False, error=f"Нельзя: договорённость в статусе «{STATUS_TEXT[row['status']]}».",
                            code="bad_status")
         if row["status"] != "proposed" and not authority.is_owner():
             return _result(False, error="Изменение срока требует подтверждения владельца.", code="approval_required")
-        await _set_due(conn, commitment_id, expression=clean_text(wording, 80), due=due, due_message_id=None)
+        await _set_due(conn, commitment_id, expression=expression, due=due, due_message_id=None)
         if row["status"] == "open":
             await _record_approval(conn, await _locked(conn, commitment_id))
         await log_event(
             conn, commitment_id, actor=_actor(actor), action="rescheduled", from_status=row["status"],
             to_status=row["status"],
-            details={"from": row["due_date"].isoformat() if row["due_date"] else None,
+            details={**(details or {}), "from": row["due_date"].isoformat() if row["due_date"] else None,
                      "to": due.due_date.isoformat()})
     return _result(True, changed=True, commitment=await get_commitment(conn, commitment_id, today=today))
+
+
+async def reschedule_to(
+    conn: asyncpg.Connection, commitment_id: int, new_date: date, *, actor: str = "agent",
+    today: date | None = None, expected_fingerprint: str | None = None, details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Новый срок датой — так переносит владелец из приложения «Штурман» (Р-94): «на завтра», «через
+    неделю», выбранная дата. Только принятой договорённости и только владельцем; время срока снимается.
+    Формулировка срока — сама дата: слов из переписки у нового срока нет."""
+    return await _new_due(conn, commitment_id, expression=f"{new_date:%d.%m.%Y}", due=dates.Resolution.ok(new_date),
+                          allowed=("open",), actor=actor, today=today, expected_fingerprint=expected_fingerprint,
+                          details=details)
+
+
+async def mark_wrong(
+    conn: asyncpg.Connection, commitment_id: int, *, actor: str = "agent", details: dict[str, Any] | None = None,
+    **kw: Any,
+) -> dict[str, Any]:
+    """«Не так» у уже принятой договорённости (Р-94): извлечено неверно. Становится отклонённой — как
+    предложение, которое владелец не подтвердил: в сводках и выборках её больше нет, а то же обещание
+    из того же сообщения заново не предлагается (`find_duplicate`). Только владелец: убрать
+    договорённость из вида ассистент сам не может."""
+    if not authority.is_owner():
+        return _result(False, error="Это решает владелец.", code="approval_required")
+    return await _move(conn, commitment_id, allowed=("open",), to="rejected", action="marked_wrong", actor=actor,
+                       details=details, **kw)
 
 
 # --- изменения, предложенные моделью -------------------------------------------------------------

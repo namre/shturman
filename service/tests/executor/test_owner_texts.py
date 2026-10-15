@@ -39,7 +39,8 @@ async def test_start_menu_help_are_short_plain_words_with_buttons(rig):
         message = await ask(rig, command)
         text = message["text"]
         assert not [w for w in JARGON if w in text], (command, text)
-        assert labels(message) == [[("Сейчас", "sh:oc:status"), ("Согласования", "sh:oc:approvals")],
+        assert labels(message) == [[("Сейчас", "sh:oc:status"), ("Согласования", "sh:oc:approvals"),
+                                    ("Сегодня", "sh:oc:today")],
                                    [("Пауза", "sh:oc:pause"), ("Помощь", "sh:oc:help"), ("Ещё", "sh:oc:more")]], command
     start = (await ask(rig, "/start"))["text"]
     assert len(start.splitlines()) <= 3

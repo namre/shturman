@@ -1463,6 +1463,7 @@ async def chatgpt_remove(request: Request) -> JSONResponse:
 
 def routes() -> list[BaseRoute]:
     from . import code_login, memory, miniapp
+    from . import agenda as agenda_page
     from . import halt as halt_page
     from . import notify as notify_page
     from . import rehearsal as rehearsal_page
@@ -1524,6 +1525,7 @@ def routes() -> list[BaseRoute]:
         *rehearsal_page.routes(),
         *halt_page.routes(),
         *code_login.routes(),
+        *agenda_page.routes(),
     ]
 
 
