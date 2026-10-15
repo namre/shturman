@@ -13,8 +13,9 @@
   После входа:
   POST   /shturman-setup/api/logout                     завершить эту сессию
   POST   /shturman-setup/api/logout-all                 завершить все сессии
-  GET    /shturman-setup/api/state                      состояние шагов и блока «Дополнительно»
-  GET    /shturman-setup/api/overview                   счётчики архива и журнал действий
+  GET    /shturman-setup/api/state                      состояние шагов, своей модели и остановки
+  GET    /shturman-setup/api/overview                   счётчики архива, журнал действий и карточка «Сейчас»
+                                                        (сколько ждёт решения по видам, сбои модели за сутки)
   PUT    /shturman-setup/api/scenario                   способ подключения: {scenario: own | staff}
   PUT    /shturman-setup/api/media                      разбор фото и документов моделью: {enabled}
   POST   /shturman-setup/api/bot/token                  проверить и сохранить токен бота: {token, separate?}
@@ -792,10 +793,47 @@ async def page_overview(request: Request) -> JSONResponse:
             "guard_hidden", "guard_released", "guard_unchecked", "embeddings_enabled", "embeddings_model",
             "embeddings_embedded", "embeddings_left", "embeddings_problem", "sending",
             "voice_enabled", "voice_problem", "voice_pending", "voice_done", "voice_failed", "voice_skipped",
-            "media_enabled", "media_pending", "media_asking", "media_done", "media_failed", "media_skipped")
+            "media_enabled", "media_pending", "media_asking", "media_done", "media_failed", "media_skipped",
+            # разбор входящих (Р-92) — строка в карточке «Сейчас»
+            "triage_enabled", "triage_analyzed_24h", "triage_shown_24h", "triage_reminded_24h", "triage_waiting")
     # audit_key — входы, смена ключей и аккаунтов: их не вытеснить из вида потоком мелких действий.
     return JSONResponse({"archive": {k: counts[k] for k in keep if k in counts}, "audit": log,
-                         "audit_key": key_log})
+                         "audit_key": key_log, "now": await _now_state(state)})
+
+
+# Карточка «Сейчас» (пакет 3 ревизии удобства, С4): только числа и время — ни текста переписки, ни
+# имён. Что ждёт решения — тот же список, что у «Согласований» в приложении (`approvals.collect`), но
+# сюда уходят лишь счётчики по видам; сбои модели за сутки — те же условия, что у «Повторить» (`retry`).
+NOW_KINDS = ("draft", "action", "question", "source", "hidden", "commitment", "owner_fact", "page", "project")
+
+
+async def _now_state(state: AppState) -> dict[str, Any]:
+    from datetime import datetime, timedelta, timezone
+
+    from .. import retry
+    from ..words import REPLY_QUESTION
+    from . import approvals
+    pending = {kind: 0 for kind in NOW_KINDS}
+    failed = {"media": 0, "requests": 0}
+    try:
+        async with state.ro_pool.acquire() as conn:
+            collected = await approvals.collect(conn, state.config)
+            since = datetime.now(timezone.utc) - timedelta(days=1)
+            found = await retry.candidates(conn, media_days=state.config.media_days, since=since)
+    except Exception as exc:  # noqa: BLE001 — карточка «Сейчас» не должна ронять счётчики страницы
+        logger.warning("страница: «Сейчас» не собрана (%s)", type(exc).__name__)
+        return {"ok": False, "pending": pending, "later": 0, "model_failed_24h": failed,
+                "nightly_at": state.config.nightly_at, "timezone": state.config.timezone}
+    for item in collected["items"]:
+        kind = item["kind"]
+        if kind == "reply":
+            kind = "question" if item["kind_title"] == REPLY_QUESTION else "source"
+        if kind in pending:
+            pending[kind] += 1
+    later = sum(int(n or 0) for n in collected["later"].values())
+    failed = {"media": int(found["media"]), "requests": int(found["requests"])}
+    return {"ok": True, "pending": pending, "later": later, "model_failed_24h": failed,
+            "nightly_at": state.config.nightly_at, "timezone": state.config.timezone}
 
 
 # --- 1. бот согласований -----------------------------------------------------------------------

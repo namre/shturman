@@ -72,6 +72,19 @@ async function shot(page, name, full = true) {
 }
 
 const browser = await chromium.launch();
+// Пакет 3 (С1): когда обязательные шаги пройдены, страница при открытии сворачивает готовые шаги в строку.
+// Основной сценарий работает внутри шагов, поэтому его вкладки открывают их заранее — так же, как это
+// сделал бы владелец нажатием «Изменить» (отметка в sessionStorage вкладки). Само сворачивание, «Сейчас»,
+// быстрые ссылки и «Готово» проверяет раздел «пульт» ниже — в чистых вкладках без этой отметки.
+const ALL_STEPS = ["s-bot", "s-mode", "s-business", "s-keys", "s-accounts", "s-assistant", "s-chats", "s-import", "s-media"];
+function OPEN_STEPS(steps) {
+  try { if (!sessionStorage.getItem("shturman-setup-open")) sessionStorage.setItem("shturman-setup-open", JSON.stringify(steps)); } catch (e) { /* без хранилища */ }
+}
+async function newContext(options) {
+  const ctx = await browser.newContext(options);
+  await ctx.addInitScript(OPEN_STEPS, ALL_STEPS);
+  return ctx;
+}
 const desktop = { viewport: { width: 1360, height: 900 }, locale: "ru-RU" };
 const phone = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, locale: "ru-RU" };
 const VARIANTS = [
@@ -79,7 +92,7 @@ const VARIANTS = [
   ["phone-light", phone],
   ["phone-dark", { ...phone, colorScheme: "dark" }],
 ];
-const context = await browser.newContext(desktop);
+const context = await newContext(desktop);
 const page = await context.newPage();
 const consoleErrors = [], foreign = [];
 page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text()); });
@@ -109,7 +122,7 @@ const storedKey = () => page.evaluate((name) => localStorage.getItem(name), KEY_
 async function variants(stage, prepare) {
   const stored = await context.storageState();
   for (const [name, options] of VARIANTS) {
-    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const ctx = await newContext({ ...options, storageState: stored });
     const p = await ctx.newPage();
     p.on("dialog", (d) => d.accept());
     await p.addInitScript(AUTO_ASK);
@@ -309,18 +322,22 @@ check("вход: основной аккаунт подключён", (await pag
 
 // чаты
 await page.waitForSelector("#chats-list li");
-check("чаты: сначала показаны первые 15", (await page.locator("#chats-list li").count()) === 15);
-check("чаты: счётчик показывает, сколько выбрано и показано", (await page.textContent("#chats-counter")).includes("Показано 15 из"));
+check("чаты: сначала показаны первые 20 — как в приложении", (await page.locator("#chats-list li").count()) === 20);
+check("чаты: счётчик — «Читается N из M в вашем Telegram», показано 20",
+      /^Читается 0 чатов из \d+ в вашем Telegram/.test(await page.textContent("#chats-counter")) &&
+      (await page.textContent("#chats-counter")).includes("Показано 20 из"), await page.textContent("#chats-counter"));
 check("чаты: один аккаунт — вкладок нет", !(await page.isVisible("#chats-accounts")));
 await page.click("#chats-more");
-await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 45);
-check("чаты: «Показать ещё» догружает следующую порцию", (await page.textContent("#chats-more")).includes("осталось"));
+await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 40);
+check("чаты: «Показать ещё» догружает следующую порцию — тоже 20, кнопка вторичная",
+      (await page.textContent("#chats-more")).includes("осталось") && (await page.getAttribute("#chats-more", "class")).includes("ghost"));
 await page.fill("#chats-q", "Иван Петров");
 await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length > 0 && document.querySelectorAll("#chats-list li").length < 30);
 check("чаты: поиск по названию", (await page.textContent("#chats-list")).includes("Иван Петров"));
-await page.locator("#chats-list li .chat-read input").first().check();
-await page.waitForFunction(() => document.querySelector("#chats-counter").textContent.includes("Выбрано для чтения: 1 чат"));
-check("чаты: включение чтения одного чата меняет счётчик", true);
+// С10: флажок включается нажатием на название чата — вся строка подписи
+await page.locator("#chats-list li .chat-title").first().click();
+await page.waitForFunction(() => document.querySelector("#chats-counter").textContent.startsWith("Читается 1 чат из"));
+check("чаты: нажатие на название включает чтение, счётчик меняется", await page.locator("#chats-list li .chat-read input").first().isChecked());
 await page.waitForFunction(() => document.querySelector("#progress").textContent.includes("выбрано: 1"), null, { timeout: 20000 });
 check("строка «что уже сделано»: все пять шагов готовы", (await page.locator("#progress li.done").count()) === 5);
 await page.fill("#chats-q", "");
@@ -373,7 +390,7 @@ check("чаты: глубина истории сохраняется", true);
   check("уведомление не ловит нажатия и не лежит поверх кнопок", clash.events === "none", "кнопок под уведомлением: " + clash.over);
 }
 await page.click("#chats-options > summary");
-await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 15);
+await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 20);
 await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("s-chats").scrollIntoView(); });
 await shot(page, "23-chats-desktop-light");
 await page.locator("#s-chats").screenshot({ path: path.join(OUT, "23b-chats-section-desktop-light.png") });
@@ -398,7 +415,7 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
   async function loadVariants(stage, word) {
     const stored = await context.storageState();
     for (const [name, options] of VARIANTS) {
-      const ctx = await browser.newContext({ ...options, storageState: stored });
+      const ctx = await newContext({ ...options, storageState: stored });
       const p = await ctx.newPage();
       await p.goto(URL_PAGE);
       await p.waitForSelector("#screen-app:not([hidden])");
@@ -438,6 +455,20 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
   check(`большой аккаунт: «Загружено N из ~${total}»`, loading.replace(/\s/g, "").includes("из~" + total), loading);
   await page.waitForTimeout(700);
   await loadShot(page, "dialogs-loading-desktop-light");
+  {
+    // Пока список грузится, страница перечитывает его раз в 2,5 с. Открытый вопрос «Не сохранять» в строке
+    // при этом не должен пропадать (сбой пакета 1: он исчезал при перерисовке списка).
+    await page.evaluate(() => { window.__manualAsk = true; });
+    await page.locator("#chats-list li button", { hasText: "Не сохранять" }).first().click();
+    await page.waitForSelector("#chats-list .ask");
+    await page.waitForTimeout(6000);
+    const still = await page.locator("#chats-list .ask").count();
+    const running = await page.evaluate(() => !document.querySelector("#chats-load").hidden);
+    check("вопрос «Не сохранять» в строке не пропадает, пока список перечитывается", still === 1 && running,
+          JSON.stringify({ still, running }));
+    await page.click('#chats-list .ask [data-ask="no"]');
+    await page.evaluate(() => { window.__manualAsk = false; });
+  }
   await loadVariants("dialogs-loading", "Загружаю");
 
   await page.waitForFunction(() => document.querySelector("#chats-load-title").textContent.includes("Telegram просит подождать"),
@@ -471,7 +502,7 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
     [...document.querySelectorAll("#chats-list .chat-title")].every((n) => n.textContent.startsWith("Татьяна Фёдорова")));
   check("большой аккаунт: поиск находит диалог из конца длинного списка", (await page.locator("#chats-list li").count()) > 0);
   await page.fill("#chats-q", "");
-  await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 15);
+  await page.waitForFunction(() => document.querySelectorAll("#chats-list li").length === 20);
   await loadShot(page, "dialogs-done-desktop-light");
 }
 
@@ -515,7 +546,7 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
   async function sphereVariants(stage, prepare, selector = "#s-chats") {
     const stored = await context.storageState();
     for (const [name, options] of VARIANTS) {
-      const ctx = await browser.newContext({ ...options, storageState: stored });
+      const ctx = await newContext({ ...options, storageState: stored });
       const p = await ctx.newPage();
       p.on("dialog", (d) => d.accept());
       await p.addInitScript(AUTO_ASK);
@@ -584,9 +615,19 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
 
   // «Сделать сферу из папки»
   const news = await openSection(page, "Новости");
-  await news.locator("button", { hasText: "Сделать сферу из папки" }).click();
+  await news.locator("button", { hasText: "Связать со сферой…" }).click();
+  {
+    const pick = news.locator(".folder-pick");
+    check("«Связать со сферой…»: сферы по умолчанию нет — «Выберите сферу…», «Связать» недоступна",
+          (await pick.locator("select").inputValue()) === "" &&
+          (await pick.locator("select option").first().textContent()) === "Выберите сферу…" &&
+          await pick.locator("button", { hasText: "Связать" }).isDisabled());
+    await pick.locator("select").selectOption("new");
+    await pick.locator("input[type=checkbox]").uncheck();
+    await pick.locator("button", { hasText: /^Связать$/ }).click();
+  }
   await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("Сфера «Новости» заведена"), null, { timeout: 15000 });
-  check("«Сделать сферу из папки»: сфера заведена с чатами папки",
+  check("«Связать со сферой…» → «Новая сфера из папки»: сфера заведена с чатами папки",
         (await control("GET", "/spheres/seen")).spheres.some((s) => s.title === "Новости" && s.chats >= 25));
 
   // сферы
@@ -638,8 +679,11 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
   await page.waitForFunction(() => document.querySelector("#sph-list").textContent.includes("Учёба"));
   check("раздел «Сферы»: новая сфера заведена", true);
   const folderRow = page.locator("#sph-folders li", { hasText: "Работа" }).first();
-  await folderRow.locator("select").selectOption({ label: "Работа РАЗУМ" });
-  await folderRow.locator("button", { hasText: "Предлагать новые" }).click();
+  await folderRow.locator("button", { hasText: "Связать со сферой…" }).click();
+  check("карточка «Сферы»: у папки сферы по умолчанию нет", (await folderRow.locator(".folder-pick select").inputValue()) === "");
+  await folderRow.locator(".folder-pick select").selectOption({ label: "Работа РАЗУМ" });
+  check("«Предлагать новые чаты папки» — флажок внутри, включён", await folderRow.locator(".folder-pick input[type=checkbox]").isChecked());
+  await folderRow.locator(".folder-pick button", { hasText: /^Связать$/ }).click();
   await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("будут предлагаться"), null, { timeout: 15000 });
   const linkedProposals = await page.locator("#sph-proposals .sph-offer").count();
   await control("POST", "/spheres/folder-new?role=owner");
@@ -762,8 +806,9 @@ check("способ «сотрудник»: бизнес-режим — шаг 3
 check("способ «сотрудник»: вход в основной аккаунт виден без номера и с пояснением — он уже подключён",
       (await page.isVisible("#s-accounts")) && (await page.textContent("#s-accounts .num")) === "" &&
       (await page.textContent("#s-accounts .other-note")).includes("Не входит в выбранный способ"));
-check("способ «сотрудник»: тексты шагов — свой вариант", (await page.innerText("#h-chats")).trim() === "Какие группы читать" &&
-      (await page.isVisible("#s-keys .optional-tag")));
+check("способ «сотрудник»: шаг чатов — «Какие чаты читать», по желанию, серой плашкой",
+      (await page.innerText("#h-chats")).trim() === "Какие чаты читать" && (await page.isVisible("#s-keys .optional-tag")) &&
+      (await page.isVisible("#s-chats .optional-tag")) && !(await page.getAttribute("#st-chats", "class")).includes("todo"));
 check("смена способа ничего не отключила", (await page.textContent("#st-accounts")) === "Готово");
 check("бизнес-режим: в схемах подставлено имя бота", (await page.locator("#s-business .bot-name").first().textContent()) === "@shturman_soglasovaniya_bot");
 await control("POST", "/business?connect=1");
@@ -787,7 +832,9 @@ await page.click("#tg-password-send");
 await page.waitForFunction(() => document.querySelector("#role-assistant-state").textContent.includes("Подключён"), null, { timeout: 20000 });
 check("помощник: подключён", (await page.textContent("#role-assistant-state")).includes("Помощник"));
 await page.waitForFunction(() => document.querySelectorAll("#chats-accounts .tab").length === 2);
-check("чаты: два аккаунта — две вкладки", true);
+check("чаты: две вкладки — «Группы помощника» и «Ваш аккаунт»",
+      (await page.locator("#chats-accounts .tab").allTextContents()).join("|") === "Группы помощника|Ваш аккаунт",
+      (await page.locator("#chats-accounts .tab").allTextContents()).join("|"));
 await page.evaluate(() => { document.getElementById("toast").hidden = true; window.scrollTo(0, 0); });
 await shot(page, "25-mode-staff-desktop-light");
 await variants("25-mode-staff");
@@ -828,6 +875,15 @@ check("модель: на странице сказано про https и про
         && !(await page.textContent("#llm-rules")).includes("SHTURMAN_"));
 await page.fill("#llm-url", "https://llm.example/v1");
 
+// С13: действует ключ — видна она, «Сменить способ…»; формы подписки нет до нажатия.
+check("модель: показан действующий способ, форма подписки скрыта",
+      (await page.textContent("#llm-way-text")).includes("Действует ключ API") && !(await page.isVisible("#sub-block")),
+      await page.textContent("#llm-way-text"));
+await page.evaluate(() => { document.getElementById("toast").hidden = true; document.querySelector(".top").style.position = "static"; });
+await page.locator("#s-llm").screenshot({ path: path.join(OUT, "26k-own-model-key-desktop-light.png") });
+await page.evaluate(() => { document.querySelector(".top").style.position = ""; });
+await page.click("#llm-switch");
+await page.waitForSelector("#sub-block:not([hidden])");
 // подписка ChatGPT вместо ключа: вход вставкой адреса. Страница входа OpenAI — подставная, в сеть не ходим.
 await context.route("https://auth.openai.com/**", (route) => route.fulfill({
   status: 200, contentType: "text/html; charset=utf-8", body: "<!doctype html><title>ChatGPT</title><p>Подставной вход</p>" }));
@@ -858,8 +914,14 @@ check("подписка: подключена — видны учётная за
       (await page.textContent("#sub-status")).includes("owner@example.com") && (await page.isVisible("#sub-usage")) &&
       (await page.isVisible("#sub-model")) && (await page.getAttribute("#sub-usage", "href")) === "https://chatgpt.com/settings/usage");
 check("подписка: заменила ключ API", (await page.textContent("#st-llm")).includes("Подписка"));
+check("модель: после смены видна только подписка — «Действует подписка ChatGPT», форма ключа скрыта",
+      (await page.textContent("#llm-way-text")).includes("Действует подписка ChatGPT") && !(await page.isVisible("#key-block")) &&
+      (await page.getAttribute("#sub-start", "class")).includes("ghost"));
 await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("s-llm").scrollIntoView(); });
 await shot(page, "26b-subscription-connected-desktop-light");
+await page.evaluate(() => { document.querySelector(".top").style.position = "static"; });
+await page.locator("#s-llm").screenshot({ path: path.join(OUT, "26c-own-model-subscription-desktop-light.png") });
+await page.evaluate(() => { document.querySelector(".top").style.position = ""; });
 
 // счётчики и журнал
 await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
@@ -872,12 +934,14 @@ check("журнал: входы, ключи и аккаунты — отдель
       ["Токен бота согласований сохранён", "Аккаунт Telegram подключён", "Своя модель сервиса сохранена"].every((t) => keyAudit.includes(t)), keyAudit.slice(0, 300));
 check("журнал: общий список действий", (await page.textContent("#audit")).length > 50);
 check("отправка со страницы не включилась", (await page.textContent("#facts")).includes("Выключена"));
-await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("extras").scrollIntoView(); });
+await page.click("#audit-details > summary");
+await page.evaluate(() => { document.getElementById("toast").hidden = true; document.getElementById("s-audit").scrollIntoView(); });
 await shot(page, "26-extras-open-desktop-light");
 await variants("26-extras-open", async (p) => {
+  await p.click("#audit-details > summary");
   await p.click("#extras > summary");
   await p.waitForFunction(() => document.querySelector("#audit").children.length > 1);
-  await p.evaluate(() => document.getElementById("extras").scrollIntoView());
+  await p.evaluate(() => document.getElementById("s-audit").scrollIntoView());
 });
 await page.evaluate(() => window.scrollTo(0, 0));
 await shot(page, "27-app-done-desktop-light");
@@ -1056,7 +1120,7 @@ await shot(page, "27-app-done-desktop-light");
                  ["phone360-light", { ...phone, viewport: { width: 360, height: 740 } }]];
   const stored = await context.storageState();
   for (const [name, options] of views) {
-    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const ctx = await newContext({ ...options, storageState: stored });
     const p = await ctx.newPage();
     await p.goto(URL_PAGE);
     await p.waitForSelector("#screen-app:not([hidden])");
@@ -1211,7 +1275,7 @@ await shot(page, "27-app-done-desktop-light");
                  ["phone360-light", { ...phone, viewport: { width: 360, height: 740 } }]];
   const stored = await context.storageState();
   for (const [name, options] of views) {
-    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const ctx = await newContext({ ...options, storageState: stored });
     const p = await ctx.newPage();
     p.on("dialog", (d) => d.accept());
     await p.addInitScript(AUTO_ASK);
@@ -1325,7 +1389,7 @@ await shot(page, "27-app-done-desktop-light");
                  ["phone360-light", { ...phone, viewport: { width: 360, height: 740 } }]];
   const stored = await context.storageState();
   for (const [name, options] of views) {
-    const ctx = await browser.newContext({ ...options, storageState: stored });
+    const ctx = await newContext({ ...options, storageState: stored });
     const p = await ctx.newPage();
     await p.goto(URL_PAGE);
     await p.waitForSelector("#screen-app:not([hidden])");
@@ -1506,6 +1570,133 @@ await shot(page, "27-app-done-desktop-light");
     const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     check(`вёрстка (разбор входящих; ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
     await ctx.close();
+  }
+}
+
+// --- пульт (пакет 3 ревизии удобства: С1, С2, С4, С7, С10, С12, Х7, П5) ----------------------------
+// Обязательные шаги пройдены (способ «Через бота и помощника»: бот, бизнес-режим). Свежая вкладка без
+// отметок о раскрытых шагах: страница — пульт. Снимки — в E2E_PULT_OUT (по умолчанию E2E_OUT).
+{
+  const PULT_OUT = process.env.E2E_PULT_OUT || OUT;
+  mkdirSync(PULT_OUT, { recursive: true });
+  const stored = await context.storageState();
+  // «Готово: что дальше» — раскрыто один раз: отметку о показе из хранилища основной вкладки убираем
+  for (const o of stored.origins) o.localStorage = o.localStorage.filter((x) => x.name !== "shturman-setup-ready-seen");
+  const ctx = await browser.newContext({ ...desktop, storageState: stored });
+  const p = await ctx.newPage();
+  p.on("dialog", (d) => d.accept());
+  await p.goto(URL_PAGE);
+  await p.waitForSelector("#screen-app:not([hidden])");
+  await p.waitForSelector("#now:not([hidden])");
+  await p.waitForFunction(() => document.querySelector("#now-list").textContent.includes("Последнее сообщение") &&
+                                !document.querySelector("#now-list").textContent.includes("считаю"), null, { timeout: 40000 });
+  const head = await p.evaluate(() => ({ h1: document.getElementById("page-title").textContent, title: document.title,
+    quick: [...document.querySelectorAll("#quick a")].map((a) => a.textContent),
+    leadInFaq: !!document.querySelector("#faq-main #intro-lead"), height: document.documentElement.scrollHeight }));
+  check("пульт: заголовок «Штурман — ваш пульт», вкладка браузера — «Настройки Штурмана»",
+        head.h1 === "Штурман — ваш пульт" && head.title === "Настройки Штурмана", JSON.stringify(head));
+  check("пульт: быстрые ссылки «Чаты · Сферы · Уведомления · Репетиция · Память · Журнал»",
+        head.quick.join("|") === "Чаты|Сферы|Уведомления|Репетиция|Память|Журнал", head.quick.join("|"));
+  check("пульт: вступление «Займёт 15–20 минут» и словарь — в «Частых вопросах»", head.leadInFaq);
+  const now = await p.textContent("#now-list");
+  check("«Сейчас»: что ждёт решения, аккаунты, последнее сообщение, сбои модели, отправка",
+        ["Ждут решения", "Аккаунты", "Последнее сообщение", "Сбои модели за сутки", "Отправка", "выключена"].every((w) => now.includes(w)), now);
+  check("«Сейчас»: без текста переписки и без кнопки «Остановить всё»",
+        !["Добрый день", "смету", "Купи хлеба"].some((w) => now.includes(w)) &&
+        !(await p.locator("#now button", { hasText: "Остановить" }).count()));
+  check("«Сейчас» — сразу под заголовком, до шагов", await p.evaluate(() =>
+    !!(document.getElementById("now").compareDocumentPosition(document.getElementById("s-bot")) & Node.DOCUMENT_POSITION_FOLLOWING)));
+  await p.evaluate(() => { document.querySelector(".top").style.position = "static"; });
+  await p.locator("#now").screenshot({ path: path.join(PULT_OUT, "pult-now-desktop-light.png") });
+  // готовые шаги — одной строкой
+  const lines = await p.evaluate(() => ["s-bot", "s-mode", "s-business"].map((id) => {
+    const c = document.getElementById(id);
+    return { id, collapsed: c.classList.contains("collapsed"), line: c.querySelector(".step-line").textContent,
+             state: c.querySelector(".sl-state").textContent };
+  }));
+  check("пульт: готовые шаги свёрнуты в строку «✓ что — состояние · Изменить»",
+        lines.every((l) => l.collapsed && l.line.startsWith("✓") && l.state.length > 3 && l.line.endsWith("Изменить")) &&
+        !(await p.isVisible("#bot-status")), JSON.stringify(lines));
+  check("пульт: опасные кнопки готового шага («Привязать другой аккаунт», «Убрать токен») не видны, пока шаг свёрнут",
+        !(await p.isVisible("#bind-go")) && !(await p.isVisible("#bot-remove")));
+  check("«Готово: что дальше»: в конце шагов, раскрыто в первый раз; ночной разбор 03:30, где решать, как остановить",
+        await p.evaluate(() => document.getElementById("ready-details").open) &&
+        (await p.textContent("#s-ready")).includes("03:30") && (await p.textContent("#s-ready")).includes("Остановить всё") &&
+        await p.evaluate(() => !!(document.getElementById("s-media").compareDocumentPosition(document.getElementById("s-ready")) &
+                                   Node.DOCUMENT_POSITION_FOLLOWING) &&
+                                !!(document.getElementById("s-ready").compareDocumentPosition(document.getElementById("s-spheres")) &
+                                   Node.DOCUMENT_POSITION_FOLLOWING)));
+  await p.locator("#s-ready").screenshot({ path: path.join(PULT_OUT, "pult-ready-desktop-light.png") });
+  await p.evaluate(() => { document.querySelector(".top").style.position = ""; });
+  await p.screenshot({ path: path.join(PULT_OUT, "pult-full-desktop-light.png"), fullPage: true });
+  // «Изменить» раскрывает шаг; раскрытое помнится во вкладке; строка прогресса — ссылки на шаги
+  await p.locator("#s-bot .step-line").click();
+  await p.waitForSelector("#s-bot:not(.collapsed) #bot-status");
+  check("пульт: «Изменить» раскрывает шаг; «Привязать другой аккаунт» — вторичная кнопка",
+        (await p.getAttribute("#bind-go", "class")).includes("ghost") && (await p.textContent("#s-bot .step-line")).endsWith("Свернуть"));
+  await p.reload();
+  await p.waitForSelector("#screen-app:not([hidden])");
+  await p.waitForSelector("#s-bot .step-line:not([hidden])");
+  check("пульт: раскрытый шаг остаётся раскрытым после перезагрузки вкладки",
+        !(await p.evaluate(() => document.getElementById("s-bot").classList.contains("collapsed"))));
+  check("«Готово»: во второй раз — свёрнуто", !(await p.evaluate(() => document.getElementById("ready-details").open)));
+  await p.locator("#s-bot .step-line").click();
+  await p.click('#progress a[data-go="s-business"]');
+  check("строка прогресса — ссылка: шаг раскрыт",
+        !(await p.evaluate(() => document.getElementById("s-business").classList.contains("collapsed"))));
+  await p.click('#quick a[data-go="s-audit"]');
+  await p.waitForFunction(() => document.getElementById("audit-details").open);
+  check("быстрая ссылка «Журнал» открывает журнал действий", await p.isVisible("#audit"));
+  check("порядок: шаги подряд, затем «Повседневное» — сферы, уведомления, наблюдатель, репетиция, память, журнал, «Дополнительно»",
+        await p.evaluate(() => {
+          const ids = ["s-chats", "s-import", "s-media", "h-daily", "s-spheres", "s-notify", "s-watch", "s-rehearsal", "s-memory", "s-audit", "extras"];
+          return ids.every((id, i) => i === 0 || !!(document.getElementById(ids[i - 1]).compareDocumentPosition(document.getElementById(id)) &
+                                                     Node.DOCUMENT_POSITION_FOLLOWING));
+        }));
+  await ctx.close();
+
+  // телефон 360 в обеих темах: цели касания и контраст основного текста
+  for (const scheme of ["light", "dark"]) {
+    const c = await browser.newContext({ ...phone, viewport: { width: 360, height: 740 }, colorScheme: scheme, storageState: await context.storageState() });
+    const q = await c.newPage();
+    await q.goto(URL_PAGE);
+    await q.waitForSelector("#now:not([hidden])");
+    await q.waitForTimeout(800);
+    const height = await q.evaluate(() => document.documentElement.scrollHeight);
+    await q.screenshot({ path: path.join(PULT_OUT, `pult-full-phone360-${scheme}.png`), fullPage: true });
+    // открыть то, где флажки: чаты, уведомления, репетиция
+    await q.locator("#s-chats .step-line").click();
+    await q.click("#notify-details > summary");
+    await q.click("#rehearsal-details > summary");
+    await q.waitForSelector("#notify-form input[name=nt-personal]:checked");
+    await q.waitForTimeout(600);
+    const m = await q.evaluate(() => {
+      function rgb(s) { const x = s.match(/[\d.]+/g); return x ? x.map(Number) : [0, 0, 0, 1]; }
+      function lum([r, g, b]) { const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); }
+      function bgOf(el) { while (el) { const c = rgb(getComputedStyle(el).backgroundColor); if ((c[3] ?? 1) > 0.5) return c; el = el.parentElement; } return [255, 255, 255]; }
+      const vis = (el) => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el); return r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none"; };
+      const small = [], low = [];
+      for (const box of document.querySelectorAll('main input[type="checkbox"], main input[type="radio"]')) {
+        if (!vis(box)) continue;
+        const r = box.getBoundingClientRect(), row = (box.closest("label") || box).getBoundingClientRect();
+        if (r.width < 24 || r.height < 24 || row.height < 44) small.push(`${(box.closest("label") || box).textContent.trim().slice(0, 30)} ${Math.round(r.width)}/${Math.round(row.height)}`);
+      }
+      for (const el of document.querySelectorAll("main *")) {
+        if (!vis(el) || el.closest(".shot, [disabled], details.for-admin")) continue;
+        const own = [...el.childNodes].filter((n) => n.nodeType === 3 && n.textContent.trim()).length;
+        if (!own) continue;
+        const st = getComputedStyle(el), a = lum(rgb(st.color)), b = lum(bgOf(el));
+        const ratio = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+        if (ratio < 4.5) low.push(`${ratio.toFixed(2)} «${el.textContent.trim().slice(0, 30)}»`);
+      }
+      return { small, low };
+    });
+    check(`пульт (телефон 360, ${scheme}): флажки не меньше 24 px, строка — не меньше 44 px`, m.small.length === 0, m.small.slice(0, 5).join("; "));
+    check(`пульт (телефон 360, ${scheme}): контраст текста не ниже 4,5:1`, m.low.length === 0, m.low.slice(0, 5).join("; "));
+    note(`длина страницы-пульта на телефоне 360 (${scheme}): ${height} px; на компьютере: ${head.height} px`);
+    const overflow = await q.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    check(`пульт (телефон 360, ${scheme}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+    await c.close();
   }
 }
 

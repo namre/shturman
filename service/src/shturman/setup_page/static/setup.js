@@ -5,7 +5,10 @@
  * сервер один раз отдаёт ключ сессии. Страница хранит его в localStorage своего адреса и шлёт
  * заголовком X-Shturman-Session с каждым запросом. Cookie нет вовсе: страница стоит на том же
  * имени узла, что и дашборд ассистента, но на другом порту, а cookie по портам не разделяются.
- * localStorage разделяется: соседний порт его не видит. Кроме ключа сессии, в хранилище ничего нет.
+ * localStorage разделяется: соседний порт его не видит. Кроме ключа сессии, в хранилище только две
+ * отметки удобства без данных (пакет 3 ревизии удобства): какие готовые шаги раскрыты в этой вкладке
+ * (sessionStorage) и что экран «Готово: что дальше» уже показан (localStorage). Без хранилища страница
+ * работает так же, только не помнит раскрытого.
  *
  * Секреты (токен, ключ, пароль, код) уходят только в теле запроса и обратно не приходят: сервер
  * отвечает «задано / не задано». Поле с секретом очищается сразу после отправки.
@@ -17,7 +20,18 @@
   var KEY_NAME = "shturman-setup-session";
   var key = "";                 // ключ сессии; пусто — входа нет
   var S = null;                 // последнее состояние с сервера
-  var FIRST_CHATS = 15, MORE_CHATS = 30;
+  // Порция списка чатов — та же, что в приложении «Штурман» (С11).
+  var FIRST_CHATS = 20, MORE_CHATS = 20;
+  var OPEN_NAME = "shturman-setup-open";          // sessionStorage: какие свёрнутые шаги владелец раскрыл
+  var READY_NAME = "shturman-setup-ready-seen";   // localStorage: «Готово: что дальше» уже показано
+
+  /* Отметки удобства: хранилища может не быть (закрытый режим, запрет сайта) — тогда без памяти. */
+  function readStore(area, name) {
+    try { return window[area].getItem(name); } catch (e) { return null; }
+  }
+  function writeStore(area, name, value) {
+    try { if (value === null) window[area].removeItem(name); else window[area].setItem(name, value); } catch (e) { /* без памяти */ }
+  }
 
   /* Хранилище может быть недоступно (закрытый режим браузера): тогда вход живёт до закрытия вкладки. */
   function loadKey() {
@@ -40,7 +54,10 @@
     // раскладки списка чатов и сферы (Р-82): раскладка — только в памяти страницы
     chatsLayout: "", sections: [], sectionOpen: {}, sectionItems: {}, sectionBusy: {},
     sphereList: [], sph: null, sphOpen: {}, sphEdit: null,
-    subUrl: ""                  // адрес входа в ChatGPT текущей попытки — только в памяти страницы
+    subUrl: "",                 // адрес входа в ChatGPT текущей попытки — только в памяти страницы
+    // пульт (пакет 3): страница вернувшегося владельца — готовые шаги свёрнуты, сверху «Сейчас»
+    pult: null, opened: null, readyShown: false, now: null, archive: null, dialogsTotal: null,
+    chatsAccountRole: null, llmSwitch: false, askRetry: null
   };
 
   /* ------------------------------------------------------------ мелочи */
@@ -133,6 +150,8 @@
         if (panel.parentNode) panel.parentNode.removeChild(panel);
         if (openAsk === done) openAsk = null;
         resolve(value);
+        // список, который не перерисовывали, пока был открыт вопрос, — перерисовать теперь
+        if (ui.afterAsk && !openAsk) { var later = ui.afterAsk; ui.afterAsk = null; later(); }
       }
       var buttons = [el("button", { class: "btn small-btn" + (options.danger ? " danger-fill" : ""), type: "button",
                                     "data-ask": "yes", text: options.yes || "Да", onclick: function () { done(true); } })];
@@ -393,6 +412,8 @@
     show("screen-login", false);
     show("screen-app", true);
     ui.signatures = {};
+    ui.pult = null;                       // мастер или пульт — по первому состоянию после входа
+    ui.readyShown = false;
     mem.pages = mem.pending = mem.person = mem.projects = mem.project = mem.chats = mem.profile = null;
     mem.personId = mem.projectId = null;
     mem.creating = false;
@@ -420,7 +441,14 @@
     ui.lastOverview = Date.now();
     refreshMemoryCount();
     refreshRetry();
-    return call("GET", "overview").then(function (r) { if (r.ok) renderSummary(r.data); });
+    return call("GET", "overview").then(function (r) {
+      if (!r.ok) return;
+      ui.now = r.data.now || null;
+      ui.archive = r.data.archive || null;
+      renderSummary(r.data);
+      renderNow();
+      drawCounter();
+    });
   }
 
   function pill(id, label, kind) {
@@ -444,6 +472,7 @@
     renderLlm(S.llm);
     renderMedia(S.media || {});
     renderProgress();
+    renderNow();
   }
 
   /* Шаги зависят от выбранного способа подключения:
@@ -505,7 +534,7 @@
       "s-accounts": !f.bot ? BOT : !f.keys ? "Откроется, когда будут сохранены ключи приложения — шаг " + num("s-keys") + "." : "",
       "s-assistant": !f.bot ? BOT : !f.keys ? "Откроется, когда будут сохранены ключи приложения — шаг " + num("s-keys") + "." : "",
       "s-chats": !f.bot ? BOT : f.sc === "staff"
-        ? (!f.helper ? "Откроется, когда будет подключён аккаунт помощника — шаг " + num("s-assistant") + "." : "")
+        ? (!f.helper && !f.owner ? "Откроется, когда будет подключён аккаунт помощника — шаг " + num("s-assistant") + "." : "")
         : (!f.owner ? "Откроется после входа в аккаунт — шаг " + num("s-accounts") + "." : "")
     };
     // Подключённое раньше или в другом способе остаётся видно, чтобы его можно было отключить.
@@ -515,6 +544,13 @@
     };
     var why = f.sc ? "Не входит в выбранный способ. Виден, потому что уже подключён; если не нужен — отключите."
                    : "Подключено раньше. Выберите способ подключения — тогда страница покажет нужные шаги.";
+    // Пульт (С1): обязательные шаги пройдены — так решается при первом состоянии после входа, чтобы шаг,
+    // который владелец только что закончил, не свернулся у него под руками. Пройти их можно и сейчас:
+    // тогда в конце шагов появится «Готово: что дальше», а свернутся шаги при следующем открытии.
+    var ready = setupDone(f);
+    if (ui.pult === null) ui.pult = ready;
+    if (ready) ui.readyShown = true;
+    var lines = stepLines(f);
     ALL_STEPS.forEach(function (id) {
       var card = $(id), planned = plan.indexOf(id) >= 0, extra = !planned && !!leftover[id];
       card.hidden = !planned && !extra;
@@ -523,11 +559,13 @@
       var other = card.querySelector(".other-note");
       if (other) { other.textContent = extra ? why : ""; other.hidden = !extra; }
       lockStep(id, planned ? lock[id] || "" : "", done[id]);
+      drawStepLine(id, lines[id], extra);
     });
+    renderPult(f);
 
     var items;
     if (f.sc === "own") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-keys", "Ключи приложения"], ["s-accounts", "Вход в аккаунт"], ["s-chats", "Выбор чатов"]];
-    else if (f.sc === "staff") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-business", "Бизнес-режим"], ["s-chats", "Группы", true, num("s-keys") + "–" + num("s-chats")]];
+    else if (f.sc === "staff") items = [["s-bot", "Бот согласований"], ["s-mode", "Способ"], ["s-business", "Бизнес-режим"], ["s-chats", "Чаты", true, num("s-keys") + "–" + num("s-chats")]];
     else items = [["s-bot", "Бот согласований"], ["s-mode", "Способ подключения"]];
     var current = null;
     var steps = items.map(function (it) {
@@ -537,22 +575,270 @@
       else if (!current && !lock[id]) { current = id; state = "сделайте сейчас"; }
       else if (!lock[id]) state = "можно сейчас";
       else state = "после шага " + blocker[id];
-      return [it[1], ok, state, it[3] || num(id)];
+      return [it[1], ok, state, it[3] || num(id), id];
     });
+    // Строка прогресса — ссылки на шаги (С1): нажатие раскрывает шаг и ведёт к нему.
     renderIfChanged("progress", [steps, f.imported], function () {
       var nodes = steps.map(function (s) {
         var now = !s[1] && s[2] === "сделайте сейчас";
         return el("li", { class: s[1] ? "done" : now ? "now" : "wait" }, [
-          el("span", { class: "p-mark", "aria-hidden": "true", text: s[1] ? "✓" : String(s[3]) }),
-          el("span", { class: "p-name", text: s[0] }),
-          el("span", { class: "p-state", text: s[2] })
+          el("a", { class: "p-link", href: "#" + s[4], "data-go": s[4] }, [
+            el("span", { class: "p-mark", "aria-hidden": "true", text: s[1] ? "✓" : String(s[3]) }),
+            el("span", { class: "p-name", text: s[0] }),
+            el("span", { class: "p-state", text: s[2] })
+          ])
         ]);
       });
       if (f.imported) nodes.push(el("li", { class: "done" }, [
-        el("span", { class: "p-mark", "aria-hidden": "true", text: "✓" }),
-        el("span", { class: "p-name", text: "Выгрузка" }), el("span", { class: "p-state", text: "импортирована" })
+        el("a", { class: "p-link", href: "#s-import", "data-go": "s-import" }, [
+          el("span", { class: "p-mark", "aria-hidden": "true", text: "✓" }),
+          el("span", { class: "p-name", text: "Выгрузка" }), el("span", { class: "p-state", text: "импортирована" })
+        ])
       ]));
       return nodes;
+    });
+  }
+
+  /* ---------------------------------------------------- пульт (пакет 3 ревизии удобства) */
+
+  /* Обязательные шаги пройдены: «Через ваш аккаунт» — бот, способ, ключи, вход в аккаунт, выбранные чаты;
+   * «Через бота и помощника» — бот, способ, бизнес-режим (группы — по желанию). Аккаунт считается по
+   * наличию, а не по связи: если связь пропала, страница остаётся пультом, а шаг раскрыт с предупреждением. */
+  function setupDone(f) {
+    if (!f.bot || !f.sc) return false;
+    if (f.sc === "own") return !!(f.keys && f.owner && f.chats > 0);
+    return !!f.business;
+  }
+
+  var ACCOUNT_WORDS = {
+    running: "на связи", starting: "подключается", paused: "на паузе", disconnected: "нет связи", error: "нет связи",
+    unauthorized: "нужно войти заново", failed: "нужно войти заново", no_session: "нужно войти заново", locked: "сессия занята"
+  };
+
+  function accountWords(a) {
+    if (!a) return "";
+    var word = a.paused ? "на паузе" : ACCOUNT_WORDS[a.status] || "нет связи";
+    return (a.label ? "«" + a.label + "» — " : "") + word;
+  }
+
+  /* Строка свёрнутого шага: что это, в каком состоянии, нужно ли внимание. */
+  function stepLines(f) {
+    var b = S.bot, k = S.tg.keys, staff = f.sc === "staff", opt = staff ? " · по желанию" : "";
+    var botState = !b.configured ? "не настроен" : b.problem_text ? "нет связи" : !b.owner_bound ? "привяжите себя владельцем"
+      : (b.username ? "@" + b.username + " " : "") + (b.polling ? "на связи" : "выходит на связь");
+    var chatsState = f.chats ? "читается " + number(f.chats) + " " + plural(f.chats, "чат", "чата", "чатов") +
+      (ui.dialogsTotal && ui.chatsAccountRole === (staff ? "assistant" : "owner") ? " из " + number(ui.dialogsTotal) : "")
+      : staff ? "не выбраны · по желанию" : "не выбраны";
+    var importItems = S.imports.items || [];
+    return {
+      "s-bot": { name: "Бот согласований", state: botState, ok: f.bot && !b.problem_text, warn: !!b.problem_text || !f.bot },
+      "s-mode": { name: "Способ", state: f.sc ? MODE_NAMES[f.sc].toLowerCase() : "не выбран", ok: !!f.sc, warn: !f.sc },
+      "s-business": { name: "Бизнес-режим", state: f.business ? "подключён" : "не подключён", ok: f.business, warn: staff && !f.business },
+      "s-keys": { name: "Ключи приложения Telegram", state: (k.configured ? (k.source === "server" ? "заданы на сервере" : "сохранены") : "не заданы") + (k.configured ? "" : opt),
+                  ok: k.configured, warn: !staff && !k.configured },
+      "s-accounts": { name: "Ваш аккаунт Telegram", state: f.owner ? accountWords(f.owner) : "не подключён", ok: f.ownerOk,
+                      warn: !staff && !f.ownerOk },
+      "s-assistant": { name: "Аккаунт помощника", state: f.helper ? accountWords(f.helper) : "не подключён" + opt, ok: f.helperOk,
+                       warn: staff && !!f.helper && !f.helperOk },
+      "s-chats": { name: "Какие чаты читать", state: chatsState, ok: f.chats > 0, warn: !staff && !f.chats },
+      "s-import": { name: "Прошлая переписка", state: importItems.some(function (i) { return i.state === "running"; }) ? "идёт импорт"
+                      : f.imported ? "импортирована" : "не загружалась · по желанию", ok: f.imported, warn: false },
+      "s-media": { name: "Фото и документы", state: f.media ? "разбор включён" : "разбор выключен · по желанию", ok: f.media, warn: false }
+    };
+  }
+
+  function openedSteps() {
+    if (ui.opened) return ui.opened;
+    var stored = null;
+    try { stored = JSON.parse(readStore("sessionStorage", OPEN_NAME) || "null"); } catch (e) { stored = null; }
+    ui.opened = {};
+    if (Array.isArray(stored)) stored.forEach(function (id) { if (typeof id === "string") ui.opened[id] = true; });
+    return ui.opened;
+  }
+
+  function setOpened(id, on) {
+    var opened = openedSteps();
+    if (on) opened[id] = true; else delete opened[id];
+    writeStore("sessionStorage", OPEN_NAME, JSON.stringify(Object.keys(opened)));
+  }
+
+  /* Строка шага в пульте: «✓ Бот согласований — @бот на связи · Изменить». Вся строка — одна кнопка
+   * (цель касания во всю ширину); внимание требующий шаг не сворачивается. */
+  function drawStepLine(id, line, extra) {
+    var card = $(id), node = card.querySelector(":scope > .step-line");
+    if (!node) {
+      node = el("button", { class: "step-line", type: "button", "aria-expanded": "false",
+        onclick: function () { var open = card.classList.contains("collapsed"); setOpened(id, open); renderProgress(); if (open) card.scrollIntoView({ block: "start" }); } }, [
+        el("span", { class: "sl-mark", "aria-hidden": "true" }), el("span", { class: "sl-name" }), el("span", { class: "sl-state" }),
+        el("span", { class: "sl-act" })
+      ]);
+      card.insertBefore(node, card.firstChild);
+    }
+    var pult = !!ui.pult, attention = !!line.warn;
+    var collapsed = pult && !attention && !openedSteps()[id];
+    card.classList.toggle("collapsed", collapsed);
+    card.classList.toggle("pult-step", pult);
+    node.hidden = !pult;
+    node.className = "step-line" + (line.ok ? " ok" : attention ? " warn" : "");
+    node.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    node.querySelector(".sl-mark").textContent = line.ok ? "✓" : attention ? "!" : "·";
+    node.querySelector(".sl-name").textContent = line.name;
+    node.querySelector(".sl-state").textContent = (extra ? "не входит в выбранный способ · " : "") + line.state;
+    node.querySelector(".sl-act").textContent = !collapsed ? (attention ? "" : "Свернуть") : line.ok ? "Изменить" : "Открыть";
+    node.disabled = !collapsed && attention;
+  }
+
+  /* Раскрыть шаг или карточку и перейти к ней: строка прогресса, быстрые ссылки, «Сейчас». */
+  var DETAILS_OF = { "s-spheres": "spheres-details", "s-notify": "notify-details", "s-rehearsal": "rehearsal-details",
+                     "s-watch": "watch-details", "s-memory": "memory-details", "s-audit": "audit-details",
+                     "s-import": "import-details", "s-media": "media-details", "s-ready": "ready-details" };
+  function goTo(id) {
+    var card = $(id);
+    if (!card) return;
+    if (ALL_STEPS.indexOf(id) >= 0) { setOpened(id, true); renderProgress(); }
+    var det = DETAILS_OF[id] && $(DETAILS_OF[id]);
+    if (det && !det.open) det.open = true;            // «toggle» загрузит содержимое, как при нажатии
+    card.scrollIntoView({ block: "start" });
+    var focus = card.querySelector("h2, .h2, h3");
+    if (focus) { focus.setAttribute("tabindex", "-1"); focus.focus({ preventScroll: true }); }
+  }
+
+  function wirePult() {
+    document.addEventListener("click", function (event) {
+      var link = event.target.closest ? event.target.closest("a[data-go]") : null;
+      if (!link) return;
+      event.preventDefault();
+      var tab = link.getAttribute("data-tab");
+      if (tab && link.getAttribute("data-go") === "s-memory") {      // «решить здесь» — сразу вкладка «Согласования»
+        mem.tab = tab; mem.personId = null; mem.projectId = null; mem.creating = false;
+        if (memOpen()) showMemory(true);
+      }
+      goTo(link.getAttribute("data-go"));
+    });
+    $("ready-close").addEventListener("click", function () { $("ready-details").open = false; $("s-ready").scrollIntoView({ block: "nearest" }); });
+  }
+
+  /* Шапка пульта: заголовок, быстрые ссылки, вступление и словарь — в «Частых вопросах», «Готово». */
+  function renderPult(f) {
+    var pult = !!ui.pult;
+    document.body.classList.toggle("pult", pult);
+    text("page-title", pult ? "Штурман — ваш пульт" : "Подключение ассистента к Telegram");
+    show("quick", pult);
+    show("now", pult);
+    var intro = $("intro-wizard"), slot = $("faq-intro");
+    if (pult && intro.parentNode !== slot) slot.appendChild(intro);
+    else if (!pult && intro.parentNode === slot) $("done-line").parentNode.insertBefore(intro, $("done-line"));
+    drawReady(f);
+  }
+
+  /* «Готово: что дальше» (Х7): после прохождения обязательных шагов — в конце шагов; раскрыт один раз. */
+  function drawReady(f) {
+    var box = $("s-ready");
+    show(box, !!ui.readyShown);
+    if (!ui.readyShown) return;
+    if (!readStore("localStorage", READY_NAME)) {
+      $("ready-details").open = true;
+      writeStore("localStorage", READY_NAME, "1");
+    }
+    var b = S.bot, works = [];
+    works.push("Бот согласований" + (b.username ? " @" + b.username : "") + " — на связи: присылает вопросы с кнопками «Да» и «Нет».");
+    if (f.sc === "own") works.push("Сервис читает " + number(f.chats) + " " + plural(f.chats, "чат", "чата", "чатов") +
+      " вашего аккаунта: загружает их историю и сохраняет новые сообщения в архив.");
+    if (f.sc === "staff") works.push("Бизнес-режим: новые сообщения личных чатов, открытых боту, идут в архив.");
+    if (f.helperOk) works.push("Аккаунт помощника читает группы, где он состоит.");
+    works.push("Уведомления «Вам написали» приходят в бот согласований — настраиваются в карточке «Уведомления».");
+    renderIfChanged("ready-works", works, function () { return works.map(function (t) { return el("li", { text: t }); }); });
+    var now = ui.now || {}, at = now.nightly_at || "03:30";
+    text("ready-when", "Первые договорённости, факты о вас и предложения завести страницы о людях — после ночного разбора в " +
+      at + " " + tzWords(now.timezone) + ": бот пришлёт их карточками. Если у вас есть ассистент в Telegram, утреннюю сводку он пришлёт по своему расписанию.");
+    text("ready-where", S.app_available
+      ? "В приложении «Штурман» — кнопка «Штурман» внизу чата с ботом согласований: все решения и выбор чатов прямо в Telegram. Карточки с кнопками приходят и в сам бот; договорённости и факты можно решать и здесь, в «Памяти ассистента»."
+      : "В боте согласований: карточки с кнопками «Да» и «Нет». Договорённости, факты и проекты можно решать и здесь, в карточке «Память ассистента».");
+  }
+
+  /* «Сейчас» (С4): что ждёт решения, аккаунты, последнее сообщение, сбои модели, отправка, остановка.
+   * Только статусы и счётчики. «Остановить всё» — в шапке, здесь его нет. */
+  var NOW_WORDS = {
+    draft: ["черновик ответа", "черновика ответа", "черновиков ответа"],
+    action: ["подтверждение действия", "подтверждения действия", "подтверждений действия"],
+    question: ["вопрос ассистента", "вопроса ассистента", "вопросов ассистента"],
+    source: ["ответ на сообщение", "ответа на сообщение", "ответов на сообщения"],
+    hidden: ["скрытое сообщение", "скрытых сообщения", "скрытых сообщений"],
+    commitment: ["договорённость", "договорённости", "договорённостей"],
+    owner_fact: ["факт о вас", "факта о вас", "фактов о вас"],
+    page: ["страница о человеке", "страницы о человеке", "страниц о людях"],
+    project: ["проект", "проекта", "проектов"]
+  };
+  var IN_APP = ["draft", "action", "question", "source", "hidden"], ON_PAGE = ["commitment", "owner_fact", "page", "project"];
+
+  function kindsLine(pending, kinds) {
+    return kinds.filter(function (k) { return pending[k]; }).map(function (k) {
+      var w = NOW_WORDS[k];
+      return number(pending[k]) + " " + plural(pending[k], w[0], w[1], w[2]);
+    }).join(", ");
+  }
+
+  function nowItem(kind, title, body, action) {
+    return el("li", { class: "now-item" + (kind ? " " + kind : "") }, [
+      el("span", { class: "now-title", text: title }),
+      el("span", { class: "now-body" }, [body].concat(action ? [" ", action] : []))
+    ]);
+  }
+
+  function renderNow() {
+    if (!S || !ui.pult) return;
+    var now = ui.now, a = ui.archive || {}, h = S.halt || {}, b = S.bot;
+    var pending = (now && now.pending) || {};
+    var total = Object.keys(pending).reduce(function (n, k) { return n + (pending[k] || 0); }, 0);
+    var failed = now ? now.model_failed_24h || {} : {};
+    var failures = (failed.media || 0) + (failed.requests || 0);
+    var accounts = (S.tg.accounts || []).filter(function (x) { return x.account_id !== null; });
+    var sig = [now, a.last_message_seen_at, a.sending, a.triage_enabled, a.triage_analyzed_24h, a.triage_shown_24h,
+               a.triage_reminded_24h, a.triage_waiting, S.sending, h.stopped, h.since, accounts.map(function (x) { return [x.label, x.status, x.paused]; }),
+               b.username, b.business_connections, S.app_available];
+    pill("now", h.stopped ? "остановлено" : total ? "ждут решения: " + total : "всё спокойно", h.stopped || total ? "todo" : "done");
+    if (document.querySelector("#now .ask")) return;          // открыт вопрос «Повторить?» — не перерисовываем под рукой
+    renderIfChanged("now-list", sig, function () {
+      var items = [];
+      if (h.stopped) items.push(nowItem("warn", "Остановлено", "с " + when(h.since) + ": ассистент ничего не делает сам. Продолжить — кнопкой в полосе вверху, подтверждение — в боте."));
+      if (!now) items.push(nowItem("", "Ждут решения", "считаю…"));
+      else if (!total) items.push(nowItem("ok", "Ждут решения", "ничего — всё решено." + (now.later ? " Ещё " + number(now.later) + " придут в следующей сводке." : "")));
+      else {
+        var app = kindsLine(pending, IN_APP), page = kindsLine(pending, ON_PAGE), parts = [];
+        if (app) parts.push(el("span", { class: "now-part" }, [app + " — ",
+          b.username ? el("a", { href: "https://t.me/" + encodeURIComponent(b.username), target: "_blank", rel: "noopener noreferrer",
+                                 text: S.app_available ? "в приложении «Штурман»" : "в боте согласований" })
+                     : "в боте согласований", "."]));
+        if (page) parts.push(el("span", { class: "now-part" }, [page + " — ",
+          el("a", { href: "#s-memory", "data-go": "s-memory", "data-tab": "pending", text: "решить здесь, в «Памяти»" }), "."]));
+        items.push(nowItem("todo", "Ждут решения: " + number(total), el("span", { class: "now-parts" }, parts)));
+      }
+      accounts.sort(function (x, y) { return (x.role === "owner" ? 0 : 1) - (y.role === "owner" ? 0 : 1); });
+      items.push(nowItem(accounts.some(function (x) { return x.status !== "running" || x.paused; }) ? "warn" : "", "Аккаунты",
+        accounts.length ? accounts.map(function (x) { return (x.role === "owner" ? "ваш " : "помощник ") + accountWords(x); }).join(" · ") +
+          (b.business_connections > 0 ? " · бизнес-режим подключён" : "")
+        : b.business_connections > 0 ? "бизнес-режим подключён" : "не подключены"));
+      items.push(nowItem("", "Последнее сообщение", a.last_message_seen_at ? when(a.last_message_seen_at) : "ещё не было"));
+      // Разбор входящих (Р-92): включён ли и что за сутки — ссылкой на блок в «Уведомлениях».
+      if (a.triage_enabled !== undefined) {
+        items.push(nowItem("", "Разбор входящих", a.triage_enabled
+          ? "вкл: за сутки " + number(a.triage_analyzed_24h) + " разобрано, " +
+            number((a.triage_shown_24h || 0) + (a.triage_reminded_24h || 0)) + " показано, " + number(a.triage_waiting) + " ждут ответа."
+          : "выкл — приходят «Вам написали» на каждое сообщение.",
+          el("a", { href: "#s-notify", "data-go": "s-notify", text: a.triage_enabled ? "Правила" : "Включить…" })));
+      }
+      if (now) {
+        var retry = failures ? el("button", { class: "btn ghost small-btn", type: "button", id: "now-retry", text: "Повторить…",
+                                              onclick: function () { if (ui.askRetry) ui.askRetry(this); } }) : null;
+        items.push(nowItem(failures ? "warn" : "", "Сбои модели за сутки", failures
+          ? number(failed.media || 0) + " " + plural(failed.media || 0, "вложение", "вложения", "вложений") + ", " +
+            number(failed.requests || 0) + " " + plural(failed.requests || 0, "запрос разбора", "запроса разбора", "запросов разбора") + "."
+          : "не было.", retry));
+      }
+      var sending = S.sending || a.sending;
+      items.push(nowItem("", "Отправка", sending ? "включена на сервере: ассистент отправляет только после вашего «Да» или по разрешённым правилам."
+                                                 : "выключена: от вашего имени ничего не уходит."));
+      return items;
     });
   }
 
@@ -605,7 +891,7 @@
     text("media-max", String(m.max_mb || 20));
     show("media-on", !m.enabled);
     show("media-off", !!m.enabled);
-    note("media-status", "info", m.enabled ? "Разбор включён. Сколько разобрано — в разделе «Дополнительно» → «Что собрано»." : "");
+    note("media-status", "info", m.enabled ? "Разбор включён. Сколько разобрано — в «Дополнительно» → «Что собрано»." : "");
   }
 
   function wireMedia() {
@@ -671,6 +957,8 @@
     show("shot-start", !!ui.bind);
     show("bind-go", !ui.bind);
     text("bind-go", b.owner_bound ? "Привязать другой аккаунт" : "Показать ссылку привязки");
+    // С7: у готового шага редкое и опасное — вторичным видом, не главной кнопкой.
+    $("bind-go").className = b.owner_bound ? "btn ghost small-btn" : "btn";
     if (b.bind_paused) note("bind-error", "warn", "Бот получил много неверных кодов привязки и на 10 минут перестал их принимать. Подождите и выдайте ссылку заново.");
   }
 
@@ -959,6 +1247,8 @@
     pill("keys", k.configured ? "Готово" : "Не заданы", k.configured ? "done" : "");
     show("keys-server", k.configured && k.source === "server");
     show("keys-ok", k.configured && k.source !== "server" && !ui.keysEditing);
+    // «Переходите к следующему шагу» — только пока идёт настройка (С1).
+    text("keys-ok", ui.pult ? "Ключи сохранены." : "Ключи сохранены. Переходите к следующему шагу.");
     show("keys-form", editing);
     show("keys-form-cancel", ui.keysEditing);
     show("keys-actions", k.configured && k.source === "page" && !ui.keysEditing);
@@ -1063,6 +1353,9 @@
     pill("assistant", helper && helper.status === "running" ? "Подключён" : "", helper ? "done" : "");
     show("accounts-nokeys", !ready);
     show("accounts-body", ready);
+    // Аккаунт уже подключён — объяснение «сервис войдёт…» больше не про него (С1).
+    show("accounts-intro", !owner);
+    show("accounts-gives", !owner);
     show("assistant-nokeys", !ready);
     show("role-assistant-state", ready);
     if (!ready) return;
@@ -1209,7 +1502,9 @@
     var accounts = runningAccounts(tg), all = (tg.accounts || []).filter(function (a) { return a.account_id !== null; });
     var total = all.filter(function (a) { return !(S.scenario || {}).chosen || a.role === ((S.scenario || {}).chosen === "staff" ? "assistant" : "owner"); })
       .reduce(function (sum, a) { return sum + (a.chats_enabled || 0); }, 0);
-    pill("chats", all.length ? (total ? "Выбрано: " + total : "Выберите чаты") : "", total ? "done" : all.length ? "todo" : "");
+    // В способе «Через бота и помощника» шаг по желанию (С8): без выбранных чатов — серая плашка «по желанию», не «сделайте».
+    var optional = (S.scenario || {}).chosen === "staff";
+    pill("chats", all.length ? (total ? "Выбрано: " + total : optional ? "" : "Выберите чаты") : "", total ? "done" : all.length && !optional ? "todo" : "");
     show("chats-none", !all.length);
     show("chats-body", !!all.length);
     if (!all.length) { ui.chatAccount = null; return; }
@@ -1222,11 +1517,13 @@
     }
     var current = all.filter(function (a) { return a.account_id === ui.chatAccount; })[0];
     show("chats-accounts", all.length > 1);
-    renderIfChanged("chats-accounts", [all.map(function (a) { return [a.account_id, a.label, a.role]; }), ui.chatAccount], function () {
-      return all.map(function (a) {
+    // Вкладки «Группы помощника» и «Ваш аккаунт» (С8); первая — аккаунт выбранного способа.
+    var tabs = all.slice().sort(function (a, b) { return (a.role === mine ? 0 : 1) - (b.role === mine ? 0 : 1); });
+    renderIfChanged("chats-accounts", [tabs.map(function (a) { return [a.account_id, a.label, a.role]; }), ui.chatAccount], function () {
+      return tabs.map(function (a) {
         return el("button", {
           class: "tab", type: "button", role: "tab", "aria-selected": a.account_id === ui.chatAccount ? "true" : "false",
-          text: (a.role === "owner" ? "Ваш: " : "Ассистента: ") + (a.label || ""),
+          title: a.label || "", text: a.role === "owner" ? "Ваш аккаунт" : "Группы помощника",
           onclick: function () { ui.chatAccount = a.account_id; ui.chatsKey = ""; render(); }
         });
       });
@@ -1321,10 +1618,14 @@
     if (!(ui.chatsLoad && ui.chatsLoad.running)) return;
     ui.chatsPoll = setTimeout(function () {
       ui.chatsPoll = null;
-      if (ui.chatsBusy > 0 || ui.chatsLoading) { schedulePoll(); return; }   // переключатель ещё сохраняется
+      // Переключатель ещё сохраняется или в списке открыт вопрос в строке («Не сохранять», «Включить все»):
+      // перерисовка списка убрала бы его из-под руки — ждём, пока владелец ответит.
+      if (ui.chatsBusy > 0 || ui.chatsLoading || chatsAskOpen()) { schedulePoll(); return; }
       loadChats(true, false, true);
     }, LOAD_POLL);
   }
+
+  function chatsAskOpen() { return !!document.querySelector("#s-chats .ask, #s-chats .sph-pick"); }
 
   function loadChats(reset, refreshList, polling) {
     if (ui.chatAccount === null || ui.chatsLoading) return;
@@ -1354,6 +1655,7 @@
       ui.chatsLoad = r.data.load || null;
       ui.chatsListLoaded = !!r.data.loaded;
       ui.chatsAge = typeof r.data.age === "number" ? r.data.age : null;
+      noteDialogsTotal(r.data);
       drawChats();
       drawLoad();
       if (was && ui.chatsLoad && !ui.chatsLoad.running && ui.chatsLoad.state === "done") toast("Список чатов обновлён из Telegram.");
@@ -1421,10 +1723,14 @@
       "aria-label": "Сферы чата " + (item.title || ""), "aria-expanded": "false",
       onclick: function () { spherePicker(item, row, this); }
     }) : null;
-    [el("div", { class: "chat-main" }, [
-      el("span", { class: "chat-title", text: item.title || "Без названия" }),
-      el("span", { class: "chat-meta" }, meta)
-    ]), el("label", { class: "chat-read" }, [toggle, el("span", { text: "читать" })]), pick, exclude].forEach(function (n) { if (n) row.appendChild(n); });
+    // Флажок «читать» включается нажатием на всю строку с названием (С10): сам флажок 24 px, строка — от 44 px.
+    [el("label", { class: "chat-read" }, [
+      el("span", { class: "chat-main" }, [
+        el("span", { class: "chat-title", text: item.title || "Без названия" }),
+        el("span", { class: "chat-meta" }, meta)
+      ]),
+      el("span", { class: "read-box" }, [toggle, el("span", { text: "читать" })])
+    ]), pick, exclude].forEach(function (n) { if (n) row.appendChild(n); });
     return row;
   }
 
@@ -1471,9 +1777,26 @@
     row.appendChild(box);
   }
 
+  /* Сколько всего чатов у открытого аккаунта в Telegram — для «Читается N из M» и строки шага в пульте. */
+  function noteDialogsTotal(data) {
+    if (typeof data.dialogs_total !== "number") return;
+    var account = ((S && S.tg.accounts) || []).filter(function (a) { return a.account_id === ui.chatAccount; })[0];
+    var changed = ui.dialogsTotal !== data.dialogs_total;
+    ui.dialogsTotal = data.dialogs_total;
+    ui.chatsAccountRole = account ? account.role : null;
+    if (changed && S && ui.pult) renderProgress();             // строка шага «Какие чаты читать» — «читается N из M»
+  }
+
+  /* «Читается 38 чатов из 4 158 в вашем Telegram · в архиве 63 чата» (С11). */
   function drawCounter() {
-    var words = "Выбрано для чтения: " + ui.chatsEnabled + " " + plural(ui.chatsEnabled, "чат", "чата", "чатов") + "." +
-      (ui.chatsLayout ? " Разделов: " + ui.sections.length + "." : " Показано " + number(ui.chats.length) + " из " + number(ui.chatsTotal) + ".");
+    if (ui.chatAccount === null || !ui.chatsKey) return;
+    var n = ui.chatsEnabled || 0;
+    var whose = ui.chatsAccountRole === "assistant" ? "у помощника в Telegram" : "в вашем Telegram";
+    var words = "Читается " + number(n) + " " + plural(n, "чат", "чата", "чатов") +
+      (ui.dialogsTotal !== null && ui.chatsListLoaded ? " из " + number(ui.dialogsTotal) + " " + whose : "");
+    var stored = ui.archive && typeof ui.archive.chats === "number" ? ui.archive.chats : null;
+    if (stored !== null) words += " · в архиве " + number(stored) + " " + plural(stored, "чат", "чата", "чатов");
+    words += "." + (ui.chatsLayout ? " Разделов: " + ui.sections.length + "." : " Показано " + number(ui.chats.length) + " из " + number(ui.chatsTotal) + ".");
     if (ui.chatsAge !== null && !(ui.chatsLoad && ui.chatsLoad.running)) words += " Список из Telegram обновлён " + ageWords(ui.chatsAge) + ".";
     text("chats-counter", words);
   }
@@ -1482,6 +1805,9 @@
     show("chats-list", !ui.chatsLayout);
     show("chats-sections", !!ui.chatsLayout);
     if (ui.chatsLayout) { show("chats-more", false); show("chats-bulk", false); drawCounter(); return; }
+    // Вопрос в строке открыт — список не перерисовываем у владельца под рукой (иначе вопрос пропадает):
+    // перерисуем, когда он ответит.
+    if (document.querySelector("#chats-list .ask")) { ui.afterAsk = drawChats; drawCounter(); return; }
     var list = $("chats-list");
     list.textContent = "";
     ui.chats.forEach(function (item) { list.appendChild(chatRow(item)); });
@@ -1503,7 +1829,7 @@
   /* ---- раскладки списка: папки Telegram, сферы, активность, вид (Р-82) */
 
   var LAYOUTS = [["", "Все чаты"], ["folders", "Папки Telegram"], ["spheres", "Сферы"], ["activity", "По активности"], ["kind", "По виду"]];
-  var SECTION_FIRST = 20, SECTION_MORE = 30;
+  var SECTION_FIRST = 20, SECTION_MORE = 20;
   var EMPTY_LAYOUT = {
     folders: "В Telegram нет папок — или список ещё не обновлялся. Нажмите «Обновить список из Telegram».",
     spheres: "Сфер пока нет. Заведите их в разделе «Сферы» ниже на этой странице.",
@@ -1553,6 +1879,7 @@
       ui.chatsListLoaded = !!r.data.loaded;
       ui.chatsAge = typeof r.data.age === "number" ? r.data.age : null;
       ui.chatsEnabled = r.data.enabled_total;
+      noteDialogsTotal(r.data);
       if (!r.data.loaded) {
         ui.chatsLoading = false;
         ui.sections = [];
@@ -1577,6 +1904,8 @@
   }
 
   function drawSections() {
+    if (document.querySelector("#chats-sections .ask")) { ui.afterAsk = drawSections; return; }
+    if (pickOpen("chats-sections", drawSections)) return;
     var box = $("chats-sections");
     box.textContent = "";
     if (!ui.sections.length) {
@@ -1654,24 +1983,8 @@
   }
 
   function folderTools(sec) {
-    var folderId = Number(sec.id.split(":")[1]);
-    var parts = [];
-    var made = (sec.spheres || [])[0];
-    var linked = (sec.spheres || []).filter(function (x) { return x.propose; })[0];
-    parts.push(el("button", { class: "btn ghost small-btn", type: "button",
-      text: made ? "Дополнить сферу «" + made.title + "»" : "Сделать сферу из папки",
-      onclick: function () { makeFromFolder(ui.chatAccount, folderId, this, function () { loadChats(true); }); } }));
-    if (linked) {
-      parts.push(el("span", { class: "small", text: "Новые чаты папки предлагаются в сферу «" + linked.title + "»." }));
-    } else if (ui.sphereList.length) {
-      var select = el("select", { "aria-label": "Сфера для новых чатов папки «" + sec.title + "»" },
-        ui.sphereList.map(function (sp) { return el("option", { value: String(sp.id), text: sp.title }); }));
-      if (made) select.value = String(made.id);
-      parts.push(el("div", { class: "sect-link" }, [el("span", { class: "sect-link-label", text: "Новые чаты папки предлагать в сферу" }),
-        select, el("button", { class: "btn ghost small-btn", type: "button", text: "Предлагать",
-        onclick: function () { linkFolder(Number(select.value), ui.chatAccount, folderId, true, this, function () { loadChats(true); }); } })]));
-    }
-    return el("div", { class: "row sect-folder" }, parts);
+    return folderLinkTools({ account_id: ui.chatAccount, folder_id: Number(sec.id.split(":")[1]), title: sec.title,
+                             spheres: sec.spheres || [] }, function () { loadChats(true); });
   }
 
   function drawSectionBody(sec) {
@@ -1947,12 +2260,26 @@
     show("llm-form", !locked);
     show("llm-remove", llm.key.source === "page");
     if (ui.llmWay !== undefined && ui.llmWay !== llm.way) {
-      // Способ сменился — прежние ошибки обоих способов больше не о том.
+      // Способ сменился — прежние ошибки обоих способов больше не о том, а смена закончена.
       note("llm-error", "warn", "");
       note("sub-error", "warn", "");
+      ui.llmSwitch = false;
     }
     ui.llmWay = llm.way;
-    renderSubscription(llm.subscription || {}, bySubscription);
+    // С13: действует один способ — он и показан, с «Сменить способ…»; форма другого — только после нажатия.
+    // Пока ни один не подключён — видны оба: это выбор.
+    var sub = llm.subscription || {};
+    var active = llm.configured ? (bySubscription ? "sub" : "key") : null;
+    show("sub-block", !active || active === "sub" || ui.llmSwitch || !!sub.attempt);
+    show("key-block", !active || active === "key" || ui.llmSwitch);
+    show("llm-way", !!active);
+    text("llm-way-text", active === "sub"
+      ? "Действует подписка ChatGPT" + (sub.email ? " (" + sub.email + ")" : "") + ". Ключ API не нужен."
+      : active === "key" ? "Действует ключ API" + (llm.model.value ? ", модель «" + llm.model.value + "»" : "") + ". Подписка ChatGPT не нужна." : "");
+    var switchButton = $("llm-switch");
+    switchButton.textContent = ui.llmSwitch ? "Не менять способ" : active === "sub" ? "Сменить способ: ключ API…" : "Сменить способ: подписка ChatGPT…";
+    switchButton.setAttribute("aria-expanded", ui.llmSwitch ? "true" : "false");
+    renderSubscription(sub, bySubscription);
     if (llm.configured && !bySubscription) {
       note("llm-status", llm.problem_text ? "warn" : "ok", llm.problem_text
         ? "Модель «" + llm.model.value + "» настроена, но последнее обращение не удалось. " + llm.problem_text
@@ -1994,7 +2321,9 @@
     var link = $("sub-open");
     link.hidden = !ui.subUrl;
     if (ui.subUrl) link.href = ui.subUrl;
-    text("sub-start", status === "connected" || status === "limit" || status === "denied" ? "Войти заново" : "Войти через ChatGPT");
+    var again = status === "connected" || status === "limit" || status === "denied";
+    text("sub-start", again ? "Войти заново" : "Войти через ChatGPT");
+    $("sub-start").className = status === "connected" ? "btn ghost small-btn" : "btn";      // С13: подписка работает — не главное действие
     show("sub-new", !!sub.registered);
     // Адрес лимитов приходит с сервера: в разметке страницы чужих адресов нет.
     if (sub.usage_url) $("sub-usage").href = sub.usage_url;
@@ -2093,6 +2422,12 @@
 
   function wireLlm() {
     wireSubscription();
+    $("llm-switch").addEventListener("click", function () {
+      ui.llmSwitch = !ui.llmSwitch;
+      if (S) renderLlm(S.llm);
+      var other = $(S && S.llm.way === "subscription" ? "key-block" : "sub-block");
+      if (ui.llmSwitch && other) other.scrollIntoView({ block: "nearest" });
+    });
     $("llm-form").addEventListener("submit", function (event) {
       event.preventDefault();
       var key = $("llm-key"), body = { api_key: key.value.trim(), base_url: $("llm-url").value.trim(), model: $("llm-model").value.trim() };
@@ -2933,15 +3268,73 @@
     ]);
   }
 
-  function makeFromFolder(account, folderId, button, done) {
+  /* Папка Telegram и сфера (С12). Одна кнопка «Связать со сферой…»: внутри — «Новая сфера из папки» или
+   * одна из ваших сфер (по умолчанию не выбрано ничего: «Выберите сферу…») и флажок «Предлагать новые чаты
+   * папки». Связать — отнести к сфере все чаты папки (`spheres/folders/make`, для существующей — с её
+   * номером); флажок — ещё и предлагать новые чаты папки (`spheres/{id}/folders`): сами они в сферу не
+   * попадают. Те же подписи — в приложении «Штурман» (app.js: folderLinkTools). */
+  function folderLinkTools(f, done) {
+    var made = (f.spheres || [])[0];
+    var linked = (f.spheres || []).filter(function (x) { return x.propose; })[0];
+    var box = el("div", { class: "folder-link" });
+    var row = el("div", { class: "row" });
+    var open = el("button", { class: "btn ghost small-btn", type: "button", "aria-expanded": "false", text: "Связать со сферой…" });
+    row.appendChild(open);
+    // Закрыли выбор — перерисовать то, что ждало, пока он был открыт (см. pickOpen).
+    function closePick() {
+      var old = box.querySelector(".folder-pick");
+      if (old) box.removeChild(old);
+      open.setAttribute("aria-expanded", "false");
+      if (ui.afterPick) { var later = ui.afterPick; ui.afterPick = null; later(); }
+    }
+    if (linked) row.appendChild(el("button", { class: "btn ghost small-btn quiet", type: "button", text: "Не предлагать новые",
+      "aria-label": "Не предлагать новые чаты папки «" + f.title + "» в сферу «" + linked.title + "»",
+      onclick: function () { linkFolder(linked.id, f.account_id, f.folder_id, false, this, done); } }));
+    box.appendChild(row);
+    open.addEventListener("click", function () {
+      if (box.querySelector(".folder-pick")) { closePick(); return; }
+      open.setAttribute("aria-expanded", "true");
+      var id = "fl-" + f.account_id + "-" + f.folder_id;
+      var options = [el("option", { value: "", text: "Выберите сферу…" })];
+      if (!made) options.push(el("option", { value: "new", text: "Новая сфера «" + f.title + "» из папки" }));
+      ui.sphereList.forEach(function (sp) { options.push(el("option", { value: String(sp.id), text: sp.title })); });
+      var select = el("select", { id: id }, options);
+      select.value = "";
+      var propose = el("input", { type: "checkbox" });
+      propose.checked = true;
+      var go = el("button", { class: "btn small-btn", type: "button", text: "Связать", disabled: true });
+      select.addEventListener("change", function () { go.disabled = !select.value; });
+      go.addEventListener("click", function () { linkWith(f, select.value, propose.checked, go, function () { closePick(); if (done) done(); }); });
+      box.appendChild(el("div", { class: "sph-pick folder-pick" }, [
+        el("div", { class: "field" }, [el("label", { for: id, text: "Сфера для чатов папки «" + f.title + "»" }), select]),
+        el("label", { class: "check" }, [propose, el("span", { text: "Предлагать новые чаты папки — сами они в сферу не попадут" })]),
+        el("div", { class: "row" }, [go, el("button", { class: "btn ghost small-btn", type: "button", text: "Отмена",
+          onclick: function () { closePick(); open.focus(); } })])
+      ]));
+      select.focus();
+    });
+    return box;
+  }
+
+  function linkWith(f, value, propose, button, done) {
+    var body = { account_id: f.account_id, folder_id: f.folder_id };
+    if (value !== "new") body.sphere_id = Number(value);
     busy(button, true);
-    call("POST", "spheres/folders/make", { account_id: account, folder_id: folderId }).then(function (r) {
-      busy(button, false);
-      if (!r.ok) { toast(r.error, true); return; }
-      toast((r.data.created ? "Сфера «" + r.data.sphere.title + "» заведена" : "Сфера «" + r.data.sphere.title + "» дополнена") +
-            ": добавлено чатов — " + r.data.added + ".");
-      refreshSpheres();
-      if (done) done();
+    call("POST", "spheres/folders/make", body).then(function (r) {
+      if (!r.ok) { busy(button, false); toast(r.error, true); return; }
+      var sphere = r.data.sphere, already = (f.spheres || []).some(function (x) { return x.id === sphere.id && x.propose; });
+      var said = (r.data.created ? "Сфера «" + sphere.title + "» заведена" : "Папка связана со сферой «" + sphere.title + "»") +
+                 ": добавлено чатов — " + r.data.added + ".";
+      var next = propose && !already
+        ? call("POST", "spheres/" + sphere.id + "/folders", { account_id: f.account_id, folder_id: f.folder_id, link: true })
+        : Promise.resolve(null);
+      return next.then(function (x) {
+        busy(button, false);
+        if (x && !x.ok) toast(said + " Предлагать новые не получилось: " + x.error, true);
+        else toast(said + (propose ? " Новые чаты папки будут предлагаться." : ""));
+        if (done) done();
+        refreshSpheres();
+      });
     });
   }
 
@@ -3137,7 +3530,16 @@
     return el("div", { class: "field sph-add" }, [el("label", { text: "Добавить чат" }), input, found]);
   }
 
+  /* Открыт выбор «Связать со сферой…» — список под ним не перерисовываем (выбор пропал бы из-под руки),
+   * а перерисуем, когда его закроют. */
+  function pickOpen(id, redraw) {
+    if (!document.querySelector("#" + id + " .folder-pick")) return false;
+    ui.afterPick = redraw;
+    return true;
+  }
+
   function drawSphereFolders() {
+    if (pickOpen("sph-folders", drawSphereFolders)) return;
     var list = $("sph-folders");
     list.textContent = "";
     var folders = ui.sphFolders || [];
@@ -3145,20 +3547,6 @@
     folders.forEach(function (f) {
       var made = f.spheres[0];
       var linked = f.spheres.filter(function (x) { return x.propose; })[0];
-      var parts = [el("button", { class: "btn ghost small-btn", type: "button",
-        text: made ? "Дополнить «" + made.title + "»" : "Сделать сферу",
-        onclick: function () { makeFromFolder(f.account_id, f.folder_id, this, function () { loadSphereFolders().then(drawSphereFolders); }); } })];
-      if (linked) {
-        parts.push(el("button", { class: "btn ghost small-btn quiet", type: "button", text: "Не предлагать новые",
-          onclick: function () { linkFolder(linked.id, f.account_id, f.folder_id, false, this, function () { loadSphereFolders().then(drawSphereFolders); }); } }));
-      } else if (ui.sphereList.length) {
-        var select = el("select", { "aria-label": "Сфера для новых чатов папки «" + f.title + "»" },
-          ui.sphereList.map(function (sp) { return el("option", { value: String(sp.id), text: sp.title }); }));
-        if (made) select.value = String(made.id);
-        parts.push(el("div", { class: "sect-link" }, [el("span", { class: "sect-link-label", text: "Новые чаты — в сферу" }),
-          select, el("button", { class: "btn ghost small-btn", type: "button", text: "Предлагать новые",
-          onclick: function () { linkFolder(Number(select.value), f.account_id, f.folder_id, true, this, function () { loadSphereFolders().then(drawSphereFolders); }); } })]));
-      }
       var meta = f.count + " " + plural(f.count, "чат", "чата", "чатов") + (f.account_role === "assistant" ? " · аккаунт помощника" : "");
       if (made) meta += " · сфера «" + made.title + "»" + (linked ? ", новые предлагаются" : "");
       list.appendChild(el("li", { class: "sph-folder" }, [
@@ -3166,7 +3554,7 @@
           el("span", { class: "sph-name", text: (f.emoticon ? f.emoticon + " " : "") + f.title }),
           el("span", { class: "mem-meta", text: meta })
         ].concat(f.notes.map(function (n) { return el("span", { class: "hint", text: n }); }))),
-        el("div", { class: "row" }, parts)
+        folderLinkTools(f, function () { loadSphereFolders().then(drawSphereFolders); })
       ]));
     });
   }
@@ -3911,18 +4299,22 @@
   }
 
   function wireRetry() {
-    $("retry-run").addEventListener("click", function () {
-      var d = rt.data || { media: 0, requests: 0 }, button = this;
-      ask(button, "Повторить то, что не получилось?", {
-        yes: "Повторить",
-        note: "Фото и документы (" + d.media + ") и разбор переписки (" + d.requests + ") снова уйдут провайдеру модели и потратят запросы."
-      }).then(function (ok) {
-        if (!ok) return;
-        var since = $("retry-since").value;
-        act(button, "retry-error", "POST", "retry", since ? { since: since } : {}, function (out) {
-          toast("Возвращено в работу: вложений — " + out.media + ", запросов разбора — " + out.requests + ".");
-          refreshRetry();
-        });
+    // Та же кнопка и то же решение владельца — и в карточке «Повторить…», и в «Сейчас» (С4).
+    ui.askRetry = askRetry;
+    $("retry-run").addEventListener("click", function () { askRetry(this); });
+  }
+
+  function askRetry(button) {
+    var d = rt.data || { media: 0, requests: 0 };
+    ask(button, "Повторить то, что не получилось?", {
+      yes: "Повторить",
+      note: "Фото и документы (" + d.media + ") и разбор переписки (" + d.requests + ") снова уйдут провайдеру модели и потратят запросы."
+    }).then(function (ok) {
+      if (!ok) return;
+      var since = $("retry-since").value;
+      act(button, button.id === "retry-run" ? "retry-error" : null, "POST", "retry", since ? { since: since } : {}, function (out) {
+        toast("Возвращено в работу: вложений — " + out.media + ", запросов разбора — " + out.requests + ".");
+        refreshRetry();
       });
     });
   }
@@ -3958,7 +4350,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireHalt(); wireCodeLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireWatch(); wireRetry(); wireMemory(); wireSession();
+  wireLogin(); wireHalt(); wireCodeLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireWatch(); wireRetry(); wireMemory(); wireSession(); wirePult();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.
