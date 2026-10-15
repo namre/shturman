@@ -12,6 +12,17 @@
 #                                  hermes      — «Ассистент в Telegram (Hermes)»;
 #                                  standalone  — «Только архив и согласования», без Hermes.
 #                                Уже записанный режим этот ключ не меняет: смена — ./ops/mode.sh.
+#   --timezone <пояс IANA>     — часовой пояс владельца, например Europe/Moscow, Asia/Yekaterinburg
+#                                (Екатеринбург), Europe/Astrakhan (Астрахань). Записывает или заменяет
+#                                строку SHTURMAN_TIMEZONE в .env; значение не секретное, этот ключ
+#                                может передавать агент — пояс он спрашивает у владельца. Имя пояса
+#                                проверяется (tz_valid в ops/lib.sh): неизвестное — отказ, .env не
+#                                меняется. Повторный запуск с тем же поясом ничего не меняет; другие
+#                                строки .env не печатаются. Без ключа строка не трогается, а пока её
+#                                нет, действует пояс по умолчанию — Europe/Moscow (compose.yaml).
+#                                По поясу считаются утренняя сводка и обзор недели (Hermes) и тихие
+#                                часы уведомлений, ночной разбор, сроки и напоминания (сервис).
+#                                Работающему экземпляру новый пояс передаёт ./ops/up.sh.
 #
 # Вариант установки выбирает владелец. При первой установке без --mode скрипт спрашивает его сам,
 # а с --auto останавливается и просит назвать вариант: агент не выбирает за владельца. Экземпляр,
@@ -33,10 +44,14 @@ cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
 ops_help "$@"
 
-auto=0; want=""
+auto=0; want=""; tz=""; tz_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --auto) auto=1 ;;
+    --timezone)
+      [ $# -ge 2 ] || { echo "после --timezone нужен часовой пояс, например Europe/Moscow" >&2; exit 2; }
+      tz="$2"; tz_given=1; shift ;;
+    --timezone=*) tz="${1#--timezone=}"; tz_given=1 ;;
     --mode)
       [ $# -ge 2 ] || { echo "после --mode нужен режим: hermes или standalone" >&2; exit 2; }
       want="$2"; shift ;;
@@ -47,6 +62,10 @@ while [ $# -gt 0 ]; do
 done
 if [ -n "$want" ] && ! valid_mode "$want"; then
   echo "неизвестный режим: $want — допустимы hermes и standalone" >&2; exit 2
+fi
+if [ "$tz_given" -eq 1 ] && ! tz_valid "$tz"; then
+  echo "неизвестный часовой пояс: $tz — нужно имя вида Europe/Moscow, Asia/Yekaterinburg, Europe/Astrakhan (список: timedatectl list-timezones). .env не изменён" >&2
+  exit 2
 fi
 
 if [ "$auto" -eq 0 ] && [ ! -t 0 ]; then
@@ -110,6 +129,16 @@ if ! grep -q '^COMPOSE_PROFILES=' "$dst" || [ "$(env_get COMPOSE_PROFILES)" != "
   env_put COMPOSE_PROFILES "$profiles"
 fi
 
+# --- часовой пояс владельца (Р-90): только по ключу --timezone ---
+if [ -n "$tz" ]; then
+  if [ "$(env_get SHTURMAN_TIMEZONE)" = "$tz" ]; then
+    echo "[SHTURMAN_TIMEZONE] пояс: $tz (без изменений)"
+  else
+    env_put SHTURMAN_TIMEZONE "$tz"
+    echo "[SHTURMAN_TIMEZONE] записан пояс: $tz — работающему экземпляру его передаст ./ops/up.sh"
+  fi
+fi
+
 current() { grep -E "^$1=" "$dst" | tail -n 1 | cut -d= -f2- || true; }
 put() { env_put "$1" "$2"; }
 
@@ -142,7 +171,9 @@ while IFS= read -r line <&3; do
     [A-Z]*=*)
       key="${line%%=*}"; default="${line#*=}"
       have="$(current "$key")"
-      if [ -n "$have" ]; then
+      if [ -n "$have" ] && [ "$key" = SHTURMAN_TIMEZONE ]; then
+        [ -n "$tz" ] || echo "[$key] уже задано — пропускаю (сменить пояс: $0 --auto --timezone Europe/Moscow, затем ./ops/up.sh)"
+      elif [ -n "$have" ]; then
         echo "[$key] уже задано — пропускаю (чтобы изменить, удалите строку из .env)"
       elif [ -n "$scope" ] && [ "$scope" != "$mode" ]; then
         : # значение другого режима: не спрашиваем
