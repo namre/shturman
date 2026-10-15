@@ -33,7 +33,8 @@ Telegram не пропускает ни одного запроса отправ
 поднимает в начало очереди разбора и ждёт до `packs.MEDIA_WAIT`; чего не дождался или что выключено
 владельцем — карточка говорит прямо («Фото не успел разобрать», «Фото не смотрел: разбор фото и
 документов выключен…»). Пауза между репетициями и дневной предел — из настроек репетиции; что в них
-не уложилось, пропускается.
+не уложилось, пропускается. О пределе владелец узнаёт одним сообщением в сутки с кнопками «Поднять до …»
+(`cap_buttons`): нажатие в личном чате бота согласований — его решение, как команда `/rehearsal cap N`.
 
 «Подготовить ответ» у уведомления (`request_once`) — разовая репетиция по просьбе владельца: на пачку,
 даже из одних пересланных, человек может быть не в списке. Почему нельзя — словами для каждого кода
@@ -238,6 +239,85 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
     if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
         return few
     return many
+
+
+# --- дневной предел: «Поднять до …» -------------------------------------------------------------------------
+
+RAISE_STEPS = ((50, 100), (200, 300))   # кнопки под «предел исчерпан»: сначала 50 и 100, с предела 100 — 200 и 300
+
+
+def raise_options(cap: int) -> list[int]:
+    """До скольких можно поднять предел кнопкой: только больше нынешнего. Пока нынешний меньше 100 —
+    50 и 100 (что из них больше); от 100 — 200 и 300; на 300 (наибольшем) кнопок нет."""
+    for step in RAISE_STEPS:
+        bigger = [v for v in step if cap < v <= rs.DAILY_CAP[1]]
+        if bigger:
+            return bigger
+    return []
+
+
+def cap_buttons(cap: int, *, message_id: int | None = None) -> list[list[dict[str, str]]]:
+    """Кнопки «Поднять до N» одной строкой: `sh:rh:c:<новый>:<нынешний>[:<сообщение>]`. Нынешний предел
+    в данных кнопки — чтобы старая кнопка не сработала, если предел с тех пор уже меняли; номер сообщения —
+    у ответа на «Подготовить ответ»: после подъёма просьба повторяется сама."""
+    tail = f":{int(message_id)}" if message_id is not None else ""
+    row = [bridge.button(f"Поднять до {v}", CALLBACK_MODULE, f"c:{v}:{cap}{tail}") for v in raise_options(cap)]
+    return [row] if row else []
+
+
+def cap_text(cap: int, *, on_demand: bool = False) -> str:
+    """«Предел исчерпан» словами — и как его поднять: кнопкой, командой или в приложении."""
+    cards = f"{cap} {_plural(cap, 'карточка', 'карточки', 'карточек')}"
+    if on_demand:
+        head = f"Дневной предел репетиции — {cards} — исчерпан."
+    else:
+        head = (f"Репетиция ответов: дневной предел — {cards} — исчерпан. До конца суток новые сообщения из "
+                "списка репетиции приходят обычными уведомлениями.")
+    if raise_options(cap):
+        how = (f"Поднять предел — кнопкой ниже, командой /rehearsal cap ЧИСЛО (до {rs.DAILY_CAP[1]}) или во "
+               "вкладке «Репетиция» приложения «Штурман».")
+    else:
+        how = f"Это наибольший предел — {rs.DAILY_CAP[1]} карточек в сутки."
+    return head + "\n" + how
+
+
+async def tell_cap(conn: asyncpg.Connection, cap: int) -> None:
+    """Фоновая репетиция упёрлась в предел: владельцу — одно сообщение (без звука) с «Поднять до …»."""
+    await bridge.notify_owner(conn, cap_text(cap), buttons=cap_buttons(cap) or None, silent=True)
+
+
+async def _raise_cap(conn: asyncpg.Connection, principal: Any, tail: str) -> dict[str, Any]:
+    """Нажатие «Поднять до N» владельцем в личном чате бота согласований — его решение: сразу, как
+    команда `/rehearsal cap N`. Из приложения (`telegram.miniapp`) эта кнопка не нажимается."""
+    from .. import authority, confirm
+    from . import service as rehearsal_service
+    refused = {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
+    if principal.action != "telegram.callback":
+        return {**refused, "answer": "Поднять предел можно только нажатием в боте согласований."}
+    parts = tail.split(":")
+    if len(parts) not in (2, 3) or not all(p.isascii() and p.isdigit() and 0 < len(p) <= 18 for p in parts):
+        return refused
+    new, old = int(parts[0]), int(parts[1])
+    message_id = int(parts[2]) if len(parts) == 3 else None
+    if new not in raise_options(old):
+        return refused
+    s = await rs.load(conn)
+    if s["daily_cap"] != old:
+        return {"answer": f"Предел уже изменён: сейчас {s['daily_cap']} в сутки.", "edit_text": None,
+                "remove_buttons": True}
+    with authority.owner_context(principal.user_id, chat_id=principal.chat_id, action="telegram.button"):
+        await confirm.apply_owner(conn, rehearsal_service.SETTINGS, {"changes": {"daily_cap": new}})
+    out: dict[str, Any] = {"answer": f"Предел — {new} в сутки.", "edit_text": None, "remove_buttons": True,
+                           "reply": {"text": f"Предел — {new} в сутки. Вернуть: /rehearsal cap {old}"}}
+    mod = current()
+    if message_id is not None and mod is not None:
+        async def again() -> None:
+            # После фиксации: просьба «Подготовить ответ» повторяется уже с новым пределом. Ответ
+            # бота собирается после этой работы (`bridge.dispatch_callback`) — итог дописывается в него.
+            got = await request_once(mod.state, message_id)
+            out["reply"]["text"] += "\n" + got["text"]
+        out["after_commit"] = again
+    return out
 
 
 async def compose_card(conn: asyncpg.Connection, item: Mapping[str, Any], row: Mapping[str, Any], outcome: Any,
@@ -461,10 +541,7 @@ class Rehearsal:
                    FROM rehearsal_items""", float(s["pause_seconds"]))
             if used["day"] >= s["daily_cap"]:
                 if not used["capped"]:
-                    await bridge.notify_owner(
-                        conn, f"Репетиция ответов: дневной предел — {s['daily_cap']} карточек — исчерпан. "
-                              "До конца суток новые сообщения из списка репетиции приходят обычными уведомлениями. "
-                              "Предел меняется в «Настройках Штурмана», раздел «Репетиция ответов».", silent=True)
+                    await tell_cap(conn, s["daily_cap"])
                 return await _skip(conn, item, "daily_cap")
             if used["recent"] and not on_demand:     # о разовой репетиции владелец попросил сам — без паузы
                 return await _skip(conn, item, "pause")
@@ -620,6 +697,8 @@ async def _rated(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str,
     if principal.user_id != user_id or principal.source != "telegram":
         raise confirm.Refused("Кнопка требует проверенного владельца Telegram.", 403, "owner_required")
     code, _, tail = rest.partition(":")
+    if code == "c":
+        return await _raise_cap(conn, principal, tail)
     raw_id, _, nonce = tail.partition(":")
     rating = CODES.get(code)
     if (rating is None and code != "k") or not raw_id.isdigit():
@@ -711,8 +790,9 @@ async def request_once(state: Any, message_id: int) -> dict[str, Any]:
         used = await conn.fetchval(
             "SELECT count(*) FROM rehearsal_items WHERE asked_at > now() - interval '24 hours'")
         if used >= s["daily_cap"]:
-            return {"ok": False, "text": f"Дневной предел репетиции — {s['daily_cap']} карточек — исчерпан. Предел "
-                                         "меняется в «Настройках Штурмана», раздел «Репетиция ответов»."}
+            # Под ответом — «Поднять до …»: нажатие поднимает предел и сразу повторяет эту просьбу.
+            return {"ok": False, "text": cap_text(s["daily_cap"], on_demand=True),
+                    "buttons": cap_buttons(s["daily_cap"], message_id=message_id)}
         existing = await conn.fetchrow("SELECT id, state FROM rehearsal_items WHERE trigger_message_id = $1", message_id)
         if existing is not None and existing["state"] in ("queued", "preparing"):
             return {"ok": True, "text": "Ответ на это сообщение уже готовится — карточка придёт сюда."}

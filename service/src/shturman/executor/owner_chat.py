@@ -59,6 +59,7 @@ HELP = f"""Как пользоваться ботом
 • «Сейчас» — что работает и сколько ждёт решения.
 • «{words.APPROVALS}» — всё, что ждёт вашего решения, одним списком.
 • Подключение аккаунтов, выбор чатов и уведомления — {words.IN_SETUP_PAGE} в браузере.
+• Репетиция ответов — /rehearsal; сколько карточек в сутки — /rehearsal cap 50 (от 1 до 300).
 • От вашего имени ничего не уходит без вашего нажатия «Отправить», и только если отправка включена на сервере. Исключение — автоответ доверенным людям, если вы его включили.
 
 Все команды с точными параметрами — /advanced."""
@@ -78,6 +79,7 @@ ADVANCED = """Все команды (для точной настройки)
 /addressing JSON — обращения к ассистенту в группах (например {"aliases":["Штурман"]})
 /prepare on|off — черновики ответов без отправки (способ «Через бота и помощника»)
 /rehearsal — репетиция в личных чатах вашего аккаунта: on|off, add НОМЕР_В_TELEGRAM, remove НОМЕР_В_TELEGRAM
+/rehearsal cap ЧИСЛО — дневной предел карточек (1–300); /rehearsal pause СЕКУНДЫ — пауза между ними (0–3600)
 /policy JSON — правила отправки (например {"daily_cap":20})
 /autoconfig JSON — настройки автоответа
 /autoreply НОМЕР_АККАУНТА on|off — автоответ доверенным
@@ -430,12 +432,24 @@ async def _prepare(conn: asyncpg.Connection, state: Any, argument: str) -> dict[
 
 
 REHEARSAL_FORMAT = ("Так: /rehearsal — посмотреть; /rehearsal on или off — включить или выключить; "
-                    "/rehearsal add номер-в-Telegram или remove номер-в-Telegram — добавить или убрать человека.")
+                    "/rehearsal add номер-в-Telegram или remove номер-в-Telegram — добавить или убрать человека; "
+                    "/rehearsal cap 50 — не больше 50 карточек в сутки (от 1 до 300); "
+                    "/rehearsal pause 60 — пауза между карточками 60 секунд (от 0 до 3600).")
+REHEARSAL_CAP_FORMAT = "Предел — целое число карточек в сутки от {lo} до {hi}, например: /rehearsal cap 50."
+REHEARSAL_PAUSE_FORMAT = "Пауза — целое число секунд от {lo} до {hi}, например: /rehearsal pause 60."
+
+
+def _bounded(raw: str, bounds: tuple[int, int], words_: str) -> int:
+    """Число из команды в пределах `bounds`; иначе — ValueError со словами, как правильно."""
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 6 or not bounds[0] <= int(raw) <= bounds[1]:
+        raise ValueError(words_.format(lo=bounds[0], hi=bounds[1]))
+    return int(raw)
 
 
 async def _rehearsal(conn: asyncpg.Connection, state: Any, argument: str) -> dict[str, Any]:
-    """Репетиция ответов (Р-85): посмотреть, включить, выключить, добавить или убрать человека.
-    Команда владельца из личного чата с ботом — его решение: применяется сразу. Отправки здесь нет."""
+    """Репетиция ответов (Р-85): посмотреть, включить, выключить, добавить или убрать человека, дневной
+    предел и пауза. Команда владельца из личного чата с ботом — его решение: применяется сразу.
+    Отправки здесь нет."""
     from ..rehearsal import core as rehearsal
     from ..rehearsal import service as rehearsal_service
     from ..rehearsal import settings as rs
@@ -447,13 +461,17 @@ async def _rehearsal(conn: asyncpg.Connection, state: Any, argument: str) -> dic
     s = await rs.load(conn)
     if not parts:
         st = await rehearsal.stats(conn)
-        text = (f"{words.REHEARSAL}: {'включена' if s['enabled'] else 'выключена'}. Людей в списке: {len(s['people'])}. "
-                f"Не больше {s['daily_cap']} карточек в сутки.\n"
+        text = (f"{words.REHEARSAL}: {'включена' if s['enabled'] else 'выключена'}. Людей в списке: {len(s['people'])}.\n"
+                f"Предел — {s['daily_cap']} {rehearsal._plural(s['daily_cap'], 'карточка', 'карточки', 'карточек')} в сутки (за последние 24 часа уже {st['asked_24h']}), пауза "
+                f"между карточками — {s['pause_seconds']} с. Поменять: /rehearsal cap ЧИСЛО, /rehearsal pause "
+                "СЕКУНДЫ — или во вкладке «Репетиция» приложения «Штурман».\n"
                 f"За {st['days']} дней карточек: {st['shown']}; оценки — годится: {st['good']}, "
                 f"почти: {st['almost']}, не годится: {st['bad']}, без оценки: {st['unrated']}.\n"
                 "Ассистент пишет, что ответил бы, вы оцениваете. Ничего не отправляется: предложенный ответ "
                 "приходит только вам, в карточке.\n" + REHEARSAL_FORMAT + elsewhere)
         return {"text": text, "buttons": menu_buttons(state)}
+    if len(parts) == 2 and parts[0] in ("cap", "pause"):
+        return await _rehearsal_number(conn, state, parts[0], parts[1], s, elsewhere)
     if len(parts) == 1 and parts[0] in ("on", "off"):
         changes: dict[str, Any] = {"enabled": parts[0] == "on"}
     elif len(parts) == 2 and parts[0] in ("add", "remove"):
@@ -479,6 +497,27 @@ async def _rehearsal(conn: asyncpg.Connection, state: Any, argument: str) -> dic
         text += (f"\nВ списке пока никого: добавьте человека — /rehearsal add номер-в-Telegram или "
                  f"{words.IN_SETUP_PAGE}.")
     return {"text": text + elsewhere, "buttons": menu_buttons(state)}
+
+
+async def _rehearsal_number(conn: asyncpg.Connection, state: Any, what: str, raw: str, s: dict[str, Any],
+                            elsewhere: str) -> dict[str, Any]:
+    """`/rehearsal cap N` и `/rehearsal pause S`: сразу, как остальные команды репетиции; ответ — что
+    стало и как вернуть."""
+    from ..rehearsal import service as rehearsal_service
+    from ..rehearsal import settings as rs
+    if what == "cap":
+        field, value = "daily_cap", _bounded(raw, rs.DAILY_CAP, REHEARSAL_CAP_FORMAT)
+        said = "Предел — {} в сутки"
+    else:
+        field, value = "pause_seconds", _bounded(raw, rs.PAUSE, REHEARSAL_PAUSE_FORMAT)
+        said = "Пауза между карточками — {} с"
+    before = s[field]
+    if value == before:
+        return {"text": said.format(value) + " — так и было, ничего не изменено." + elsewhere,
+                "buttons": menu_buttons(state)}
+    await confirm.apply_owner(conn, rehearsal_service.SETTINGS, {"changes": rs.validate({field: value})})
+    return {"text": said.format(value) + f". Вернуть: /rehearsal {what} {before}" + elsewhere,
+            "buttons": menu_buttons(state)}
 
 
 async def on_menu(conn: asyncpg.Connection, state: Any, rest: str, user_id: int) -> dict[str, Any]:

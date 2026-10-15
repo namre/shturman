@@ -47,6 +47,9 @@
   GET  /bot/sent                             что бот прислал владельцу: текст и кнопки (для снимков)
   POST /bot/press?data=…                     владелец нажал кнопку под сообщением бота
   POST /bot/reply?text=…[&to=…]             владелец ответил на сообщение бота (ForceReply; по умолчанию — на последнее)
+  POST /rehearsal/capped                     фоновая репетиция упёрлась в дневной предел: бот присылает «…исчерпан»
+                                             с кнопками «Поднять до …» (`rehearsal.core.tell_cap`); ответ — настройки
+  GET  /rehearsal/settings                   настройки репетиции (предел, пауза, включена ли, сколько людей)
 
 E2E_SETUP_ORIGIN — «внешний адрес» страницы (https): с ним в приложении есть «Открыть настройки в браузере».
 """
@@ -420,6 +423,19 @@ async def main() -> None:
         await asyncio.sleep(0.6)
         return JSONResponse({"ok": True})
 
+    async def rehearsal_settings(request):
+        from shturman.rehearsal import settings as rs
+        settings = await rs.load(conn)
+        return JSONResponse({k: settings[k] for k in ("enabled", "daily_cap", "pause_seconds")}
+                            | {"people": len(settings["people"])})
+
+    async def rehearsal_capped(request):
+        from shturman.rehearsal import core as rehearsal
+        from shturman.rehearsal import settings as rs
+        await rehearsal.tell_cap(conn, (await rs.load(conn))["daily_cap"])
+        await asyncio.sleep(0.6)
+        return await rehearsal_settings(request)
+
     # --- экран «Чаты» ---
 
     def runtime(request):
@@ -584,6 +600,8 @@ async def main() -> None:
                                 Route("/pack2/ask", pack2_ask, methods=["POST"]),
                                 Route("/bot/sent", bot_sent), Route("/bot/press", bot_press, methods=["POST"]),
                                 Route("/bot/reply", bot_reply, methods=["POST"]),
+                                Route("/rehearsal/capped", rehearsal_capped, methods=["POST"]),
+                                Route("/rehearsal/settings", rehearsal_settings),
                                 Route("/spheres/seed", spheres_seed, methods=["POST"]),
                                 Route("/spheres/folder-new", spheres_folder_new, methods=["POST"]),
                                 Route("/spheres/seen", spheres_seen),

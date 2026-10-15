@@ -14,16 +14,18 @@
   GET  app/rehearsal          способ работы, настройки, люди с именами, статистика за 7 дней и последние
                               карточки: кто, исход, оценка и свой вариант владельца (его слова) — без
                               предложенного ответа и без текста собеседника (их в базе нет)
-  PUT  app/rehearsal          {enabled?, people?} — сразу, и расширение тоже: так решил владелец. Цена —
-                              войти в приложение может и держатель токена бота согласований (Р-80), а с
-                              ним — включить репетицию и добавить людей. Поэтому каждое изменение отсюда —
-                              запись в журнал (`rehearsal.settings`, «через: приложение») и сообщение
-                              владельцу в бот «В приложении изменена репетиция: … Вернуть: …»
+  PUT  app/rehearsal          {enabled?, people?, daily_cap?, pause_seconds?} — сразу, и расширение тоже:
+                              так решил владелец. Цена — войти в приложение может и держатель токена бота
+                              согласований (Р-80), а с ним — включить репетицию, добавить людей и поднять
+                              предел. Поэтому каждое изменение отсюда — запись в журнал
+                              (`rehearsal.settings`, «через: приложение») и сообщение владельцу в бот
+                              «В приложении изменена репетиция: … Вернуть: …» с командами отката
   GET  app/rehearsal/people   собеседники личных чатов основного аккаунта — поиск по имени, без номеров
 
-Предел в сутки и паузу приложение не меняет — только страница. Внутренний API (`PUT /api/rehearsal`,
-роль дашборда в плагине) не меняется: там расширение по-прежнему ждёт нажатия в боте. В способе
-«Через бота и помощника» вкладка показывает одну строку, почему репетиции там нет.
+Предел в сутки и паузу приложение меняет так же, как включение и список людей (дополнение к Р-89):
+сразу, с журналом и сообщением в бот (`/rehearsal cap N`, `/rehearsal pause S` — вернуть). Внутренний
+API (`PUT /api/rehearsal`, роль дашборда в плагине) не меняется: там расширение по-прежнему ждёт нажатия
+в боте. В способе «Через бота и помощника» вкладка показывает одну строку, почему репетиции там нет.
 """
 
 from __future__ import annotations
@@ -105,8 +107,9 @@ async def app_view(request: Request) -> dict[str, Any]:
     return {"mode": mode, "available": mode != "staff", "own_bot": bridge.owns_bot(),
             "unavailable_text": words.REHEARSAL_ELSEWHERE if mode == "staff" else None,
             "settings": {"enabled": settings["enabled"], "people": settings["people"],
-                         "daily_cap": settings["daily_cap"]},
-            "people": people, "stats": stats, "recent": recent, "limits": {"people": rs.MAX_PEOPLE}}
+                         "daily_cap": settings["daily_cap"], "pause_seconds": settings["pause_seconds"]},
+            "people": people, "stats": stats, "recent": recent,
+            "limits": {"people": rs.MAX_PEOPLE, "daily_cap": list(rs.DAILY_CAP), "pause_seconds": list(rs.PAUSE)}}
 
 
 async def app_rehearsal_get(request: Request) -> JSONResponse:
@@ -125,19 +128,34 @@ def _undo(before: dict[str, Any], after: dict[str, Any], names: dict[int, str]) 
     for tg_id in sorted(set(before["people"]) - set(after["people"])):
         what.append(f"убран из списка: {names.get(tg_id) or f'№ {tg_id}'}")
         undo.append(f"/rehearsal add {tg_id}")
+    if before["daily_cap"] != after["daily_cap"]:
+        what.append(f"предел — {after['daily_cap']} в сутки (был {before['daily_cap']})")
+        undo.append(f"/rehearsal cap {before['daily_cap']}")
+    if before["pause_seconds"] != after["pause_seconds"]:
+        what.append(f"пауза между карточками — {after['pause_seconds']} с (была {before['pause_seconds']} с)")
+        undo.append(f"/rehearsal pause {before['pause_seconds']}")
     return what, undo
+
+
+APP_FIELDS = {"daily_cap": ("Карточек в сутки", rs.DAILY_CAP, ""),
+              "pause_seconds": ("Пауза между карточками", rs.PAUSE, " секунд")}
+
+
+def _app_words(error: str) -> str:
+    """Отказ проверки словами приложения: поле — как оно подписано во вкладке."""
+    for key, (label, (lo, hi), unit) in APP_FIELDS.items():
+        if error.startswith(f"поле {key}:"):
+            return f"«{label}» — целое число от {lo} до {hi}{unit}."
+    return error
 
 
 async def app_rehearsal_put(request: Request) -> JSONResponse:
     from . import audit, miniapp
     data = await page._body(request)
-    if set(data) - {"enabled", "people"}:
-        raise BadRequest("Из приложения меняются только «включена» и список людей. Предел и паузу — в "
-                         "«Настройках Штурмана».", 400, "page_only")
     try:
         changes = rs.validate(data)
     except ValueError as exc:
-        raise BadRequest(str(exc)) from None
+        raise BadRequest(_app_words(str(exc))) from None
     if not changes:
         raise BadRequest("Нечего менять.")
     state, session = state_of(request), request.state.app_session

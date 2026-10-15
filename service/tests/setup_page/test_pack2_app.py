@@ -140,17 +140,56 @@ async def test_app_rehearsal_tab_widens_at_once_but_writes_journal_and_tells_the
     found = (await s.app.get("/rehearsal/people", params={"q": "анна"})).json()["items"]
     assert [p["tg_id"] for p in found] == [ANNA]
     out = await s.app.put("/rehearsal", {"enabled": True, "people": [ANNA]})
-    assert out.status_code == 200 and out.json()["settings"] == {"enabled": True, "people": [ANNA], "daily_cap": 30}
+    assert out.status_code == 200 and out.json()["settings"] == {"enabled": True, "people": [ANNA], "daily_cap": 30,
+                                                                 "pause_seconds": 5}
     assert (await rs.load(conn))["enabled"] is True
     log = await conn.fetchval("SELECT detail FROM setup_audit WHERE action = 'rehearsal.settings'")
     assert "через: приложение" in log and "Анна" not in log
     told = [p["text"] for p in await bot_messages(s) if p["text"].startswith("В приложении изменена репетиция")]
     assert told and "добавлен в список: Анна Ким" in told[0] and "/rehearsal remove 5001" in told[0] \
         and "/rehearsal off" in told[0]
-    # предел и паузу из приложения не меняют
-    assert (await s.app.put("/rehearsal", {"daily_cap": 300})).status_code == 400
     # внутренний API (роль дашборда) не меняется: расширение там по-прежнему ждёт нажатия в боте —
     # tests/rehearsal/test_rehearsal_api.py
+
+
+async def test_app_rehearsal_cap_and_pause_apply_at_once_with_journal_and_undo_in_the_bot(stand, conn):
+    s = await ready(stand, conn)
+    await conn.execute("""INSERT INTO setup_state (key, value) VALUES ('scenario', '{"scenario": "own"}')
+                          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""")
+    assert (await s.app.sign_in(signed(query_id="rh-cap"))).status_code == 200
+    view = (await s.app.get("/rehearsal")).json()
+    assert view["settings"]["daily_cap"] == 30 and view["settings"]["pause_seconds"] == 5
+    assert view["limits"]["daily_cap"] == [1, 300] and view["limits"]["pause_seconds"] == [0, 3600]
+    assert view["stats"]["asked_24h"] == 0
+    # расширение — выше предел, короче пауза — сразу, без карточки «Да»
+    out = await s.app.put("/rehearsal", {"daily_cap": 100, "pause_seconds": 0})
+    assert out.status_code == 200 and out.json()["settings"]["daily_cap"] == 100
+    stored = await rs.load(conn)
+    assert (stored["daily_cap"], stored["pause_seconds"]) == (100, 0)
+    assert await conn.fetchval("SELECT count(*) FROM pending_actions") == 0
+    log = await conn.fetchval("SELECT detail FROM setup_audit WHERE action = 'rehearsal.settings'")
+    assert "в сутки: 100" in log and "пауза: 0 с" in log and log.endswith("через: приложение")
+    told = [p["text"] for p in await bot_messages(s) if p["text"].startswith("В приложении изменена репетиция")]
+    assert told == ["В приложении изменена репетиция: предел — 100 в сутки (был 30); пауза между карточками — 0 с "
+                    "(была 5 с).\nВернуть: /rehearsal cap 30, /rehearsal pause 5 — или во вкладке «Репетиция» "
+                    "приложения. Если это были не вы — верните и нажмите «Выйти на всех устройствах» в «Настройках "
+                    "Штурмана»."]
+    # ужесточение — тоже сразу, и тоже сообщением
+    assert (await s.app.put("/rehearsal", {"daily_cap": 10})).status_code == 200
+    assert (await rs.load(conn))["daily_cap"] == 10
+    told = [p["text"] for p in await bot_messages(s) if p["text"].startswith("В приложении изменена репетиция")]
+    assert len(told) == 2 and "/rehearsal cap 100" in told[1]
+    # неверные значения — словами, ничего не меняется
+    for body, words in [({"daily_cap": 0}, "«Карточек в сутки» — целое число от 1 до 300."),
+                        ({"daily_cap": 301}, "«Карточек в сутки» — целое число от 1 до 300."),
+                        ({"daily_cap": "50"}, "«Карточек в сутки» — целое число от 1 до 300."),
+                        ({"pause_seconds": 3601}, "«Пауза между карточками» — целое число от 0 до 3600 секунд."),
+                        ({"pause_seconds": True}, "«Пауза между карточками» — целое число от 0 до 3600 секунд.")]:
+        bad = await s.app.put("/rehearsal", body)
+        assert bad.status_code == 400 and bad.json()["error"] == words, body
+    assert (await s.app.put("/rehearsal", {"send": True})).status_code == 400
+    stored = await rs.load(conn)
+    assert (stored["daily_cap"], stored["pause_seconds"]) == (10, 0)
 
 
 async def test_app_rehearsal_tab_explains_staff_mode(stand, conn):

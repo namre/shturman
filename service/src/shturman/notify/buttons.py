@@ -171,8 +171,12 @@ async def prepare_reply(conn: asyncpg.Connection, message_id: int, *, personal: 
     else:
         from ..rehearsal import core as rehearsal
         out = await rehearsal.request_once(state, message_id)
+    reply: dict[str, Any] = {"text": out["text"]}
+    if out.get("buttons"):
+        # Кнопки сервиса под ответом (дневной предел — «Поднять до …»): бот шлёт ответ сам, парами.
+        reply["buttons"] = [[(b["text"], b["data"]) for b in row] for row in out["buttons"]]
     return {"answer": "Готовлю." if out["ok"] else "Не получилось.", "edit_text": None, "remove_buttons": False,
-            "reply": {"text": out["text"]}}
+            "reply": reply}
 
 
 # --- черновик по «Подготовить ответ» (способ «Через бота и помощника») ------------------------------------
