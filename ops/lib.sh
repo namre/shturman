@@ -276,6 +276,24 @@ container_state() {
 
 valid_mode() { case "$1" in hermes|standalone) return 0 ;; *) return 1 ;; esac; }
 
+# Имя часового пояса IANA (Europe/Moscow, Asia/Yekaterinburg, UTC). Сначала — вид записи: буквы,
+# цифры, _ + -, до трёх частей через «/», без «..»; затем — есть ли такой пояс в базе поясов сервера
+# (/usr/share/zoneinfo), а без неё — в Python (zoneinfo). Так же пояс проверяют Hermes и сервис
+# (ZoneInfo), а ./ops/up.sh — перед записью в config.yaml Hermes (cron_jobs.zone_valid). Если
+# проверить нечем, принимается запись правильного вида.
+tz_valid() {
+  printf '%s' "$1" | grep -Eq '^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$' || return 1
+  case "$1" in *..*) return 1 ;; esac
+  if [ -d /usr/share/zoneinfo ]; then
+    [ -f "/usr/share/zoneinfo/$1" ] && return 0
+  fi
+  if command -v python3 > /dev/null 2>&1; then
+    python3 -c 'import sys, zoneinfo; zoneinfo.ZoneInfo(sys.argv[1])' "$1" > /dev/null 2>&1
+    return
+  fi
+  [ ! -d /usr/share/zoneinfo ]
+}
+
 # Печатает режим установки. Строки нет — режим прежний, hermes.
 shturman_mode() {
   local m
