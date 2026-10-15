@@ -101,8 +101,10 @@ MCP_AUTH = {"Authorization": f"Bearer {MCP_TOKEN}"}
 def config(tmp_path):
     from shturman.config import Config
 
+    # Пачки (packs.py, Р-93) в тестах выключены: каждое сообщение — своя, сразу закрытая пачка, вложения
+    # не ждутся. Тесты пачек задают паузу сами (`packs.configure`).
     return Config(dsn=DSN, api_token=API_TOKEN, mcp_token=MCP_TOKEN, data_dir=tmp_path / "data",
-                  allowed_hosts=("test",))
+                  allowed_hosts=("test",), pack_gap=0.0, pack_media_wait=0.0)
 
 
 @pytest_asyncio.fixture
@@ -260,6 +262,16 @@ def _no_guard_left_behind():
     guard.set_current(None)
     yield
     guard.set_current(None)
+
+
+@pytest.fixture(autouse=True)
+def _packs_off_by_default():
+    """Пачки (packs.py) — настройка процесса: по умолчанию в тестах выключены, тест пачек включает сам."""
+    from shturman import packs
+
+    packs.configure(gap=0.0, media_wait=0.0)
+    yield
+    packs.configure(gap=0.0, media_wait=0.0)
 
 
 @pytest_asyncio.fixture

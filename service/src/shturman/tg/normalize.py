@@ -432,6 +432,12 @@ def _reply_to(message: Any) -> int | None:
     return int(value) if value is not None else None
 
 
+def _grouped(message: Any) -> int | None:
+    """Номер альбома: у фото и видео, отправленных вместе, он общий (пачка — packs.py)."""
+    value = getattr(message, "grouped_id", None)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -476,6 +482,7 @@ def message_record(message: Any, entities: Entities, *, self_id: int) -> Message
         telegram_via_bot=getattr(message, "via_bot_id", None) is not None,
         telegram_sender_bot=bool(sender_entity.bot) if isinstance(sender_entity, types.User) else None,
         media_duration=None if service else media_duration(message.media),
+        grouped_id=None if service else _grouped(message),
         **({} if service else media_file_info(message.media)),
     )
 

@@ -112,9 +112,9 @@ async def test_project_and_profile_pages_from_a_service_dialog_are_closed(conn):
 def test_unverified_transport_cannot_create_telegram_addressing_proof():
     record = message(telegram_entities=[], topic_tg_id=44, is_forwarded=False,
                      telegram_via_bot=False, telegram_sender_bot=False)
-    assert store._row(1, record, OWNER, False, "import")[-10:-5] == (None,) * 5
-    assert store._row(1, record, OWNER, False, "business")[-10:-5] == (None,) * 5
-    assert store._row(1, record, OWNER, False, "session")[-10:-5] == ("[]", 44, False, False, False)
+    assert store._row(1, record, OWNER, False, "import")[-11:-6] == (None,) * 5
+    assert store._row(1, record, OWNER, False, "business")[-11:-6] == (None,) * 5
+    assert store._row(1, record, OWNER, False, "session")[-11:-6] == ("[]", 44, False, False, False)
 
 
 @pytest.mark.parametrize("source_kind", ["chat", "memory", "trigger"])

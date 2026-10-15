@@ -70,22 +70,25 @@ async def test_listed_person_gets_one_card_with_ratings_and_nothing_is_sent(rv):
 
 
 async def test_burst_of_messages_gives_one_card_on_the_last(rv):
+    from shturman import packs
     await enable(rv.conn)
-    from shturman.outbox import autoreply
-    await autoreply.update(rv.conn, {"debounce_seconds": 3})
+    packs.configure(gap=90)                           # пачка (Р-93): ждём, не допишет ли
     anna = await _anna(rv)
     first = await message(rv.conn, anna, 1, "Привет", age=2)
     second = await message(rv.conn, anna, 2, "Ты сегодня на объекте?")
     _, a = await live(rv, rv.owner_acc, anna, first)
     _, b = await live(rv, rv.owner_acc, anna, second)
     rv.mod.close()                                    # таймеры пачки не ждём: разбираем сами
+    assert await rv.mod.prepare(b) == "waiting"       # пачка ещё не закрылась
+    await rv.conn.execute("UPDATE messages SET sent_at = sent_at - interval '100 seconds' WHERE chat_id = $1", anna)
     assert await rv.mod.prepare(a) == "newer"         # первое закроет карточка второго
     assert await rv.mod.prepare(b) == "preparing"
     assert (await item(rv.conn, b))["covered"] == 2
     [job] = await model_jobs(rv.conn)
     await answer(rv.conn, job["id"], {"outcome": "reply", "text": "Да, буду после обеда."})
     [card] = await cards(rv.conn)
-    assert "Перед этим ещё 1 сообщение от него" in card["text"]
+    assert "2 сообщения: «Привет» · «Ты сегодня на объекте?»" in card["text"]
+    assert "Ассистент отвечал на всю пачку — 2 сообщения подряд." in card["text"]
     states = [r["dropped_reason"] for r in await rv.conn.fetch("SELECT dropped_reason FROM notify_items ORDER BY id")]
     assert states == ["rehearsal", "rehearsal"]
 

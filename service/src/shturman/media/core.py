@@ -2,7 +2,8 @@
 
 Очередь — сами строки архива (`messages.media_state`), как у голосовых. В неё попадают фото и
 документы не старше `media_days` дней из невыключенных чатов, сначала свежие, — только пока
-разбор включён владельцем (media.enabled).
+разбор включён владельцем (media.enabled). Вложения, по которым готовится ответ или идёт разбор
+входящих (пачка, packs.py), идут первыми (`messages.rush_at`).
 
 Путь одного вложения:
   pending — скачать файл: из загруженной выгрузки (media_file), сессией аккаунта по номеру
@@ -122,7 +123,8 @@ SELECT m.id, m.tg_message_id, m.media_type, m.media_ref, m.media_name, m.media_m
 FROM messages m JOIN chats c ON c.id = m.chat_id JOIN peers p ON p.id = c.peer_id
 WHERE m.media_state = 'pending' AND (m.media_at IS NULL OR m.media_at <= now())
   AND m.deleted_at IS NULL AND NOT c.excluded AND (m.agent_visible OR m.is_outgoing IS TRUE)
-ORDER BY m.sent_at DESC
+-- по вложению готовится ответ (packs.rush, Р-93) — первым
+ORDER BY m.rush_at DESC NULLS LAST, m.sent_at DESC
 LIMIT $1
 """
 

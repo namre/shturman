@@ -160,7 +160,9 @@ async def main() -> None:
     config = Config(
         dsn=DSN, api_token="e2e-api-token-0123456789abcdef0123456789", mcp_token="e2e-mcp-token-0123456789abcdef0123456789",
         host="127.0.0.1", port=PORT, data_dir=data_dir,
-        allowed_hosts=(f"127.0.0.1:{PORT}", f"localhost:{PORT}"), setup_origin=ORIGIN, dashboard_origin=DASHBOARD)
+        allowed_hosts=(f"127.0.0.1:{PORT}", f"localhost:{PORT}"), setup_origin=ORIGIN, dashboard_origin=DASHBOARD,
+        # Пачки (packs.py) на стенде выключены: каждое сообщение — сразу закрытая пачка.
+        pack_gap=0.0, pack_media_wait=0.0)
 
     async def resolve(host: str, port: int) -> list[str]:
         """Имена узлов в сеть не уходят: любое «разрешается» в один адрес в интернете, а
@@ -686,12 +688,11 @@ async def main() -> None:
 
     async def triage_live(request):
         """Живое сообщение для разбора входящих: ?case=urgent|question|thanks|group. Подставная модель
-        отвечает на запрос разбора готовым выводом; ожидание пачки на стенде нулевое."""
+        отвечает на запрос разбора готовым выводом; пачки на стенде выключены (pack_gap=0)."""
         from shturman import events, store
         from shturman.records import ChatRecord, MessageRecord
 
         app = state["app"]
-        app.extras["triage"].wait = 0
         case = request.query_params["case"]
         sender, name, kind, text, verdict = TRIAGE_CASES[case]
         reply = json.dumps(verdict, ensure_ascii=False)

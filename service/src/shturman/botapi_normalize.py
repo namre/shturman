@@ -221,6 +221,15 @@ def text_entities(text: str | None, entities: Any) -> list[dict[str, Any]] | Non
     return out or None
 
 
+def _media_group(value: Any) -> int | None:
+    """Номер альбома Bot API (`media_group_id`) — строка; в архив идёт, только если это число
+    (у Telegram он тот же, что `grouped_id` сессии). Иное — без номера: альбом соберут паузы."""
+    if isinstance(value, str) and value.isascii() and value.lstrip("-").isdigit() and len(value) <= 19:
+        number = int(value)
+        return number if -2**63 <= number < 2**63 else None
+    return None
+
+
 def forwarded_from(origin: Any) -> str | None:
     """Источник пересылки одной строкой — как `forwarded_from` в экспорте."""
     origin = _dict(origin)
@@ -379,6 +388,7 @@ def normalize_message(message: Any) -> Normalized:
         media_type=None if action else _media_type(message),
         media_path=None,
         service_action=action,
+        grouped_id=None if action else _media_group(message.get("media_group_id")),
         **({} if action else _voice_ref(message)),
     )
     by_business_bot = _dict(message.get("sender_business_bot")) is not None

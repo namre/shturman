@@ -49,8 +49,8 @@ async def test_stopped_assistant_does_not_read_and_plain_forwarding_works(tm):
     kind, item_id = await live(tm, tm.owner_acc, anna, await message(tm.conn, anna, 2, "Ау?"))
     assert kind == "personal" and item_id is None
     await tm.n.flush(at(15))
-    [note] = await notifications(tm.conn)                          # одно уведомление о чате: «…и ещё 1»
-    assert note.startswith("💬 Вам написали: Анна Ким") and "…и ещё 1 сообщение" in note
+    [note] = await notifications(tm.conn)                          # одно уведомление о чате на оба
+    assert note.startswith("💬 Вам написали: Анна Ким") and "2 сообщения: «Пришлите смету» · «Ау?»" in note
     assert await cards(tm.conn) == []
     assert len(await model_jobs(tm.conn)) == 1
     # база — вторая линия: строку разбора при остановке не вставить

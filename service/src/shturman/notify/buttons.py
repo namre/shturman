@@ -12,6 +12,10 @@
         «Через бота и помощника»  → черновик ответа только для просмотра — если черновики ответов
                                     включены (`/prepare on`); иначе — ответ, как включить.
     Остановка ассистента (Р-87) «Подготовить ответ» не пропускает.
+    Ответ готовится на всю пачку (packs.py, Р-93): пересланное в ней — цитата третьего лица, вложения
+    пачки сначала разбираются (до `packs.MEDIA_WAIT`). Если ответ на сообщение подготовить нельзя
+    заранее — скрыто защитой, не личное, нечем отвечать, — кнопки «Подготовить ответ» нет
+    (`can_prepare`); если обстоятельства изменились после уведомления — ответ называет точную причину.
 
 Кнопка несёт номер строки очереди и её случайную метку (`notify_items.nonce`): чужая или устаревшая
 кнопка ничего не делает. Нажатие принимается только от привязанного владельца в его личном чате с
@@ -47,18 +51,32 @@ MUTED_TEXT = f"Готово: об этом чате больше не сообщ
 REFUSED = {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
 
 
-def buttons(item_id: int, nonce: str, *, personal: bool) -> list[list[dict[str, str]]]:
-    rows = [[bridge.button(PREPARE, CALLBACK_MODULE, f"p:{item_id}:{nonce}")]] if personal else []
+def buttons(item_id: int, nonce: str, *, personal: bool, prepare: bool = True) -> list[list[dict[str, str]]]:
+    rows = [[bridge.button(PREPARE, CALLBACK_MODULE, f"p:{item_id}:{nonce}")]] if personal and prepare else []
     rows.append([bridge.button(REMIND, CALLBACK_MODULE, f"l:{item_id}:{nonce}"),
                  bridge.button(MUTE, CALLBACK_MODULE, f"m:{item_id}:{nonce}")])
     return rows
 
 
-async def attach(conn: asyncpg.Connection, item_id: int, *, personal: bool) -> list[list[dict[str, str]]]:
+async def attach(conn: asyncpg.Connection, item_id: int, *, personal: bool,
+                 prepare: bool = True) -> list[list[dict[str, str]]]:
     """Новая метка строки очереди и кнопки с ней — для уведомления об одном чате."""
     nonce = secrets.token_urlsafe(9)
     await conn.execute("UPDATE notify_items SET nonce = $2 WHERE id = $1", item_id, nonce)
-    return buttons(item_id, nonce, personal=personal)
+    return buttons(item_id, nonce, personal=personal, prepare=prepare)
+
+
+async def can_prepare(conn: asyncpg.Connection, message_id: int) -> str | None:
+    """Почему «Подготовить ответ» на это сообщение (и его пачку) невозможен — код, тогда кнопки нет;
+    None — кнопка будет. По способу работы: «Через ваш аккаунт» — проверки разовой репетиции
+    (`rehearsal.why_not_once`), «Через бота и помощника» — черновика (`draft_why_not`). Временное —
+    остановка ассистента, дневной предел, выключенные черновики — кнопку не убирает: на нажатие
+    владелец узнает точную причину и как её снять."""
+    from ..executor import owner_views
+    if await owner_views.work_mode(conn) == "staff":
+        return await draft_why_not(conn, message_id)
+    from ..rehearsal import core as rehearsal
+    return await rehearsal.why_not_once(conn, message_id)
 
 
 def _state() -> Any:
@@ -109,7 +127,9 @@ async def _mute(conn: asyncpg.Connection, item: Any) -> dict[str, Any]:
     if not await mute_chat(conn, item["chat_id"]):
         return {"answer": "Об этом чате уже не сообщаю.", "edit_text": None, "remove_buttons": False}
 
-    left = [row for row in buttons(item["id"], item["nonce"], personal=item["kind"] == "personal")]
+    personal = item["kind"] == "personal"
+    prepare = personal and await can_prepare(conn, item["message_id"]) is None
+    left = [row for row in buttons(item["id"], item["nonce"], personal=personal, prepare=prepare)]
     left[-1] = [b for b in left[-1] if b["text"] != MUTE]
     return {"answer": "Больше не сообщаю об этом чате.", "edit_text": None, "remove_buttons": False,
             "buttons": left, "reply": {"text": MUTED_TEXT}}
@@ -159,21 +179,83 @@ async def prepare_reply(conn: asyncpg.Connection, message_id: int, *, personal: 
 
 DRAFTS_OFF = (f"«{words.DRAFTS_MODE}» выключены — поэтому ответ не готовится. Включить — командой /prepare on: "
               "ассистент станет готовить ответы на новые сообщения и показывать их вам, ничего не отправляя.")
+# Почему черновик не готовится — словами, для каждого кода (после «Не получилось: »).
+DRAFT_WORDS = {
+    "gone": "сообщение удалено или чат исключён из архива.",
+    "not_personal": "это не входящее сообщение человека (ваше собственное, служебное или от бота).",
+    "hidden": "сообщение скрыто защитой от внедрённых инструкций — модель его не видит. Решите в карточке защиты.",
+    "no_text": "в сообщении нет ни текста, ни фото, документа или голосового — отвечать не на что.",
+}
+
+
+async def draft_why_not(conn: asyncpg.Connection, message_id: int) -> str | None:
+    """Почему черновик ответа на это сообщение (и его пачку) не подготовить — код из `DRAFT_WORDS`."""
+    from .. import packs
+    msg = await conn.fetchrow(
+        """SELECT m.id, m.deleted_at, m.kind, m.is_outgoing, m.telegram_sender_bot, m.telegram_via_bot, c.excluded
+           FROM messages m JOIN chats c ON c.id = m.chat_id WHERE m.id = $1""", message_id)
+    if msg is None or msg["deleted_at"] is not None or msg["excluded"]:
+        return "gone"
+    if msg["kind"] != "message" or msg["is_outgoing"] is True or msg["telegram_sender_bot"] or msg["telegram_via_bot"]:
+        return "not_personal"
+    pack = await packs.around(conn, message_id)
+    if pack is None:
+        return "gone"
+    if not pack.visible:
+        return "hidden"
+    if pack.trigger(on_demand=True) is None:
+        return "no_text"
+    return None
 
 
 async def request_draft(state: Any, message_id: int) -> dict[str, Any]:
-    """Просит модель подготовить ответ на это сообщение; результат — черновик «только для просмотра»."""
-    from ..outbox import autoreply, policy
+    """Просит модель подготовить ответ на пачку этого сообщения; результат — черновик «только для просмотра».
+    Вложения пачки ещё разбираются — черновик готовится в фоне после них (до `packs.MEDIA_WAIT`)."""
+    from .. import packs
     if not getattr(state.config, "prepare_only", False):
         return {"ok": False, "text": DRAFTS_OFF}
+    async with state.pool.acquire() as conn:
+        code = await draft_why_not(conn, message_id)
+        if code is not None:
+            return {"ok": False, "text": "Не получилось: " + DRAFT_WORDS[code]}
+        pack = await packs.around(conn, message_id)
+        media, voice = await packs.media_on(conn), packs.switches_of(state)
+        slow = pack is not None and packs.MEDIA_WAIT > 0 and any(packs.waiting(r, media, voice) for r in pack.visible)
+    if slow:
+        # Вложения пачки ещё разбираются: ждать их в нажатии кнопки нельзя — черновик готовится в фоне.
+        state.spawn(_draft_after_media(state, message_id), name=f"notify-draft-{message_id}")
+        return {"ok": True, "text": "Готовлю черновик ответа — сначала дождусь разбора вложений "
+                                    f"(до {int(packs.MEDIA_WAIT)} с), потом пришлю карточкой. Он только для "
+                                    "просмотра: ничего не отправится."}
+    return await _request_draft(state, message_id)
+
+
+async def _draft_after_media(state: Any, message_id: int) -> None:
+    from .. import packs
+    async with state.pool.acquire() as conn:
+        pack = await packs.around(conn, message_id)
+    if pack is not None:
+        await packs.settle(state.pool, pack.ids, state=state)
+    out = await _request_draft(state, message_id)
+    if not out["ok"]:
+        async with state.pool.acquire() as conn:
+            await bridge.notify_owner(conn, "Черновик ответа не подготовлен. " + out["text"])
+
+
+async def _request_draft(state: Any, message_id: int) -> dict[str, Any]:
+    """Сам запрос к модели: пачка целиком (пересланное — цитатой третьего лица), справка — этот чат."""
+    from .. import packs
+    from ..outbox import autoreply, policy
     async with state.pool.acquire() as conn, conn.transaction():
         if not (await policy.check_halt(conn)).ok:
             return {"ok": False, "text": "Ассистент остановлен — ответ не готовится. Продолжить — /resume."}
-        msg = await conn.fetchrow(
-            """SELECT id, chat_id, text FROM messages WHERE id = $1 AND deleted_at IS NULL AND agent_visible
-                 AND kind = 'message' AND is_outgoing IS NOT TRUE""", message_id)
-        if msg is None or not (msg["text"] or "").strip():
-            return {"ok": False, "text": "Не получилось: сообщение удалено, скрыто защитой или без текста."}
+        code = await draft_why_not(conn, message_id)
+        if code is not None:
+            return {"ok": False, "text": "Не получилось: " + DRAFT_WORDS[code]}
+        msg = await conn.fetchrow("SELECT id, chat_id, text FROM messages WHERE id = $1", message_id)
+        pack = await packs.around(conn, message_id)
+        visible = pack.visible
+        codes = await packs.current_notes(conn, visible, state)
         tgt = await policy.target(conn, msg["chat_id"])
         if tgt is None or tgt.excluded:
             return {"ok": False, "text": "Не получилось: чат исключён из архива."}
@@ -185,14 +267,15 @@ async def request_draft(state: Any, message_id: int) -> dict[str, Any]:
         if channel is None:
             return {"ok": False, "text": "Не получилось: " + decision.message}
         settings = await autoreply.load(conn)
+        asked = packs.prompt_text(visible, codes, who=tgt.display_name)
         topic, recent, hits = await autoreply.gather_context(conn, state, settings, msg["chat_id"], message_id,
-                                                             msg["text"])
+                                                             asked, exclude=[r["id"] for r in visible])
         from ..notify import core as notify_core
         from ..replies import model, workflow
-        messages = autoreply.build_messages(settings, tgt, channel, msg["text"], list(recent), hits,
-                                            notify_core.zone(state.config.timezone))
+        messages = autoreply.build_messages(settings, tgt, channel, asked, list(recent), hits,
+                                            notify_core.zone(state.config.timezone), trigger_limit=6000)
         offered: list[int] = []
-        for mid in [message_id] + [r["id"] for r in recent] + [h["id"] for h in hits]:
+        for mid in [r["id"] for r in visible] + [r["id"] for r in recent] + [h["id"] for h in hits]:
             if mid not in offered:
                 offered.append(mid)
         refs = [{"kind": "chat", "source_id": str(msg["chat_id"]), "message_id": mid, "topic_tg_id": topic}
@@ -201,7 +284,8 @@ async def request_draft(state: Any, message_id: int) -> dict[str, Any]:
         job = await bridge.request_structured(
             conn, handler=DRAFT_HANDLER, instructions=instructions, input=input_text, json_schema=model.SCHEMA,
             schema_name="reply_outcome", task="shturman_reply", max_tokens=4000,
-            context={"chat_id": msg["chat_id"], "message_id": message_id, "offered": offered},
+            context={"chat_id": msg["chat_id"], "message_id": message_id, "offered": offered,
+                     "notes": packs.card_lines(visible, codes)},
             dedup_key=f"notify-draft:{message_id}")
     if job is None:
         return {"ok": True, "text": "Ответ на это сообщение уже готовится — черновик придёт сюда."}
@@ -240,6 +324,12 @@ async def _draft_ready(conn: asyncpg.Connection, job: dict[str, Any], result: di
                             idempotency_key=f"notify-draft:{message_id}", prepare_only=True)
     except drafts.Refused as exc:
         await bridge.notify_owner(conn, "Черновик ответа не подготовлен: " + exc.decision.message)
+        return
+    notes = [n for n in ctx.get("notes") or [] if isinstance(n, str)]
+    if notes:
+        # Чего ассистент не видел, готовя черновик (Р-93): готовые фразы сервиса, без слов переписки.
+        await bridge.notify_owner(conn, "К черновику ответа: " + "; ".join(notes) + ".", silent=True,
+                                  dedup_key=f"notify-draft-notes:{message_id}")
 
 
 @bridge.on_failure(DRAFT_HANDLER)

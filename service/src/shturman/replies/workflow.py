@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from .. import bridge, words
+from .. import bridge, packs, words
 from ..outbox import policy, runtime
 from ..sanitize import clean_line
 from . import model
@@ -102,9 +102,10 @@ async def register(conn: Any, state: Any, chat_id: int, message_id: int) -> dict
     if not (await autoreply.eligible(conn, tgt, message_id)).ok:
         return None
     msg = await conn.fetchrow(
-        "SELECT text FROM messages WHERE id=$1 AND chat_id=$2 AND deleted_at IS NULL AND agent_visible "
+        "SELECT text, media_type FROM messages WHERE id=$1 AND chat_id=$2 AND deleted_at IS NULL AND agent_visible "
         "AND kind='message' AND is_outgoing IS NOT TRUE", message_id, chat_id)
-    if msg is None or not msg['text'].strip():
+    # Фото, документ или голосовое без подписи — повод: пересказ или расшифровка дописываются позже (Р-93).
+    if msg is None or not (msg['text'].strip() or msg['media_type'] in packs.MEDIA_KINDS + packs.VOICE_KINDS):
         return None
     topic = await scopes.topic_for_message(conn, message_id, chat_id)
     row = await conn.fetchrow(

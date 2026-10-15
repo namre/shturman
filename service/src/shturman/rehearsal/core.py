@@ -18,15 +18,26 @@ Telegram не пропускает ни одного запроса отправ
 Что запускает репетицию — только код, без модели:
   * событие `message.live` из сессии основного аккаунта (не догрузка истории, не импорт, не правка);
   * личный чат с человеком (не бот, не «Избранное», не служебные чаты Telegram и не управляющий бот),
-    входящее от самого собеседника, не через бота, не пересланное (`notify.core.personal_candidate`
-    и проверки ниже);
+    входящее от самого собеседника, не через бота (`notify.core.personal_candidate` и проверки ниже);
   * собеседник — в списке репетиции (по числовому ID); сообщение видно ассистенту (скрытое защитой от
-    внедрённых инструкций — нет), с текстом, не старше предела автоответа (`max_age_seconds`);
+    внедрённых инструкций — нет), с текстом или вложением, не старше предела автоответа
+    (`max_age_seconds`);
+  * в пачке есть собственное сообщение собеседника: пачка из одних пересланных сама репетицию не
+    запускает (Р-93) — пересланное подаётся модели цитатой третьего лица, когда собеседник его
+    прокомментировал;
   * у сервиса свой бот согласований (без него карточку слать некуда: через Hermes чужой текст попал бы
     в разговор ассистента);
   * настоящий автоответ 2а этого сообщения не готовит (иначе было бы два ответа на одно сообщение).
-Пачка сообщений подряд — одна карточка на последнее (ожидание `debounce_seconds` автоответа).
-Пауза между репетициями и дневной предел — из настроек репетиции; что в них не уложилось, пропускается.
+Пачка сообщений (packs.py, Р-93: подряд с паузами до `packs.GAP`, альбом, «переслал и прокомментировал») —
+одна карточка на всю пачку, когда она закрылась. Вложения пачки (фото, документы, голосовые) сервис
+поднимает в начало очереди разбора и ждёт до `packs.MEDIA_WAIT`; чего не дождался или что выключено
+владельцем — карточка говорит прямо («Фото не успел разобрать», «Фото не смотрел: разбор фото и
+документов выключен…»). Пауза между репетициями и дневной предел — из настроек репетиции; что в них
+не уложилось, пропускается.
+
+«Подготовить ответ» у уведомления (`request_once`) — разовая репетиция по просьбе владельца: на пачку,
+даже из одних пересланных, человек может быть не в списке. Почему нельзя — словами для каждого кода
+(`WORDS`); если нельзя заранее, кнопки под уведомлением нет (`why_not_once`).
 
 Связка с уведомлениями (Р-84). Уведомление о сообщении, на которое пойдёт репетиция, придерживается
 (`notify_items.held_for_rehearsal`, не дольше `NOTIFY_HOLD`): карточка репетиции сама говорит «вам
@@ -46,7 +57,7 @@ from typing import Any, Mapping
 
 import asyncpg
 
-from .. import bridge, store
+from .. import bridge, packs, store
 from ..outbox import autoreply, policy
 from ..outbox import text as textlib
 from . import settings as rs
@@ -72,6 +83,30 @@ SWEEP_EVERY = 60.0
 QUEUED_STUCK = 60                    # секунд: строка «ждёт пачку» дольше — её разбирает обход
 OUTCOMES = ("reply", "decline", "ask_owner", "need_source")
 LIMITED = ("daily_cap", "pause")
+TIMER_ROUNDS = 20                    # столько раз таймер пачки дождётся её продления, дальше — обход
+
+# Почему ответ не готовится — словами, для владельца (после «Не получилось: »). Код — из `why_not` и
+# итогов `Rehearsal.prepare`; у каждого кода своя точная причина, общей «по умолчанию» нет.
+WORDS = {
+    "disabled": "репетиция ответов выключена.",
+    "unavailable": "репетиция сейчас недоступна: сервис репетиции не запущен.",
+    "no_bot": "у сервиса нет своего бота согласований — карточку прислать некуда.",
+    "gone": "сообщение удалено или чат исключён из архива.",
+    "not_personal": "это не личное сообщение человека вашему аккаунту (группа, канал, бот, служебный чат, "
+                    "ваше собственное или изменённое сообщение).",
+    "not_session": "сообщение пришло не через вход в ваш аккаунт (из выгрузки или бизнес-режима): по нему не "
+                   "видно, переслано ли оно и не от бота ли, поэтому ответ не готовится.",
+    "hidden": "сообщение скрыто защитой от внедрённых инструкций — модель его не видит. Решите в карточке защиты.",
+    "not_listed": "собеседника нет в списке репетиции.",
+    "no_text": "в сообщении нет ни текста, ни фото, документа или голосового — отвечать не на что.",
+    "forwarded_only": "в пачке только пересланное, без слов собеседника, — само по себе это не повод отвечать.",
+    "stale": "сообщение старше суток — ответ на него не готовится.",
+    "answered": "вы уже ответили в этом чате.",
+    "newer": "в чате уже есть сообщение новее — ответ готовится на него.",
+    "daily_cap": "дневной предел репетиции исчерпан.",
+    "pause": "не прошла пауза между репетициями.",
+    "stopped": "ассистент остановлен.",
+}
 
 _current: "Rehearsal | None" = None
 
@@ -97,26 +132,32 @@ async def message_row(conn: asyncpg.Connection, message_id: int) -> asyncpg.Reco
 
 
 async def why_not(conn: asyncpg.Connection, row: Mapping[str, Any] | None, s: Mapping[str, Any], *,
-                  max_age: float, now: datetime | None = None) -> str | None:
-    """Почему это сообщение не для репетиции (код) — или None, если для неё. Любое сомнение — «нет»."""
+                  max_age: float, now: datetime | None = None, pack: packs.Pack | None = None,
+                  on_demand: bool = False) -> str | None:
+    """Почему на это сообщение (и его пачку) репетиции нет — код из `WORDS`, или None, если она будет.
+    Любое сомнение — «нет». `on_demand` — владелец попросил сам («Подготовить ответ»): тогда и пачка из
+    одних пересланных подходит."""
     from ..notify import core as notify_core
     if not s["enabled"]:
         return "disabled"
     if not bridge.owns_bot():
         return "no_bot"
-    if row is None:
+    if row is None or row["deleted_at"] is not None or row["excluded"]:
         return "gone"
     if not await notify_core.personal_candidate(conn, row):
         return "not_personal"          # не личный чат основного аккаунта, бот, своё, правка, служебный чат
-    if row["is_forwarded"] is not False or "session" not in (row["sources"] or ()):
-        return "not_session"           # пересланное, а признаков живой сессии нет — не угадываем
-    if not row["agent_visible"]:
+    if row["is_forwarded"] is None or "session" not in (row["sources"] or ()):
+        return "not_session"           # признаков живой сессии нет (пересылка, бот) — не угадываем
+    rows = pack.rows if pack is not None else [row]
+    if not any(r["agent_visible"] for r in rows):
         return "hidden"                # скрыто защитой от внедрённых инструкций
     if int(row["peer_tg_id"]) not in set(s["people"]):
         return "not_listed"
-    if not (row["text"] or "").strip():
-        return "no_text"
-    if ((now or _now()) - row["sent_at"]).total_seconds() > max_age:
+    whole = pack if pack is not None else packs.Pack(rows=[dict(row)], closed=True, closes_at=row["sent_at"])
+    trigger = whole.trigger(on_demand=on_demand)
+    if trigger is None:
+        return "forwarded_only" if whole.forwarded_only else "no_text"
+    if ((now or _now()) - trigger["sent_at"]).total_seconds() > max_age:
         return "stale"
     return None
 
@@ -150,7 +191,7 @@ async def notify_hold(conn: asyncpg.Connection, row: Mapping[str, Any]) -> str |
     if not s["enabled"]:
         return None
     max_age = float((await autoreply.load(conn))["max_age_seconds"])
-    if await why_not(conn, row, s, max_age=max_age) is not None:
+    if await why_not(conn, row, s, max_age=max_age, pack=await packs.around(conn, row["id"])) is not None:
         return None
     if await handled_by_autoreply(conn, mod.state, row["chat_id"], row["id"]):
         return None
@@ -210,14 +251,20 @@ async def compose_card(conn: asyncpg.Connection, item: Mapping[str, Any], row: M
     head = "🎭 Репетиция ответа — ничего не отправлено"
     if item.get("on_demand"):
         head += "\nПо вашей просьбе — кнопкой «Подготовить ответ» под уведомлением."
+    rows = [r for r in await conn.fetch(notify_core._ROWS, list(item.get("pack_ids") or []))] or [row]
+    rows.sort(key=lambda r: (r["sent_at"], r["id"]))
+    when = notify_core._clock(rows[0]["sent_at"], tz, now)
+    if len(rows) > 1 and notify_core._clock(rows[-1]["sent_at"], tz, now) != when:
+        when += "–" + notify_core._clock(rows[-1]["sent_at"], tz, now)
     lines = [head,
              f"💬 Вам написали: {who}",
-             f"Личный чат{sphere} · {notify_core._clock(row['sent_at'], tz, now)}",
-             notify_core.body(row, {"preview": True})]
-    if item["covered"] > 1:
-        more = item["covered"] - 1
-        lines.append(f"Перед этим ещё {more} {_plural(more, 'сообщение', 'сообщения', 'сообщений')} от него — "
-                     "ассистент отвечал на всю пачку.")
+             f"Личный чат{sphere} · {when}",
+             notify_core.body(rows[0], {"preview": True}) if len(rows) == 1
+             else notify_core.pack_line(rows, {"preview": True})]
+    if len(rows) > 1:
+        lines.append(f"Ассистент отвечал на всю пачку — {len(rows)} "
+                     f"{_plural(len(rows), 'сообщение', 'сообщения', 'сообщений')} подряд.")
+    lines += list(item.get("media_notes") or [])
     if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM notify_items WHERE message_id = $1 AND state = 'sent')",
                            item["trigger_message_id"]):
         lines.append("Уведомление об этом сообщении уже приходило.")
@@ -327,7 +374,8 @@ class Rehearsal:
             row = await message_row(conn, message_id)
             if row is None or row["chat_id"] != chat_id or row["account_id"] != payload.get("account_id"):
                 return None
-            if await why_not(conn, row, s, max_age=float(settings["max_age_seconds"])) is not None:
+            pack = await packs.around(conn, message_id)
+            if await why_not(conn, row, s, max_age=float(settings["max_age_seconds"]), pack=pack) is not None:
                 return None
             if await handled_by_autoreply(conn, self.state, chat_id, message_id):
                 return None
@@ -335,10 +383,10 @@ class Rehearsal:
                 """INSERT INTO rehearsal_items (account_id, chat_id, trigger_message_id, peer_tg_id, nonce)
                    VALUES ($1, $2, $3, $4, $5) ON CONFLICT (trigger_message_id) DO NOTHING RETURNING id""",
                 row["account_id"], chat_id, message_id, int(row["peer_tg_id"]), secrets.token_urlsafe(12))
+            delay = await packs.closes_in(conn, message_id)
         if item_id is None:
             return None
-        delay = float(settings["debounce_seconds"])
-        # Несколько сообщений подряд — одна карточка: прежний таймер снимается, взводится новый.
+        # Пачка — одна карточка (Р-93): прежний таймер чата снимается, новый ждёт закрытия пачки.
         prior = self.debounce.pop(chat_id, None)
         if prior is not None and not prior.done():
             prior.cancel()
@@ -350,14 +398,29 @@ class Rehearsal:
         return item_id
 
     async def _later(self, chat_id: int, item_id: int, delay: float) -> None:
-        await asyncio.sleep(delay)
+        for _ in range(TIMER_ROUNDS):
+            await asyncio.sleep(delay + 0.5)
+            if await self.prepare(item_id) != "waiting":
+                break
+            async with self.pool.acquire() as conn:
+                trigger = await conn.fetchval("SELECT trigger_message_id FROM rehearsal_items WHERE id = $1", item_id)
+                delay = await packs.closes_in(conn, trigger) if trigger is not None else 0.0
         if self.debounce.get(chat_id) is asyncio.current_task():
             self.debounce.pop(chat_id, None)
-        await self.prepare(item_id)
 
     async def prepare(self, item_id: int) -> str:
-        """Проверяет всё заново и просит модель подготовить ответ. Возвращает итог: preparing либо
-        код пропуска. Ничего не отправляет."""
+        """Проверяет всё заново и просит модель подготовить ответ на всю пачку. Возвращает итог:
+        preparing, waiting (пачка ещё не закрылась) либо код пропуска. Ничего не отправляет."""
+        # Пачка и её вложения — до транзакции: ожидание разбора вложений длится до `packs.MEDIA_WAIT`.
+        async with self.pool.acquire() as conn:
+            item = await conn.fetchrow("SELECT * FROM rehearsal_items WHERE id = $1", item_id)
+            if item is None or item["state"] != "queued":
+                return "gone"
+            pack = await packs.around(conn, item["trigger_message_id"])
+        if not packs.ready(pack) and not item["on_demand"]:
+            return "waiting"        # человек дописывает: карточка — когда пачка закроется
+        if pack is not None:
+            await packs.settle(self.pool, pack.ids, state=self.state)
         async with self.pool.acquire() as conn, conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.rehearsal'))")
             item = await conn.fetchrow("SELECT * FROM rehearsal_items WHERE id = $1 FOR UPDATE", item_id)
@@ -378,16 +441,17 @@ class Rehearsal:
             settings = await autoreply.load(conn)
             row = await message_row(conn, trigger)
             s, max_age = _for_item(s, settings, item)
-            code = await why_not(conn, row, s, max_age=max_age)
+            pack = await packs.around(conn, trigger)      # заново: пересказы вложений уже в тексте
+            code = await why_not(conn, row, s, max_age=max_age, pack=pack, on_demand=on_demand)
             if code is not None:
-                return await _skip(conn, item, "stale" if code == "stale" else "gone")
+                return await _skip(conn, item, code)
             if await handled_by_autoreply(conn, self.state, chat_id, trigger):
                 return await _skip(conn, item, "gone")
             newer = await conn.fetchrow(
                 """SELECT n.is_outgoing FROM messages n JOIN messages t ON t.id = $1
                    WHERE n.chat_id = t.chat_id AND n.kind = 'message' AND n.deleted_at IS NULL
                      AND (n.sent_at, n.id) > (t.sent_at, t.id)
-                   ORDER BY n.sent_at DESC, n.id DESC LIMIT 1""", trigger)
+                   ORDER BY n.sent_at DESC, n.id DESC LIMIT 1""", pack.last["id"])
             if newer is not None and (newer["is_outgoing"] or not on_demand):
                 return await _skip(conn, item, "answered" if newer["is_outgoing"] else "newer")
             used = await conn.fetchrow(
@@ -404,32 +468,25 @@ class Rehearsal:
                 return await _skip(conn, item, "daily_cap")
             if used["recent"] and not on_demand:     # о разовой репетиции владелец попросил сам — без паузы
                 return await _skip(conn, item, "pause")
-            # Сообщения пачки до этого — под этой карточкой: их строки закрываются, а в карточке
-            # говорится, сколько сообщений подряд она покрывает. Пачка — сообщения, на которые репетиция
-            # уже заводилась и которые закрыло это, более новое (после вашего последнего ответа и после
-            # прошлой карточки в этом чате). Старые сообщения чата без репетиции — только справка.
+            # Карточка — на всю пачку (Р-93): строки репетиции её прежних сообщений закрываются этой.
+            # Сообщения чата до пачки — только справка.
             if not on_demand:
                 await conn.execute(
                     """UPDATE rehearsal_items SET state = 'skipped', reason = 'newer', updated_at = now()
                        WHERE chat_id = $1 AND state = 'queued' AND id <> $2""", chat_id, item_id)
-            covered = 1 + await conn.fetchval(
-                """SELECT count(*) FROM rehearsal_items r JOIN messages n ON n.id = r.trigger_message_id
-                   JOIN messages t ON t.id = $1
-                   WHERE r.chat_id = t.chat_id AND r.id <> $2 AND r.state = 'skipped' AND r.reason = 'newer'
-                     AND (n.sent_at, n.id) < (t.sent_at, t.id)
-                     AND n.sent_at > GREATEST(
-                         (SELECT max(o.sent_at) FROM messages o WHERE o.chat_id = t.chat_id AND o.kind = 'message'
-                            AND o.deleted_at IS NULL AND o.is_outgoing IS TRUE AND o.sent_at <= t.sent_at),
-                         (SELECT max(m.sent_at) FROM rehearsal_items p JOIN messages m ON m.id = p.trigger_message_id
-                            WHERE p.chat_id = t.chat_id AND p.id <> $2 AND p.state IN ('preparing', 'shown')),
-                         '-infinity'::timestamptz)""", trigger, item_id)
+            visible = pack.visible
+            covered = len(visible)
             tgt = await policy.target(conn, chat_id)
+            who = textlib.one_line(row["chat_title"], 60) or textlib.one_line(row["sender_name"], 60) or "Собеседник"
+            codes = await packs.current_notes(conn, visible, self.state)     # что вышло после ожидания
+            asked = packs.prompt_text(visible, codes, who=who)
             topic, recent, hits = await autoreply.gather_context(conn, self.state, settings, chat_id, trigger,
-                                                                 row["text"])
+                                                                 asked, exclude=[r["id"] for r in visible])
             from ..replies import model, workflow
-            messages = autoreply.build_messages(settings, tgt, "business", row["text"], recent, hits, self.zone())
+            messages = autoreply.build_messages(settings, tgt, "business", asked, recent, hits, self.zone(),
+                                                trigger_limit=6000)
             offered: list[int] = []
-            for mid in [trigger] + [r["id"] for r in recent] + [h["id"] for h in hits]:
+            for mid in [r["id"] for r in visible] + [r["id"] for r in recent] + [h["id"] for h in hits]:
                 if mid not in offered:
                     offered.append(mid)
             refs = [{"kind": "chat", "source_id": str(chat_id), "message_id": mid, "topic_tg_id": topic}
@@ -441,8 +498,10 @@ class Rehearsal:
                 context={"item_id": item_id}, dedup_key=f"rehearsal:{item_id}")
             await conn.execute(
                 """UPDATE rehearsal_items SET state = 'preparing', job_id = $2, asked_at = now(), covered = $3,
-                          offered = $4::bigint[], updated_at = now() WHERE id = $1""",
-                item_id, job_id, max(1, min(int(covered), 1000)), offered)
+                          offered = $4::bigint[], pack_ids = $5::bigint[], media_notes = $6::text[],
+                          updated_at = now() WHERE id = $1""",
+                item_id, job_id, max(1, min(int(covered), 1000)), offered, [r["id"] for r in visible],
+                packs.card_lines(visible, codes))
         return "preparing"
 
     async def sweep(self) -> int:
@@ -643,15 +702,12 @@ async def request_once(state: Any, message_id: int) -> dict[str, Any]:
             return {"ok": False, "text": "Ассистент остановлен — ответ не готовится. Продолжить — /resume."}
         row = await message_row(conn, message_id)
         s = await rs.load(conn)
-        probe = {"on_demand": True, "peer_tg_id": int(row["peer_tg_id"]) if row is not None else None}
-        relaxed, max_age = _for_item(s, {"max_age_seconds": 0}, probe)
-        code = await why_not(conn, row, relaxed, max_age=max_age)
+        code = await _once_code(conn, row, s, message_id)
         if code is not None:
-            words = {"stale": "сообщение старше суток — репетиция на него не готовится.",
-                     "hidden": "сообщение скрыто защитой — репетиция на него не готовится.",
-                     "no_text": "в сообщении нет текста — отвечать не на что."}
-            return {"ok": False, "text": "Не получилось: " + words.get(code, "это сообщение для репетиции не подходит "
-                                                                           "(только личные сообщения людей вашему аккаунту).")}
+            return {"ok": False, "text": "Не получилось: " + WORDS[code]}
+        pack = await packs.around(conn, message_id)
+        media, voice = await packs.media_on(conn), packs.switches_of(state)
+        slow = pack is not None and packs.MEDIA_WAIT > 0 and any(packs.waiting(r, media, voice) for r in pack.visible)
         used = await conn.fetchval(
             "SELECT count(*) FROM rehearsal_items WHERE asked_at > now() - interval '24 hours'")
         if used >= s["daily_cap"]:
@@ -672,12 +728,34 @@ async def request_once(state: Any, message_id: int) -> dict[str, Any]:
                 """INSERT INTO rehearsal_items (account_id, chat_id, trigger_message_id, peer_tg_id, nonce, on_demand)
                    VALUES ($1, $2, $3, $4, $5, true) RETURNING id""",
                 row["account_id"], row["chat_id"], message_id, int(row["peer_tg_id"]), secrets.token_urlsafe(12))
+    if slow:
+        # Вложения пачки ещё разбираются: ждать их в нажатии кнопки нельзя — готовится в фоне (Р-93).
+        mod.state.spawn(mod.prepare(item_id), name=f"rehearsal-once-{item_id}")
+        return {"ok": True, "text": "Готовлю, что ответил бы ассистент, — сначала дождусь разбора вложений "
+                                    f"(до {int(packs.MEDIA_WAIT)} с), потом пришлю карточкой репетиции. "
+                                    "Ничего не отправляется."}
     outcome = await mod.prepare(item_id)
     if outcome != "preparing":
-        reasons = {"answered": "вы уже ответили в этом чате.", "daily_cap": "дневной предел репетиции исчерпан.",
-                   "stopped": "ассистент остановлен."}
-        return {"ok": False, "text": "Не получилось: " + reasons.get(outcome, "сообщение изменилось или удалено.")}
+        return {"ok": False, "text": "Не получилось: " + WORDS.get(outcome, WORDS["gone"])}
     return {"ok": True, "text": "Готовлю, что ответил бы ассистент, — пришлю карточкой репетиции. Ничего не отправляется."}
+
+
+async def _once_code(conn: asyncpg.Connection, row: Mapping[str, Any] | None, s: Mapping[str, Any],
+                     message_id: int) -> str | None:
+    probe = {"on_demand": True, "peer_tg_id": int(row["peer_tg_id"]) if row is not None else None}
+    relaxed, max_age = _for_item(s, {"max_age_seconds": 0}, probe)
+    pack = await packs.around(conn, message_id) if row is not None else None
+    return await why_not(conn, row, relaxed, max_age=max_age, pack=pack, on_demand=True)
+
+
+async def why_not_once(conn: asyncpg.Connection, message_id: int) -> str | None:
+    """Для кнопки «Подготовить ответ» под уведомлением: почему разовая репетиция на это сообщение
+    невозможна (код из `WORDS`) — тогда кнопки нет; None — кнопка будет. Временное (остановка,
+    дневной предел) кнопку не убирает: на нажатие владелец получит точную причину."""
+    if current() is None:
+        return "unavailable"
+    row = await message_row(conn, message_id)
+    return await _once_code(conn, row, await rs.load(conn), message_id)
 
 
 @bridge.on_owner_change

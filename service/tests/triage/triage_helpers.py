@@ -1,8 +1,9 @@
 """Общее для тестов разбора входящих (triage/, Р-92): архив, живые сообщения, ответ «модели», карточки.
 
-Сервис поднимается с модулями разбора; фоновый обход разбора снят, уведомления (Р-84) тест зовёт сам
-(`Notifier.on_message`, `Notifier.flush`) — без гонок по часам. Ожидание пачки (`Triage.wait`) нулевое:
-разбор просится прямо в обработчике события; тест пачки сам ставит строки и зовёт `prepare`.
+Сервис поднимается с модулями разбора и репетиции (кнопка «Подготовить ответ» под карточкой — разовая
+репетиция); фоновый обход разбора снят, уведомления (Р-84) тест зовёт сам (`Notifier.on_message`,
+`Notifier.flush`) — без гонок по часам. Пачки (packs.py) в тестах выключены: каждое сообщение — своя,
+сразу закрытая пачка, и разбор просится прямо в обработчике события; тест пачки задаёт паузу сам.
 Модель заменена прямой работой с очередью заданий: тест закрывает задание `llm.structured` своим ответом
 через `bridge.deliver_result`, как это сделал бы исполнитель.
 """
@@ -26,7 +27,7 @@ from shturman.triage import core  # noqa: E402
 from shturman.triage import settings as ts  # noqa: E402
 
 GROUP = 3001
-MODULES = ("shturman.api_core", "shturman.triage.service")
+MODULES = ("shturman.api_core", "shturman.triage.service", "shturman.rehearsal.service")
 
 
 @pytest_asyncio.fixture
@@ -37,7 +38,7 @@ async def tv(make_client, conn, own_bot):
 async def setup_env(make_client, conn, modules=MODULES):
     client, state = await make_client(*modules)
     for task in list(state._tasks):
-        if task.get_name() == "triage-sweeper":
+        if task.get_name() in ("triage-sweeper", "rehearsal-sweeper"):
             task.cancel()          # обход тест зовёт сам
     with authority.owner_context(OWNER, chat_id=OWNER, action="test.fixture.bind"):
         await bridge.set_owner(conn, OWNER, OWNER)
@@ -48,7 +49,6 @@ async def setup_env(make_client, conn, modules=MODULES):
     state.extras["notify"] = notifier
     await configure(conn, quiet=False)
     mod = state.extras["triage"]
-    mod.wait = 0
     return SimpleNamespace(client=client, state=state, conn=conn, n=notifier, t=mod, owner_acc=owner_acc,
                            helper_acc=helper_acc)
 

@@ -12,8 +12,10 @@
       (`direct_address.mentions_username`). Пересылка, цитата, код, правка, бот — не обращение.
 
 Очередь — таблица `notify_items`: строка на сообщение, со временем отправки (`due_at`):
-  «сразу» — первое сообщение чата уходит при следующем обходе; следующие в течение `gap_minutes`
-      копятся и уходят одним уведомлением «…и ещё N сообщений»;
+  «сразу» — уведомление уходит, когда пачка сообщений закрылась (packs.py, Р-93: сообщения одного
+      человека подряд с паузами до `packs.GAP`, альбом, «переслал и прокомментировал»), — одно на
+      пачку: «3 сообщения: ↪ пересланное от …: «…» · 🖼 фото (2) · «…»». Следующие в течение
+      `gap_minutes` после отправленного копятся и уходят одним уведомлением;
   «пачкой» — всё уходит одним сообщением в начале следующего отрезка в 15, 30 или 60 минут;
   тихие часы — всё, что пришло или созрело в них, уходит одной пачкой в их конце.
 Перед отправкой каждое сообщение проверяется заново: не удалено ли, не исключён ли чат, не выключили
@@ -43,7 +45,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from .. import bridge, control_peers, spheres, store
+from .. import bridge, control_peers, packs, spheres, store
 from ..outbox import direct_address
 from ..outbox import text as textlib
 from . import settings as ns
@@ -55,11 +57,13 @@ STALE = timedelta(hours=36)         # дождалось отправки, но 
 KEEP = timedelta(days=7)            # сколько хранить отправленное и снятое (для «не чаще раза на чат» и счётчиков)
 EXCERPT = 300
 NAME = 60
+PART = 120                          # знаков на одно сообщение в строке пачки
+PACK_LINE = 600                     # знаков на всю строку пачки
 DIGEST_CHATS = 15                   # чатов в одной пачке; остальные — строкой «и ещё N»
 GROUP_TYPES = frozenset({"private_group", "private_supergroup", "public_supergroup"})
 
 MEDIA_LABELS = {
-    "voice_message": "🎤 голосовое", "video_message": "⏺ кружок", "photo": "📷 фото", "file": "📎 файл",
+    "voice_message": "🎤 голосовое", "video_message": "⏺ кружок", "photo": "🖼 фото", "file": "📎 файл",
     "sticker": "стикер", "animation": "GIF", "video_file": "🎬 видео", "audio_file": "🎵 аудио",
 }
 HIDDEN_TEXT = "🛡 Сообщение скрыто защитой — решите в карточке защиты."
@@ -69,8 +73,8 @@ _ROWS = """
 SELECT m.id, m.chat_id, m.tg_message_id, m.sent_at, m.kind, m.is_outgoing, m.deleted_at, m.text, m.edited_at,
        m.is_forwarded, m.telegram_entities, m.telegram_via_bot, m.telegram_sender_bot, m.reply_to_tg_id,
        m.topic_tg_id, m.agent_visible, m.sources, m.media_type, m.media_name, m.media_duration,
-       m.transcript_state, m.media_state, m.sender_name, m.sender_peer_id,
-       c.type AS chat_type, c.excluded, c.account_id, c.peer_id, COALESCE(c.title, p.name) AS chat_title,
+       m.transcript_state, m.media_state, m.sender_name, m.sender_peer_id, m.grouped_id, m.forwarded_from,
+       m.guard_label, c.type AS chat_type, c.excluded, c.account_id, c.peer_id, COALESCE(c.title, p.name) AS chat_title,
        a.role AS account_role, p.class AS peer_class, p.tg_id AS peer_tg_id, p.is_bot AS peer_is_bot,
        p.username AS peer_username, sp.class AS sender_class, sp.tg_id AS sender_tg_id,
        sp.is_bot AS sender_is_bot
@@ -298,13 +302,80 @@ def body(row: Mapping[str, Any], s: Mapping[str, Any]) -> str:
     if row["media_type"] and (row["transcript_state"] == "done" or row["media_state"] == "done"):
         raw = _LABEL.sub("", raw, count=1)     # метку «[голосовое, 0:42]» заменяет своя
     if row["is_forwarded"]:
-        label = ("↪ пересланное" + (", " + label if label else ""))
+        label = (_forwarded_word(row) + (", " + label if label else ""))
     excerpt = textlib.one_line(raw, EXCERPT) if s["preview"] else ""
     if excerpt and label:
         return f"{label}: «{excerpt}»"
     if excerpt:
         return f"«{excerpt}»"
     return label or ("(без текста)" if s["preview"] else "")
+
+
+def _forwarded_word(row: Mapping[str, Any]) -> str:
+    source = textlib.one_line(row.get("forwarded_from"), 40)
+    return "↪ пересланное" + (f" от {source}" if source else "")
+
+
+def _part(row: Mapping[str, Any], s: Mapping[str, Any]) -> tuple[str | None, str]:
+    """Одно сообщение в строке пачки: (метка для склейки одинаковых подряд или None, текст)."""
+    if not row["agent_visible"]:
+        return "🛡 скрыто защитой", "🛡 скрыто защитой"
+    label = media_label(row)
+    raw = row["text"] or ""
+    if row["media_type"] and (row["transcript_state"] == "done" or row["media_state"] == "done"):
+        raw = _LABEL.sub("", raw, count=1)
+    excerpt = textlib.one_line(raw, PART) if s["preview"] else ""
+    if packs.forwarded(row):
+        label = _forwarded_word(row) + (", " + label if label else "")
+    if excerpt:
+        return None, (f"{label}: «{excerpt}»" if label else f"«{excerpt}»")
+    label = label or "сообщение"
+    return label, label
+
+
+def pack_parts(rows: Sequence[Mapping[str, Any]], s: Mapping[str, Any]) -> list[str]:
+    """Части строки пачки: альбом — одной частью («🖼 фото (3): «подпись»»), одинаковые вложения без
+    текста подряд — одной частью со счётом."""
+    groups: list[list[Mapping[str, Any]]] = []
+    for row in rows:
+        if groups and row.get("grouped_id") is not None and groups[-1][-1].get("grouped_id") == row["grouped_id"]:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    parts: list[tuple[str | None, str, int]] = []
+    for group in groups:
+        if len(group) == 1:
+            key, text = _part(group[0], s)
+            if key is not None and parts and parts[-1][0] == key:
+                parts[-1] = (key, key, parts[-1][2] + 1)
+            else:
+                parts.append((key, text, 1))
+            continue
+        shown = [_part(r, s) for r in group]
+        captioned = next((text for key, text in shown if key is None), None)
+        key = next((k for k, _ in shown if k is not None), None) or "🖼 фото"
+        if captioned is not None and ": «" in captioned:
+            head, _, tail = captioned.partition(": «")
+            parts.append((None, f"{head} ({len(group)}): «{tail}", 1))
+        elif captioned is not None:
+            parts.append((None, f"{key} ({len(group)}): {captioned}", 1))
+        else:
+            parts.append((None, f"{key} ({len(group)})", 1))
+    return [text if count == 1 else f"{text} ({count})" for _, text, count in parts]
+
+
+def pack_line(rows: Sequence[Mapping[str, Any]], s: Mapping[str, Any]) -> str:
+    """Несколько сообщений одной строкой: «3 сообщения: ↪ пересланное от Ивана: «…» · 🖼 фото (2) · «…»»."""
+    n = len(rows)
+    out = f"{n} {_plural(n, 'сообщение', 'сообщения', 'сообщений')}: "
+    parts = pack_parts(rows, s)
+    for i, part in enumerate(parts):
+        piece = (" · " if i else "") + part
+        if i and len(out) + len(piece) > PACK_LINE:
+            out += f" · …ещё {len(parts) - i}"
+            break
+        out += piece
+    return out
 
 
 def _link(row: Mapping[str, Any]) -> str | None:
@@ -332,24 +403,21 @@ def _place(rows: Sequence[Mapping[str, Any]], kind: str) -> str:
 
 def compose_chat(rows: Sequence[Mapping[str, Any]], kind: str, s: Mapping[str, Any], tz: ZoneInfo,
                  now: datetime, sphere_titles: Sequence[str]) -> str:
-    """Уведомление об одном чате: первое сообщение и «…и ещё N»."""
+    """Уведомление об одном чате: одно сообщение — его начало; пачка — одной строкой (Р-93)."""
     first, last = rows[0], rows[-1]
     sphere = (" · " + ", ".join(textlib.one_line(t, 40) for t in sphere_titles)) if sphere_titles else ""
     remind = ["⏰ Напоминаю: вы ещё не ответили"] if any(r.get("reminder") for r in rows) else []
+    when = _clock(first["sent_at"], tz, now)
+    if len(rows) > 1 and _clock(last["sent_at"], tz, now) != when:
+        when += "–" + _clock(last["sent_at"], tz, now)
     if kind == "personal":
-        lines = remind + [f"💬 Вам написали: {_place(rows, kind)}",
-                 f"Личный чат{sphere} · {_clock(first['sent_at'], tz, now)}"]
+        lines = remind + [f"💬 Вам написали: {_place(rows, kind)}", f"Личный чат{sphere} · {when}"]
     else:
         reason = REASON_WORDS.get(first.get("reason") or "", "обращение")
-        lines = remind + [f"📣 Вас упомянули в {_place(rows, kind)}",
-                 f"{_who(first)}{sphere} · {_clock(first['sent_at'], tz, now)} · {reason}"]
-    text = body(first, s)
+        lines = remind + [f"📣 Вас упомянули в {_place(rows, kind)}", f"{_who(first)}{sphere} · {when} · {reason}"]
+    text = body(first, s) if len(rows) == 1 else pack_line(rows, s)
     if text:
         lines.append(text)
-    if len(rows) > 1:
-        more = len(rows) - 1
-        lines.append(f"…и ещё {more} {_plural(more, 'сообщение', 'сообщения', 'сообщений')}, "
-                     f"последнее в {_clock(last['sent_at'], tz, now)}.")
     link = _link(first)
     if link:
         lines.append(f"Открыть: {link}")
@@ -406,12 +474,18 @@ async def queue(conn: asyncpg.Connection, row: Mapping[str, Any], now: datetime,
     # карточки — уведомление придерживается и уходит, только если репетиция не состоялась.
     from ..rehearsal import core as rehearsal
     hold = await rehearsal.notify_hold(conn, row) if kind == "personal" else None
+    # Пачка (Р-93): уведомление — одно на пачку, когда она закрылась (не дольше `packs.GAP` после
+    # последнего сообщения). Придержка ради репетиции считается от закрытия пачки и разбора её вложений.
+    close = now + timedelta(seconds=await packs.closes_in(conn, message_id, now=now))
+    ready = close + timedelta(seconds=packs.MEDIA_WAIT)
     async with conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.notify'), $1::int)",
                            chat_id % 2_000_000_000)
         due, quiet, digest = await schedule(conn, s, chat_id, now, tz)
+        if not quiet and not digest:
+            due = max(due, close)
         if hold == "hold":
-            due = max(due, now + rehearsal.NOTIFY_HOLD)
+            due = max(due, ready + rehearsal.NOTIFY_HOLD)
         added = await conn.fetchval(
             """INSERT INTO notify_items (message_id, chat_id, kind, reason, quiet, digest, due_at,
                                          held_for_rehearsal, state, dropped_reason)
@@ -419,6 +493,14 @@ async def queue(conn: asyncpg.Connection, row: Mapping[str, Any], now: datetime,
                ON CONFLICT (message_id) DO NOTHING RETURNING id""",
             message_id, chat_id, kind, reason, quiet, digest, due, hold == "hold",
             "dropped" if hold == "covered" else "waiting", "rehearsal" if hold == "covered" else None)
+        if added is not None and hold != "covered" and not quiet and not digest:
+            # Уже ждущие уведомления этого чата уходят вместе с новым — одним сообщением о пачке; если новое
+            # ждёт карточку репетиции, то и они: карточка покроет всю пачку (или отпустит её целиком).
+            await conn.execute(
+                """UPDATE notify_items SET due_at = GREATEST(due_at, $2),
+                          held_for_rehearsal = held_for_rehearsal OR $3
+                   WHERE chat_id = $1 AND state = 'waiting' AND NOT quiet AND NOT digest AND NOT reminder""",
+                chat_id, due, hold == "hold")
     if added is None or hold == "covered":
         return None, None
     return kind, due
@@ -564,12 +646,24 @@ class Notifier:
             single = {c: r for c, r in by_chat.items() if not any(x["batch"] for x in r)}
             batched = {c: r for c, r in by_chat.items() if c not in single}
             for chat_id, chat_rows in single.items():
+                if not any(r["reminder"] for r in chat_rows):
+                    # Пачка ещё не закрылась (человек дописывает) — подождать её конца (Р-93).
+                    pack = await packs.around(conn, chat_rows[-1]["id"], now=now)
+                    if not packs.ready(pack, now):
+                        await conn.execute(
+                            "UPDATE notify_items SET due_at = $2 WHERE id = ANY($1::bigint[]) AND state = 'waiting'",
+                            [r["item_id"] for r in chat_rows],
+                            min(pack.closes_at, pack.first["sent_at"] + timedelta(seconds=packs.HOLD_MAX)))
+                        continue
                 text = compose_chat(chat_rows, chat_rows[0]["item_kind"], s, tz, now, titles.get(chat_id, []))
-                # Кнопки (Б14): «Подготовить ответ» — к последнему сообщению чата, «Напомнить» и «Не
-                # сообщать» — к нему же (notify/buttons.py).
+                # Кнопки (Б14): «Подготовить ответ» — к последнему сообщению чата (ответ готовится на всю
+                # пачку), «Напомнить» и «Не сообщать» — к нему же (notify/buttons.py). Если ответ на него
+                # подготовить нельзя (скрыто защитой, не личный чат, нечем готовить), кнопки нет.
                 from . import buttons as notify_buttons
-                keys = await notify_buttons.attach(conn, chat_rows[-1]["item_id"],
-                                                   personal=chat_rows[0]["item_kind"] == "personal")
+                personal = chat_rows[0]["item_kind"] == "personal"
+                prepare = personal and await notify_buttons.can_prepare(conn, chat_rows[-1]["id"]) is None
+                keys = await notify_buttons.attach(conn, chat_rows[-1]["item_id"], personal=personal,
+                                                   prepare=prepare)
                 sent += await self._send(conn, text, [r["item_id"] for r in chat_rows], now, buttons=keys)
             if batched:
                 order = sorted(batched.items(), key=lambda kv: kv[1][-1]["sent_at"], reverse=True)
