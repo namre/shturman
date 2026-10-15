@@ -292,6 +292,29 @@ for (const [width, scheme, theme] of [[390, "dark", THEME], [390, "light", THEME
   mkdirSync(P2_OUT, { recursive: true });
   const post = async (pathname) => (await fetch(CONTROL + pathname, { method: "POST" })).json();
   const flat = (m) => (m && m.reply_markup && m.reply_markup.inline_keyboard ? m.reply_markup.inline_keyboard.flat() : []);
+  // Сообщения бота как в чате Telegram: текст ровно как ушёл в Bot API и кнопки под ним. Только для снимка.
+  const botShot = async (messages, name) => {
+    const ctx = await browser.newContext({ viewport: { width: 460, height: 300 }, deviceScaleFactor: 2, locale: "ru-RU" });
+    const page = await ctx.newPage();
+    const esc = (s) => String(s || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    const body = messages.map((m) => {
+      const rows = ((m.reply_markup && m.reply_markup.inline_keyboard) || [])
+        .map((row) => `<div class="row">${row.map((b) => `<span class="b">${esc(b.text)}</span>`).join("")}</div>`).join("");
+      return `<div class="msg"><div class="bubble">${esc(m.text)}</div>${rows ? `<div class="kbd">${rows}</div>` : ""}</div>`;
+    }).join("");
+    await page.setContent(`<!doctype html><meta charset="utf-8"><style>
+      body { margin: 0; padding: 14px; font: 15px/1.38 -apple-system, "Segoe UI", Roboto, sans-serif; background: #c8d8e6; color: #000; }
+      .head { font-weight: 600; margin: 0 0 10px; color: #2b5278; }
+      .msg { max-width: 420px; margin-bottom: 12px; }
+      .bubble { white-space: pre-wrap; overflow-wrap: anywhere; background: #fff; border-radius: 12px 12px 12px 4px;
+                padding: 8px 11px; box-shadow: 0 1px 1px rgba(0,0,0,.12); }
+      .kbd .row { display: flex; gap: 4px; margin-top: 4px; }
+      .kbd .b { flex: 1; text-align: center; padding: 8px 6px; border-radius: 8px; font-size: 14px;
+                background: rgba(64,120,160,.55); color: #fff; }
+    </style><div class="head">Бот согласований</div>${body}`);
+    await page.locator("body").screenshot({ path: path.join(P2_OUT, name + ".png") });
+    await ctx.close();
+  };
   // Сообщения бота уходят очередью заданий — ждём нужное до 8 секунд.
   const waitSent = async (pred) => {
     for (let i = 0; i < 40; i++) {
@@ -395,6 +418,42 @@ for (const [width, scheme, theme] of [[390, "dark", THEME], [390, "light", THEME
   check("приложение, «Репетиция»: добавлен человек и включено сразу; бот каждый раз пишет, как вернуть",
         told.length === 2 && told.some((m) => m.text.includes("/rehearsal remove 5101")) && told.some((m) => m.text.includes("/rehearsal off")),
         told.map((m) => m.text).join(" | "));
+
+  // предел и пауза во вкладке: сразу, бот пишет, как вернуть; неверное число — словами
+  check("приложение, «Репетиция»: поля «Карточек в сутки» и «Пауза…» и «Сегодня уже: 0 из 30»",
+        (await p.inputValue("#rh-cap-input")) === "30" && (await p.inputValue("#rh-pause-input")) === "5"
+        && (await p.textContent("#rh-used")).startsWith("Сегодня уже: 0 из 30"), await p.textContent("#rh-used"));
+  await p.fill("#rh-cap-input", "0");
+  await p.click("#rh-limits-save");
+  await p.waitForSelector("#toast:not([hidden])");
+  check("приложение, «Репетиция»: предел 0 — отказ словами, без запроса",
+        (await p.textContent("#toast")).includes("«Карточек в сутки» — целое число от 1 до 300")
+        && (await control("/rehearsal/settings")).daily_cap === 30, await p.textContent("#toast"));
+  await p.fill("#rh-cap-input", "2");
+  await p.click("#rh-limits-save");
+  const capTold = (await waitSent((m) => (m.text || "").startsWith("В приложении изменена репетиция: предел — 2 в сутки"))).pop();
+  await p.waitForFunction(() => document.querySelector("#rh-used").textContent.includes("из 2"));
+  check("приложение, «Репетиция»: предел 2 сохранён сразу; бот — «Вернуть: /rehearsal cap 30»",
+        !!capTold && capTold.text.includes("/rehearsal cap 30") && (await control("/rehearsal/settings")).daily_cap === 2,
+        capTold ? capTold.text : "нет сообщения");
+
+  // бот: «предел исчерпан» с «Поднять до 50» / «до 100»; нажатие — сразу, ответ с командой отката
+  await post("/rehearsal/capped");
+  const capMsg = (await waitSent((m) => (m.text || "").includes("дневной предел — 2 карточки — исчерпан"))).pop();
+  check("бот: «предел исчерпан» — кнопки «Поднять до 50» и «Поднять до 100», без отсылки на страницу",
+        !!capMsg && JSON.stringify(flat(capMsg).map((b) => b.text)) === JSON.stringify(["Поднять до 50", "Поднять до 100"])
+        && !capMsg.text.includes("Настройках Штурмана"), capMsg ? JSON.stringify(flat(capMsg)) : "нет сообщения");
+  await botShot([capMsg], "bot-rehearsal-cap-reached");
+  await post("/bot/press?data=" + encodeURIComponent(flat(capMsg).find((b) => b.text === "Поднять до 50").callback_data));
+  const raised = (await waitSent((m) => m.text === "Предел — 50 в сутки. Вернуть: /rehearsal cap 2")).pop();
+  check("бот: «Поднять до 50» — предел 50 сразу, ответ «Предел — 50 в сутки. Вернуть: /rehearsal cap 2»",
+        !!raised && (await control("/rehearsal/settings")).daily_cap === 50);
+  await botShot([{ ...capMsg, reply_markup: null }, raised], "bot-rehearsal-cap-raised");
+  await p.reload();
+  await p.waitForSelector("#screen-approvals:not([hidden]), #screen-rehearsal:not([hidden])");
+  if (!(await p.isVisible("#rh-body"))) { await p.click("#tab-rehearsal"); await p.waitForSelector("#rh-body:not([hidden])"); }
+  check("приложение, «Репетиция»: после кнопки в боте поле показывает 50",
+        (await p.inputValue("#rh-cap-input")) === "50", await p.inputValue("#rh-cap-input"));
   await p.fill("#rh-q", "");
   for (const [width, scheme, theme] of [[390, "light", THEME_LIGHT], [360, "dark", THEME]]) {
     const o = width === 390 ? opened : await openApp(width, scheme, theme);

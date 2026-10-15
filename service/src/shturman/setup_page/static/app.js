@@ -25,7 +25,7 @@
  * Пакет 2 ревизии удобства: ответ на «Вопрос ассистента» полем «Ваш ответ» (П1), «Остановить всё» и
  * «Продолжить…» (Р-87: остановка сразу, продолжение — только нажатием в боте), кнопка «Открыть
  * настройки в браузере» (П4: web_app_open_link, адрес «Настроек Штурмана» отдаёт сервер) и вкладка
- * «Репетиция» (Р-89: включить, люди, последние карточки и оценки за 7 дней).
+ * «Репетиция» (Р-89: включить, люди, предел в сутки и пауза, последние карточки и оценки за 7 дней).
  *
  * Всё, что приходит с сервера, выводится только через textContent: в карточках и названиях чатов
  * чужой текст.
@@ -1707,9 +1707,10 @@
 
   /* ------------------------------------------------------------ «Репетиция» (Р-89) */
 
-  // Включить и добавить человека отсюда можно сразу (владелец так решил), но каждое изменение сервер
-  // пишет в журнал и сообщает в бот с командой, которой его вернуть. Предел и пауза — только на странице.
-  var rh = { data: null, loaded: false, timer: null };
+  // Включить, добавить человека, поднять предел и сократить паузу отсюда можно сразу (владелец так решил),
+  // но каждое изменение сервер пишет в журнал и сообщает в бот с командой, которой его вернуть.
+  // limitsDirty — владелец правит числа: перерисовка вкладки их не затирает.
+  var rh = { data: null, loaded: false, timer: null, limitsDirty: false };
 
   function rhPanel(name) {
     ["rh-loading", "rh-failed", "rh-unavailable", "rh-body"].forEach(function (id) { show(id, id === name); });
@@ -1747,8 +1748,12 @@
     var s = d.settings;
     show("rh-halted", Boolean(halt.stopped));
     $("rh-enabled").checked = Boolean(s.enabled);
-    $("rh-cap").textContent = "Не больше " + s.daily_cap + " " + plural(s.daily_cap, "карточки", "карточек", "карточек") +
-      " в сутки. Только личные чаты вашего основного аккаунта.";
+    if (!rh.limitsDirty) {
+      $("rh-cap-input").value = String(s.daily_cap);
+      $("rh-pause-input").value = String(s.pause_seconds);
+    }
+    $("rh-used").textContent = "Сегодня уже: " + ((d.stats || {}).asked_24h || 0) + " из " + s.daily_cap +
+      " (считаются последние 24 часа).";
     var list = $("rh-people");
     clear(list);
     (d.people || []).forEach(function (p) {
@@ -1824,11 +1829,36 @@
 
   function savePeople(people, b, done) { saveRehearsal({ people: people }, b, done); }
 
+  // Предел и пауза: целое число в пределах, которые назвал сервер; меняется только то, что изменили.
+  function saveLimits(ev) {
+    ev.preventDefault();
+    if (!rh.data) return;
+    var lim = rh.data.limits || {}, s = rh.data.settings, body = {}, bad = null;
+    [["daily_cap", "rh-cap-input", "Карточек в сутки", lim.daily_cap || [1, 300], ""],
+     ["pause_seconds", "rh-pause-input", "Пауза между карточками", lim.pause_seconds || [0, 3600], " секунд"]]
+      .forEach(function (f) {
+        var raw = $(f[1]).value.trim(), n = Number(raw);
+        if (!/^\d+$/.test(raw) || n < f[3][0] || n > f[3][1]) {
+          bad = bad || "«" + f[2] + "» — целое число от " + f[3][0] + " до " + f[3][1] + f[4] + ".";
+        } else if (n !== s[f[0]]) {
+          body[f[0]] = n;
+        }
+      });
+    if (bad) { toast(bad); return; }
+    if (!Object.keys(body).length) { rh.limitsDirty = false; drawRehearsal(); toast("Ничего не изменилось."); return; }
+    rh.limitsDirty = false;
+    saveRehearsal(body, $("rh-limits-save"), "Сохранено. Бот сообщит об изменении и как его вернуть.");
+  }
+
   function wireRehearsal() {
     $("rh-retry").addEventListener("click", function () { loadRehearsal(false); });
     $("rh-enabled").addEventListener("change", function () {
       var on = this.checked;
       saveRehearsal({ enabled: on }, this, on ? "Репетиция включена. Бот сообщит об изменении." : "Репетиция выключена.");
+    });
+    $("rh-limits").addEventListener("submit", saveLimits);
+    ["rh-cap-input", "rh-pause-input"].forEach(function (id) {
+      $(id).addEventListener("input", function () { rh.limitsDirty = true; });
     });
     $("rh-q").addEventListener("input", function () {
       var q = this.value.trim();

@@ -188,6 +188,17 @@ MUTATIONS = (
              "    if False:\n        out.append(\"enabled\")",
              "tests/rehearsal/test_rehearsal_api.py::test_enabling_and_adding_people_wait_for_the_owner",
              database=True),
+    # «Поднять до …» под «предел исчерпан»: только нажатие в самом боте (не из приложения) и только
+    # пока предел тот, при котором кнопка выдана.
+    Mutation("rehearsal_raise_cap_bot_only", "src/shturman/rehearsal/core.py",
+             "    if principal.action != \"telegram.callback\":\n        return {**refused,",
+             "    if False:\n        return {**refused,",
+             "tests/rehearsal/test_rehearsal_cap.py::test_cap_message_has_raise_buttons_and_the_owners_press_applies_at_once",
+             database=True),
+    Mutation("rehearsal_raise_cap_not_stale", "src/shturman/rehearsal/core.py",
+             "    if s[\"daily_cap\"] != old:\n", "    if False:\n",
+             "tests/rehearsal/test_rehearsal_cap.py::test_cap_message_has_raise_buttons_and_the_owners_press_applies_at_once",
+             database=True),
     Mutation("reply_context_hides_guarded", "src/shturman/outbox/autoreply.py",
              "WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL AND agent_visible\n",
              "WHERE chat_id = $1 AND id <> $2 AND kind = 'message' AND deleted_at IS NULL\n",

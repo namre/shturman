@@ -300,7 +300,7 @@
       <p class="banner" id="rh-halted" hidden>Ассистент остановлен — пока он не продолжит, репетиция стоит.</p>
       <div class="panel">
         <label class="check rh-switch"><input type="checkbox" id="rh-enabled"><span>Репетиция включена</span></label>
-        <p class="muted small" id="rh-cap"></p>
+        <p class="muted small">Только личные чаты вашего основного аккаунта.</p>
       </div>
       <div class="panel">
         <h2>С кем репетировать</h2>
@@ -310,14 +310,28 @@
                autocomplete="off" spellcheck="false" enterkeyhint="search">
         <ul class="rh-people rh-found" id="rh-found" aria-live="polite"></ul>
       </div>
+      <form class="panel rh-limits" id="rh-limits" autocomplete="off" novalidate>
+        <h2>Сколько и как часто</h2>
+        <div class="tools-row">
+          <label class="field" for="rh-cap-input"><span>Карточек в сутки</span>
+            <input type="number" id="rh-cap-input" min="1" max="300" step="1" inputmode="numeric" required></label>
+          <label class="field" for="rh-pause-input"><span>Пауза между карточками, секунд</span>
+            <input type="number" id="rh-pause-input" min="0" max="3600" step="1" inputmode="numeric" required></label>
+        </div>
+        <p class="rh-used" id="rh-used" aria-live="polite"></p>
+        <p class="muted small">Когда предел исчерпан, новые сообщения из списка приходят обычными уведомлениями до конца
+          суток. Больше карточек — больше сообщений уходит модели.</p>
+        <button type="submit" class="primary wide" id="rh-limits-save">Сохранить</button>
+      </form>
       <div class="panel">
         <h2>За 7 дней</h2>
         <p id="rh-stats"></p>
         <ul class="rh-recent" id="rh-recent"></ul>
         <p class="muted small" id="rh-recent-empty" hidden>Карточек пока не было.</p>
       </div>
-      <p class="muted foot">Включение и новые люди отсюда действуют сразу; о каждом изменении бот согласований
-        напишет вам отдельно — с командой, которой его вернуть. Предел в сутки и паузу меняют в «Настройках Штурмана».</p>
+      <p class="muted foot">Изменения отсюда действуют сразу; о каждом бот согласований напишет вам отдельно — с
+        командой, которой его вернуть. Предел можно поднять и кнопкой в боте, когда он исчерпан, или командой
+        /rehearsal cap ЧИСЛО.</p>
     </div>
   </section>
 </main>
