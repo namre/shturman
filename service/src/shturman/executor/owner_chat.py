@@ -21,7 +21,7 @@ import asyncpg
 from .. import authority, bridge, confirm, words
 from ..outbox import autoreply, drafts, policy
 from ..sources.registry import SourceError
-from . import binding, menu_button, owner_views
+from . import binding, menu_button, owner_settings, owner_views
 
 MODULE = "oc"
 # «Остановить всё» (Х2, Р-87): кнопка главного меню и команды /pause, /stop. Пока остановлено, на
@@ -40,6 +40,8 @@ MORE = [
     [("Источники", "sources"), ("Группы и темы", "groups")],
     [("Внешние программы", "mcpaccess"), ("Чаты", "chats")],
     [(words.REHEARSAL, "rehearsal"), ("Настройки", "config")],
+    # Р-95: доверенные и обращения — кнопками, без номеров
+    [("Доверенные", "trusted"), ("Обращения", "addressing")],
     [("Все команды", "advanced")],
 ]
 # Данные кнопок, которые принимает `on_menu`: нынешние меню и «Ещё» и кнопки прежних версий
@@ -60,6 +62,7 @@ HELP = f"""Как пользоваться ботом
 • «{words.APPROVALS}» — всё, что ждёт вашего решения, одним списком.
 • Подключение аккаунтов, выбор чатов и уведомления — {words.IN_SETUP_PAGE} в браузере.
 • Репетиция ответов — /rehearsal; сколько карточек в сутки — /rehearsal cap 50 (от 1 до 300).
+• Доверенные, группы и обращения — кнопками: /trusted, /groups, /addressing. Что менялось и что ассистент делал — «История» в приложении «Штурман» и в «Настройках Штурмана».
 • От вашего имени ничего не уходит без вашего нажатия «Отправить», и только если отправка включена на сервере. Исключение — автоответ доверенным людям, если вы его включили.
 
 Все команды с точными параметрами — /advanced."""
@@ -71,20 +74,21 @@ ADVANCED = """Все команды (для точной настройки)
 /replytask НОМЕР answer ТЕКСТ — ответить ассистенту; /replytask НОМЕР cancel — отменить
 /sources — источники и разрешения; /sourcegrant JSON — разрешение для ответа
 /sourcepolicy JSON — точное разрешение для будущих ответов в этом чате (до 30 дней)
-/sourcerevoke НОМЕР — отозвать разрешение
-/mcpaccess — внешние программы с доступом к архиву; /mcprevoke НОМЕР — отозвать доступ
-/groups — группы и темы для ответов
-/groupallow НОМЕР_ЧАТА [НОМЕР_ТЕМЫ] — разрешить отвечать в группе или теме
+/sourcerevoke НОМЕР — отозвать разрешение (или кнопкой «Отозвать» под /sources)
+/mcpaccess — внешние программы с доступом к архиву и кнопки «Отозвать»; /mcprevoke НОМЕР — отозвать доступ
+/groups — группы и темы для ответов, с кнопками
+/groupallow НОМЕР_ЧАТА [НОМЕР_ТЕМЫ] — разрешить отвечать в группе или теме; без номера — выбрать кнопкой
 /groupdeny НОМЕР — убрать разрешение
-/addressing JSON — обращения к ассистенту в группах (например {"aliases":["Штурман"]})
+/addressing JSON — обращения к ассистенту в группах (например {"aliases":["Штурман"]}); без JSON — кнопками
 /prepare on|off — черновики ответов без отправки (способ «Через бота и помощника»)
 /rehearsal — репетиция в личных чатах вашего аккаунта: on|off, add НОМЕР_В_TELEGRAM, remove НОМЕР_В_TELEGRAM
 /rehearsal cap ЧИСЛО — дневной предел карточек (1–300); /rehearsal pause СЕКУНДЫ — пауза между ними (0–3600)
 /policy JSON — правила отправки (например {"daily_cap":20})
 /autoconfig JSON — настройки автоответа
-/autoreply НОМЕР_АККАУНТА on|off — автоответ доверенным
+/autoreply НОМЕР_АККАУНТА on|off — автоответ доверенным; без номера — кнопками
 /trust НОМЕР_В_TELEGRAM [ЗАМЕТКА] — доверенный; /untrust НОМЕР_В_TELEGRAM — убрать
-/chats — чаты и их номера; /drafting НОМЕР_ЧАТА allow|deny|default — черновики в этом чате
+/trusted — доверенные с кнопками; /trust без номера — выбрать из последних собеседников
+/chats — чаты и их номера; /drafting НОМЕР_ЧАТА allow|deny|default — черновики в этом чате; без номера — выбрать кнопкой
 /drafts — черновики, которые ждут решения; /cancel НОМЕР — снять черновик
 
 Команды меняют только названное. Отправка требует включённого выключателя на сервере и разрешённого канала. В режиме без отправки сообщение остаётся черновиком. Решения по источникам и раскрытию — в карточках здесь."""
@@ -236,6 +240,8 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         await confirm.apply_owner(conn, AUTOREPLY, {"changes": changes})
         return _done("Настройки автоответа изменены:\n" + policy.describe_changes(before, changes, autoreply.LABELS),
                      "/autoconfig " + _compact({k: before.get(k) for k in changes}), menu)
+    if command == "autoreply" and not argument:
+        return await owner_settings.autoreply_screen(conn, state)
     if command == "autoreply":
         from ..outbox.service import AUTOREPLY
         parts = argument.split()
@@ -249,6 +255,8 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
                      + ("включён: этим людям ассистент будет отвечать сам, если отправка включена на сервере."
                         if on else "выключен."),
                      f"/autoreply {account_id} {'off' if on else 'on'}", menu)
+    if command == "drafting" and not argument:
+        return await owner_settings.chat_picker(conn, 0)
     if command == "drafting":
         from ..outbox.service import CHAT_DRAFTING
         parts = argument.split()
@@ -262,6 +270,10 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         word = {"allow": "можно готовить", "deny": "нельзя готовить", "default": "как в общих правилах"}[parts[1]]
         return _done(f"Черновики в чате «{owner_views._name(title, f'№ {chat_id}')}»: {word}.",
                      f"/drafting {chat_id} {before}", menu)
+    if command == "trusted":
+        return await owner_settings.trusted_screen(conn)
+    if command == "trust" and not argument:
+        return await owner_settings.people_screen(conn, 0, purpose="trust")
     if command == "trust":
         from ..outbox.service import TRUSTED_ADD
         raw, _, note = argument.partition(" ")
@@ -270,9 +282,10 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         return _done(f"Человек с номером {tg_id} в Telegram — в доверенных. Если автоответ включён, ассистент "
                      "будет отвечать ему сам.", f"/untrust {tg_id}", menu)
     if command == "untrust":
+        from ..outbox.service import TRUSTED_REMOVE
         tg_id = _int(argument)
-        removed = await conn.fetchval("DELETE FROM outbox_trusted WHERE tg_user_id = $1 RETURNING true", tg_id)
-        if not removed:
+        out = await confirm.apply_owner(conn, TRUSTED_REMOVE, {"tg_user_id": tg_id})
+        if not out["result"]:
             return {"text": f"Номера {tg_id} в доверенных не было — ничего не изменилось.", "buttons": menu}
         return _done(f"Человек с номером {tg_id} в Telegram больше не в доверенных: ассистент не отвечает ему сам.",
                      f"/trust {tg_id}", menu)
@@ -291,29 +304,45 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         return {"text": await owner_views.drafts_text(conn, state)}
     if command in ("groups", "groupallow", "groupdeny", "addressing"):
         from ..outbox import scopes
+        from ..outbox.service import ADDRESSING, GROUP_SCOPE
         if command == "groups":
-            return {"text": await owner_views.groups_text(conn)}
-        async with conn.transaction():
-            if command == "groupdeny":
-                scope_id = _int(argument)
-                if not await scopes.remove(conn, scope_id):
-                    return {"text": f"Разрешения № {scope_id} нет. Список — /groups.", "buttons": menu}
-                return _done(f"Разрешение № {scope_id} убрано: в этой группе ассистент больше не отвечает.",
-                             "/groupallow с номером чата из /chats", menu)
-            if command == "addressing":
-                before = (await scopes.addressing(conn))["aliases"]
-                after = (await scopes.update_addressing(conn, scopes.validate_addressing(_json(argument))))["aliases"]
-                return _done("Обращения к ассистенту в группах: " + (", ".join(f"«{a}»" for a in after) or "нет") + ".",
-                             "/addressing " + _compact({"aliases": before}), menu)
-            parts = argument.split()
-            if not 1 <= len(parts) <= 2:
-                raise ValueError("Так: /groupallow номер-чата или /groupallow номер-чата номер-темы. "
-                                 "Номера чатов — в /chats.")
-            row = await scopes.put(conn, _int(parts[0]), topic_tg_id=_int(parts[1]) if len(parts) == 2 else None)
-            title = await conn.fetchval("SELECT title FROM chats WHERE id = $1", _int(parts[0]))
-            topic = f", тема № {parts[1]}" if len(parts) == 2 else ""
-            return _done(f"Ассистенту можно отвечать в группе «{owner_views._name(title, 'без названия')}»{topic}.",
-                         f"/groupdeny {row['id']}", menu)
+            return {"text": await owner_views.groups_text(conn),
+                    "buttons": (await owner_settings.groups_screen(conn))["buttons"]}
+        if command == "groupallow" and not argument:
+            return await owner_settings.group_picker(conn, 0)
+        if command == "addressing" and not argument:
+            return await owner_settings.addressing_screen(conn)
+        # Через функции применения (Р-95): со строкой «Истории», тем же путём, что кнопки, страница и приложение.
+        if command == "groupdeny":
+            scope_id = _int(argument)
+            row = await conn.fetchrow(
+                """SELECT c.id AS chat_id, s.topic_tg_id FROM outbox_reply_scopes s
+                   JOIN chats c ON c.account_id = s.account_id AND c.peer_id = s.peer_id WHERE s.id = $1""", scope_id)
+            if row is None:
+                return {"text": f"Разрешения № {scope_id} нет. Список — /groups.", "buttons": menu}
+            await confirm.apply_owner(conn, GROUP_SCOPE, {"chat_id": row["chat_id"],
+                                                          "topic_tg_id": row["topic_tg_id"] or None, "enabled": False})
+            await conn.execute("DELETE FROM outbox_reply_scopes WHERE id = $1", scope_id)
+            return _done(f"Разрешение № {scope_id} убрано: в этой группе ассистент больше не отвечает.",
+                         "/groupallow с номером чата из /chats", menu)
+        if command == "addressing":
+            before = (await scopes.addressing(conn))["aliases"]
+            wanted = scopes.validate_addressing(_json(argument))["aliases"]
+            after = (await confirm.apply_owner(conn, ADDRESSING, {"aliases": wanted}))["result"]["aliases"]
+            return _done("Обращения к ассистенту в группах: " + (", ".join(f"«{a}»" for a in after) or "нет") + ".",
+                         "/addressing " + _compact({"aliases": before}), menu)
+        parts = argument.split()
+        if not 1 <= len(parts) <= 2:
+            raise ValueError("Так: /groupallow номер-чата или /groupallow номер-чата номер-темы. "
+                             "Номера чатов — в /chats. Или /groupallow без номера — выбрать кнопкой.")
+        chat_id, topic = _int(parts[0]), _int(parts[1]) if len(parts) == 2 else None
+        await confirm.apply_owner(conn, GROUP_SCOPE, {"chat_id": chat_id, "topic_tg_id": topic, "enabled": True})
+        row = await conn.fetchrow(
+            """SELECT s.id, c.title FROM outbox_reply_scopes s JOIN chats c ON c.account_id = s.account_id
+               AND c.peer_id = s.peer_id WHERE c.id = $1 AND s.topic_tg_id = $2""", chat_id, topic or 0)
+        topic_words = f", тема № {parts[1]}" if len(parts) == 2 else ""
+        return _done(f"Ассистенту можно отвечать в группе «{owner_views._name(row['title'], 'без названия')}»{topic_words}.",
+                     f"/groupdeny {row['id']}", menu)
     if command in ("mcpaccess", "mcpclients", "mcprevoke"):
         from ..remote_mcp import core
         if command == "mcprevoke":
@@ -321,11 +350,12 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
             revoked = await core.revoke_grant(conn, grant_id)
             return {"text": f"Доступ № {grant_id} отозван: эта программа больше не читает архив. Вернуть — только "
                             "подключить её заново." if revoked else f"Доступа № {grant_id} нет. Список — /mcpaccess."}
-        return {"text": await owner_views.mcp_text(conn, state)}
+        return {"text": await owner_views.mcp_text(conn, state), "buttons": await owner_settings.mcp_buttons(conn)}
     if command in ("sources", "sourcegrant", "sourcerevoke", "sourcepolicy"):
         from ..sources import broker
         if command == "sources":
-            return {"text": await owner_views.sources_text(conn, state)}
+            return {"text": await owner_views.sources_text(conn, state),
+                    "buttons": await owner_settings.sources_buttons(conn)}
         if command == "sourcerevoke":
             grant_id = _int(argument)
             await broker.revoke_grant(conn, grant_id, owner_id=user_id)
@@ -401,6 +431,8 @@ async def handle_prompt(conn: asyncpg.Connection, state: Any, prompt: dict[str, 
                 return {"text": "Время вышло — вариант не записан. Оценку можно поменять кнопками под карточкой."}
             out = await rehearsal.save_variant(conn, int(prompt["id"]), str(prompt.get("nonce") or ""), text)
             return {"text": out["text"]}
+        if prompt.get("kind") == "alias":
+            return await owner_settings.handle_prompt(conn, prompt, text)
     return None
 
 
@@ -472,6 +504,8 @@ async def _rehearsal(conn: asyncpg.Connection, state: Any, argument: str) -> dic
         return {"text": text, "buttons": menu_buttons(state)}
     if len(parts) == 2 and parts[0] in ("cap", "pause"):
         return await _rehearsal_number(conn, state, parts[0], parts[1], s, elsewhere)
+    if parts == ["add"]:
+        return await owner_settings.people_screen(conn, 0, purpose="rehearsal")
     if len(parts) == 1 and parts[0] in ("on", "off"):
         changes: dict[str, Any] = {"enabled": parts[0] == "on"}
     elif len(parts) == 2 and parts[0] in ("add", "remove"):

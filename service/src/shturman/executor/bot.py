@@ -38,7 +38,7 @@ from ..api_core import BadRequest
 from ..app import AppState
 from ..sanitize import clean_line
 from ..outbox.text import split_text
-from . import binding, menu_button, owner_chat, prompts
+from . import binding, menu_button, owner_chat, owner_settings, prompts
 from .botapi import BotApi, BotApiError, NeverLeft, OutcomeUnknown, Refused
 
 logger = logging.getLogger("shturman.executor.bot")
@@ -400,6 +400,9 @@ class Bot:
             self.counters["callbacks_refused"] += 1
             await self._answer(query_id, TEXT_REFUSED)
             return
+        if data.startswith(bridge.CALLBACK_PREFIX + owner_settings.MODULE + ":"):
+            await self._on_settings(query_id, data.split(":", 2)[2], presser, chat_id, message_id)
+            return
         try:
             async with self.state.pool.acquire() as conn:
                 with authority.owner_context(presser, chat_id=chat_id, action="telegram.callback"):
@@ -452,6 +455,36 @@ class Bot:
             asyncio.get_running_loop().call_later(0.6, self.wake)
         except RuntimeError:
             pass
+
+    async def _on_settings(self, query_id: str, rest: str, presser: int, chat_id: int, message_id: int) -> None:
+        """Кнопки настроек ответов и доверия (`owner_settings.py`, Р-95): выбрать человека, группу, чат,
+        отозвать разрешение. Проверка, что нажал владелец в своём личном чате, уже сделана в `_on_callback`.
+        Ответ — правка этого же сообщения (новый текст и новые кнопки) или просьба написать текст."""
+        try:
+            async with self.state.pool.acquire() as conn:
+                with authority.owner_context(presser, chat_id=chat_id, action="telegram.callback"):
+                    out = await owner_settings.on_press(conn, self.state, rest, presser)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — кнопки остаются, владелец может нажать ещё раз
+            self.counters["callback_errors"] += 1
+            logger.warning("бот согласований: нажатие настроек не разобрано (%s)", type(exc).__name__)
+            await self._answer(query_id, TEXT_FAILED)
+            return
+        self.counters["callbacks"] += 1
+        await self._answer(query_id, out.get("answer") or None)
+        prompt = out.get("prompt")
+        if isinstance(prompt, dict) and isinstance(prompt.get("text"), str):
+            await self._ask(chat_id, prompt)
+        edit = out.get("edit")
+        if isinstance(edit, dict) and isinstance(edit.get("text"), str):
+            from .botapi import keyboard
+            try:
+                await self.api.edit_message_text(chat_id, message_id, bridge.fit_message(edit["text"]),
+                                                 reply_markup=keyboard(edit.get("buttons") or None))
+            except BotApiError as exc:    # «не изменено», сообщение удалено — изменение уже сделано
+                if not (isinstance(exc, Refused) and exc.reason in ("not_modified", "message_not_found")):
+                    logger.warning("бот согласований: сообщение настроек не обновлено (%s)", exc)
 
     # --- бизнес-режим ---
 

@@ -86,7 +86,8 @@ def test_page_order_steps_then_everyday_cards():
 def test_pult_header_quick_links_and_title():
     assert "<title>Настройки Штурмана</title>" in INDEX                     # вкладка браузера — прежняя
     nav = INDEX[INDEX.index('<nav class="quick"'):INDEX.index("</nav>")]
-    assert re.findall(r">([^<]+)</a>", nav) == ["Чаты", "Сферы", "Уведомления", "Репетиция", "Память", "Журнал"]
+    assert re.findall(r">([^<]+)</a>", nav) == ["Чаты", "Сферы", "Уведомления", "Репетиция", "Доверие", "Память",
+                                                     "История"]
     assert '"Штурман — ваш пульт"' in SCRIPT
     # вступление и словарь в пульте уходят в «Частые вопросы»
     assert 'id="faq-intro"' in INDEX and 'id="intro-wizard"' in INDEX

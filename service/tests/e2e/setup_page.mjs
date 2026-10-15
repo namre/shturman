@@ -1595,8 +1595,8 @@ await shot(page, "27-app-done-desktop-light");
     leadInFaq: !!document.querySelector("#faq-main #intro-lead"), height: document.documentElement.scrollHeight }));
   check("пульт: заголовок «Штурман — ваш пульт», вкладка браузера — «Настройки Штурмана»",
         head.h1 === "Штурман — ваш пульт" && head.title === "Настройки Штурмана", JSON.stringify(head));
-  check("пульт: быстрые ссылки «Чаты · Сферы · Уведомления · Репетиция · Память · Журнал»",
-        head.quick.join("|") === "Чаты|Сферы|Уведомления|Репетиция|Память|Журнал", head.quick.join("|"));
+  check("пульт: быстрые ссылки «Чаты · Сферы · Уведомления · Репетиция · Доверие · Память · История»",
+        head.quick.join("|") === "Чаты|Сферы|Уведомления|Репетиция|Доверие|Память|История", head.quick.join("|"));
   check("пульт: вступление «Займёт 15–20 минут» и словарь — в «Частых вопросах»", head.leadInFaq);
   const now = await p.textContent("#now-list");
   check("«Сейчас»: что ждёт решения, аккаунты, последнее сообщение, сбои модели, отправка",
@@ -1646,10 +1646,10 @@ await shot(page, "27-app-done-desktop-light");
         !(await p.evaluate(() => document.getElementById("s-business").classList.contains("collapsed"))));
   await p.click('#quick a[data-go="s-audit"]');
   await p.waitForFunction(() => document.getElementById("audit-details").open);
-  check("быстрая ссылка «Журнал» открывает журнал действий", await p.isVisible("#audit"));
-  check("порядок: шаги подряд, затем «Повседневное» — сферы, уведомления, наблюдатель, репетиция, память, журнал, «Дополнительно»",
+  check("быстрая ссылка «История» открывает историю", await p.isVisible("#hs-tabs"));
+  check("порядок: шаги подряд, затем «Повседневное» — сферы, уведомления, сводки, наблюдатель, репетиция, доверие, память, история, «Дополнительно»",
         await p.evaluate(() => {
-          const ids = ["s-chats", "s-import", "s-media", "h-daily", "s-spheres", "s-notify", "s-watch", "s-rehearsal", "s-memory", "s-audit", "extras"];
+          const ids = ["s-chats", "s-import", "s-media", "h-daily", "s-spheres", "s-notify", "s-summaries", "s-watch", "s-rehearsal", "s-replies", "s-memory", "s-audit", "extras"];
           return ids.every((id, i) => i === 0 || !!(document.getElementById(ids[i - 1]).compareDocumentPosition(document.getElementById(id)) &
                                                      Node.DOCUMENT_POSITION_FOLLOWING));
         }));
@@ -1882,6 +1882,148 @@ check("вход по коду: после входа cookie попытки ст�
   check("сообщение с кодом: предупреждение и кнопки «Это не я», «Выйти на всех устройствах»",
         !!msg && msg.text.includes("Никому не сообщайте код, даже ассистенту") &&
         labels.includes("Это не я") && labels.includes("Выйти на всех устройствах"), msg ? msg.text : "нет сообщения");
+}
+
+// --- пакет 4б (Р-95): «Ответы и доверие», утренняя сводка, «История» с «Отозвать», /sources в боте ------
+// Страница — сам владелец: доверенный по поиску имени — сразу; сводка — сразу, плагин применяет (пульт
+// `/pack4b/plugin`); «История»: «Отозвать» и «Вернуть как было» (ужесточение — сразу, расширение — карточка
+// в бот). Снимки — в `E2E_PACK4B_OUT`.
+{
+  const P4_OUT = process.env.E2E_PACK4B_OUT || OUT;
+  mkdirSync(P4_OUT, { recursive: true });
+  const seen = async () => control("GET", "/pack4b/seen");
+  async function waitFor(test, timeout = 10000) {
+    const until = Date.now() + timeout;
+    while (Date.now() < until) { if (await test()) return true; await page.waitForTimeout(200); }
+    return false;
+  }
+  async function cardShot(p, id, name) {
+    await p.evaluate(() => { const t = document.getElementById("toast"); if (t) t.hidden = true;
+                             document.querySelector(".top").style.position = "static"; });
+    await p.locator("#" + id).screenshot({ path: path.join(P4_OUT, name + ".png") });
+    await p.evaluate(() => { document.querySelector(".top").style.position = ""; });
+  }
+  async function open(p, details, ready) {
+    if (!(await p.evaluate((d) => document.getElementById(d).open, details))) await p.click(`#${details} > summary`);
+    if (ready) await p.waitForSelector(ready);
+  }
+  const seeded = await control("POST", "/pack4b/seed");
+  check("пакет 4б: стенд засеян", !seeded.error, seeded.error || "");
+  await page.goto(URL_PAGE);
+  await page.waitForSelector("#screen-app:not([hidden])");
+  // «Ответы и доверие»
+  await open(page, "replies-details", "#rp-trusted li");
+  check("доверие: Анна — в списке по имени, без номера",
+        (await page.textContent("#rp-trusted")).includes("Анна Ким") && !(await page.textContent("#rp-trusted")).includes("5101"));
+  await page.fill("#rp-people-q", "борис");
+  await page.waitForSelector("#rp-people-found button");
+  await page.click("#rp-people-found button");
+  check("доверие: со страницы — сразу (сам владелец), без карточки в боте",
+        await waitFor(async () => (await seen()).trusted.includes(5102)));
+  await page.fill("#rp-alias", "Штурман");
+  await page.click("#rp-alias-add");
+  await page.waitForFunction(() => document.getElementById("rp-aliases").textContent.includes("«Штурман»"));
+  check("доверие: обращение добавлено", (await page.textContent("#rp-aliases")).includes("«Штурман»"));
+  await page.fill("#rp-chats-q", "анна");
+  await page.waitForSelector("#rp-chats-found select");
+  await page.selectOption("#rp-chats-found select", "deny");
+  await page.waitForFunction(() => document.getElementById("rp-drafting").textContent.includes("Анна Ким"));
+  check("доверие: черновики в чате «Анна Ким» — нельзя", (await page.inputValue("#rp-drafting select")) === "deny");
+  await cardShot(page, "s-replies", "page-replies-desktop-light");
+  // утренняя сводка: видна, потому что ассистент в Hermes ответил
+  await page.reload();
+  await page.waitForSelector("#screen-app:not([hidden])");
+  await page.waitForSelector("#s-summaries:not([hidden])");
+  await open(page, "summaries-details", "#sm-morning-time");
+  check("сводка: из Hermes — 08:27 и пт 17:47", await waitFor(async () =>
+    (await page.inputValue("#sm-morning-time")) === "08:27" &&
+    (await page.inputValue("#sm-weekly-day")) === "5" && (await page.inputValue("#sm-weekly-time")) === "17:47"),
+        [await page.inputValue("#sm-morning-time"), await page.inputValue("#sm-weekly-day")].join(" "));
+  await page.fill("#sm-morning-time", "07:30");
+  await page.selectOption("#sm-weekly-day", "1");
+  await page.click("#summaries-save");
+  check("сводка: выбор записан сразу", await waitFor(async () => (await seen()).summaries.choice["morning-brief"].time === "07:30"));
+  await control("POST", "/pack4b/plugin");
+  check("сводка: плагин применил — совпадает", await waitFor(async () => (await seen()).summaries.state === "in_sync"));
+  await page.reload();
+  await page.waitForSelector("#s-summaries:not([hidden])");
+  await open(page, "summaries-details", "#sm-morning-time");
+  await page.waitForFunction(() => document.getElementById("sm-morning-next").textContent.includes("07:30"));
+  await cardShot(page, "s-summaries", "page-summaries-desktop-light");
+  // бот, пока разрешение действует: /sources и /trusted (проверка — ниже)
+  await control("POST", "/pack4b/say?text=" + encodeURIComponent("/sources"));
+  await control("POST", "/pack4b/say?text=" + encodeURIComponent("/trusted"));
+  // «История»
+  await open(page, "audit-details", "#hs-panel .hs-grants");
+  const panel = await page.textContent("#hs-panel");
+  check("история: действующие разрешения с «Отозвать», изменения — с «Вернуть как было», просьба ассистента — «ждёт вашего решения»",
+        panel.includes("смета по фасадам") && panel.includes("«Claude»") && panel.includes("Вернуть как было") &&
+        panel.includes("ждёт вашего решения"), panel.slice(0, 400));
+  check("история: текста переписки нет", !panel.includes("Добрый день!"));
+  await cardShot(page, "s-audit", "page-history-desktop-light");
+  await page.locator("#hs-panel .hs-grants li", { hasText: "смета по фасадам" }).locator("button").click();
+  check("история: «Отозвать» — сразу", await waitFor(async () => (await seen()).grants_active === 0));
+  await page.waitForSelector(".hs-item:has-text('Борис Ли — в доверенных.') button");
+  await page.locator(".hs-item", { hasText: "Борис Ли — в доверенных." }).locator("button", { hasText: "Вернуть как было" }).click();
+  check("история: вернуть добавление доверенного (ужесточение) — сразу", await waitFor(async () => !(await seen()).trusted.includes(5102)));
+  await page.waitForSelector(".hs-item:has-text('Борис Ли — больше не в доверенных.') button");
+  await page.locator(".hs-item", { hasText: "Борис Ли — больше не в доверенных." }).locator("button", { hasText: "Вернуть как было" }).click();
+  check("история: вернуть доверенного (расширение) — только карточка в бот, и со страницы",
+        await waitFor(async () => { const s = await seen(); return s.widen_pending === 1 && !s.trusted.includes(5102); }));
+  await page.click("#hs-tab-assistant");
+  await page.waitForFunction(() => document.getElementById("hs-tab-assistant").getAttribute("aria-selected") === "true");
+  await page.waitForTimeout(400);
+  await cardShot(page, "s-audit", "page-history-assistant-desktop-light");
+  await page.click("#hs-tab-logins");
+  await page.waitForSelector("#hs-logins-extra:not([hidden])");
+  check("история: «Входы» — вход по ссылке", await waitFor(async () => (await page.textContent("#hs-panel")).includes("Вход по ссылке")),
+        (await page.textContent("#hs-panel")).slice(0, 300));
+  await page.click("#hs-tab-decisions");
+  for (const [name, options] of VARIANTS) {
+    const ctx = await newContext({ ...options, storageState: await context.storageState() });
+    const p = await ctx.newPage();
+    await p.addInitScript(AUTO_ASK);
+    await p.goto(URL_PAGE);
+    await p.waitForSelector("#screen-app:not([hidden])");
+    await open(p, "audit-details", "#hs-panel .hs-grants");
+    await open(p, "replies-details", "#rp-trusted li");
+    await p.waitForTimeout(300);
+    const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    check(`вёрстка (история и доверие, ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+    await cardShot(p, "s-audit", `page-history-${name}`);
+    await cardShot(p, "s-replies", `page-replies-${name}`);
+    await ctx.close();
+  }
+  // бот: /sources и /mcpaccess — «Отозвать» кнопкой (команды отправлены до «Отозвать» на странице)
+  const sent = (await control("GET", "/bot/sent")).filter((m) => m.method === "sendMessage");
+  const sources = sent.filter((m) => (m.text || "").startsWith("Источники и разрешения")).pop();
+  const trustedMsg = sent.filter((m) => (m.text || "").startsWith("Доверенные люди")).pop();
+  const buttonsOf = (m) => ((m && m.reply_markup && m.reply_markup.inline_keyboard) || []).map((row) => row.map((b) => b.text));
+  check("бот: /sources — без «/sourcerevoke», «Отозвать» кнопкой",
+        !!sources && !(sources.text || "").includes("/sourcerevoke") && (sources.text || "").includes("кнопкой"), sources && sources.text);
+  check("бот: /trusted — «Убрать» кнопкой и «Выбрать человека»",
+        !!trustedMsg && buttonsOf(trustedMsg).flat().includes("Выбрать человека"), JSON.stringify(buttonsOf(trustedMsg)));
+  async function botShot(messages, name) {
+    const ctx = await browser.newContext({ viewport: { width: 460, height: 400 }, deviceScaleFactor: 2, locale: "ru-RU" });
+    const p = await ctx.newPage();
+    const esc = (s) => String(s || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    const body = messages.map((m) => {
+      const rows = buttonsOf(m).map((row) => `<div class="row">${row.map((b) => `<span class="b">${esc(b)}</span>`).join("")}</div>`).join("");
+      return `<div class="msg"><div class="bubble">${esc(m.text)}</div>${rows ? `<div class="kbd">${rows}</div>` : ""}</div>`;
+    }).join("");
+    await p.setContent(`<!doctype html><meta charset="utf-8"><style>
+      body { margin: 0; padding: 14px; font: 15px/1.38 -apple-system, "Segoe UI", Roboto, sans-serif; background: #c8d8e6; }
+      .head { font-weight: 600; margin: 0 0 10px; color: #2b5278; }
+      .msg { max-width: 420px; margin-bottom: 12px; }
+      .bubble { white-space: pre-wrap; overflow-wrap: anywhere; background: #fff; border-radius: 12px 12px 12px 4px;
+                padding: 8px 11px; box-shadow: 0 1px 1px rgba(0,0,0,.12); }
+      .kbd .row { display: flex; gap: 4px; margin-top: 4px; }
+      .kbd .b { flex: 1; text-align: center; padding: 8px 6px; border-radius: 8px; font-size: 14px; background: rgba(64,120,160,.55); color: #fff; }
+    </style><div class="head">Бот согласований</div>${body}`);
+    await p.locator("body").screenshot({ path: path.join(P4_OUT, name + ".png") });
+    await ctx.close();
+  }
+  if (sources && trustedMsg) await botShot([sources, trustedMsg], "bot-sources-trusted");
 }
 
 // --- «Остановить всё» (Р-87): сразу; «Продолжить» — только нажатием в боте ------------------------

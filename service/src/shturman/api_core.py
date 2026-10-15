@@ -251,7 +251,12 @@ async def overview(state: AppState) -> dict[str, Any]:
         retried = await retry.overview(conn, media_days=state.config.media_days)
         from . import halt
         stopped = halt.public(await halt.current(conn))
+        from . import summaries
+        scheduled = await summaries.overview(conn)
     out = dict(row)
+    # Утренняя сводка и обзор недели (Р-95): выбрал ли владелец, совпадает ли с Hermes, следующий запуск.
+    # Только признаки и время; строка summaries в ./ops/doctor.sh.
+    out.update(scheduled)
     # «Остановить всё» (Р-87): остановлено ли, с какого времени, откуда, сколько аккаунтов на паузе.
     out["stopped"] = stopped
     # Уведомления владельцу (Р-84): какие включены, сколько ждут и сколько ушло за сутки.

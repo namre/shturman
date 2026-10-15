@@ -65,6 +65,7 @@ MODULES = (
     "shturman.triage.service",     # разбор входящих моделью вместо «Вам написали» (Р-92)
     "shturman.replies.service",    # продолжение задач после Telegram-решений владельца
     "shturman.remote_mcp",
+    "shturman.summaries",          # утренняя сводка и обзор недели: выбор владельца → плагин Hermes (Р-95)
     "shturman.setup_page.service",  # последним: страница настройки пользуется остальными модулями
 )
 

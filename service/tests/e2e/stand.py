@@ -27,6 +27,9 @@ SHTURMAN_TEST_DSN: база должна быть отдельной тесто�
 подставная модель отвечает готовым выводом (`POST /triage/live?case=…`), прогоняет обход «через 2 часа»
 (`POST /triage/remind`) и говорит, что ушло владельцу (`GET /triage/seen`).
 
+Для пакета 4б (Р-95: «История», «Ответы и доверие», расписание сводок) — маршруты `/pack4b/…` из
+`pack4b_stand.py`: люди, доверенные, разрешения, ответ плагина Hermes о сводках.
+
 Третий порт (порт сервиса + 2) — подставной «дашборд»: пустая страница и service worker на том же
 имени узла, что и страница настройки, но на другом порту. С неё сценарий делает то, что делал бы
 скрипт ассистента на адресе дашборда Hermes: `fetch` к API страницы, чтение `localStorage`,
@@ -59,6 +62,7 @@ from starlette.routing import Route  # noqa: E402
 from telethon import errors  # noqa: E402
 
 import exec_fakes  # noqa: E402
+import pack4b_stand  # noqa: E402 — «История», доверие, сводки (Р-95)
 import openai_fakes  # noqa: E402
 import tg_fakes  # noqa: E402
 from shturman import db, netguard  # noqa: E402
@@ -793,7 +797,8 @@ async def main() -> None:
         Route("/rehearsal/live", rehearsal_live, methods=["POST"]),
         Route("/rehearsal/press", rehearsal_press, methods=["POST"]), Route("/rehearsal/seen", rehearsal_seen),
         Route("/triage/seed", triage_seed, methods=["POST"]), Route("/triage/live", triage_live, methods=["POST"]),
-        Route("/triage/remind", triage_remind, methods=["POST"]), Route("/triage/seen", triage_seen)])
+        Route("/triage/remind", triage_remind, methods=["POST"]), Route("/triage/seen", triage_seen),
+        *pack4b_stand.routes(conn, telegram)])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

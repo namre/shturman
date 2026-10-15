@@ -119,6 +119,70 @@ def hermes_llm_scope() -> Any:
     return _scope_factory()
 
 
+def cron_available() -> bool:
+    """Есть ли в этом Hermes функции расписания, которыми пользуется плагин."""
+    try:
+        import cron.jobs  # noqa: F401
+        import tools.cronjob_tools  # noqa: F401
+    except Exception:  # noqa: BLE001 — другая версия Hermes или запуск вне Hermes
+        return False
+    return True
+
+
+def _cron_call(action: str, **kwargs: Any) -> None:
+    """Штатный инструмент расписания Hermes — тот же, что `hermes cron edit|pause|resume` (hermes_cli/cron.py)."""
+    from tools.cronjob_tools import cronjob
+
+    out = json.loads(cronjob(action=action, **kwargs))
+    if not isinstance(out, dict) or not out.get("success"):
+        raise RuntimeError(f"cron {action} refused")
+
+
+def cron_sync(payload: dict[str, Any]) -> dict[str, Any]:
+    """Задание `hermes.cron` (Р-95): привести задачи сводок к выбору владельца и сообщить, что есть.
+
+    Синхронно, в потоке и в области профиля запуска (`hermes_cron`). Трогает только задачи с именами
+    `shturman:morning-brief` и `shturman:weekly-review` (`shturman_core.summaries`)."""
+    from cron.jobs import list_jobs
+    from hermes_cli.config import get_env_value_prefer_dotenv, read_raw_config
+    from shturman_core import cron_jobs, summaries
+
+    zone = cron_jobs.config_zone(read_raw_config())
+    jobs = list_jobs(include_disabled=True)
+    applied, error = False, None
+    desired = payload.get("desired")
+    if payload.get("apply") is True and isinstance(desired, dict):
+        home = bool((get_env_value_prefer_dotenv("TELEGRAM_HOME_CHANNEL") or "").strip())
+        actions, error = summaries.plan(desired, jobs, can_create=home)
+        for act in actions:
+            try:
+                if act["op"] == "create":
+                    from cron.scheduler import create_job_with_scheduler_registration
+                    create_job_with_scheduler_registration(**act["spec"])
+                elif act["op"] == "schedule":
+                    _cron_call("update", job_id=act["id"], schedule=act["expr"])
+                elif act["op"] == "pause":
+                    _cron_call("pause", job_id=act["id"], reason=summaries.PAUSE_REASON)
+                elif act["op"] == "resume":
+                    _cron_call("resume", job_id=act["id"])
+            except Exception as exc:  # noqa: BLE001 — Hermes не принял; что есть на самом деле — в ответе
+                logger.warning("shturman: расписание сводки не применено (%s, %s)", act["op"], type(exc).__name__)
+                error = "create_failed" if act["op"] == "create" else "update_failed"
+                break
+        applied = error is None
+        jobs = list_jobs(include_disabled=True)
+    out = summaries.report(jobs, zone)
+    out.update(applied=applied, revision=payload.get("revision"))
+    if error:
+        out["error"] = error
+    return out
+
+
+async def hermes_cron(payload: Any) -> dict[str, Any]:
+    async with hermes_llm_scope():
+        return await asyncio.to_thread(cron_sync, dict(payload or {}))
+
+
 class PtbBot:
     """Отправка в Telegram через бота Hermes. Всё — обычным текстом, без разметки:
     в сообщениях есть чужой текст, и разметка позволила бы подделать вид сообщения."""
@@ -292,7 +356,7 @@ class Runtime:
             bot = PtbBot(self)
             self.executor = Executor(self.call, llm=self._llm(), bot=bot, stats=self.stats,
                                      owner=lambda: store.read("owner"), tasks=tuple(AUX_TASKS),
-                                     llm_scope=hermes_llm_scope)
+                                     llm_scope=hermes_llm_scope, cron=hermes_cron if cron_available() else None)
             self.ingest = Ingest(
                 self.call,
                 # Строгое чтение: «не удалось прочитать» не должно выглядеть как «владельца нет».
@@ -305,6 +369,8 @@ class Runtime:
         jobs = {
             "shturman:jobs-bot": lambda: self.executor.run_lane("bot"),
             "shturman:jobs-llm": lambda: self.executor.run_lane("llm"),
+            # расписание сводок по выбору владельца (Р-95): редкий опрос, своя дорожка
+            "shturman:jobs-hermes": lambda: self.executor.run_lane("hermes"),
             "shturman:ingest": lambda: self.ingest.run(),
             "shturman:heartbeat": self._heartbeat,
         }

@@ -68,6 +68,9 @@ async def _apply_enable(conn: asyncpg.Connection, payload: dict[str, Any]) -> co
     await ts.save(conn, s)
     from ..setup_page import audit
     await audit.write_conn(conn, "triage.enable", detail=ts.audit_detail(s, "бот, «Да» под карточкой"))
+    from .. import history
+    await history.record(conn, "triage", "triage", "Разбор входящих включён — подтверждено в боте.",
+                         {"kind": "triage.disable"})
     note = ("Разбор входящих включён. Теперь вместо «Вам написали» на каждое сообщение я пишу только о срочном и "
             f"важном, а о вопросе без ответа напоминаю через {ts.hours(s['remind_minutes'])}. Выключить — "
             f"{words.IN_SETUP_PAGE}, раздел «Уведомления», сразу.")
@@ -94,6 +97,53 @@ async def request_enable(conn: asyncpg.Connection) -> dict[str, Any]:
         f"Выключить — {words.IN_SETUP_PAGE}, раздел «Уведомления», сразу.",
     ])
     return await confirm.request_card(conn, ENABLE, summary, {"enable": True})
+
+
+RULE_FIELDS = ("remind_minutes", *ts.PEOPLE.values(), *ts.CHATS.values(), "important_spheres")
+
+
+async def record_page_change(conn: asyncpg.Connection, before: dict[str, Any], after: dict[str, Any]) -> None:
+    """«История» (Р-95) для изменений со страницы: выключение и правила. В транзакции изменения."""
+    from .. import history
+    if before["enabled"] and not after["enabled"]:
+        await history.record(conn, "triage", "triage", "Разбор входящих выключен.", {"kind": "triage.enable"})
+    changed = {k: before[k] for k in RULE_FIELDS if before.get(k) != after.get(k)}
+    if changed:
+        await history.record(conn, "triage", "triage-rules", "Правила разбора входящих изменены: "
+                             + ts.audit_detail(after, history.via()).split("; через:")[0] + ".",
+                             {"kind": "triage.settings", "payload": {"changes": changed}})
+
+
+async def disable(conn: asyncpg.Connection, *, via_words: str) -> None:
+    """Выключить разбор входящих — ужесточение: сразу (страница; «Вернуть как было» в «Истории»).
+    Начатые разборы снимаются, их сообщения уходят обычным уведомлением."""
+    from ..setup_page import audit
+    async with conn.transaction():
+        await ts.lock(conn)
+        before = await ts.load(conn)
+        if not before["enabled"]:
+            return
+        after = {**before, "enabled": False}
+        await ts.save(conn, after)
+        fallback = await core.switch_off(conn)
+        mod = core.current()
+        if fallback and mod is not None:
+            await mod.fallback(conn, fallback)
+        await record_page_change(conn, before, after)
+        await audit.write_conn(conn, "triage.disable", detail=ts.audit_detail(after, via_words))
+
+
+async def restore_settings(conn: asyncpg.Connection, changes: dict[str, Any]) -> None:
+    """Вернуть правила разбора как были (страница, «История»): точные прежние значения полей."""
+    from ..setup_page import audit
+    clean = ts.validate({k: v for k, v in changes.items() if k in RULE_FIELDS})
+    async with conn.transaction():
+        await ts.lock(conn)
+        before = await ts.load(conn)
+        after = ts.normalize({**before, **clean})
+        await ts.save(conn, after)
+        await record_page_change(conn, before, after)
+        await audit.write_conn(conn, "triage.settings", detail=ts.audit_detail(after, "страница, «Вернуть как было»"))
 
 
 async def pending_enable(conn: asyncpg.Connection) -> dict[str, Any] | None:

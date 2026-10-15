@@ -50,6 +50,23 @@ def via() -> str:
             "telegram.miniapp": "приложение"}.get(principal.action or "", "бот")
 
 
+async def _history_words(conn: asyncpg.Connection, before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    """Что изменилось — для «Истории» (Р-95): имена людей — как в архиве, без номеров."""
+    from .. import history
+    out = []
+    if before["enabled"] != after["enabled"]:
+        out.append("включена" if after["enabled"] else "выключена")
+    for tg_id in sorted(set(after["people"]) - set(before["people"])):
+        out.append("добавлен(а) " + await history.person(conn, tg_id))
+    for tg_id in sorted(set(before["people"]) - set(after["people"])):
+        out.append("убран(а) " + await history.person(conn, tg_id))
+    if before["daily_cap"] != after["daily_cap"]:
+        out.append(f"в сутки — {after['daily_cap']} (было {before['daily_cap']})")
+    if before["pause_seconds"] != after["pause_seconds"]:
+        out.append(f"пауза — {after['pause_seconds']} с (была {before['pause_seconds']} с)")
+    return out or ["без изменений"]
+
+
 @confirm.applier(SETTINGS)
 async def _apply(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
     try:
@@ -67,6 +84,10 @@ async def _apply(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.D
     await rs.save(conn, after)
     if after != before:
         await confirm.tell(conn, "Изменена репетиция ответов:\n" + "\n".join(rs.describe(after)), silent=True)
+        from .. import history
+        changed = {k: before[k] for k in rs.DEFAULTS if before.get(k) != after.get(k)}
+        await history.record(conn, "rehearsal", "rehearsal", "Репетиция ответов: " + "; ".join(
+            await _history_words(conn, before, after)) + ".", {"kind": SETTINGS, "payload": {"changes": changed}})
     source = via()
     mod = core.current()
 

@@ -41,6 +41,7 @@ AUTHORITY = "tests/test_authority.py::"
 CODE_LOGIN = "tests/setup_page/test_code_login.py::"
 TRIAGE = "tests/triage/test_triage_core.py::"
 TRIAGE_PAGE = "tests/triage/test_triage_page.py::"
+PACK4B = "tests/setup_page/test_pack4b.py::"
 MUTATIONS = (
     Mutation("background_owner_context", "src/shturman/authority.py",
              "    context.run(_owner.set, None)", "    # mutation: retain inherited owner context",
@@ -319,6 +320,30 @@ MUTATIONS = (
              "    if False:",
              CODE_LOGIN + "test_managed_bot_has_code_login_off_until_the_owner_presses_in_the_bot",
              database=True),
+    # Пакет 4б (Р-95): из приложения ослабление — только карточкой в бот; «Вернуть как было», если возврат
+    # расширяет, — тоже только карточкой (и со страницы); `owner.widen` применяется только нажатием в боте;
+    # разрешить группу и добавить обращение — ослабления, решает функция применения.
+    Mutation("app_widening_only_card", "src/shturman/history.py",
+             "        try:\n            out = await confirm.apply_narrowing(conn, kind, payload)\n",
+             "        try:\n            out = await confirm.apply_owner(conn, kind, payload)\n",
+             PACK4B + "test_page_widens_at_once_app_only_asks_the_bot", database=True),
+    Mutation("narrowing_is_strict", "src/shturman/confirm.py",
+             "    strict = _unconfirmed.set(True)", "    strict = _unconfirmed.set(False)",
+             PACK4B + "test_page_widens_at_once_app_only_asks_the_bot", database=True),
+    Mutation("revert_widening_only_card", "src/shturman/history.py",
+             "        await confirm.apply_narrowing(conn, kind, payload, quiet=where == \"page\")",
+             "        await confirm.apply_owner(conn, kind, payload)",
+             PACK4B + "test_revert_tightening_at_once_widening_only_in_the_bot", database=True),
+    Mutation("owner_widen_needs_bot_press", "src/shturman/history.py",
+             "    if principal.source != \"telegram\" or principal.action == \"telegram.miniapp\" or not confirm.card_press():",
+             "    if False:",
+             PACK4B + "test_owner_widen_applies_only_under_a_press_in_the_bot", database=True),
+    Mutation("group_scope_is_widening", "src/shturman/outbox/service.py",
+             "    confirm.must_not_widen(data[\"enabled\"] and not was)", "    confirm.must_not_widen(False)",
+             PACK4B + "test_groups_drafting_addressing_autoreply_from_the_page_and_the_app", database=True),
+    Mutation("new_alias_is_widening", "src/shturman/outbox/service.py",
+             "    confirm.must_not_widen(any(a.casefold() not in folded for a in after))", "    confirm.must_not_widen(False)",
+             PACK4B + "test_groups_drafting_addressing_autoreply_from_the_page_and_the_app", database=True),
 )
 
 # Capture actual pytest phases and exception types, rather than treating a

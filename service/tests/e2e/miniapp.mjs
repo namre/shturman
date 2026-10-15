@@ -1040,6 +1040,94 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
   }
 }
 
+// --- 11. Пакет 4б (Р-95): вкладка «История», «Доверие», сводки во вкладке 🔔 ------------------------------
+// «Отозвать» — сразу; «Вернуть как было» ужесточение — сразу; расширение доверия — только карточкой в бот,
+// «Да» под которой в приложении не нажать. Сводки: строка во вкладке 🔔, сразу, плагин применяет.
+{
+  const P4_OUT = process.env.E2E_PACK4B_OUT || OUT;
+  mkdirSync(P4_OUT, { recursive: true });
+  const seen = async () => (await fetch(CONTROL + "/pack4b/seen")).json();
+  const seeded = await (await fetch(CONTROL + "/pack4b/seed", { method: "POST" })).json();
+  check("пакет 4б: стенд засеян", !seeded.error, seeded.error || "");
+  const { ctx, p, errs } = await openApp(390, "light", THEME_LIGHT);
+  await p.click("#tab-history");
+  await p.waitForSelector("#hs-body:not([hidden]) .panel");
+  const grants = await p.$$eval("#hs-body .hs-grant > span:first-child", (n) => n.map((x) => x.textContent));
+  check("приложение, «История»: действующие разрешения — словами, с «Отозвать»",
+        grants.some((t) => t.includes("смета по фасадам") && t.includes("Анна Ким")) && grants.some((t) => t.includes("«Claude»")),
+        grants.join(" | "));
+  const titles = await p.$$eval("#hs-body .hs-title", (n) => n.map((x) => x.textContent));
+  check("приложение, «История»: «Анна Ким — в доверенных» и просьба ассистента о Борисе",
+        titles.includes("Анна Ким — в доверенных.") && titles.some((t) => t.startsWith("Добавить в доверенные: Борис Ли")),
+        titles.join(" | "));
+  await p.screenshot({ path: path.join(P4_OUT, "app-history-390-light.png"), fullPage: true });
+  // отозвать доступ внешней программы — сразу
+  await p.locator(".hs-grant", { hasText: "Claude" }).locator("button", { hasText: "Отозвать" }).click();
+  check("приложение: «Отозвать» — сразу", await waitFor(async () => (await seen()).mcp_active === 0, 8000));
+  // вернуть «в доверенных» (ужесточение) — сразу
+  await p.waitForSelector("#hs-body .hs-item button");
+  await p.locator(".hs-item", { hasText: "Анна Ким — в доверенных." }).locator("button", { hasText: "Вернуть как было" }).click();
+  check("приложение: «Вернуть как было» (убрать доверенного) — сразу",
+        await waitFor(async () => !(await seen()).trusted.includes(5101), 8000));
+  // теперь вернуть удаление — это расширение: только карточка в бот
+  await p.waitForSelector(".hs-item:has-text('больше не в доверенных') button");
+  await p.locator(".hs-item", { hasText: "Анна Ким — больше не в доверенных." }).locator("button", { hasText: "Вернуть как было" }).click();
+  check("приложение: вернуть доверенного — только карточкой в бот, сразу ничего не меняется",
+        await waitFor(async () => { const s = await seen(); return s.widen_pending === 1 && !s.trusted.includes(5101); }, 8000));
+  // вкладка «Доверие»: добавить — карточка, убрать — сразу
+  await p.click("#hs-seg button[data-hs='trust']");
+  await p.waitForSelector("#hs-body .panel h2");
+  await p.fill("#hs-body input[type=search]", "борис");
+  await p.waitForSelector("#hs-body .hs-found button");
+  await p.evaluate(() => { document.getElementById("toast").hidden = true; });
+  await p.screenshot({ path: path.join(P4_OUT, "app-trust-390-light.png"), fullPage: true });
+  await p.click("#hs-body .hs-found button");
+  check("приложение, «Доверие»: «Сделать доверенным» — карточка в бот",
+        await waitFor(async () => (await seen()).widen_pending === 2, 8000));
+  const approvals = await p.evaluate(async () => {
+    const key = sessionStorage.getItem("shturman-app-session");
+    const res = await fetch("../api/app/approvals", { credentials: "omit", headers: { "X-Shturman-App": key } });
+    return (await res.json()).items.filter((i) => i.kind === "action");
+  });
+  const widen = approvals.filter((i) => (i.text || "").includes("вы попросили"));
+  check("приложение, «Согласования»: карточки расширения — без кнопок (подтвердить только в боте)",
+        widen.length === 2 && widen.every((i) => i.actions.length === 0), JSON.stringify(widen.map((i) => i.actions)));
+  // строка сводок во вкладке 🔔
+  await p.click("#tab-notify");
+  await p.waitForSelector("#sm-form:not([hidden])");
+  await p.fill("#sm-morning-time", "07:45");
+  await p.click("#sm-save");
+  check("приложение, 🔔: время сводки — сразу, выбор записан",
+        await waitFor(async () => (await seen()).summaries.choice["morning-brief"].time === "07:45", 8000));
+  await fetch(CONTROL + "/pack4b/plugin", { method: "POST" });
+  check("сводки: плагин применил — совпадает", await waitFor(async () => (await seen()).summaries.state === "in_sync", 8000));
+  await p.click("#tab-history");
+  await p.click("#tab-notify");
+  await p.waitForSelector("#sm-form:not([hidden])");
+  await p.locator("#sm-form").screenshot({ path: path.join(P4_OUT, "app-summaries-390-light.png") });
+  const audit = (await seen()).audit.map((r) => r.action);
+  check("приложение: журнал — app.revoke, app.history_revert, app.replies_request, summaries.schedule",
+        ["app.revoke", "app.history_revert", "app.replies_request", "summaries.schedule"].every((a) => audit.includes(a)),
+        audit.join(", "));
+  check("приложение, «История»: в консоли нет ошибок", realErrors(errs).length === 0, realErrors(errs).join(" | "));
+  await ctx.close();
+  for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark", THEME], [390, "dark", THEME]]) {
+    const tag = `${width}-${scheme}`;
+    const opened = await openApp(width, scheme, theme);
+    await opened.p.click("#tab-history");
+    await opened.p.waitForSelector("#hs-body:not([hidden]) .panel");
+    const wide = await opened.p.evaluate(() => {
+      const out = [...document.querySelectorAll("main button, main select, main input, .tabs button")]
+        .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+      return { wide: document.documentElement.scrollWidth <= window.innerWidth + 1, out };
+    });
+    check(`приложение, «История» ${tag}: страница не шире экрана, кнопки и вкладки не выходят за край`,
+          wide.wide && wide.out === 0, JSON.stringify(wide));
+    await opened.p.screenshot({ path: path.join(P4_OUT, `app-history-${tag}.png`), fullPage: true });
+    await opened.ctx.close();
+  }
+}
+
 await browser.close();
 console.log(failed ? `ИТОГ: ${failed} FAIL` : "ИТОГ: OK");
 process.exit(failed ? 1 : 0);

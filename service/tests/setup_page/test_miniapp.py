@@ -290,7 +290,19 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
         (miniapp.APP_API + "/halt", ["GET"]), (miniapp.APP_API + "/halt", ["POST"]),
         (miniapp.APP_API + "/halt/resume", ["POST"]),
         (miniapp.APP_API + "/rehearsal", ["GET"]), (miniapp.APP_API + "/rehearsal", ["PUT"]),
-        (miniapp.APP_API + "/rehearsal/people", ["GET"])])
+        (miniapp.APP_API + "/rehearsal/people", ["GET"]),
+        # пакет 4б (Р-95, tests/setup_page/test_pack4b.py): «История», доверие — расширение только
+        # карточкой в бот, расписание сводок
+        (miniapp.APP_API + "/history", ["GET"]), (miniapp.APP_API + "/history/{item_id:int}/revert", ["POST"]),
+        (miniapp.APP_API + "/history/grants/{grant_type:str}/{item_id:int}/revoke", ["POST"]),
+        (miniapp.APP_API + "/replies", ["GET"]), (miniapp.APP_API + "/replies/people", ["GET"]),
+        (miniapp.APP_API + "/replies/chats", ["GET"]), (miniapp.APP_API + "/replies/trusted", ["POST"]),
+        (miniapp.APP_API + "/replies/trusted/{tg_user_id:int}", ["DELETE"]),
+        (miniapp.APP_API + "/replies/drafting/{chat_id:int}", ["PUT"]),
+        (miniapp.APP_API + "/replies/autoreply/{account_id:int}", ["PUT"]),
+        (miniapp.APP_API + "/replies/groups", ["POST"]), (miniapp.APP_API + "/replies/groups/{chat_id:int}", ["DELETE"]),
+        (miniapp.APP_API + "/replies/addressing", ["PUT"]),
+        (miniapp.APP_API + "/summaries", ["GET"]), (miniapp.APP_API + "/summaries", ["PUT"])])
     for route in routes:
         if route.path != APP_PATH:
             assert getattr(route.endpoint, "miniapp", False), route.path     # своя обёртка — своя сессия

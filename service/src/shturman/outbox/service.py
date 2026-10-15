@@ -39,7 +39,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
-from .. import bridge, confirm, store
+from .. import bridge, confirm, history, store
 from ..api_core import BadRequest, body, handler, need_int, settle
 from ..app import AppState, state_of
 from ..events import CHAT_EXCLUDED, MESSAGE_CONTENT, MESSAGE_LIVE
@@ -176,6 +176,11 @@ ACCOUNT_DRAFTING = "outbox.account_drafting"
 CHAT_DRAFTING = "outbox.chat_drafting"
 AUTOREPLY = "outbox.autoreply"
 TRUSTED_ADD = "outbox.trusted_add"
+# Р-95: «убрать из доверенных», группы и обращения — тоже через функции применения: так их можно
+# вернуть из «Истории», а ослабление из приложения — только нажатием в боте (`owner.widen`).
+TRUSTED_REMOVE = "outbox.trusted_remove"
+GROUP_SCOPE = "outbox.group_scope"
+ADDRESSING = "outbox.addressing"
 RULE_CREATE = "watch.rule_create"
 RULE_UPDATE = "watch.rule_update"
 RULE_DELETE = "watch.rule_delete"
@@ -195,6 +200,9 @@ async def _apply_policy(conn: asyncpg.Connection, payload: dict[str, Any]) -> No
     note = _changes(before, changes)
     if note:
         await confirm.tell(conn, f"Изменены правила отправки сообщений. {note}", silent=True)
+        changed = {k: v for k, v in changes.items() if before.get(k) != v}
+        await history.record(conn, "policy", "policy", "Правила отправки:\n" + policy.describe_changes(
+            before, changed, policy.LABELS), {"kind": POLICY, "payload": {"changes": {k: before.get(k) for k in changed}}})
 
 
 @confirm.applier(ACCOUNT_DRAFTING)
@@ -212,6 +220,12 @@ async def _apply_account_drafting(conn: asyncpg.Connection, payload: dict[str, A
         """INSERT INTO outbox_accounts (account_id, drafting_default) VALUES ($1, $2)
            ON CONFLICT (account_id) DO UPDATE SET drafting_default = EXCLUDED.drafting_default,
                                                   updated_at = now()""", account_id, value)
+    if current != value:
+        words = {"allow": "можно", "deny": "нельзя", None: "как в общих правилах"}
+        await history.record(
+            conn, "drafting", f"drafting-account:{account_id}",
+            f"Черновики во всех чатах аккаунта «{textlib.one_line(label, 40)}»: {words.get(value, value)}.",
+            {"kind": ACCOUNT_DRAFTING, "payload": {"account_id": account_id, "value": current}})
     await confirm.tell(
         conn, f"Изменены правила отправки сообщений. аккаунт «{textlib.one_line(label, 40)}»: "
               f"черновики по умолчанию — {value or 'как в общих правилах'}", silent=True)
@@ -236,6 +250,10 @@ async def _apply_chat_drafting(conn: asyncpg.Connection, payload: dict[str, Any]
                ON CONFLICT (chat_id) DO UPDATE SET drafting = EXCLUDED.drafting, updated_at = now()""",
             chat_id, value)
     words = {"allow": "разрешены", "deny": "запрещены", "default": "как в общих правилах"}
+    if (current or "default") != value:
+        await history.record(conn, "drafting", f"drafting:{chat_id}",
+                             f"Черновики ответов в чате «{tgt.display_name}»: {words[value]}.",
+                             {"kind": CHAT_DRAFTING, "payload": {"chat_id": chat_id, "value": current or "default"}})
     await confirm.tell(conn, f"Черновики сообщений в чат «{tgt.display_name}»: {words[value]}.", silent=True)
 
 
@@ -371,6 +389,9 @@ async def _apply_autoreply(conn: asyncpg.Connection, payload: dict[str, Any]) ->
                 f"Автоответ доверенным ВКЛЮЧЁН для аккаунта «{name}». Доверенных в списке: {count}. "
                 "Им сервис будет отвечать сам, без вашего подтверждения. Остальным не отвечает."
                 if enabled else f"Автоответ доверенным выключен для аккаунта «{name}».")
+            await history.record(conn, "autoreply", f"autoreply:{account_id}",
+                                 f"Автоответ доверенным для аккаунта «{name}»: " + ("включён." if enabled else "выключен."),
+                                 {"kind": AUTOREPLY, "payload": {"account_id": account_id, "enabled": bool(was)}})
     if payload.get("changes"):
         try:
             changes = autoreply.validate_update(dict(payload["changes"]))
@@ -383,6 +404,10 @@ async def _apply_autoreply(conn: asyncpg.Connection, payload: dict[str, Any]) ->
         diff = _changes(before, changes)
         if diff:
             notes.append(f"Изменены настройки автоответа. {diff}")
+            changed = {k: v for k, v in changes.items() if before.get(k) != v}
+            await history.record(conn, "autoreply", "autoreply-settings", "Настройки автоответа:\n"
+                                 + policy.describe_changes(before, changed, autoreply.LABELS),
+                                 {"kind": AUTOREPLY, "payload": {"changes": {k: before.get(k) for k in changed}}})
     for note in notes:
         await confirm.tell(conn, note)
 
@@ -518,7 +543,26 @@ async def _apply_trusted_add(conn: asyncpg.Connection, payload: dict[str, Any]) 
         await confirm.tell(
             conn, f"В список доверенных добавлен идентификатор {tg_user_id}{known}. "
                   f"Всего доверенных: {count}. Если автоответ включён, этому человеку сервис отвечает сам.")
+        await history.record(conn, "trusted", f"trusted:{tg_user_id}",
+                             f"{await history.person(conn, tg_user_id)} — в доверенных.",
+                             {"kind": TRUSTED_REMOVE, "payload": {"tg_user_id": tg_user_id}})
     return confirm.Done(note=f"Всего доверенных: {count}.", result=added is not None)
+
+
+@confirm.applier(TRUSTED_REMOVE)
+async def _apply_trusted_remove(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    """Убрать из доверенных — ужесточение: сразу, откуда бы ни попросили (Р-95: «Вернуть как было»,
+    кнопка в боте, страница, приложение). Внутренний API — тем же путём (`remove_trusted`)."""
+    tg_user_id = _trusted_id(payload.get("tg_user_id"))
+    confirm.must_not_widen(False)
+    row = await conn.fetchrow("DELETE FROM outbox_trusted WHERE tg_user_id = $1 RETURNING tg_user_id, note", tg_user_id)
+    count = await conn.fetchval("SELECT count(*) FROM outbox_trusted")
+    if row is not None:
+        await confirm.tell(conn, f"Из списка доверенных убран идентификатор {tg_user_id}. Осталось: {count}.")
+        await history.record(conn, "trusted", f"trusted:{tg_user_id}",
+                             f"{await history.person(conn, tg_user_id)} — больше не в доверенных.",
+                             {"kind": TRUSTED_ADD, "payload": {"tg_user_id": tg_user_id, "note": row["note"]}})
+    return confirm.Done(note=f"Осталось доверенных: {count}.", result=row is not None)
 
 
 @handler
@@ -527,14 +571,77 @@ async def remove_trusted(request: Request) -> JSONResponse:
     if raw is None:
         raw = (await body(request)).get("tg_user_id")
     tg_user_id = _trusted_id(raw)
-    async with _pool(request).acquire() as conn, conn.transaction():
-        removed = await conn.fetchval(
-            "DELETE FROM outbox_trusted WHERE tg_user_id = $1 RETURNING tg_user_id", tg_user_id)
-        if removed is not None:
-            count = await conn.fetchval("SELECT count(*) FROM outbox_trusted")
-            await bridge.notify_owner(
-                conn, f"Из списка доверенных убран идентификатор {tg_user_id}. Осталось: {count}.")
-        return JSONResponse({**await _trusted_view(conn), "removed": removed is not None})
+    async with _pool(request).acquire() as conn:
+        _, removed = await settle(conn, TRUSTED_REMOVE, {"tg_user_id": tg_user_id}, summary=None)
+        return JSONResponse({**await _trusted_view(conn), "removed": bool(removed)})
+
+
+# --- группы и обращения (Р-95): раньше — только командами бота, теперь и со страницы и из приложения ---
+
+async def _scope_target(conn: asyncpg.Connection, chat_id: int, topic_tg_id: int | None) -> tuple[Any, str]:
+    from . import scopes
+    tgt = await policy.target(conn, chat_id)
+    if tgt is None or tgt.account_role != "assistant" or not scopes.is_group(tgt) or tgt.excluded:
+        raise confirm.Refused("Нужна группа аккаунта помощника, которую сервис читает: аккаунт владельца только читает.",
+                              400, "not_helper_group")
+    topic = f", тема № {topic_tg_id}" if topic_tg_id else ""
+    return tgt, f"«{tgt.display_name}»{topic}"
+
+
+@confirm.applier(GROUP_SCOPE)
+async def _apply_group_scope(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    """Разрешить или запретить ассистенту отвечать в группе (или теме) аккаунта помощника.
+    Разрешить — ослабление (со страницы — сам владелец, из приложения — только нажатием в боте),
+    запретить — сразу."""
+    from . import scopes
+    try:
+        data = scopes.validate_scope({k: payload.get(k) for k in ("chat_id", "topic_tg_id", "enabled")
+                                      if k in payload})
+    except ValueError as exc:
+        raise confirm.Refused(str(exc), 400) from None
+    tgt, where = await _scope_target(conn, data["chat_id"], data["topic_tg_id"])
+    await _lock(conn, f"outbox.scope:{tgt.account_id}:{tgt.peer_id}:{data['topic_tg_id'] or 0}")
+    was = await conn.fetchval(
+        "SELECT enabled FROM outbox_reply_scopes WHERE account_id = $1 AND peer_id = $2 AND topic_tg_id = $3",
+        tgt.account_id, tgt.peer_id, data["topic_tg_id"] or 0)
+    confirm.must_not_widen(data["enabled"] and not was)
+    if data["enabled"]:
+        await scopes.put(conn, data["chat_id"], topic_tg_id=data["topic_tg_id"], enabled=True)
+    else:
+        await conn.execute("DELETE FROM outbox_reply_scopes WHERE account_id = $1 AND peer_id = $2 AND topic_tg_id = $3",
+                           tgt.account_id, tgt.peer_id, data["topic_tg_id"] or 0)
+    if bool(was) != data["enabled"]:
+        await confirm.tell(conn, (f"Ассистенту можно отвечать в группе {where}." if data["enabled"] else
+                                  f"В группе {where} ассистент больше не отвечает."), silent=True)
+        await history.record(conn, "groups", f"group:{data['chat_id']}:{data['topic_tg_id'] or 0}",
+                             (f"Ответы в группе {where}: разрешены." if data["enabled"] else
+                              f"Ответы в группе {where}: запрещены."),
+                             {"kind": GROUP_SCOPE, "payload": {"chat_id": data["chat_id"],
+                                                               "topic_tg_id": data["topic_tg_id"],
+                                                               "enabled": bool(was)}})
+    return confirm.Done(result={"changed": bool(was) != data["enabled"]})
+
+
+@confirm.applier(ADDRESSING)
+async def _apply_addressing(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    """Обращения к ассистенту в группах («Штурман, …»). Новое обращение — ослабление: ассистент
+    откликается чаще; убрать — сразу."""
+    from . import scopes
+    try:
+        after = scopes.validate_addressing({"aliases": payload.get("aliases")})["aliases"]
+    except ValueError as exc:
+        raise confirm.Refused(str(exc), 400) from None
+    await _lock(conn, scopes.SETTINGS_KEY)
+    before = (await scopes.addressing(conn))["aliases"]
+    folded = {a.casefold() for a in before}
+    confirm.must_not_widen(any(a.casefold() not in folded for a in after))
+    await scopes.update_addressing(conn, {"aliases": after})
+    if before != after:
+        said = ", ".join(f"«{a}»" for a in after) or "нет"
+        await confirm.tell(conn, f"Обращения к ассистенту в группах: {said}.", silent=True)
+        await history.record(conn, "addressing", "addressing", f"Обращения к ассистенту в группах: {said}.",
+                             {"kind": ADDRESSING, "payload": {"aliases": before}})
+    return confirm.Done(result={"aliases": after})
 
 
 # --- наблюдатель ---
