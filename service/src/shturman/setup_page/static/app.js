@@ -152,6 +152,57 @@
     if (remember) {
       try { sessionStorage.setItem(THEME_NAME, JSON.stringify(theme)); } catch (e) { /* не страшно */ }
     }
+    fixContrast();
+  }
+
+  /* Контраст не ниже 4,5:1 (П5). Цвета темы Telegram бывают бледнее: подсказка #8e8e93 на белом — 3,3:1,
+   * синий #007aff — 4,0:1 и как текст, и как фон кнопки под белой надписью. Поправка — сдвиг того же цвета
+   * к чёрному (на светлом фоне) или к белому (на тёмном), пока контраст не станет достаточным; оттенок
+   * остаётся темы. Цвет, которому хватает контраста, не трогается. */
+  function rgbOf(value) {
+    var s = String(value || "").trim(), m;
+    if ((m = /^#([0-9a-f]{6})$/i.exec(s))) return [0, 2, 4].map(function (i) { return parseInt(m[1].substr(i, 2), 16); });
+    if ((m = /^rgba?\(([^)]+)\)$/i.exec(s))) {
+      var parts = m[1].split(/[\s,\/]+/).filter(Boolean).map(Number);
+      if (parts.length >= 3 && (parts.length < 4 || parts[3] > 0.5)) return parts.slice(0, 3);
+    }
+    return null;
+  }
+  function luminance(c) {
+    var f = function (v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2]);
+  }
+  function ratio(a, b) { var x = luminance(a), y = luminance(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+  function hex(c) { return "#" + c.map(function (v) { return ("0" + Math.round(Math.max(0, Math.min(255, v))).toString(16)).slice(-2); }).join(""); }
+  // fg против всех фонов: смешиваем с чёрным или белым шагами по 4 %, пока хуже всего не станет ≥ need
+  // (берём 4,6 — с запасом на округление цвета).
+  function readable(fg, grounds, need) {
+    var worst = function (c) { return Math.min.apply(null, grounds.map(function (g) { return ratio(c, g); })); };
+    if (worst(fg) >= need) return null;
+    var dark = grounds.every(function (g) { return luminance(g) < 0.18; }), target = dark ? [255, 255, 255] : [0, 0, 0];
+    for (var k = 1; k <= 25; k++) {
+      var c = fg.map(function (v, i) { return v + (target[i] - v) * k * 0.04; });
+      if (worst(c) >= need) return hex(c);
+    }
+    return hex(target);
+  }
+  function fixContrast() {
+    var root = document.documentElement, style = root.style;
+    ["--hint-fix", "--accent-fix", "--button-fix", "--danger-fix"].forEach(function (n) { style.removeProperty(n); });
+    var cs = getComputedStyle(root);
+    var get = function (name) { return rgbOf(cs.getPropertyValue(name)); };
+    var bg = get("--bg"), section = get("--section"), text = get("--button-text");
+    if (!bg || !section) return;
+    var grounds = [bg, section];
+    var hint = get("--hint-src"), accent = get("--accent-src"), danger = get("--danger-src"), button = get("--button-src");
+    var fixed = {
+      "--hint-fix": hint && readable(hint, grounds, 4.6),
+      "--accent-fix": accent && readable(accent, grounds, 4.6),
+      "--danger-fix": danger && readable(danger, grounds, 4.6),
+      // кнопка — фон под надписью цвета button_text: двигаем фон, а не надпись
+      "--button-fix": button && text && readable(button, [text], 4.6)
+    };
+    Object.keys(fixed).forEach(function (n) { if (fixed[n]) style.setProperty(n, fixed[n]); });
   }
 
   (function () {
@@ -464,10 +515,10 @@
   // список — из базы сервиса (обновить из Telegram — только кнопкой «Обновить список из Telegram»),
   // чаты включаются по одному, исключение не стирает уже сохранённое.
 
-  var FIRST_CHATS = 20, MORE_CHATS = 30;
+  var FIRST_CHATS = 20, MORE_CHATS = 20;           // та же порция, что на странице (С11)
   var KIND_NAMES = { personal: "личный", group: "группа", channel: "канал" };
   var chats = {
-    accounts: [], account: null, mine: null, items: [], total: 0, enabledTotal: 0, loaded: true, age: null,
+    accounts: [], account: null, mine: null, items: [], total: 0, enabledTotal: 0, dialogsTotal: null, loaded: true, age: null,
     loading: false, key: "", opened: false, depthFor: null,
     load: null, poll: null, tick: null, busy: 0     // фоновая загрузка списка: ход, опрос, отсчёт, сохранения
   };
@@ -666,7 +717,8 @@
     if (!(chats.load && chats.load.running) || tab !== "chats") return;
     chats.poll = setTimeout(function () {
       chats.poll = null;
-      if (chats.busy > 0 || chats.loading || document.visibilityState !== "visible") { schedulePoll(); return; }
+      if (chats.busy > 0 || chats.loading || document.visibilityState !== "visible" ||
+          document.querySelector("#screen-chats .confirm, #screen-chats .pick, #screen-chats .folder-pick")) { schedulePoll(); return; }
       loadDialogs(true, false, true);
     }, LOAD_POLL);
   }
@@ -708,6 +760,7 @@
       chats.items = reset ? (got.data.items || []) : chats.items.concat(got.data.items || []);
       chats.total = got.data.total || 0;
       chats.enabledTotal = got.data.enabled_total || 0;
+      if (typeof got.data.dialogs_total === "number") chats.dialogsTotal = got.data.dialogs_total;
       if (!polling) chatsStatus("", "");
       drawChats();
       drawLoad();
@@ -732,8 +785,11 @@
   }
 
   function drawCounter() {
-    var n = chats.enabledTotal;
-    var words = "Выбрано для чтения: " + n + " " + plural(n, "чат", "чата", "чатов") + ".";
+    var n = chats.enabledTotal, a = currentAccount();
+    // «Читается 38 чатов из 4 158 в вашем Telegram» — те же слова, что на странице (С11).
+    var words = "Читается " + number(n) + " " + plural(n, "чат", "чата", "чатов") +
+      (chats.loaded && chats.dialogsTotal !== null ? " из " + number(chats.dialogsTotal) +
+        (a && a.role === "assistant" ? " у помощника в Telegram" : " в вашем Telegram") : "") + ".";
     if (chats.loaded && $("chats-layout").value) words += " Разделов: " + sections.list.length + ".";
     else if (chats.loaded) words += " Показано " + number(chats.items.length) + " из " + number(chats.total) + ".";
     if (chats.loaded && chats.age !== null && !(chats.load && chats.load.running)) {
@@ -914,7 +970,7 @@
   // сферы, активность, вид — со счётчиком «читается X из Y». Отличие от страницы: «Включить все» здесь
   // нет (Р-80 — включать чтение из приложения можно только по одному чату), «Выключить все» есть, и
   // о нём бот согласований пришлёт сообщение.
-  var SECTION_FIRST = 20, SECTION_MORE = 30;
+  var SECTION_FIRST = 20, SECTION_MORE = 20;
   var EMPTY_LAYOUT = {
     folders: "В Telegram нет папок — или список ещё не обновлялся из Telegram.",
     spheres: "Сфер пока нет. Заведите их на вкладке «Сферы»."
@@ -1070,17 +1126,10 @@
       var off = button("secondary", "Выключить все (" + number(sec.enabled) + ")", function () { disableSection(sec, off); });
       actions.appendChild(off);
     }
-    if (folderId !== null) {
-      var made = (sec.spheres || [])[0];
-      actions.appendChild(button("secondary", made ? "Дополнить «" + made.title + "»" : "Сделать сферу", function () {
-        makeFromFolder(chats.account, folderId, this, function () { loadDialogs(true); });
-      }));
-    }
     if (actions.firstChild) body.appendChild(actions);
     if (folderId !== null) {
-      var linked = (sec.spheres || []).filter(function (x) { return x.propose; })[0];
-      if (linked) body.appendChild(el("p", "sect-note", "Новые чаты папки предлагаются в сферу «" + linked.title + "»."));
-      else if (sph.list.length) body.appendChild(linkRow(chats.account, folderId, sec.title, (sec.spheres || [])[0], function () { loadDialogs(true); }));
+      body.appendChild(folderLinkTools({ account_id: chats.account, folder_id: folderId, title: sec.title, spheres: sec.spheres || [] },
+                                       function () { loadDialogs(true); }));
     }
     var got = sections.items[sec.id];
     if (!got) { body.appendChild(el("p", "sect-note", "Загружаю…")); return; }
@@ -1104,17 +1153,79 @@
     }
   }
 
-  function linkRow(account, folderId, folderTitle, made, done) {
-    var row = el("div", "sect-link");
-    var select = el("select");
-    select.setAttribute("aria-label", "Сфера для новых чатов папки «" + folderTitle + "»");
-    sph.list.forEach(function (s) { var o = el("option", null, s.title); o.value = String(s.id); select.appendChild(o); });
-    if (made) select.value = String(made.id);
-    row.appendChild(select);
-    row.appendChild(button("secondary", "Предлагать новые", function () {
-      linkFolder(Number(select.value), account, folderId, true, this, done);
+  /* Папка Telegram и сфера (С12) — как на странице (setup.js: folderLinkTools): одна кнопка «Связать со
+   * сферой…»; внутри — «Новая сфера из папки» или одна из ваших (по умолчанию ничего: «Выберите сферу…») и
+   * флажок «Предлагать новые чаты папки». */
+  function folderLinkTools(f, done) {
+    var made = (f.spheres || [])[0];
+    var linked = (f.spheres || []).filter(function (x) { return x.propose; })[0];
+    var box = el("div", "folder-link");
+    if (made) box.appendChild(el("p", "sect-note", "Связана со сферой «" + made.title + "»" + (linked ? ", новые чаты папки предлагаются." : ".")));
+    var actions = el("div", "actions");
+    var open = button("secondary", "Связать со сферой…", function () {
+      var old = box.querySelector(".folder-pick");
+      if (old) { box.removeChild(old); open.setAttribute("aria-expanded", "false"); pickClosed(); return; }
+      open.setAttribute("aria-expanded", "true");
+      var pick = el("div", "pick folder-pick");
+      var select = el("select");
+      select.setAttribute("aria-label", "Сфера для чатов папки «" + f.title + "»");
+      var first = el("option", null, "Выберите сферу…"); first.value = ""; select.appendChild(first);
+      if (!made) { var fresh = el("option", null, "Новая сфера «" + f.title + "» из папки"); fresh.value = "new"; select.appendChild(fresh); }
+      sph.list.forEach(function (s) { var o = el("option", null, s.title); o.value = String(s.id); select.appendChild(o); });
+      select.value = "";
+      pick.appendChild(select);
+      var label = el("label", "check");
+      var propose = el("input"); propose.type = "checkbox"; propose.checked = true;
+      label.appendChild(propose);
+      label.appendChild(el("span", null, "Предлагать новые чаты папки — сами они в сферу не попадут"));
+      pick.appendChild(label);
+      var row = el("div", "actions");
+      var go = button("primary", "Связать", function () {
+        linkWith(f, select.value, propose.checked, go, function () {
+          if (pick.parentNode) box.removeChild(pick);
+          open.setAttribute("aria-expanded", "false");
+          pickClosed();
+          if (done) done();
+        });
+      });
+      go.disabled = true;
+      select.addEventListener("change", function () { go.disabled = !select.value; });
+      row.appendChild(go);
+      row.appendChild(button("secondary", "Отмена", function () { box.removeChild(pick); open.setAttribute("aria-expanded", "false"); open.focus(); pickClosed(); }));
+      pick.appendChild(row);
+      box.appendChild(pick);
+      select.focus();
+    });
+    open.setAttribute("aria-expanded", "false");
+    actions.appendChild(open);
+    if (linked) actions.appendChild(button("secondary", "Не предлагать новые", function () {
+      linkFolder(linked.id, f.account_id, f.folder_id, false, this, done);
     }));
-    return row;
+    box.appendChild(actions);
+    return box;
+  }
+
+  function linkWith(f, value, propose, b, done) {
+    var body = { account_id: f.account_id, folder_id: f.folder_id };
+    if (value !== "new") body.sphere_id = Number(value);
+    b.disabled = true;
+    request("POST", "spheres/folders/make", body).then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) { b.disabled = false; toast(got.data.error || "Не получилось."); return; }
+      var sphere = got.data.sphere, already = (f.spheres || []).some(function (x) { return x.id === sphere.id && x.propose; });
+      var said = (got.data.created ? "Сфера «" + sphere.title + "» заведена" : "Папка связана со сферой «" + sphere.title + "»") +
+                 ": добавлено чатов — " + got.data.added + ".";
+      var next = propose && !already
+        ? request("POST", "spheres/" + sphere.id + "/folders", { account_id: f.account_id, folder_id: f.folder_id, link: true })
+        : Promise.resolve(null);
+      return next.then(function (x) {
+        b.disabled = false;
+        toast(x && x.status !== 200 ? said + " Предлагать новые не получилось." : said + (propose ? " Новые чаты папки будут предлагаться." : ""));
+        sph.loaded = false;
+        refreshSphereList();
+        if (done) done();
+      });
+    }, function () { b.disabled = false; toast("Нет связи с сервером."); });
   }
 
   function spherePicker(item, row) {
@@ -1179,20 +1290,6 @@
     actions.appendChild(button("secondary", "Не предлагать", function () { decide(false, this); }));
     box.appendChild(actions);
     return box;
-  }
-
-  function makeFromFolder(account, folderId, b, done) {
-    b.disabled = true;
-    request("POST", "spheres/folders/make", { account_id: account, folder_id: folderId }).then(function (got) {
-      if (got.status === 401) { sessionLost(got.data); return; }
-      b.disabled = false;
-      if (got.status !== 200) { toast(got.data.error || "Не получилось."); return; }
-      toast((got.data.created ? "Сфера «" + got.data.sphere.title + "» заведена" : "Сфера «" + got.data.sphere.title + "» дополнена") +
-            ": добавлено чатов — " + got.data.added + ".");
-      sph.loaded = false;
-      refreshSphereList();
-      if (done) done();
-    }, function () { b.disabled = false; toast("Нет связи с сервером."); });
   }
 
   function linkFolder(sphereId, account, folderId, link, b, done) {
@@ -1267,10 +1364,20 @@
     clear(list);
     show("sph-empty", !data.spheres.length);
     data.spheres.forEach(function (s, i) { list.appendChild(sphereItem(s, i, data.spheres)); });
+    drawFolders();
+  }
+
+  // Открыт выбор «Связать со сферой…» — папки не перерисовываем у владельца под рукой; перерисуем, когда закроет.
+  var foldersLater = false;
+  function drawFolders() {
     var folders = $("sph-folders");
+    if (folders.querySelector(".folder-pick")) { foldersLater = true; return; }
     clear(folders);
     show("sph-folders-empty", !sph.folders.length);
     sph.folders.forEach(function (f) { folders.appendChild(folderItem(f)); });
+  }
+  function pickClosed() {
+    if (foldersLater) { foldersLater = false; drawFolders(); }
   }
 
   function changeSphere(method, path, body, b, message) {
@@ -1388,21 +1495,10 @@
   function folderItem(f) {
     var li = el("li", "sph");
     li.appendChild(el("div", "sph-name", (f.emoticon ? f.emoticon + " " : "") + f.title));
-    var made = (f.spheres || [])[0];
-    var linked = (f.spheres || []).filter(function (x) { return x.propose; })[0];
     var meta = f.count + " " + plural(f.count, "чат", "чата", "чатов") + (f.account_role === "assistant" ? " · аккаунт помощника" : "");
-    if (made) meta += " · сфера «" + made.title + "»" + (linked ? ", новые предлагаются" : "");
     li.appendChild(el("div", "sph-meta", meta));
     (f.notes || []).forEach(function (n) { li.appendChild(el("div", "sect-note", n)); });
-    var actions = el("div", "actions");
-    actions.appendChild(button("secondary", made ? "Дополнить «" + made.title + "»" : "Сделать сферу", function () {
-      makeFromFolder(f.account_id, f.folder_id, this, function () { loadSpheres(true); });
-    }));
-    if (linked) actions.appendChild(button("secondary", "Не предлагать новые", function () {
-      linkFolder(linked.id, f.account_id, f.folder_id, false, this, function () { loadSpheres(true); });
-    }));
-    li.appendChild(actions);
-    if (!linked && sph.list.length) li.appendChild(linkRow(f.account_id, f.folder_id, f.title, made, function () { loadSpheres(true); }));
+    li.appendChild(folderLinkTools(f, function () { loadSpheres(true); }));
     return li;
   }
 
