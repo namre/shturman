@@ -221,7 +221,7 @@ async def test_usage_limit_during_the_probe_still_connects_and_says_so(stand, co
 async def test_env_key_locks_the_subscription(stand, conn, openai):
     s = await opened(stand, conn, llm_api_key="sk-env-key", llm_model="gpt-env", locked=frozenset({ss.LLM_API_KEY}))
     sub = (await s.page.get("/state")).json()["llm"]["subscription"]
-    assert sub["available"] is False and "SHTURMAN_LLM_API_KEY" in sub["locked_text"]
+    assert sub["available"] is False and "задан в настройках сервера" in sub["locked_text"] and "SHTURMAN_" not in sub["locked_text"]
     got = await s.page.post("/llm/chatgpt/start", {})
     assert got.status_code == 422 and got.json()["code"] == "locked" and not openai.authorize_params
 

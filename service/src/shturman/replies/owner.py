@@ -67,26 +67,29 @@ async def handle_command(conn: Any, state: Any, text: str, user_id: int) -> dict
         return {'text': 'Решение доступно только владельцу в управляющем боте.'}
     parts = text.split(maxsplit=3)
     if parts and parts[0].split('@')[0] == '/replytasks':
-        rows = await conn.fetch("SELECT id,chat_id,status,error_code FROM reply_tasks ORDER BY id DESC LIMIT 20")
-        return {'text': '\n'.join(f"№ {r['id']} · чат {r['chat_id']} · {r['status']}" for r in rows) or 'Задач нет.'}
+        from ..executor import owner_views
+        return {'text': await owner_views.reply_tasks_text(conn)}
     if len(parts) < 3 or not parts[1].isascii() or not parts[1].isdigit() or len(parts[1]) > 18:
-        return {'text': 'Команды: /replytasks; /replytask ID answer <ответ>; /replytask ID cancel.'}
+        return {'text': 'Так: /replytask номер answer ваш ответ — ответить ассистенту; '
+                        '/replytask номер cancel — отменить. Номера — в /replytasks.'}
     task = await workflow.get(conn, int(parts[1]), lock=True)
     if task is None or task['status'] in workflow.TERMINAL:
-        return {'text': 'Задача недоступна.'}
+        return {'text': f'Ответа на сообщение № {parts[1]} нет или он уже завершён. Список — /replytasks.'}
     if parts[2] == 'cancel':
         await workflow.stop(conn, task['id'], 'cancelled', 'owner_cancelled')
-        return {'text': 'Задача отменена.'}
+        return {'text': f'Ответ на сообщение № {task["id"]} отменён: ассистент его больше не готовит. '
+                        'Нужен снова — попросите ассистента.'}
     if parts[2] != 'answer' or len(parts) != 4 or task['status'] != 'waiting_owner' \
             or not parts[3].strip() or len(parts[3]) > 2000:
-        return {'text': 'Ответ нужен только задаче waiting_owner: /replytask ID answer <до 2000 знаков>.'}
+        return {'text': 'Ответить можно, только когда ассистент задал вопрос (в /replytasks — «ассистент ждёт '
+                        'вашего уточнения»). Так: /replytask номер answer ваш ответ — до 2000 знаков.'}
     if not await workflow.valid(conn, state, task):
         await workflow.stop(conn, task['id'], 'cancelled', 'context_changed')
-        return {'text': 'Контекст изменился; задача закрыта.'}
+        return {'text': 'Переписка изменилась, пока ассистент ждал: этот ответ закрыт.'}
     answer = parts[3].strip()
     await conn.execute('UPDATE reply_tasks SET owner_answer=$2,owner_decided_by=$3,owner_decided_at=now(),'
                        'requires_approval=true WHERE id=$1', task['id'], answer, user_id)
     await workflow.record_owner_resume(conn, task['id'])
     task.update(owner_answer=answer, requires_approval=True)
     await workflow.queue(conn, task)
-    return {'text': 'Та же задача продолжена. Готовый ответ будет отдельным черновиком.'}
+    return {'text': 'Спасибо, ассистент продолжает. Готовый ответ придёт отдельным черновиком.'}

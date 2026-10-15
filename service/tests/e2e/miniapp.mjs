@@ -96,20 +96,24 @@ check("в списке — черновик, подтверждение дейс
       JSON.stringify(kinds) === JSON.stringify(["Подтверждение действия", "Страница памяти", "Черновик ответа"]),
       JSON.stringify(kinds));
 const draft = cards.find((c) => c.kind === "Черновик ответа");
-check("черновик: адресат, текст дословно, кнопки как в боте (без «Изменить»)",
-      draft && draft.text.includes("Кому: Иван Петров") && draft.text.includes("Смету пришлю в пятницу.\nС уважением.")
-        && JSON.stringify(draft.buttons) === JSON.stringify(["Отправить", "Отклонить"]));
+check("черновик: первой строкой — кому и от чьего имени, текст дословно",
+      draft && draft.text.includes("Ответ: Иван Петров (личный чат) · от ") && draft.text.includes("Смету пришлю в пятницу.\nС уважением."),
+      draft && draft.text.slice(0, 200));
+// П2: отправка выключена — вместо «Отправить» и «Отклонить» одна «Понятно» (то же действие, что «Отклонить»)
+check("черновик при выключенной отправке: одна кнопка «Понятно», «Отправить» нет",
+      draft && JSON.stringify(draft.buttons) === JSON.stringify(["Понятно"]), JSON.stringify(draft && draft.buttons));
 check("предупреждение: отправка на сервере выключена", await page.isVisible("#sending-off"));
 await page.screenshot({ path: path.join(OUT, (process.env.E2E_SHOT_PREFIX || "") + "approvals-phone-dark.png"), fullPage: true });
 const wide = await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
 check("страница не шире экрана телефона", wide);
 
-// «Отправить» при выключенной отправке — ответ как в боте, черновик остаётся
-await page.click(".card:has(.kind:text('Черновик ответа')) button:text('Отправить')");
-await page.waitForSelector("#toast:not([hidden])");
-const sendToast = await page.textContent("#toast");
-check("«Отправить» при выключенной отправке: «Пока нельзя», черновик ждёт",
-      sendToast.startsWith("Пока нельзя") && (await control("/state")).draft === "pending", sendToast);
+await page.locator(".card:has(.kind:text('Черновик ответа'))").screenshot({ path: path.join(OUT, (process.env.E2E_SHOT_PREFIX || "") + "draft-sending-off-phone-dark.png") });
+// «Понятно» снимает черновик: ничего не отправлено, пункт ушёл — то же, что «Отклонить» в боте
+await page.click(".card:has(.kind:text('Черновик ответа')) button:text('Понятно')");
+await page.waitForFunction(() => ![...document.querySelectorAll(".card .kind")].some((n) => n.textContent === "Черновик ответа"));
+const seenToast = await page.textContent("#toast");
+check("«Понятно»: черновик снят без отправки, пункт исчез",
+      seenToast.includes("ничего не отправлено") && (await control("/state")).draft === "rejected", seenToast);
 
 // «Нет» под подтверждением действия — действие отклонено, пункт ушёл
 await page.click(".card:has(.kind:text('Подтверждение действия')) button:text('Нет')");
@@ -120,11 +124,11 @@ check("решение в приложении: действие отклонен
 // перезагрузка (так Telegram Web перезагружает рамку) — вход сохраняется
 await page.reload();
 await page.waitForSelector("#screen-approvals:not([hidden])");
-check("после перезагрузки вход на месте", (await page.$$(".card")).length === 2);
+check("после перезагрузки вход на месте", (await page.$$(".card")).length === 1);
 
 // страница памяти — «Завести страницу»
 await page.click(".card:has(.kind:text('Страница памяти')) button:text('Завести страницу')");
-await page.waitForFunction(() => document.querySelectorAll(".card").length === 1);
+await page.waitForFunction(() => document.querySelectorAll(".card").length === 0);
 state = await control("/state");
 check("страница о человеке заведена тем же обработчиком, что под сводкой", state.page === "accepted", state.page);
 
@@ -196,7 +200,7 @@ const RAW = [
   [/\b(None|null|undefined|NaN|true|false)\b/, "служебное значение"], [/[{}]|\[\s*["\d]/, "скобки словаря или списка"],
   [/"[a-z_]+"\s*:/, "ключ JSON"],
 ];
-const ALL_KINDS = ["Задача ответа", "Подтверждение действия", "Скрытое сообщение", "Обязательство", "Факт о вас",
+const ALL_KINDS = ["Вопрос ассистента", "Подтверждение действия", "Скрытое сообщение", "Договорённость", "Факт о вас",
                    "Страница памяти", "Проект", "Черновик ответа"];
 
 async function openApp(width, scheme, theme) {
@@ -418,7 +422,7 @@ async function layoutOk(p) {
   check("«Чаты»: список открылся из базы сервиса, без запроса к Telegram",
         JSON.stringify(seen.dialog_requests) === JSON.stringify(before.dialog_requests), JSON.stringify(seen.dialog_requests));
   const tabs = await p.$$eval("#chats-accounts button", (b) => b.map((x) => [x.textContent, x.getAttribute("aria-selected")]));
-  check("«Чаты»: два аккаунта, выбран ваш (способ «как вы»)",
+  check("«Чаты»: два аккаунта, выбран ваш (способ «Через ваш аккаунт»)",
         tabs.length === 2 && tabs[0][0].startsWith("Ваш") && tabs[0][1] === "true", JSON.stringify(tabs));
   let rows = await rowsOf(p);
   const counter = await p.textContent("#chats-counter");
@@ -577,7 +581,7 @@ async function layoutOk(p) {
   await p.click("#chats-accounts button:nth-child(2)");
   await p.waitForSelector("#chats-offline:not([hidden])").catch(() => {});
   check("«Чаты»: аккаунт на паузе — «сейчас не подключён»", await p.isVisible("#chats-offline")
-        && (await p.textContent("#chats-offline")).includes("странице «Переписка»"));
+        && (await p.textContent("#chats-offline")).includes("в «Настройках Штурмана»"));
   await p.screenshot({ path: path.join(OUT, `${SHOT}chats-offline-390-light.png`), fullPage: false });
   await chatsControl("/chats/resume?role=assistant");
   await p.click("#chats-offline-retry");
@@ -603,9 +607,9 @@ for (const [name, status, body] of [["none", 200, { accounts: [], mine: null }],
   await p.click("#tab-chats");
   await p.waitForSelector(`#chats-${name}:not([hidden])`).catch(() => {});
   const text = await p.textContent(`#chats-${name}`);
-  check(name === "none" ? "«Чаты»: аккаунта нет — «войдите на странице «Переписка»»"
+  check(name === "none" ? "«Чаты»: аккаунта нет — «войдите в «Настройках Штурмана»»"
                         : "«Чаты»: сбой сервера — понятный текст и «Повторить»",
-        await p.isVisible(`#chats-${name}`) && (name === "none" ? text.includes("странице «Переписка»") : text.includes("Повторить")),
+        await p.isVisible(`#chats-${name}`) && (name === "none" ? text.includes("в «Настройках Штурмана»") : text.includes("Повторить")),
         text.slice(0, 120));
   await p.screenshot({ path: path.join(OUT, `${SHOT}chats-${name}-360-dark.png`), fullPage: true });
   await ctx.close();

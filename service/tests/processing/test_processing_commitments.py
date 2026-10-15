@@ -88,14 +88,14 @@ async def test_full_round_trip_from_message_to_closed_commitment(conn):
     assert first["model"] == "test-model"
     assert await conn.fetchval("SELECT status FROM processing_runs") == "done"
 
-    # 3. одна сводка владельцу, под каждым пунктом ✓ и ✗
+    # 3. одна сводка владельцу, под каждым пунктом «верно» и «не так» (данные кнопок прежние)
     digest, = await digest_jobs(conn)
     text = digest["payload"]["text"]
     assert "1. Вы → Иван Петров: отправить договор\nСрок: ср, 7 октября («завтра»)\n«Договор отправлю завтра»" in text
     assert "2. Иван Петров → вам: прислать смету по фасадам\nСрок: пт, 9 октября («к пятнице»)" in text
     assert buttons_of(digest) == [
-        ("1 ✓", f"sh:cm:a:{second['id']}:{second['digest_fingerprint'][:24]}"), ("1 ✗", f"sh:cm:r:{second['id']}"),
-        ("2 ✓", f"sh:cm:a:{first['id']}:{first['digest_fingerprint'][:24]}"), ("2 ✗", f"sh:cm:r:{first['id']}"),
+        ("1 — верно", f"sh:cm:a:{second['id']}:{second['digest_fingerprint'][:24]}"), ("1 — не так", f"sh:cm:r:{second['id']}"),
+        ("2 — верно", f"sh:cm:a:{first['id']}:{first['digest_fingerprint'][:24]}"), ("2 — не так", f"sh:cm:r:{first['id']}"),
     ]
 
     # 4. владелец принимает одно и отклоняет другое
@@ -103,7 +103,7 @@ async def test_full_round_trip_from_message_to_closed_commitment(conn):
     assert (await press(conn, f"sh:cm:a:{first['id']}"))["answer"] == "Уже решено: открыто."
     done = await press(conn, f"sh:cm:r:{second['id']}")
     assert done["answer"] == "Отклонено." and done["remove_buttons"] is True
-    assert done["edit_text"] == ("Обязательства из переписки — решено:\n"
+    assert done["edit_text"] == ("Договорённости из переписки — решено:\n"
                                  "1. отправить договор — ✗ отклонено\n2. прислать смету по фасадам — ✓ принято")
     assert (await bridge.dispatch_callback(conn, f"sh:cm:a:{second['id']}", 6666))["answer"] == "Кнопка недоступна."
     opened = await commitments.list_commitments(conn, view="open", today=TODAY)
@@ -129,7 +129,7 @@ async def test_full_round_trip_from_message_to_closed_commitment(conn):
     # 6. закрытие — одним нажатием
     digest, = await digest_jobs(conn)
     assert "1. Похоже, выполнено: Иван Петров → вам — прислать смету по фасадам\n«Смету отправил»" in digest["payload"]["text"]
-    assert buttons_of(digest) == [("1 ✓", f"sh:cm:ca:{change['id']}:{change['digest_fingerprint'][:24]}"), ("1 ✗", f"sh:cm:cr:{change['id']}")]
+    assert buttons_of(digest) == [("1 — применить", f"sh:cm:ca:{change['id']}:{change['digest_fingerprint'][:24]}"), ("1 — оставить", f"sh:cm:cr:{change['id']}")]
     closed = await press(conn, f"sh:cm:ca:{change['id']}")
     assert closed["answer"] == "Закрыто." and closed["remove_buttons"] is True
     assert (await rows(conn))[0]["status"] == "done"

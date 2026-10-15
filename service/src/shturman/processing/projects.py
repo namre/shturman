@@ -548,15 +548,15 @@ async def send_digest(conn: asyncpg.Connection, *, run_id: int | str, max_items:
     for pos, r in enumerate(rows, start=1):
         lines.append(f"{pos}. {clean_line(r['title'], TITLE_LIMIT) or 'без названия'} — "
                      f"{_reason_text(_loads(r['reason']) or {})}")
-        buttons.append([bridge.button(f"{pos} ✓ завести", CALLBACK_MODULE, f"a:{r['id']}"),
-                        bridge.button(f"{pos} ✗ не нужно", CALLBACK_MODULE, f"r:{r['id']}")])
+        buttons.append([bridge.button(f"{pos} — завести проект", CALLBACK_MODULE, f"a:{r['id']}"),
+                        bridge.button(f"{pos} — не нужно", CALLBACK_MODULE, f"r:{r['id']}")])
         await conn.execute(
             """UPDATE projects SET batch = $2, pos = $3, notified_at = now(), digest_attempts = digest_attempts + 1
                WHERE id = $1""", r["id"], batch, pos)
     waiting = await conn.fetchval(
         "SELECT count(*) FROM projects WHERE status = 'proposed' AND batch IS NULL AND digest_attempts < $1",
         DIGEST_MAX_SENDS)
-    text = ("Проекты из переписки: завести страницу проекта? ✓ — завести, ✗ — не нужно. "
+    text = ("Проекты из переписки: завести страницу проекта? "
             "Отклонённое больше не предлагается.\n\n" + "\n".join(lines))
     if waiting:
         text += f"\n\nЕщё ждут решения: {waiting}. Придут со следующим прогоном."

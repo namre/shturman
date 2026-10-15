@@ -380,7 +380,7 @@ class Rehearsal:
                     await bridge.notify_owner(
                         conn, f"Репетиция ответов: дневной предел — {s['daily_cap']} карточек — исчерпан. "
                               "До конца суток новые сообщения из списка репетиции приходят обычными уведомлениями. "
-                              "Предел меняется на странице «Переписка», раздел «Репетиция ответов».", silent=True)
+                              "Предел меняется в «Настройках Штурмана», раздел «Репетиция ответов».", silent=True)
                 return await _skip(conn, item, "daily_cap")
             if used["recent"]:
                 return await _skip(conn, item, "pause")

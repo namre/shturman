@@ -402,8 +402,8 @@ async def send_owner_digest(conn: asyncpg.Connection, *, run_id: int | str,
         body = bridge.fit_message(_item_text(row), budget // max(1, len(rows)))
         lines.append(f"{pos}. {body}")
         print_ = fingerprint(row)
-        buttons.append([bridge.button(f"{pos} ✓", CALLBACK_MODULE, f"a:{row['id']}:{print_[:24]}"),
-                        bridge.button(f"{pos} ✗", CALLBACK_MODULE, f"r:{row['id']}")])
+        buttons.append([bridge.button(f"{pos} — запомнить", CALLBACK_MODULE, f"a:{row['id']}:{print_[:24]}"),
+                        bridge.button(f"{pos} — не запоминать", CALLBACK_MODULE, f"r:{row['id']}")])
         await conn.execute(
             """UPDATE facts SET batch = $2, pos = $3, notified_at = now(), digest_attempts = digest_attempts + 1,
                       digest_fingerprint = $4 WHERE id = $1""",
@@ -411,8 +411,8 @@ async def send_owner_digest(conn: asyncpg.Connection, *, run_id: int | str,
     waiting = await conn.fetchval(
         f"""SELECT count(*) {_FROM} WHERE {VISIBLE} AND f.subject_type = 'owner' AND f.status = 'proposed'
             AND f.batch IS NULL AND f.digest_attempts < $1""", DIGEST_MAX_SENDS)
-    text = ("Профиль: запомнить это о вас? ✓ — да, ✗ — нет. Без вашего «да» в профиль ничего не "
-            "попадает.\n\n" + "\n\n".join(lines))
+    text = ("Профиль: запомнить это о вас? Под пунктами — кнопки «запомнить» и «не запоминать». "
+            "Без вашего «да» в профиль ничего не попадает.\n\n" + "\n\n".join(lines))
     if waiting:
         text += f"\n\nЕщё ждут решения: {waiting}. Придут со следующим прогоном."
     await bridge.notify_owner(conn, bridge.fit_message(text), buttons=buttons, handler=HANDLER_DIGEST,

@@ -212,7 +212,7 @@ async def test_every_refusal_looks_the_same_and_tells_nothing(stand, conn, monke
     # и владелец узнаёт о повторе в боте — один раз на одни данные входа
     await exec_fakes.until(lambda: [m for m in s.telegram.sent() if m["text"] == miniapp.REPLAY_TEXT])
     assert len([m for m in s.telegram.sent() if m["text"] == miniapp.REPLAY_TEXT]) == 1
-    assert "Выйти на всех устройствах" in miniapp.REPLAY_TEXT and "./ops/logout-all.sh" in miniapp.REPLAY_TEXT
+    assert "Выйти на всех устройствах" in miniapp.REPLAY_TEXT and "./ops/" not in miniapp.REPLAY_TEXT
     dumped = json.dumps(await app_audit(conn), ensure_ascii=False)
     assert not any(word in dumped for word in SECRET_WORDS) and "Некто" not in dumped
 
@@ -523,19 +523,21 @@ async def test_send_in_the_app_obeys_the_sending_switch_like_the_bot(stand, conn
     listed = (await s.app.get("/approvals")).json()
     (item,) = [i for i in listed["items"] if i["kind"] == "draft"]
     assert item["text"] == "Смету пришлю в пятницу." and listed["sending"] == "off"
-    assert any(line.startswith("Кому: Иван Петров") for line in item["head"])
-    assert "Изменить текст здесь нельзя" in item["note"]
+    assert item["head"][0] == "Ответ: Иван Петров (личный чат) · от помощника"
+    assert "только для просмотра" in item["note"]
     labels = {a["label"]: a["ref"] for a in item["actions"]}
-    assert set(labels) == {"Отправить", "Отклонить"}            # «Изменить» нет — как и в боте
-    # «Отправить» при выключенной отправке — тот же ответ, что в боте; черновик ждёт
-    sent = await s.app.post("/approvals/decide", {"ref": labels["Отправить"]})
-    assert sent.status_code == 200 and sent.json()["answer"].startswith("Пока нельзя") and "выключен" in sent.json()["answer"]
+    # П2: отправка выключена — одна «Понятно» с данными «Отклонить»; «Отправить» в списке нет
+    assert list(labels) == ["Понятно"] and labels["Понятно"].startswith("sh:ob:r:")
+    assert [a["primary"] for a in item["actions"]] == [True]
+    # «Отправить» (данные кнопки прежних карточек в боте) из приложения не принимается: её нет в списке
+    sent = await s.app.post("/approvals/decide", {"ref": labels["Понятно"].replace("sh:ob:r:", "sh:ob:s:", 1)})
+    assert sent.status_code != 200
     assert (await conn.fetchval("SELECT status FROM outbox_drafts WHERE id = $1", draft["draft_id"])) == "pending"
     assert not s.telegram.sent(business=True)
-    # «Отклонить» — черновик закрыт, карточка в боте без кнопок
+    # «Понятно» — черновик закрыт тем же обработчиком, что «Отклонить», карточка в боте без кнопок
     card_id = await conn.fetchval("SELECT card_message_ids[1] FROM outbox_drafts WHERE id = $1", draft["draft_id"])
-    rejected = await s.app.post("/approvals/decide", {"ref": labels["Отклонить"]})
-    assert rejected.json()["answer"] == "Отклонено, ничего не отправлено."
+    rejected = await s.app.post("/approvals/decide", {"ref": labels["Понятно"]})
+    assert rejected.json()["answer"] == "Понятно, ничего не отправлено."
     assert (await conn.fetchval("SELECT status FROM outbox_drafts WHERE id = $1", draft["draft_id"])) == "rejected"
     await _delivered(s)
     assert any(e["message_id"] == card_id and "reply_markup" not in e for e in s.telegram.calls("editMessageText"))
@@ -739,8 +741,8 @@ async def test_a_person_opening_a_service_address_sees_a_page_not_json(stand, co
         (APP_API + "/approvals", 403, "приложение «Штурман» получает данные"),
         (APP_API + "/login", 405, "приложение «Штурман» получает данные"),
         (APP_PATH + "nothing-marker", 404, "кнопкой <strong>«Штурман»</strong>"),
-        (API + "/state", 403, "страница «Переписка» получает данные"),
-        (PREFIX + "/nothing-marker", 404, "Открыть страницу «Переписка»"),
+        (API + "/state", 403, "«Настройки Штурмана» получают данные"),
+        (PREFIX + "/nothing-marker", 404, "Открыть «Настройки Штурмана»"),
         (PREFIX + "//app/", 404, "Такой страницы нет"),
     ]
     for path, status, words in cases:

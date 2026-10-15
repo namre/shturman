@@ -106,7 +106,7 @@ async def test_bot_command_is_the_owners_decision_and_applies_at_once(rv):
     s = await rs.load(rv.conn)
     assert s["enabled"] is True and s["people"] == [ANNA]
     assert "ничего не отправляется" in (await _command(rv.conn, rv.state, "/rehearsal"))["text"].lower()
-    assert "Репетиция ответов: включена" in (await _command(rv.conn, rv.state, "/status"))["text"]
+    assert "Репетиция: включена" in (await _command(rv.conn, rv.state, "/status"))["text"]
     await _command(rv.conn, rv.state, f"/rehearsal remove {ANNA}")
     await _command(rv.conn, rv.state, "/rehearsal off")
     s = await rs.load(rv.conn)
@@ -119,7 +119,7 @@ async def test_bot_command_is_the_owners_decision_and_applies_at_once(rv):
     try:
         await _command(rv.conn, rv.state, "/rehearsal send")
     except ValueError as exc:
-        assert "Формат" in str(exc)
+        assert "/rehearsal on или off" in str(exc)
     else:
         raise AssertionError("неизвестный вид команды должен получить подсказку формата")
 

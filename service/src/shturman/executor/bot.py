@@ -33,7 +33,7 @@ from typing import Any, Callable
 
 import asyncpg
 
-from .. import authority, bridge, control_peers, ingest_api
+from .. import authority, bridge, control_peers, ingest_api, words
 from ..api_core import BadRequest
 from ..app import AppState
 from ..sanitize import clean_line
@@ -49,11 +49,16 @@ REFUSED_TTL = 600.0               # секунд не переспрашиват
 UPDATE_RETRIES = 5                # столько раз обновление разбирается заново при временном сбое Telegram
 
 TEXT_BOUND = ("Готово: вы привязаны как владелец.\n\n"
-              "Управляйте настройками и заданиями здесь: /menu. Решения по источникам приходят карточками с кнопками.")
-TEXT_HINT = "Управление Штурманом: /menu — настройки, задания ответов и источники. /help — команды."
+              f"Вернитесь в «{words.SETUP_PAGE}» — там следующий шаг.\n"
+              "Кнопка «Штурман» внизу этого чата — ваши решения. /help — как пользоваться.")
+# Без внешнего адреса страницы настройки приложения «Штурман» нет (menu_button.py): решения — карточками.
+TEXT_BOUND_NO_APP = ("Готово: вы привязаны как владелец.\n\n"
+                     f"Вернитесь в «{words.SETUP_PAGE}» — там следующий шаг.\n"
+                     "Решения будут приходить сюда карточками с кнопками. /help — как пользоваться.")
+TEXT_HINT = "Я понимаю кнопки и команды. /menu — главное, /help — как пользоваться."
 TEXT_NOT_CREATOR = ("Привязать не получилось: этого бота создал другой аккаунт Telegram. Владельцем бота "
                     "согласований, созданного в одно нажатие, может стать только тот, кто его создал. Ссылка "
-                    "привязки отменена: получите новую на странице «Переписка» и откройте её в том аккаунте, "
+                    f"привязки отменена: получите новую в «{words.SETUP_PAGE}» и откройте её в том аккаунте, "
                     "которым создавали бота.")
 TEXT_REFUSED = "Кнопка недоступна."
 TEXT_FAILED = "Не получилось. Попробуйте ещё раз."
@@ -281,7 +286,7 @@ class Bot:
         if self._hint_at is not None and now - self._hint_at < HINT_EVERY:
             return
         self._hint_at = now
-        await self._say(chat_id, TEXT_HINT, buttons=owner_chat.menu_buttons())
+        await self._say(chat_id, TEXT_HINT, buttons=owner_chat.menu_buttons(self.state))
 
     async def _bind(self, code: str, *, user_id: int, chat_id: int, private: bool,
                     name: str | None = None) -> None:
@@ -327,7 +332,8 @@ class Bot:
         self.counters["binds"] += 1
         self._hint_at = None
         logger.info("бот согласований: владелец привязан")
-        await self._say(chat_id, TEXT_BOUND, buttons=owner_chat.menu_buttons())
+        await self._say(chat_id, TEXT_BOUND if menu_button.app_url(self.state.config) else TEXT_BOUND_NO_APP,
+                        buttons=owner_chat.menu_buttons(self.state))
         await self.sync_menu()        # кнопка «Штурман» — новому владельцу, прежнему — обычная
         self.wake()                   # карточки, ждавшие владельца, можно отправлять
 
@@ -384,6 +390,10 @@ class Bot:
         self.counters["callbacks"] += 1
         answer = out.get("answer")
         await self._answer(query_id, answer if isinstance(answer, str) else None)
+        reply = out.get("reply")
+        if isinstance(reply, dict) and isinstance(reply.get("text"), str):
+            # Ответ на кнопку меню (owner_chat.on_menu): новым сообщением в этот же личный чат владельца.
+            await self._say(chat_id, reply["text"], buttons=reply.get("buttons"))
         new_text, remove = out.get("edit_text"), bool(out.get("remove_buttons"))
         try:
             if isinstance(new_text, str) and new_text.strip():

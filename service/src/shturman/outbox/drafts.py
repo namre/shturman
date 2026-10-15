@@ -45,7 +45,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from .. import authority, bridge, confirm, jobs
+from .. import authority, bridge, confirm, jobs, words
 from ..tg.gateway import AccountUnavailable, FloodWait, SendForbidden
 from . import policy, runtime
 from . import text as textlib
@@ -132,9 +132,15 @@ def _chat_kind(tgt: Target) -> str:
 
 
 def _voice(tgt: Target, channel: str) -> str:
-    if channel == "business":
-        return "от вашего имени (через бизнес-бота)"
-    return f"от имени помощника (аккаунт «{textlib.one_line(tgt.account_label, 40)}»)"
+    """От чьего имени уйдёт ответ — словами из единого словаря (Р-86)."""
+    return words.VOICE_OWNER if channel == "business" else words.VOICE_HELPER
+
+
+def lead(row: Mapping[str, Any], tgt: Target) -> str:
+    """Первая строка карточки: кому и от чьего имени (Б10). Имя не склоняется — оно чужое и любое."""
+    kind, name = _chat_kind(tgt), textlib.one_line(tgt.display_name, 80) or "без названия"
+    where = {"группа": f" в группу «{name}»", "канал": f" в канал «{name}»"}.get(kind, f": {name} ({kind})")
+    return f"Ответ{where} · {_voice(tgt, row['channel'])}"
 
 
 def _timezone() -> ZoneInfo:
@@ -154,11 +160,12 @@ def _messages_word(n: int) -> str:
 
 
 def _who(tgt: Target) -> str:
-    """Кому: имя (его выбирает сам собеседник, поэтому рядом — то, что подделать нельзя)."""
-    line = f"{tgt.display_name} ({_chat_kind(tgt)})"
+    """Что подделать нельзя: имя выбирает сам собеседник, поэтому в служебной строке карточки —
+    номер в Telegram и @имя."""
+    line = f"номер в Telegram {int(tgt.tg_id)}"
     if tgt.username and _USERNAME.match(tgt.username):
         line += f" · @{tgt.username}"
-    return f"{line} · номер в Telegram {int(tgt.tg_id)}"
+    return line
 
 
 async def card_context(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Target) -> dict[str, Any]:
@@ -168,7 +175,7 @@ async def card_context(conn: asyncpg.Connection, row: Mapping[str, Any], tgt: Ta
            WHERE chat_id = $1 AND kind = 'message' AND deleted_at IS NULL""", row["chat_id"])
     if stats["total"]:
         first = stats["first"].astimezone(_timezone()).strftime("%d.%m.%Y")
-        facts = f"В архиве: {stats['total']} {_messages_word(stats['total'])}, первое {first}"
+        facts = f"в архиве {stats['total']} {_messages_word(stats['total'])}, первое {first}"
     else:
         facts = ("Новый собеседник" if tgt.peer_class == "user" else "Новый чат") + ": раньше переписки не было"
     excerpt = None
@@ -185,33 +192,56 @@ def _note(row: Mapping[str, Any]) -> str | None:
     return None
 
 
+PREPARE_ONLY_LINE = "Только для просмотра: этот черновик не будет отправлен."
+
+
+def _service_line(row: Mapping[str, Any], tgt: Target, facts: str | None) -> str:
+    """Служебное — одной строкой в конце шапки (Б10): то, что подделать нельзя, и сведения из архива."""
+    parts = [_who(tgt)]
+    if facts and not facts.startswith("Нов"):
+        parts.append(textlib.one_line(facts, 120))
+    if tgt.account_role == "assistant":
+        parts.append(f"{words.HELPER_ACCOUNT} «{textlib.one_line(tgt.account_label, 40)}»")
+    parts.append(f"{len(row['text'])} знаков")
+    return "Служебное: " + " · ".join(parts)
+
+
 def card_head(row: Mapping[str, Any], tgt: Target, *, note: str | None = None,
               reply_excerpt: str | None = None, facts: str | None = None) -> list[str]:
-    """Шапка карточки: кому, от чьего имени, на что ответ. Одна и та же в боте и в Mini App."""
+    """Шапка карточки: первой строкой — кому и от чьего имени; затем на что ответ и важные
+    оговорки; служебное — последней строкой. Одна и та же в боте и в Mini App."""
     sends = len(policy.parts_of(row["channel"], row["text"]))
-    head = [f"Кому: {_who(tgt)}"]
+    head = [lead(row, tgt)]
     if row.get("prepare_only"):
-        head.append("Подготовлено для просмотра без отправки. Для отправки нужен новый черновик.")
-    if facts:
-        head.append(textlib.one_line(facts, 120))
-    head.append(f"От кого: {_voice(tgt, row['channel'])}")
+        head.append(PREPARE_ONLY_LINE)
     if reply_excerpt:
         head.append(f"В ответ на: «{textlib.one_line(reply_excerpt, 100)}»")
+    if facts and facts.startswith("Нов"):
+        head.append(textlib.one_line(facts, 120))     # новый собеседник — это важно, не служебное
     if sends > 1:
         head.append(f"Текст длинный: уйдёт {sends} сообщениями подряд.")
     if note:
         head.append(textlib.one_line(note, 300))
+    head.append(_service_line(row, tgt, facts))
     return head
+
+
+def _status_word(row: Mapping[str, Any], status: str | None) -> str:
+    status = status or row["status"]
+    if row.get("prepare_only") and status == "rejected":
+        return "просмотрен, ничего не отправлено"
+    return STATUS_WORDS[status]
 
 
 def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None, note: str | None = None,
                reply_excerpt: str | None = None, facts: str | None = None) -> list[str]:
     """Текст карточки. Весь текст сообщения показывается дословно; длинный — в нескольких
-    карточках подряд, без сокращений. Текст идёт последним: после него в карточке ничего нет."""
-    word = STATUS_WORDS[status or row["status"]]
+    карточках подряд, без сокращений. Текст идёт последним: после него в карточке ничего нет.
+    Первая строка — кому и от чьего имени, вторая — номер черновика и его состояние."""
+    word = _status_word(row, status)
     head = card_head(row, tgt, note=note, reply_excerpt=reply_excerpt, facts=facts)
-    tail = f"Знаков: {len(row['text'])}. Всё, что ниже этой строки, — текст сообщения дословно."
-    budget = CARD_LIMIT - 200 - sum(textlib.utf16_len(line) + 1 for line in head) - textlib.utf16_len(tail)
+    tail = " · ниже — текст сообщения дословно"
+    budget = CARD_LIMIT - 200 - sum(textlib.utf16_len(line) + 1 for line in head) - textlib.utf16_len(tail) - 60
     chunks = textlib.split_text(row["text"], budget) or [row["text"]]
     total = len(chunks)
     cards = []
@@ -220,18 +250,22 @@ def card_parts(row: Mapping[str, Any], tgt: Target, *, status: str | None = None
         if total > 1:
             title += f" · часть {index} из {total}"
         if index == 1:
-            lines = [title, *head]
+            lines = [head[0], title, *head[1:-1]]
             if total > 1:
                 lines.append(f"Текст показан в {total} сообщениях подряд; кнопки — под последним.")
-            lines.append(tail)
+            lines.append(head[-1] + tail)
         else:
-            lines = [title, "Продолжение текста сообщения, дословно:"]
+            lines = [head[0], title, "Продолжение текста сообщения, дословно:"]
         cards.append("\n".join(lines) + "\n\n" + chunk)
     return cards
 
 
 def _buttons(row: Mapping[str, Any]) -> list[list[dict[str, str]]]:
+    """Кнопки под карточкой. Черновик только для просмотра отправить нельзя (П2): вместо «Отправить»
+    и «Отклонить» — одна «Понятно» с теми же данными, что у «Отклонить». Данные кнопок прежние."""
     rest = f"{row['id']}:{row['nonce']}"
+    if row.get("prepare_only"):
+        return [[bridge.button(words.DRAFT_SEEN, CALLBACK_MODULE, f"r:{rest}")]]
     return [[bridge.button("Отправить", CALLBACK_MODULE, f"s:{rest}"),
              bridge.button("Отклонить", CALLBACK_MODULE, f"r:{rest}")]]
 
@@ -520,7 +554,7 @@ async def create_autoreply(
         secrets.token_urlsafe(16), "pending" if prepare_only else "approved", len(policy.parts_of(channel, cleaned)),
         task_id, binding["sources"], binding["policy_revision"], binding["topic_tg_id"], prepare_only)
     if row is not None and prepare_only:
-        cards = card_parts(row, tgt, note="Подготовлено без отправки.", **await card_context(conn, row, tgt))
+        cards = card_parts(row, tgt, note="Автоответ, подготовленный без отправки.", **await card_context(conn, row, tgt))
         for index, card in enumerate(cards, 1):
             await bridge.notify_owner(conn, card, buttons=_buttons(row) if index == len(cards) else None,
                                       handler=CARD_HANDLER, context={"draft_id": row["id"], "part": index},
@@ -638,7 +672,7 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
         return await closed("Срок черновика истёк. Попросите подготовить новый.")
     if action == "r":
         await finish(conn, row, tgt, "rejected", tell_owner=False, skip_part=pressed)
-        return await closed("Отклонено, ничего не отправлено.")
+        return await closed("Понятно, ничего не отправлено." if row["prepare_only"] else "Отклонено, ничего не отправлено.")
 
     mod = runtime.current()
     if mod is None:

@@ -241,8 +241,8 @@ async def index(request: Request) -> Response:
 
 REPLAY_TEXT = ("Кто-то открыл приложение «Штурман» с теми же данными входа Telegram, по которым уже был вход. "
                "Если вы сейчас не смогли войти в приложение — значит, кто-то вошёл с вашими данными раньше вас. "
-               "Тогда откройте страницу «Переписка» и нажмите «Выйти на всех устройствах» (или выполните на сервере "
-               "./ops/logout-all.sh), затем снова откройте приложение кнопкой «Штурман». Если вы просто открыли "
+               "Тогда откройте «Настройки Штурмана» и нажмите «Выйти на всех устройствах», "
+               "затем снова откройте приложение кнопкой «Штурман». Если вы просто открыли "
                "приложение повторно, ничего делать не нужно.")
 REPLAY_NOTICES = 200          # столько подписей помнится, чтобы не писать владельцу дважды об одной
 
@@ -350,7 +350,7 @@ async def approvals_decide(request: Request) -> JSONResponse:
 # по одному чату; без стирания сохранённого.
 
 TITLE_LIMIT = 80              # знаков названия чата в сообщении владельцу
-IF_NOT_YOU = ("Если это были не вы — {fix} на странице «Переписка» и нажмите там «Выйти на всех устройствах». "
+IF_NOT_YOU = ("Если это были не вы — {fix} в «Настройках Штурмана» и нажмите там «Выйти на всех устройствах». "
               "Если бот согласований создан в одно нажатие, замените его ботом, созданным вручную у @BotFather "
               "(«Сменить токен»).")
 
@@ -408,8 +408,8 @@ async def _known_title(tg: TgManager, account_id: int, key: tuple[str, int]) -> 
 async def chats_sync(request: Request) -> JSONResponse:
     data = await page._body(request)
     if "chats" in data or "kind" in data:
-        raise BadRequest("Из приложения чаты включаются по одному. Все чаты одного вида разом — на странице "
-                         "«Переписка».", 400, "one_chat")
+        raise BadRequest("Из приложения чаты включаются по одному. Все чаты одного вида разом — в "
+                         "«Настройках Штурмана».", 400, "one_chat")
     enabled = bool(page._flag(data, "enabled", required=True))
     (key,) = chats.peer_keys([data])
     if enabled and "months" not in data:
@@ -443,7 +443,7 @@ async def chats_exclude(request: Request) -> JSONResponse:
     """Не сохранять чат или вернуть его в архив. Стереть уже сохранённое отсюда нельзя."""
     data = await page._body(request)
     if data.get("purge") not in (None, False):
-        raise BadRequest("Стереть сохранённые сообщения чата можно только на странице «Переписка».", 400, "page_only")
+        raise BadRequest("Стереть сохранённые сообщения чата можно только в «Настройках Штурмана».", 400, "page_only")
     excluded = bool(page._flag(data, "excluded", required=True))
     (key,) = chats.peer_keys([data])
     state, session = state_of(request), request.state.app_session

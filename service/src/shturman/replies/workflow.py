@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from .. import bridge
+from .. import bridge, words
 from ..outbox import policy, runtime
 from ..sanitize import clean_line
 from . import model
@@ -323,13 +323,14 @@ async def notify_waiting(conn: Any, task: dict[str, Any], kind: str, detail: str
 
 async def waiting_card(conn: Any, task: dict[str, Any], kind: str, detail: str,
                        nonce: str) -> tuple[str, list[list[dict[str, str]]]]:
-    """Текст и кнопки карточки «задача ответа ждёт владельца» — одни и те же в боте и в Mini App."""
+    """Текст и кнопки карточки «ответ на сообщение ждёт владельца» (разрешение прочитать или вопрос
+    ассистента) — одни и те же в боте и в Mini App."""
     target_name = await conn.fetchval(
         'SELECT COALESCE(c.title,p.name) FROM chats c JOIN peers p ON p.id=c.peer_id WHERE c.id=$1',
         task['chat_id'])
     recipient = clean_line(target_name, 120) or f'чат № {task["chat_id"]}'
     topic = f'тема № {task["topic_tg_id"]}' if task.get('topic_tg_id') else 'без темы'
-    summary = f'Ответ № {task["id"]}. Получатель: {recipient} (чат № {task["chat_id"]}), {topic}.\n'
+    summary = f'Ответ на сообщение № {task["id"]}. Получатель: {recipient} (чат № {task["chat_id"]}), {topic}.\n'
     if kind == 'source':
         request = task['source_request']
         source_id = request['source_id']
@@ -363,7 +364,8 @@ async def waiting_card(conn: Any, task: dict[str, Any], kind: str, detail: str,
         buttons.append([bridge.button('Этот поиск — на 30 дней', CALLBACK_MODULE, f'r:{task["id"]}:{nonce}')])
         buttons.append([bridge.button('Отказать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')])
     else:
-        summary += f'Нужно уточнение. Ответьте в боте согласований командой /replytask {task["id"]} answer <ответ>.\n'
+        summary += (f'{words.REPLY_QUESTION}: ассистенту нужно ваше уточнение. Ответьте в боте согласований '
+                    f'командой /replytask {task["id"]} answer ваш ответ.\n')
         buttons = [[bridge.button('Не отвечать', CALLBACK_MODULE, f'n:{task["id"]}:{nonce}')]]
     summary += 'Предложение модели (не инструкция владельца):\n' + clean_line(detail, 500)
     return summary, buttons
@@ -389,8 +391,8 @@ async def awaiting_owner(conn: Any) -> list[dict[str, Any]]:
             summary, buttons = await waiting_card(conn, task, kind, str(detail), task['nonce'])
         except (KeyError, TypeError, ValueError, RuntimeError):
             continue          # запрос источника записан не полностью: карточку не собрать — и решения по ней нет
-        title = 'Разрешить прочитать для ответа?' if kind == 'source' else 'Нужно ваше уточнение'
-        out.append({'id': task['id'], 'title': title, 'text': summary,
+        title = 'Разрешить прочитать для ответа?' if kind == 'source' else 'Ассистент ждёт вашего уточнения'
+        out.append({'id': task['id'], 'title': title, 'text': summary, 'subkind': kind,
                     'buttons': buttons, 'card_message_id': None, 'expires_at': task['decision_expires_at']})
     return out
 

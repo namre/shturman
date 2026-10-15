@@ -110,11 +110,23 @@ def reason_code(description: Any) -> str:
     return found.group(0).lower()[:60] if found else "other"
 
 
-def keyboard(buttons: list[list[tuple[str, str]]] | None) -> dict[str, Any] | None:
+def _key(text: str, data: Any) -> dict[str, Any]:
+    # Кнопка, открывающая приложение «Штурман» (только в ответах бота владельцу на его же команды,
+    # owner_chat.menu_buttons): данные вида {"web_app": "https://…"}. Задания notify.owner таких
+    # кнопок не несут — их данные проверяет worker.parse_buttons.
+    if isinstance(data, dict):
+        url = data.get("web_app")
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise ValueError("кнопка приложения: нужен адрес https")
+        return {"text": text, "web_app": {"url": url}}
+    return {"text": text, "callback_data": data}
+
+
+def keyboard(buttons: list[list[tuple[str, Any]]] | None) -> dict[str, Any] | None:
     """Строки пар (подпись, данные) → клавиатура Bot API."""
     if not buttons:
         return None
-    return {"inline_keyboard": [[{"text": text, "callback_data": data} for text, data in row] for row in buttons]}
+    return {"inline_keyboard": [[_key(text, data) for text, data in row] for row in buttons]}
 
 
 class _TokenTransport(httpx.AsyncBaseTransport):

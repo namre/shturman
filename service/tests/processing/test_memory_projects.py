@@ -130,6 +130,10 @@ async def test_rejected_project_is_never_proposed_again(conn):
     assert project["title"] == "Стройка: Северный" and projects._loads(project["reason"])["messages"] == 20
     assert await conn.fetchval("SELECT origin FROM project_chats WHERE project_id = $1", project["id"]) == "model"
     assert await projects.send_digest(conn, run_id=1) == 1
+    # подписи словами (Б6, Р-86), данные кнопок прежние
+    digest = [j for j in await notifications(conn) if "Проекты из переписки" in j["payload"]["text"]][-1]
+    assert [(b["text"], b["data"]) for row in digest["payload"]["buttons"] for b in row] == [
+        ("1 — завести проект", f"sh:pj:a:{project['id']}"), ("1 — не нужно", f"sh:pj:r:{project['id']}")]
     out = await projects.decide_project_proposal(conn, project["id"], False)       # отказ — и без владельца
     assert out["status"] == "rejected"
     assert await projects.propose(conn, now=NOW) == {"projects_proposed": 0}

@@ -90,6 +90,16 @@ page.on("response", async (r) => {
   try { seenBodies.push(await r.text()); } catch { /* тело уже недоступно */ }
 });
 page.on("dialog", (d) => d.accept());
+// Подтверждения на странице — в строке, а не системным окном (Р-86, С6). Как раньше page.on("dialog", accept),
+// сценарий сам нажимает главную кнопку такого подтверждения, если не управляет им сам (window.__manualAsk).
+function AUTO_ASK() {
+  new MutationObserver(() => {
+    if (window.__manualAsk) return;
+    const yes = document.querySelector('.ask [data-ask="yes"]');
+    if (yes) yes.click();
+  }).observe(document, { childList: true, subtree: true });
+}
+await page.addInitScript(AUTO_ASK);
 const URL_PAGE = BASE + "/shturman-setup/";
 const API = BASE + "/shturman-setup/api";
 const storedKey = () => page.evaluate((name) => localStorage.getItem(name), KEY_NAME);
@@ -102,6 +112,7 @@ async function variants(stage, prepare) {
     const ctx = await browser.newContext({ ...options, storageState: stored });
     const p = await ctx.newPage();
     p.on("dialog", (d) => d.accept());
+    await p.addInitScript(AUTO_ASK);
     await p.goto(URL_PAGE);
     await p.waitForSelector("#screen-app:not([hidden])");
     await p.waitForSelector("#progress li");
@@ -128,8 +139,9 @@ async function variants(stage, prepare) {
   check("ни cookie, ни заголовков CORS страница не отдаёт", !h["set-cookie"] && !Object.keys(h).some((k) => k.startsWith("access-control-")));
   await page.waitForSelector("#login-nolink:not([hidden])");
   const lead = await page.textContent("#login-nolink");
-  check("без ссылки — экран «нужна ссылка входа» с объяснением, откуда её взять",
-        lead.includes("./ops/setup-link.sh") && lead.includes("кто ставил ассистента"));
+  check("без ссылки — экран «нужна ссылка входа» с объяснением, откуда её взять; команда — только в свёрнутой строке для того, кто обслуживает сервер",
+        lead.includes("кто обслуживает ваш сервер") && !(await page.innerText("#login-nolink")).includes("./ops/")
+          && (await page.textContent("#login-nolink details.for-admin")).includes("./ops/setup-link.sh"));
   await shot(page, "01-login-no-link-desktop-light");
   for (const p of ["/state", "/overview"]) {
     const r = await page.request.get(API + p);
@@ -162,7 +174,7 @@ linkPath = cli("setup-link").trim();           // новая ссылка отм
   await p2.click("#login-link-go");
   await p2.waitForSelector("#login-message:not([hidden])");
   const text = await p2.textContent("#login-message-text");
-  check("прежняя ссылка после выдачи новой не действует; сказано, где взять новую", text.includes("устарела") && text.includes("./ops/setup-link.sh"));
+  check("прежняя ссылка после выдачи новой не действует; сказано, где взять новую", text.includes("устарела") && text.includes("кто обслуживает ваш сервер") && !text.includes("./ops/"));
   await other.close();
 }
 await page.goto(BASE + linkPath);
@@ -316,7 +328,21 @@ await page.selectOption("#chats-kind", "channel");
 await page.waitForFunction(() => document.querySelector("#chats-bulk") && !document.querySelector("#chats-bulk").hidden);
 check("чаты: отбор по виду и кнопка «читать все»", (await page.textContent("#chats-bulk")).includes("каналы"));
 check("чаты: служебный чат Telegram нельзя ни читать, ни вернуть", (await page.locator("#chats-list li", { hasText: "служебный чат" }).count()) === 0);
-await page.locator("#chats-list li button").first().click();              // «Не сохранять» + два подтверждения
+// «Не сохранять»: подтверждение в строке с двумя явными выборами, стирание — отдельной красной кнопкой (С6)
+await page.evaluate(() => { window.__manualAsk = true; });
+await page.locator("#chats-list li button", { hasText: "Не сохранять" }).first().click();
+await page.waitForSelector("#chats-list .ask");
+{
+  const askButtons = await page.locator("#chats-list .ask button").allTextContents();
+  const purgeClass = await page.getAttribute('#chats-list .ask [data-ask="purge"]', "class");
+  check("«Не сохранять»: подтверждение в строке — «Только перестать сохранять», красная «Перестать и стереть сохранённое», «Отмена»",
+        JSON.stringify(askButtons) === JSON.stringify(["Только перестать сохранять", "Перестать и стереть сохранённое", "Отмена"])
+          && purgeClass.includes("danger-fill"), JSON.stringify(askButtons));
+  await page.locator("#chats-list li:has(.ask)").scrollIntoViewIfNeeded();
+  await page.locator("#chats-list li:has(.ask)").screenshot({ path: path.join(OUT, "chat-exclude-ask-desktop-light.png") });
+}
+await page.click('#chats-list .ask [data-ask="purge"]');
+await page.evaluate(() => { window.__manualAsk = false; });
 await page.waitForFunction(() => document.querySelector("#chats-list").textContent.includes("не сохраняется"));
 check("чаты: исключённый чат помечен, читать его нельзя", await page.locator("#chats-list li.is-excluded .chat-read input").first().isDisabled());
 await page.selectOption("#chats-kind", "");
@@ -481,6 +507,7 @@ await variants("23-chats", (p) => p.waitForSelector("#chats-list li"));
       const ctx = await browser.newContext({ ...options, storageState: stored });
       const p = await ctx.newPage();
       p.on("dialog", (d) => d.accept());
+      await p.addInitScript(AUTO_ASK);
       await p.goto(URL_PAGE);
       await p.waitForSelector("#screen-app:not([hidden])");
       await p.waitForSelector("#chats-list li");
@@ -786,14 +813,15 @@ await page.waitForFunction(() => document.querySelector("#llm-error").textConten
 check("модель: смена адреса без ввода ключа не проходит, и запрос никуда не уходит",
       (await control("GET", "/seen")).llm_requests === llmBefore);
 check("модель: на странице сказано про https и про локальную модель",
-      (await page.textContent("#llm-rules")).includes("SHTURMAN_LLM_BASE_URL") && (await page.textContent("#llm-rules")).includes("https://"));
+      (await page.textContent("#llm-rules")).includes("Локальную модель") && (await page.textContent("#llm-rules")).includes("https://")
+        && !(await page.textContent("#llm-rules")).includes("SHTURMAN_"));
 await page.fill("#llm-url", "https://llm.example/v1");
 
 // подписка ChatGPT вместо ключа: вход вставкой адреса. Страница входа OpenAI — подставная, в сеть не ходим.
 await context.route("https://auth.openai.com/**", (route) => route.fulfill({
   status: 200, contentType: "text/html; charset=utf-8", body: "<!doctype html><title>ChatGPT</title><p>Подставной вход</p>" }));
 check("подписка: блок виден, кнопка «Войти через ChatGPT» есть",
-      (await page.isVisible("#sub-start")) && (await page.textContent("#sub-block")).includes("мастере Hermes"));
+      (await page.isVisible("#sub-start")) && (await page.textContent("#sub-block")).includes("его мастере настройки") && !(await page.textContent("#sub-block")).includes("Hermes"));
 const popupWait = context.waitForEvent("page", { timeout: 10000 }).catch(() => null);
 await page.click("#sub-start");                     // ключ API уже сохранён: страница спрашивает о замене — да
 await page.waitForSelector("#sub-paste:not([hidden])");
@@ -855,7 +883,7 @@ await shot(page, "27-app-done-desktop-light");
   }));
   check("память: в свёрнутом виде — короткое пояснение", (await page.textContent("#s-memory .memory-lead")).includes("проектах"));
   await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
-  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "ждут решения: 4");
+  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "на согласовании: 4");
   check("память: на свёрнутой карточке видно, сколько ждёт решения", true);
 
   await page.click("#memory-details > summary");
@@ -863,8 +891,8 @@ await shot(page, "27-app-done-desktop-light");
   const explained = await page.textContent("#s-memory .memory-body > p");
   check("память: объяснено, что такое страница, что сводка — каждую ночь, а «ваш блок» ассистент не меняет",
         explained.includes("страницы") && explained.includes("каждую ночь") && explained.includes("ассистент их не меняет"));
-  check("память: вкладки «Люди», «Проекты», «Профиль» и «Ждут решения» с числом",
-        (await page.locator("#mem-tabs [role=tab]").allTextContents()).join("|") === "Люди|Проекты|Профиль|Ждут решения4");
+  check("память: вкладки «Люди», «Проекты», «Профиль» и «Согласования» с числом",
+        (await page.locator("#mem-tabs [role=tab]").allTextContents()).join("|") === "Люди|Проекты|Профиль|Согласования4");
   check("память: в списке людей — страница с датой обновления",
         (await page.textContent("#mem-list")).includes("Ольга Смирнова") && (await page.textContent("#mem-list")).includes("обновлена"));
 
@@ -912,14 +940,14 @@ await shot(page, "27-app-done-desktop-light");
   await page.click("#mem-tab-pending");
   await page.waitForSelector(".mem-item");
   const waiting = await page.textContent("#mem-panel");
-  check("память: «Ждут решения» — проект, факт о вас, страница и договорённость",
+  check("память: «Согласования» — проект, факт о вас, страница и договорённость",
         (await page.locator(".mem-item").count()) === 4 && ["Склад на Окружной", "групповой чат: сообщений за 30 дн. — 24", "Чаты: Склад на Окружной: снабжение",
           "роль: отвечаю за бюджет фасадов", "Сергей Ковалёв", "прислать график поставок бетона"].every((t) => waiting.includes(t)));
   await page.evaluate(() => document.getElementById("s-memory").scrollIntoView());
   await shot(page, "30-memory-pending-desktop-light", false);
-  await page.click(".mem-item:has-text('поставок бетона') >> text=✓ Верно");
+  await page.click(".mem-item:has-text('поставок бетона') >> text=\"Верно\"");
   await page.waitForFunction(() => document.querySelectorAll(".mem-item").length === 3);
-  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "ждут решения: 3");
+  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "на согласовании: 3");
   const decided = (await control("GET", "/seen")).audit.filter((r) => r.action === "memory.commitment_accept");
   check("память: договорённость принята со страницы сразу, без карточки в боте; в журнале — номер, без текста",
         decided.length === 1 && /^№ \d+$/.test(decided[0].detail), JSON.stringify(decided));
@@ -981,8 +1009,8 @@ await shot(page, "27-app-done-desktop-light");
   // профиль: правила и факты о вас
   await page.click("#mem-tab-profile");
   await page.waitForSelector("#mem-owner");
-  check("профиль: объяснено, что факты о вас появляются только после вашего «✓», а правила ассистент не меняет",
-        (await page.textContent("#mem-panel")).includes("только после вашего «✓»") &&
+  check("профиль: объяснено, что факты о вас появляются только после вашего «Запомнить», а правила ассистент не меняет",
+        (await page.textContent("#mem-panel")).includes("только после вашего «Запомнить»") &&
         (await page.textContent("#mem-owner-hint")).includes("никогда их не меняет"));
   const RULES = "Отвечать коротко.\nПо выходным не беспокоить, кроме срочного по стройке.";
   await page.fill("#mem-owner", RULES);
@@ -991,12 +1019,12 @@ await shot(page, "27-app-done-desktop-light");
 
   await page.click("#mem-tab-pending");
   await page.waitForSelector(".mem-item");
-  await page.click(".mem-item:has-text('отвечаю за бюджет фасадов') >> text=✓ Верно");
+  await page.click(".mem-item:has-text('отвечаю за бюджет фасадов') >> text=\"Запомнить\"");
   await page.waitForFunction(() => document.querySelectorAll(".mem-item").length === 2);
-  await page.click(".mem-item:has-text('Склад на Окружной') >> text=✓ Завести проект");
+  await page.click(".mem-item:has-text('Склад на Окружной') >> text=\"Завести проект\"");
   await page.waitForFunction(() => document.querySelectorAll(".mem-item").length === 1);
-  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "ждут решения: 1");
-  check("ждут решения: факт о вас и проект приняты со страницы", true);
+  await page.waitForFunction(() => document.querySelector("#st-memory").textContent === "на согласовании: 1");
+  check("согласования: факт о вас и проект приняты со страницы", true);
   await page.click("#mem-tab-profile");
   await page.waitForSelector("#mem-owner");
   check("профиль: принятый факт о вас и сохранённые правила видны",
@@ -1076,6 +1104,7 @@ await shot(page, "27-app-done-desktop-light");
         await page.isChecked("#nt-groups") && await page.isChecked("input[name=nt-personal][value=all]") &&
         await page.isChecked("input[name=nt-mode][value=instant]"));
   await cardShot(page, "#s-notify", "notify-default-desktop-light");
+  check("часовой пояс уведомлений — словами", (await page.textContent("#nt-tz")) === "по московскому времени", await page.textContent("#nt-tz"));
   // тихие часы выключаются — иначе уведомления стенда ночью копились бы до утра
   await page.uncheck("#nt-quiet");
   check("уведомления: без тихих часов время не выбирается", await page.isDisabled("#nt-quiet-from"));
@@ -1174,6 +1203,7 @@ await shot(page, "27-app-done-desktop-light");
     const ctx = await browser.newContext({ ...options, storageState: stored });
     const p = await ctx.newPage();
     p.on("dialog", (d) => d.accept());
+    await p.addInitScript(AUTO_ASK);
     await p.goto(URL_PAGE);
     await p.waitForSelector("#screen-app:not([hidden])");
     await p.click("#notify-details > summary");
@@ -1404,6 +1434,22 @@ check("в журнале действий нет ни секретов, ни и�
       !SECRETS.concat(["Иван", "Семья", "Тестов", "t.me/", "tg://", KEY]).some((s) => JSON.stringify(seen.audit).includes(s)));
 check("страница не обращалась к чужим серверам", foreign.length === 0, foreign.slice(0, 3).join(", "));
 check("в консоли браузера нет ошибок", consoleErrors.filter((e) => !/401|403|404|409|422|Failed to load resource|ServiceWorker|service worker/i.test(e)).length === 0, consoleErrors.slice(0, 3).join(" | "));
+{
+  // С5, С3 (Р-86): на экране владельца нет команд сервера, имён переменных, названий поясов и Hermes —
+  // кроме свёрнутых строк «Для того, кто обслуживает сервер». Проверяется вся разметка, и скрытая тоже.
+  const owner = await page.evaluate(() => {
+    const copy = document.body.cloneNode(true);
+    copy.querySelectorAll("details.for-admin, script, style").forEach((n) => n.remove());
+    return { text: copy.textContent, title: document.title, head: document.querySelector("header.top").textContent };
+  });
+  const jargon = ["./ops/", "SHTURMAN_", "Europe/", "Hermes", "wrong_state", "blocked_address", "кабинет", "«Переписка»"]
+    .filter((w) => owner.text.includes(w));
+  check("на экране владельца нет ./ops/, SHTURMAN_, Europe/…, Hermes, кодов причин", jargon.length === 0, jargon.join(", "));
+  check("страница называет себя «Настройки Штурмана» — во вкладке и в шапке",
+        owner.title === "Настройки Штурмана" && owner.head.includes("Настройки Штурмана"), owner.title + " | " + owner.head.trim());
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.locator("header.top").screenshot({ path: path.join(OUT, "header-desktop-light.png") });
+}
 
 // --- выход и вход по коду от бота ---------------------------------------------------------------
 await page.click("#logout");

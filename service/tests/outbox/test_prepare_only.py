@@ -17,7 +17,11 @@ async def test_prepare_only_without_transport_creates_pending_and_cannot_approve
     out = await drafts.create(env.conn, env.state, chat_id=chat_id, text='Проверяемый ответ', prepare_only=True)
     assert out['status'] == 'pending' and out['prepare_only'] is True
     notes = await owner_messages(env.conn)
-    result = await press(env, button(notes, 'Отправить'))
+    # П2 (Р-86): у черновика только для просмотра одна кнопка «Понятно» — данные те же, что у «Отклонить».
+    seen = button(notes, 'Понятно')
+    assert seen.startswith('sh:ob:r:') and all(b['text'] != 'Отправить' for n in notes for row in n['payload']['buttons'] or [] for b in row)
+    # Кнопка «Отправить» прежних карточек (те же данные с «s») по-прежнему ничего не отправляет.
+    result = await press(env, seen.replace('sh:ob:r:', 'sh:ob:s:', 1))
     assert 'выключена' in result['answer']
     assert (await draft_row(env.conn, out['draft_id']))['status'] == 'pending'
     await settle(env)
@@ -62,7 +66,7 @@ async def test_prepared_draft_never_auto_upgrades_when_switch_turns_on(env):
     out = await drafts.create(env.conn, env.state, chat_id=chat_id, text='Только для просмотра', prepare_only=True)
     notes = await owner_messages(env.conn)
     switch(env, sending=True)
-    result = await press(env, button(notes, 'Отправить'))
+    result = await press(env, button(notes, 'Понятно').replace('sh:ob:r:', 'sh:ob:s:', 1))
     assert 'без права отправки' in result['answer']
     assert (await draft_row(env.conn, out['draft_id']))['status'] == 'pending'
     await settle(env)

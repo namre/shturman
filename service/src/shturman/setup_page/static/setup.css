@@ -694,3 +694,22 @@ ol.howto { margin: 8px 0 0; padding-left: 22px; display: flex; flex-direction: c
 ol.howto code { overflow-wrap: anywhere; }
 ol.howto .small-btn { margin-left: 4px; }
 #bot-managed h3, #bot-howto h3 { margin: 0; }
+
+/* Строка для того, кто обслуживает сервер: свёрнута и мелко — владельцу команды сервера не нужны (Р-86) */
+details.for-admin { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
+details.for-admin > summary { cursor: pointer; }
+details.for-admin p { margin: 4px 0 0; font-size: 13px; }
+details.for-admin code { overflow-wrap: anywhere; }
+
+/* Подтверждение в строке вместо системного окна (С6, Р-86) */
+.ask {
+  margin: 8px 0 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--accent-soft); display: flex; flex-direction: column; gap: 10px;
+  flex-basis: 100%; width: 100%; box-sizing: border-box;
+}
+.ask p { margin: 0; }
+.chat:has(> .ask), .row:has(> .ask) { flex-wrap: wrap; }
+.ask .ask-note { font-size: 14px; color: var(--muted); }
+.ask .ask-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn.danger-fill { background: var(--danger); border-color: var(--danger); color: var(--surface); }
+.btn.danger-fill:hover { background: var(--danger); border-color: var(--danger); color: var(--surface); filter: brightness(0.92); }
