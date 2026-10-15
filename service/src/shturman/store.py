@@ -54,7 +54,7 @@ CREATE TEMP TABLE IF NOT EXISTS import_stage (
     telegram_entities jsonb, topic_tg_id bigint, is_forwarded boolean,
     telegram_via_bot boolean, telegram_sender_bot boolean,
     media_duration integer, media_ref text,
-    media_name text, media_mime text, media_size bigint
+    media_name text, media_mime text, media_size bigint, grouped_id bigint
 ) ON COMMIT DELETE ROWS
 """
 
@@ -127,14 +127,14 @@ INSERT INTO messages AS m (
     text, entities, reply_to_tg_id, forwarded_from, edited_at,
     media_type, media_path, service_action, sources, agent_visible,
     telegram_entities, topic_tg_id, is_forwarded, telegram_via_bot, telegram_sender_bot,
-    media_duration, media_ref, media_name, media_mime, media_size
+    media_duration, media_ref, media_name, media_mime, media_size, grouped_id
 )
 SELECT s.chat_id, s.tg_message_id, s.sent_at, s.kind, p.id, s.sender_name, s.is_outgoing,
        s.text, s.entities, s.reply_to_tg_id, s.forwarded_from, s.edited_at,
        s.media_type, s.media_path, s.service_action, ARRAY[$1::text],
        NOT ($2::boolean AND s.is_outgoing IS NOT TRUE AND s.kind = 'message' AND s.text <> ''),
        s.telegram_entities, s.topic_tg_id, s.is_forwarded, s.telegram_via_bot, s.telegram_sender_bot,
-       s.media_duration, s.media_ref, s.media_name, s.media_mime, s.media_size
+       s.media_duration, s.media_ref, s.media_name, s.media_mime, s.media_size, s.grouped_id
 FROM import_stage s
 LEFT JOIN peers p ON p.class = s.sender_class AND p.tg_id = s.sender_tg_id
 -- Номера строк архива идут в порядке сообщений, а не в том, какой выберет план запроса:
@@ -186,6 +186,7 @@ ON CONFLICT (chat_id, tg_message_id) DO UPDATE SET
     media_name     = COALESCE(m.media_name, EXCLUDED.media_name),
     media_mime     = COALESCE(m.media_mime, EXCLUDED.media_mime),
     media_size     = COALESCE(m.media_size, EXCLUDED.media_size),
+    grouped_id     = COALESCE(m.grouped_id, EXCLUDED.grouped_id),
     sources = CASE WHEN $1 = ANY (m.sources) THEN m.sources ELSE m.sources || $1::text END
 RETURNING m.id, (xmax = 0) AS inserted
 """
@@ -285,6 +286,8 @@ def _row(chat_id: int, m: MessageRecord, owner_tg_id: int, outgoing: bool | None
         _clean(m.media_name)[:255] if m.media_name else None,
         _clean(m.media_mime)[:100] if m.media_mime else None,
         m.media_size if isinstance(m.media_size, int) and 0 <= m.media_size < 10**13 else None,
+        m.grouped_id if isinstance(m.grouped_id, int) and not isinstance(m.grouped_id, bool)
+        and -2**63 <= m.grouped_id < 2**63 else None,
     )
 
 

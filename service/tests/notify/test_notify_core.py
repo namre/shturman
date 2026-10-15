@@ -191,9 +191,9 @@ async def test_mention_by_numeric_id_text_link_and_owner_username_are_direct(nv)
     assert await live(nv, nv.owner_acc, grp, mid3) == "mention"
     assert [i[:2] for i in await items(nv.conn)] == [("mention", "mention")] * 3
     await nv.n.flush()
-    [note] = await sent(nv.conn)                       # один чат — одно уведомление и «…и ещё 2»
+    [note] = await sent(nv.conn)                       # один чат — одно уведомление о трёх сообщениях
     assert note.startswith("📣 Вас упомянули в «Стройка ЖК»\nПётр Сидоров · ")
-    assert "упоминание" in note and "«Евгений, посмотрите смету»" in note and "…и ещё 2 сообщения" in note
+    assert "упоминание" in note and "3 сообщения: «Евгений, посмотрите смету» · «Скиньте контакт" in note
 
 
 async def test_reply_to_owners_real_message_in_same_topic_is_direct(nv):
@@ -268,7 +268,7 @@ async def test_instant_then_collapsed_into_one_more_message_per_gap(nv):
     assert await nv.n.flush(t0 + timedelta(minutes=5)) == 0          # не чаще раза в 10 минут
     assert await nv.n.flush(t0 + timedelta(minutes=10, seconds=1)) == 1
     texts = await sent(nv.conn)
-    assert len(texts) == 2 and "«Сообщение 2»" in texts[1] and "…и ещё 2 сообщения, последнее в" in texts[1]
+    assert len(texts) == 2 and "3 сообщения: «Сообщение 2» · «Сообщение 3» · «Сообщение 4»" in texts[1]
     # другой чат в это время не ждёт
     petr = await chat(nv.conn, nv.owner_acc, PETR, name="Пётр")
     await live(nv, nv.owner_acc, petr, await message(nv.conn, petr, 9, "Срочно", sender=PETR))

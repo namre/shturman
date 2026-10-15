@@ -145,6 +145,9 @@ services:
       SHTURMAN_ASR_DAYS: ${SHTURMAN_ASR_DAYS:-30}
       SHTURMAN_ASR_MAX_SECONDS: ${SHTURMAN_ASR_MAX_SECONDS:-600}
       SHTURMAN_MEDIA_DAYS: ${SHTURMAN_MEDIA_DAYS:-30}
+      # Пачка сообщений (Р-93): пауза, до которой сообщения одного человека — одна пачка, и ожидание её вложений.
+      SHTURMAN_PACK_GAP: ${SHTURMAN_PACK_GAP:-90}
+      SHTURMAN_PACK_MEDIA_WAIT: ${SHTURMAN_PACK_MEDIA_WAIT:-90}
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}

@@ -190,6 +190,8 @@ def build_app(
                 await conn.close()
             if applied:
                 logger.info("применены миграции: %s", ", ".join(applied))
+        from . import packs
+        packs.configure(gap=config.pack_gap, media_wait=config.pack_media_wait)
         pool, ro_pool = await create_pools(config)
         state = AppState(config=config, pool=pool, ro_pool=ro_pool)
         app.state.shturman = state

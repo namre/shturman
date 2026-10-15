@@ -44,6 +44,8 @@ class MessageRecord:
     media_name: str | None = None      # имя файла документа
     media_mime: str | None = None
     media_size: int | None = None      # байт
+    # Номер альбома Telegram: у фото и видео, отправленных вместе, он общий (пачка — packs.py).
+    grouped_id: int | None = None
 
 
 @dataclass

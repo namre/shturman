@@ -101,6 +101,10 @@ class Config:
     # настройки переписки (setup_state 'media'): файлы уходят модели. Здесь — только пределы.
     media_days: int = 30
     media_max_bytes: int = 20 * 1024 * 1024
+    # Пачка сообщений — одно высказывание (packs.py, Р-93): сколько секунд паузы между сообщениями одного
+    # отправителя ещё считаются одной пачкой и сколько секунд ждать разбора её вложений перед ответом.
+    pack_gap: float = 90.0
+    pack_media_wait: float = 90.0
     # Внешний адрес страницы настройки (схема, имя и порт, без пути), например
     # https://assistant.example.com:8443. Пусто — страница отвечает только под локальными именами
     # из allowed_hosts (туннель SSH). Адрес обязан отличаться от адреса дашборда Hermes хотя бы
@@ -235,6 +239,8 @@ class Config:
             asr_days=min(3650, max(0, _int("SHTURMAN_ASR_DAYS", 30))),
             asr_max_seconds=min(3600, max(10, _int("SHTURMAN_ASR_MAX_SECONDS", 600))),
             media_days=min(3650, max(0, _int("SHTURMAN_MEDIA_DAYS", 30))),
+            pack_gap=float(min(600, max(0, _int("SHTURMAN_PACK_GAP", 90)))),
+            pack_media_wait=float(min(600, max(0, _int("SHTURMAN_PACK_MEDIA_WAIT", 90)))),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
             bot_manager_api=bot_manager_api(_env("SHTURMAN_BOT_MANAGER_API")),
         )

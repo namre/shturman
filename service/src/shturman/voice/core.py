@@ -93,7 +93,8 @@ SELECT m.id, m.tg_message_id, m.media_type, m.media_duration, m.media_ref, m.med
 FROM messages m JOIN chats c ON c.id = m.chat_id JOIN peers p ON p.id = c.peer_id
 WHERE m.transcript_state = 'pending' AND (m.transcript_at IS NULL OR m.transcript_at <= now())
   AND m.deleted_at IS NULL AND NOT c.excluded
-ORDER BY m.sent_at DESC
+-- по голосовому готовится ответ (packs.rush, Р-93) — первым
+ORDER BY m.rush_at DESC NULLS LAST, m.sent_at DESC
 LIMIT $1
 """
 

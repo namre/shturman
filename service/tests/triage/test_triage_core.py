@@ -94,14 +94,17 @@ async def test_hidden_message_is_not_context_either(tv):
 
 
 async def test_batch_from_one_person_is_one_reading(tv):
+    from shturman import packs
     await enable(tv.conn)
-    tv.t.wait = 60                         # ждём, не допишет ли
+    packs.configure(gap=90)                # пачка (Р-93): ждём, не допишет ли
     anna = await _anna(tv)
     ids = []
     for n, text in enumerate(["Добрый день", "Бетон не пришёл", "Нужно решение до 14:00"], start=1):
         mid = await message(tv.conn, anna, n, text)
         ids.append((await live(tv, tv.owner_acc, anna, mid))[1])
     tv.t.close()                           # таймеры сняты — обход разберёт строку, как после перезапуска
+    assert await tv.t.prepare(ids[2]) == "waiting"           # пачка ещё не закрылась — человек дописывает
+    await tv.conn.execute("UPDATE messages SET sent_at = sent_at - interval '100 seconds' WHERE chat_id = $1", anna)
     assert await tv.t.prepare(ids[0]) == "newer" and await tv.t.prepare(ids[1]) == "newer"
     assert await tv.t.prepare(ids[2]) == "preparing"
     [job] = await model_jobs(tv.conn)
