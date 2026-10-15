@@ -156,7 +156,7 @@ async def status_text(conn: asyncpg.Connection, state: Any) -> str:
     stopped = await halt.current(conn)
     if stopped["stopped"]:
         # Остановлено (Р-87) — на самом видном месте: первой строкой.
-        lines[2:2] = ["⏸ Остановлено с " + halt.since_words(stopped, config)
+        lines[2:2] = ["⏸ Остановлено " + halt.since_words(stopped, config)
                       + ": ассистент ничего не делает сам — ни ответов, ни вопросов, ни отправки. "
                         "Продолжить — /resume.", ""]
         if stopped["paused_accounts"]:

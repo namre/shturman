@@ -21,7 +21,9 @@
 # шлюз, и с этим заголовком идёт один запрос к 127.0.0.1:8765/mcp — смотрится только код ответа;
 # в журнале ошибок Hermes (logs/errors.log) считаются строки отказа 401 архива за последний час —
 # печатается только число. Строка jobs-failing — задания модели за час по счётчику сервиса
-# (llm_jobs в /api/status: числа и виды ошибок, без текстов).
+# (llm_jobs в /api/status: числа и виды ошибок, без текстов). Строка stopped (Р-87) — остановил ли
+# владелец ассистента кнопкой «Остановить всё» (WARN, пока остановлено); setup-code-login (Р-88) —
+# включён ли вход на страницу по коду из бота и сколько было таких входов за 7 суток, без кодов.
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -543,6 +545,36 @@ EOF6
           esac ;;
       esac
     fi
+    # «Остановить всё» (Р-87): остановлен ли ассистент, с какого времени и откуда. Только признаки
+    # и время. Продолжить может только владелец — нажатием в боте согласований.
+    hl="$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, re, sys
+try:
+    h = json.load(sys.stdin).get("stopped")
+except Exception:
+    sys.exit(0)
+if not isinstance(h, dict):
+    sys.exit(0)
+since = h.get("since") if isinstance(h.get("since"), str) else ""
+since = since[:16].replace("T", " ") if re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d[0-9:.+\-Z]*", since) else "?"
+via = h.get("via") if h.get("via") in ("page", "app", "bot") else "?"
+n = h.get("reading_paused")
+n = n if isinstance(n, int) and not isinstance(n, bool) and 0 <= n < 1000 else 0
+print("%s %s %s %d" % ("yes" if h.get("stopped") is True else "no", since.replace(" ", "_"), via, n))' 2>/dev/null)"
+    if [ -n "$hl" ]; then
+      read -r hl_on hl_since hl_via hl_reading <<EOF7
+$hl
+EOF7
+      case "$hl_via" in page) hl_where="в «Настройках Штурмана»" ;; app) hl_where="в приложении «Штурман»" ;;
+        bot) hl_where="в боте согласований" ;; *) hl_where="" ;; esac
+      if [ "$hl_on" = yes ]; then
+        hl_read="переписка по-прежнему собирается"
+        [ "${hl_reading:-0}" -gt 0 ] && hl_read="чтение переписки тоже на паузе (аккаунтов: $hl_reading)"
+        warn stopped "владелец остановил ассистента (с ${hl_since/_/ } UTC${hl_where:+, $hl_where}): ответы, вопросы, черновики, репетиция, наблюдатель и отправка стоят, уведомления приходят; $hl_read. Продолжить может только владелец — нажатием в боте согласований (/resume)"
+      else
+        pass stopped "ассистент не остановлен владельцем"
+      fi
+    fi
   else
     fail archive "сервис не отдал состояние"
   fi
@@ -559,11 +591,13 @@ EOF6
   # Из .env читаются два несекретных адреса: SHTURMAN_SETUP_URL и SHTURMAN_PUBLIC_URL.
   setup_known=no; setup_enabled=unknown; setup_fields=no; setup_reason=unknown; setup_keys=unknown
   setup_accounts=0; setup_business=unknown; setup_socket=absent
+  setup_code=absent; setup_code_reason=none; setup_code_logins=0
   while IFS='=' read -r k v; do
     case "$k" in
       setup_known) setup_known="$v" ;; setup_enabled) setup_enabled="$v" ;; setup_fields) setup_fields="$v" ;;
       setup_reason) setup_reason="$v" ;; setup_keys) setup_keys="$v" ;; setup_accounts) setup_accounts="$v" ;;
       setup_business) setup_business="$v" ;; setup_socket) setup_socket="$v" ;;
+      setup_code) setup_code="$v" ;; setup_code_reason) setup_code_reason="$v" ;; setup_code_logins) setup_code_logins="$v" ;;
     esac
   done <<EOF4
 $(printf '%s' "$st" | docker exec -i "$svc" python -c '
@@ -590,7 +624,14 @@ print("setup_business=" + yn(s.get("business_connected")))
 # Сокет для обратного прокси (Р-76); сервис прежней сборки этого поля не отдаёт.
 sock = s.get("socket")
 codes = ("listening", "off", "dir_missing", "dir_owner", "dir_mode", "not_socket", "error")
-print("setup_socket=" + (sock if sock in codes else "unknown" if "socket" in s else "absent"))' 2>/dev/null)
+print("setup_socket=" + (sock if sock in codes else "unknown" if "socket" in s else "absent"))
+# Вход по коду из бота (Р-88): включён ли, почему нет и сколько входов за 7 суток — без кодов и адресов.
+c = s.get("code_login")
+if isinstance(c, dict):
+    print("setup_code=" + yn(c.get("enabled")))
+    r = c.get("reason")
+    print("setup_code_reason=" + (r if r in ("no_bot", "no_owner", "managed", "off", "no_socket") else "none"))
+    print("setup_code_logins=" + num(c.get("logins_7d")))' 2>/dev/null)
 EOF4
   word() { case "$1" in yes) printf '%s' "$2" ;; no) printf '%s' "$3" ;; *) printf 'неизвестно' ;; esac; }
   # Один запрос GET <адрес>/shturman-setup/. После вызова: probe_code — код ответа, probe_mark —
@@ -787,6 +828,18 @@ EOF4
     else
       warn setup-state "$setup_line. Переписка ещё не настроена — это делает владелец на странице настройки переписки: бот согласований, способ подключения, дальше шаги выбранного способа"
     fi
+
+    # 7. Вход на страницу по коду из бота (Р-88). Кодов и адресов здесь нет — только состояние и число входов.
+    code_logins="входов по коду за 7 суток: ${setup_code_logins:-0}"
+    case "$setup_code:$setup_code_reason" in
+      absent:*) ;;   # сервис прежней сборки — входа по коду у него нет
+      yes:*) pass setup-code-login "вход по коду из бота включён; $code_logins (вход по ссылке — ./ops/setup-link.sh, по просьбе владельца)" ;;
+      *:managed) pass setup-code-login "вход по коду из бота выключен: бот согласований заведён посредником (так по умолчанию). Включает владелец в «Настройках Штурмана» и подтверждает в боте; $code_logins" ;;
+      *:off) pass setup-code-login "вход по коду из бота выключил владелец; $code_logins" ;;
+      *:no_bot|*:no_owner) pass setup-code-login "вход по коду из бота появится после настройки бота согласований и привязки владельца; пока вход — по ссылке ./ops/setup-link.sh" ;;
+      *:no_socket) warn setup-code-login "вход по коду из бота не работает: с Hermes он принимается только через сокет обратного прокси, а сокета нет — смотрите строку setup-socket; пока вход — по ссылке ./ops/setup-link.sh" ;;
+      *) warn setup-code-login "состояние входа по коду из бота неизвестно; $code_logins" ;;
+    esac
   fi
 
   # Защита от внедрённых инструкций: включена ли, отвечает ли модель и сколько входящих сообщений

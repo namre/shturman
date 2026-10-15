@@ -15,8 +15,24 @@
     <svg width="22" height="22" viewBox="0 0 36 36" fill="none" aria-hidden="true"><circle cx="18" cy="18" r="16" stroke="currentColor" stroke-width="2"/><path d="M18 5l4 13-4 13-4-13z" fill="#F2B441"/><circle cx="18" cy="18" r="2.4" fill="currentColor"/></svg>
     <span>Штурман</span>
   </div>
-  <button type="button" class="ghost" id="refresh" hidden>Обновить</button>
+  <div class="top-actions">
+    <button type="button" class="ghost" id="refresh" hidden>Обновить</button>
+    <button type="button" class="stop" id="halt-stop" hidden>Остановить всё</button>
+  </div>
 </header>
+
+<!-- «Остановить всё» (Р-87): пока остановлено — над любым разделом -->
+<div class="halt" id="halt-banner" role="status" hidden>
+  <p class="halt-title"><b>⏸ Остановлено <span id="halt-since"></span></b></p>
+  <p class="small">Ассистент ничего не делает сам: не готовит ответы, не задаёт вопросов, ничего не отправляет.
+    Уведомления приходят. <span id="halt-reading"></span></p>
+  <label class="check" id="halt-reading-box" hidden><input type="checkbox" id="halt-reading-resume"><span>и снова читать переписку</span></label>
+  <div class="actions">
+    <button type="button" class="primary" id="halt-resume">Продолжить…</button>
+    <button type="button" class="secondary" id="halt-reading-stop" hidden>Ещё и перестать читать переписку</button>
+  </div>
+  <p class="small" id="halt-note" hidden></p>
+</div>
 
 <nav class="tabs" id="tabs" role="tablist" aria-label="Разделы" hidden>
   <button type="button" role="tab" id="tab-approvals" aria-controls="screen-approvals" aria-selected="true">
@@ -27,6 +43,10 @@
   </button>
   <button type="button" role="tab" id="tab-spheres" aria-controls="screen-spheres" aria-selected="false">
     <span>Сферы</span><span class="badge" id="tab-spheres-count" hidden></span>
+  </button>
+  <button type="button" role="tab" id="tab-rehearsal" aria-controls="screen-rehearsal" aria-selected="false"
+          aria-label="Репетиция" title="Репетиция">
+    <span aria-hidden="true">🎭</span>
   </button>
   <button type="button" role="tab" id="tab-notify" aria-controls="screen-notify" aria-selected="false"
           aria-label="Уведомления" title="Уведомления">
@@ -44,7 +64,7 @@
     <h1>Откройте в Telegram</h1>
     <p>Это приложение открывается кнопкой <strong>«Штурман»</strong> внизу чата с вашим ботом согласований.
        Отдельного входа у него нет: Telegram сам сообщает, что открыли именно вы.</p>
-    <p class="muted">Настройка — первый вход, ключи, вход в аккаунт Telegram и выгрузка — в «Настройках Штурмана» в браузере.</p>
+    <p class="muted">Настройка — первый вход, ключи, вход в аккаунт Telegram и выгрузка — в «Настройках Штурмана».</p>
   </section>
 
   <section class="state" id="screen-failed" hidden>
@@ -73,6 +93,7 @@
     <p class="later muted" id="later" hidden></p>
     <p class="muted foot">Те же решения приходят карточками в бот согласований — решать можно и там, и здесь.
       Отдельные экраны со списком договорённостей и состоянием сервера появятся в следующих версиях приложения.</p>
+    <button type="button" class="secondary wide open-setup" hidden>Открыть настройки в браузере</button>
     <button type="button" class="home" id="home-screen" hidden>Добавить «Штурман» на главный экран</button>
   </section>
 
@@ -90,15 +111,21 @@
 
     <div class="panel" id="chats-none" hidden>
       <h2>Аккаунт Telegram не подключён</h2>
-      <p>Войдите в него в «Настройках Штурмана» в браузере — шаг со входом в аккаунт Telegram. В приложении
+      <p>Войдите в него в «Настройках Штурмана» — шаг со входом в аккаунт Telegram. В приложении
          входа нет: QR-код для входа с этого же телефона не отсканировать.</p>
-      <button type="button" class="secondary" id="chats-none-retry">Проверить ещё раз</button>
+      <div class="actions">
+        <button type="button" class="primary open-setup" hidden>Открыть настройки в браузере</button>
+        <button type="button" class="secondary" id="chats-none-retry">Проверить ещё раз</button>
+      </div>
     </div>
 
     <div class="panel" id="chats-offline" hidden>
       <h2>Аккаунт сейчас не подключён</h2>
-      <p id="chats-offline-text">Поэтому список его чатов недоступен. Состояние аккаунта и вход в него — в «Настройках Штурмана» в браузере.</p>
-      <button type="button" class="secondary" id="chats-offline-retry">Проверить ещё раз</button>
+      <p id="chats-offline-text">Поэтому список его чатов недоступен. Состояние аккаунта и вход в него — в «Настройках Штурмана».</p>
+      <div class="actions">
+        <button type="button" class="primary open-setup" hidden>Открыть настройки в браузере</button>
+        <button type="button" class="secondary" id="chats-offline-retry">Проверить ещё раз</button>
+      </div>
     </div>
 
     <div class="panel" id="chats-failed" hidden>
@@ -158,8 +185,9 @@
 
       <p class="muted foot">Каждое включение и выключение чата отсюда бот согласований сообщит вам отдельным
         сообщением — так вы заметите, если чаты меняет кто-то другой. Стереть уже сохранённые сообщения чата,
-        включить сразу все чаты раздела, группы или каналы и войти в аккаунт — в «Настройках Штурмана» в браузере.
+        включить сразу все чаты раздела, группы или каналы и войти в аккаунт — в «Настройках Штурмана».
         Выключить все чаты раздела можно и здесь.</p>
+      <button type="button" class="secondary wide open-setup" hidden>Открыть настройки в браузере</button>
     </div>
   </section>
 
@@ -204,7 +232,7 @@
       <h1>Уведомления</h1>
     </div>
     <p class="lead muted">Бот пишет вам, когда вам написали в личку или обратились к вам в группе. Здесь можно
-      выключить лишнее и выбрать время. Включить больше — в «Настройках Штурмана» в браузере.</p>
+      выключить лишнее и выбрать время. Включить больше — в «Настройках Штурмана».</p>
     <p class="muted" id="nt-loading">Загружаю…</p>
     <div class="panel" id="nt-failed" hidden>
       <h2>Не загрузилось</h2>
@@ -244,6 +272,51 @@
         <button type="submit" class="primary wide" id="nt-save">Сохранить</button>
       </form>
       <p class="muted foot">Каждое изменение отсюда бот согласований сообщит вам отдельным сообщением.</p>
+      <button type="button" class="secondary wide open-setup" hidden>Открыть настройки в браузере</button>
+    </div>
+  </section>
+
+  <!-- экран «Репетиция» (Р-89): способ «Через ваш аккаунт», только личные чаты -->
+  <section id="screen-rehearsal" role="tabpanel" aria-labelledby="tab-rehearsal" hidden>
+    <div class="title-row">
+      <h1>Репетиция</h1>
+      <span class="count" id="rh-count"></span>
+    </div>
+    <p class="lead muted">Когда вам пишет человек из списка, ассистент готовит, что ответил бы, и показывает это вам
+      в боте. Ничего не отправляется. Вы оцениваете — так видно, можно ли ему доверять.</p>
+    <p class="muted" id="rh-loading">Загружаю…</p>
+    <div class="panel" id="rh-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="rh-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="rh-retry">Повторить</button>
+    </div>
+    <div class="panel" id="rh-unavailable" hidden>
+      <h2>Недоступна в этом способе</h2>
+      <p id="rh-unavailable-text"></p>
+      <p class="muted small">Способ работы меняется в «Настройках Штурмана».</p>
+    </div>
+    <div id="rh-body" hidden>
+      <p class="banner" id="rh-halted" hidden>Ассистент остановлен — пока он не продолжит, репетиция стоит.</p>
+      <div class="panel">
+        <label class="check rh-switch"><input type="checkbox" id="rh-enabled"><span>Репетиция включена</span></label>
+        <p class="muted small" id="rh-cap"></p>
+      </div>
+      <div class="panel">
+        <h2>С кем репетировать</h2>
+        <ul class="rh-people" id="rh-people"></ul>
+        <p class="muted small" id="rh-people-empty" hidden>Список пуст — добавьте человека из ваших личных чатов.</p>
+        <input type="search" id="rh-q" placeholder="Найти человека по имени" aria-label="Найти человека по имени"
+               autocomplete="off" spellcheck="false" enterkeyhint="search">
+        <ul class="rh-people rh-found" id="rh-found" aria-live="polite"></ul>
+      </div>
+      <div class="panel">
+        <h2>За 7 дней</h2>
+        <p id="rh-stats"></p>
+        <ul class="rh-recent" id="rh-recent"></ul>
+        <p class="muted small" id="rh-recent-empty" hidden>Карточек пока не было.</p>
+      </div>
+      <p class="muted foot">Включение и новые люди отсюда действуют сразу; о каждом изменении бот согласований
+        напишет вам отдельно — с командой, которой его вернуть. Предел в сутки и паузу меняют в «Настройках Штурмана».</p>
     </div>
   </section>
 </main>

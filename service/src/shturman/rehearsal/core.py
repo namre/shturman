@@ -207,7 +207,10 @@ async def compose_card(conn: asyncpg.Connection, item: Mapping[str, Any], row: M
     titles = (await spheres.titles_by_chat(conn, [item["chat_id"]])).get(item["chat_id"], [])
     sphere = (" · " + ", ".join(textlib.one_line(t, 40) for t in titles)) if titles else ""
     who = textlib.one_line(row["chat_title"], 60) or textlib.one_line(row["sender_name"], 60) or "собеседник"
-    lines = ["🎭 Репетиция ответа — ничего не отправлено",
+    head = "🎭 Репетиция ответа — ничего не отправлено"
+    if item.get("on_demand"):
+        head += "\nПо вашей просьбе — кнопкой «Подготовить ответ» под уведомлением."
+    lines = [head,
              f"💬 Вам написали: {who}",
              f"Личный чат{sphere} · {notify_core._clock(row['sent_at'], tz, now)}",
              notify_core.body(row, {"preview": True})]

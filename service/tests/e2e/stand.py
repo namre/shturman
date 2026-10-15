@@ -61,6 +61,12 @@ from shturman import db, netguard  # noqa: E402
 from shturman.app import build_app  # noqa: E402
 from shturman.config import Config  # noqa: E402
 from shturman.executor import service as executor_service  # noqa: E402
+from shturman.setup_page import service as setup_service  # noqa: E402
+
+# Вход по коду из бота при заданном адресе дашборда принимается только через сокет обратного прокси
+# (Р-88, `service._via_proxy`). Стенд слушает порт, а «прокси» для него — сам браузер сценария: считаем
+# каждый запрос пришедшим через сокет. Отказ через порт проверяют тесты (`test_code_login.py`).
+setup_service._via_proxy = lambda request, state: True
 
 DSN = os.environ.get("SHTURMAN_TEST_DSN", "")
 PORT = int(os.environ.get("E2E_PORT", "8765"))
@@ -194,9 +200,38 @@ async def main() -> None:
         """Последний код входа, который бот прислал владельцу."""
         for params in reversed(telegram.calls("sendMessage")):
             text = params.get("text", "")
-            if text.startswith("Код входа"):
+            if "Код входа" in text.split("\n")[0]:
                 return JSONResponse({"code": "".join(ch for ch in text.split("\n")[0] if ch.isdigit())})
         return JSONResponse({"code": None})
+
+    async def bot_sent(request):
+        """Пакет 2: что бот прислал владельцу (текст и кнопки) — для снимков сообщений бота."""
+        out = []
+        for name, params in telegram.requests:
+            if name in ("sendMessage", "editMessageText", "editMessageReplyMarkup"):
+                out.append({"method": name, "text": params.get("text"), "reply_markup": params.get("reply_markup"),
+                            "message_id": params.get("message_id")})
+        return JSONResponse(out)
+
+    async def bot_press(request):
+        """Владелец нажал кнопку под сообщением бота: ?data=sh:…"""
+        telegram.press(request.query_params["data"])
+        await asyncio.sleep(0.6)
+        return JSONResponse({"ok": True})
+
+    async def bot_reply(request):
+        """Владелец ответил на последнее сообщение бота (ForceReply): ?text=…"""
+        telegram.push(message={"message_id": 900, "date": int(time.time()), "from": exec_fakes.OWNER_USER,
+                               "chat": exec_fakes.private(exec_fakes.OWNER_USER), "text": request.query_params["text"],
+                               "reply_to_message": {"message_id": telegram.last_message_id()}})
+        await asyncio.sleep(0.6)
+        return JSONResponse({"ok": True})
+
+    async def bot_say(request):
+        """Владелец написал боту: ?text=…"""
+        telegram.text(request.query_params["text"])
+        await asyncio.sleep(0.6)
+        return JSONResponse({"ok": True})
 
     async def business(request):
         """Человек включил режим у @BotFather и подключил бота в настройках Telegram."""
@@ -623,7 +658,8 @@ async def main() -> None:
             "settings": json.loads(await conn.fetchval("SELECT value::text FROM settings WHERE key = 'rehearsal.settings'")
                                    or "null"),
             "items": [dict(r) for r in await conn.fetch(
-                "SELECT state, reason, outcome, rating FROM rehearsal_items ORDER BY id")],
+                "SELECT state, reason, outcome, rating, owner_variant IS NOT NULL AS variant "
+                "FROM rehearsal_items ORDER BY id")],
             "audit": [dict(r) for r in rows]})
 
     async def dashboard_page(request):
@@ -637,6 +673,8 @@ async def main() -> None:
     control = Starlette(routes=[
         Route("/scan", scan, methods=["POST"]), Route("/start", start, methods=["POST"]),
         Route("/last-code", last_code), Route("/business", business, methods=["POST"]), Route("/seen", seen),
+        Route("/bot/sent", bot_sent), Route("/bot/press", bot_press, methods=["POST"]),
+        Route("/bot/say", bot_say, methods=["POST"]), Route("/bot/reply", bot_reply, methods=["POST"]),
         Route("/chatgpt/authorize", chatgpt_authorize, methods=["POST"]),
         Route("/seed-memory", seed_memory, methods=["POST"]),
         Route("/dialogs/big", dialogs_big, methods=["POST"]), Route("/dialogs/seen", dialogs_seen),

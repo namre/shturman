@@ -549,7 +549,61 @@ details.sect[open] > summary::before { transform: rotate(45deg); }
 .nt-when { display: flex; flex-direction: column; gap: 10px; }
 .nt-when .tools-row .field { flex: 1 1 120px; }
 .nt-when .small { margin: 0; }
-/* Вкладка «🔔» узкая, остальные — по ширине подписи: на 360 пикселях «Согласования» не вылезает. */
-.tabs button:not(#tab-notify) { flex: 1 1 auto; padding: 6px 8px; }
-#tab-notify { flex: 0 0 44px; padding: 6px 0; }
+/* Вкладки «🎭» и «🔔» узкие, остальные — по ширине подписи: на 360 пикселях «Согласования» не вылезает. */
+.tabs button:not(#tab-notify):not(#tab-rehearsal) { flex: 1 1 auto; padding: 6px 8px; }
+#tab-notify, #tab-rehearsal { flex: 0 0 40px; padding: 6px 0; }
+@media (max-width: 380px) {
+  .tabs button:not(#tab-notify):not(#tab-rehearsal) { padding: 6px 5px; }
+  #tab-notify, #tab-rehearsal { flex-basis: 36px; }
+}
+
+/* ---------------------------------------------------------------- «Остановить всё» (Р-87) */
+
+.top-actions { display: flex; align-items: center; gap: 6px; }
+.stop {
+  background: transparent; color: #a86a00; border: 1px solid #F2B441;
+  min-height: 34px; padding: 4px 10px; font-size: 14px; font-weight: 600;
+}
+@media (prefers-color-scheme: dark) { .stop { color: #F2B441; } }
+.halt {
+  background: var(--section);
+  border: 1px solid #F2B441;
+  border-left: 4px solid #F2B441;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 6px 0 8px;
+}
+.halt p { margin: 4px 0; }
+.halt .halt-title { font-size: 16px; }
+.halt .actions { margin-top: 8px; }
+
+/* ---------------------------------------------------------------- ответ на вопрос ассистента (П1) */
+
+.answer { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.answer textarea {
+  font: inherit; font-size: 16px; color: var(--text); background: var(--section);
+  border: 1px solid var(--sep); border-radius: 10px; padding: 8px 12px; min-height: 76px; resize: vertical;
+  width: 100%; max-width: 100%;
+}
+.answer textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.answer .field-label { font-size: 13px; color: var(--hint); }
+.answer .left { font-size: 13px; color: var(--hint); }
+
+/* ---------------------------------------------------------------- «Репетиция» (Р-89) */
+
+.rh-people { list-style: none; margin: 6px 0 10px; padding: 0; }
+.rh-people li {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--sep);
+}
+.rh-people li:last-child { border-bottom: 0; }
+.rh-people .who { min-width: 0; overflow-wrap: anywhere; }
+.rh-people button { flex: 0 0 auto; min-height: 36px; padding: 6px 12px; }
+.rh-found:empty { display: none; }
+.rh-recent { list-style: none; margin: 8px 0 0; padding: 0; }
+.rh-recent li { padding: 8px 0; border-bottom: 1px solid var(--sep); font-size: 14px; }
+.rh-recent li:last-child { border-bottom: 0; }
+.rh-recent .meta { color: var(--hint); font-size: 13px; }
+.rh-recent .variant { white-space: pre-wrap; background: var(--quote); border-radius: 8px; padding: 6px 10px; margin-top: 6px; }
+.rh-switch { font-weight: 600; }
 .small { font-size: 13px; }

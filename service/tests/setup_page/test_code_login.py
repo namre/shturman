@@ -65,7 +65,7 @@ async def test_code_from_the_bot_logs_in_once_in_the_browser_that_asked(stand, c
     for part in ("Path=/shturman-setup/api/login/code", "HttpOnly", "Secure", "SameSite=Strict", "Max-Age=300"):
         assert part in cookie
     assert "Domain" not in cookie
-    guest.code_cookie = cookie.split(";", 1)[0].split("=", 1)[1]
+    guest.code_cookie = attempt_cookie = cookie.split(";", 1)[0].split("=", 1)[1]
 
     (sent,) = code_messages(s)
     (code,) = codes(s)
@@ -82,7 +82,7 @@ async def test_code_from_the_bot_logs_in_once_in_the_browser_that_asked(stand, c
 
     # тот же код в другом браузере (без этой cookie) не действует — и попытку этого браузера не тратит
     other = s.browser()
-    assert (await other.post("/login/code", {"code": code})).json()["code"] == "none"
+    assert (await other.post("/login/code", {"code": code})).json().get("code") == "none"
     done = await guest.post("/login/code", {"code": f"{code[:3]} {code[3:]}"})
     assert done.status_code == 200
     assert any("Max-Age=0" in v for v in done.headers.get_list("set-cookie"))     # cookie стёрта
@@ -92,9 +92,10 @@ async def test_code_from_the_bot_logs_in_once_in_the_browser_that_asked(stand, c
     assert (await s.page.get("/state")).status_code == 200
     ttl = await conn.fetchval("SELECT extract(epoch FROM expires_at - created_at) FROM setup_sessions WHERE via = 'code'")
     assert ttl == auth.SESSION_MAX
-    # одноразовый: второй раз тем же кодом и той же cookie — нет
+    # одноразовый: второй раз тем же кодом и той же cookie (браузер её стёр — подставим снова) — нет
     guest.key = ""
-    assert (await guest.post("/login/code", {"code": code})).json()["code"] == "none"
+    guest.code_cookie = attempt_cookie
+    assert (await guest.post("/login/code", {"code": code})).json().get("code") == "none"
     log = await conn.fetch("SELECT action, detail FROM setup_audit ORDER BY id")
     assert ("login.code", "по коду из бота") in [(r["action"], r["detail"]) for r in log]
     assert any(r["action"] == "login.link" and "по ссылке" in r["detail"] for r in log)
@@ -108,8 +109,8 @@ async def test_expired_code_does_not_work(stand, conn):
     await guest.post("/login/code/request")
     code = codes(s)[-1]
     await conn.execute("UPDATE setup_codes SET expires_at = now() - interval '1 second'")
-    assert (await guest.post("/login/code", {"code": code})).json()["code"] == "expired"
-    assert (await guest.post("/login/code", {"code": code})).json()["code"] == "none"     # погашен
+    assert (await guest.post("/login/code", {"code": code})).json().get("code") == "expired"
+    assert (await guest.post("/login/code", {"code": code})).json().get("code") == "none"     # погашен
 
 
 async def test_two_cookies_with_the_same_name_mean_no_attempt(stand, conn):
@@ -121,8 +122,22 @@ async def test_two_cookies_with_the_same_name_mean_no_attempt(stand, conn):
     forged = auth.new_token()
     response = await guest.http.post(API + "/login/code", json={"code": code}, headers={
         **guest.headers(), "Cookie": f"{auth.CODE_COOKIE}={forged}; {auth.CODE_COOKIE}={guest.code_cookie}"})
-    assert response.json()["code"] == "none"
+    assert response.json().get("code") == "none"
     assert (await guest.post("/login/code", {"code": code})).status_code == 200    # своя — по-прежнему годна
+
+
+async def test_code_of_one_browser_does_not_work_in_another(stand, conn):
+    """Два браузера запросили по коду: каждый код действует только в своём браузере."""
+    s = await owner_bound(stand, conn)
+    first, second = s.browser(), s.browser()
+    await first.post("/login/code/request")
+    await second.post("/login/code/request")
+    code_first, code_second = codes(s)
+    if code_first != code_second:
+        assert (await first.post("/login/code", {"code": code_second})).json().get("code") == "wrong"
+        assert (await second.post("/login/code", {"code": code_first})).json().get("code") == "wrong"
+    assert (await first.post("/login/code", {"code": code_first})).status_code == 200
+    assert (await second.post("/login/code", {"code": code_second})).status_code == 200
 
 
 async def test_new_request_from_the_same_browser_cancels_its_previous_code(stand, conn):
@@ -134,7 +149,7 @@ async def test_new_request_from_the_same_browser_cancels_its_previous_code(stand
     assert guest.code_cookie != first_cookie
     stale = s.browser()
     stale.code_cookie = first_cookie
-    assert (await stale.post("/login/code", {"code": first})).json()["code"] == "none"
+    assert (await stale.post("/login/code", {"code": first})).json().get("code") == "none"
 
 
 async def test_five_wrong_codes_cancel_the_code_and_pause_code_login(stand, conn, monkeypatch):
@@ -149,13 +164,13 @@ async def test_five_wrong_codes_cancel_the_code_and_pause_code_login(stand, conn
         answer = (await guest.post("/login/code", {"code": wrong})).json()
         assert answer["code"] == "wrong" and answer["left"] == left
     fifth = await guest.post("/login/code", {"code": wrong})
-    assert fifth.status_code == 401 and fifth.json()["code"] == "locked" and fifth.json()["retry_after"] == 60
+    assert fifth.status_code == 401 and fifth.json().get("code") == "locked" and fifth.json()["retry_after"] == 60
     await until(lambda: lock_notices(s))
-    assert (await guest.post("/login/code", {"code": good})).json()["code"] == "locked"     # пауза
+    assert (await guest.post("/login/code", {"code": good})).json().get("code") == "locked"     # пауза
     locked = await guest.post("/login/code/request")
     assert locked.status_code == 429 and locked.json()["result"] == "locked"
     clock[0] += 61
-    assert (await guest.post("/login/code", {"code": good})).json()["code"] == "none"      # код погашен
+    assert (await guest.post("/login/code", {"code": good})).json().get("code") == "none"      # код погашен
     # вторая пауза длиннее первой; удачный вход по ссылке её снимает
     await conn.execute("DELETE FROM setup_codes")      # предел запросов здесь не проверяем
     await guest.post("/login/code/request")
@@ -214,8 +229,8 @@ async def test_not_me_cancels_the_code_and_every_waiting_attempt(stand, conn):
     message = code_messages(s)[0]
     done = await press(s, buttons(message)["Это не я"])
     assert done["answer"] == "Код погашен." and "Выйти на всех устройствах" in done["edit_text"]
-    assert (await guest.post("/login/code", {"code": first})).json()["code"] == "none"
-    assert (await other.post("/login/code", {"code": second})).json()["code"] == "none"
+    assert (await guest.post("/login/code", {"code": first})).json().get("code") == "none"
+    assert (await other.post("/login/code", {"code": second})).json().get("code") == "none"
     assert await conn.fetchval("SELECT count(*) FROM setup_audit WHERE action = 'login.code_denied'") == 1
     # «Выйти на всех устройствах» под тем же сообщением — все сессии страницы и приложения
     assert (await s.page.get("/state")).status_code == 200
@@ -235,7 +250,7 @@ async def test_without_a_bound_owner_the_answer_is_the_same_and_nothing_is_sent(
     # тот же вид ответа, что при отправленном коде — ничего не раскрывает
     assert nobody.status_code == 200 and nobody.json() == {"result": "sent", "expires_in": 300, "left": 2}
     for guess in ("000000", "123456", "999999"):
-        assert (await guest.post("/login/code", {"code": guess})).json()["code"] == "wrong"   # недоставленный не срабатывает
+        assert (await guest.post("/login/code", {"code": guess})).json().get("code") == "wrong"   # недоставленный не срабатывает
     # бот есть, а владелец не привязан — тоже некому
     await s.page.login(conn)
     await save_bot(s)
@@ -267,8 +282,8 @@ async def test_dashboard_origin_and_service_port_cannot_ask_or_enter_a_code(stan
     assert refused.status_code in (403, 421)
     # через порт сервиса (так ходит и процесс на хосте) — отказ, даже с правильными заголовками
     port = await s.browser().post("/login/code/request")
-    assert port.status_code == 403 and port.json()["code"] == "port"
-    assert (await s.browser().post("/login/code", {"code": "123456"})).json()["code"] == "port"
+    assert port.status_code == 403 and port.json().get("code") == "port"
+    assert (await s.browser().post("/login/code", {"code": "123456"})).json().get("code") == "port"
     assert (await s.browser().get("/session")).json()["code_login_off"] == "port"
     assert code_messages(s) == [] and await conn.fetchval("SELECT count(*) FROM setup_codes") == 0
 
@@ -317,7 +332,7 @@ async def test_owner_turns_code_login_off_at_once_and_waiting_codes_die(stand, c
     off = await s.page.put("/code-login", {"enabled": False})
     assert off.status_code == 200 and off.json()["enabled"] is False
     assert (await guest.get("/session")).json() == {"authenticated": False, "code_login": False, "code_login_off": "off"}
-    assert (await guest.post("/login/code", {"code": code})).json()["code"] == "none"
+    assert (await guest.post("/login/code", {"code": code})).json().get("code") == "none"
     await guest.post("/login/code/request")
     assert len(code_messages(s)) == 1                    # выключен — код больше не уходит
     on = await s.page.put("/code-login", {"enabled": True})     # свой бот: включение со страницы — сразу

@@ -116,6 +116,7 @@ async def test_app_answer_goes_the_same_way_as_the_command(stand, conn, monkeypa
     (item,) = [i for i in items if i["kind"] == "reply"]
     assert item["answer"]["ref"] == f"sh:rp:a:{task}:task-nonce-0001" and item["answer"]["question"]
     assert "Ответить" not in [a["label"] for a in item["actions"]]        # в приложении это поле, не кнопка
+    assert "Ответьте в поле ниже." in item["text"] and "/replytask" not in item["text"]   # подсказка бота — не здесь
     assert [a["label"] for a in item["actions"]] == ["Не отвечать"]
     done = await s.app.post("/approvals/answer", {"ref": item["answer"]["ref"], "text": "В пятницу."})
     assert done.status_code == 200 and done.json()["answer"] == replies_owner.THANKS

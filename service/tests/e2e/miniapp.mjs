@@ -11,7 +11,7 @@
 // передаёт и Telegram. Сообщения приложения Telegram'у (готово, развернуть) здесь уходить некуда.
 
 import { createRequire } from "node:module";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -268,6 +268,134 @@ for (const [width, scheme, theme] of [[390, "dark", THEME], [390, "light", THEME
     }
   }
   await ctx.close();
+}
+
+// --- 5б. пакет 2 (Р-87…Р-89): ответ полем, «Остановить всё», «Открыть настройки», «Репетиция» ----------
+{
+  const P2_OUT = process.env.E2E_PACK2_OUT || OUT;
+  mkdirSync(P2_OUT, { recursive: true });
+  const post = async (pathname) => (await fetch(CONTROL + pathname, { method: "POST" })).json();
+  const flat = (m) => (m && m.reply_markup && m.reply_markup.inline_keyboard ? m.reply_markup.inline_keyboard.flat() : []);
+  // Сообщения бота уходят очередью заданий — ждём нужное до 8 секунд.
+  const waitSent = async (pred) => {
+    for (let i = 0; i < 40; i++) {
+      const found = (await control("/bot/sent")).filter(pred);
+      if (found.length) return found;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return [];
+  };
+  await post("/pack2/seed");
+  await post("/pack2/ask");
+  const question = (await waitSent((m) => (m.text || "").includes("Вопрос ассистента"))).pop();
+  check("бот: у «Вопроса ассистента» — «Ответить» и «Не отвечать» и срок",
+        ["Ответить", "Не отвечать"].every((t) => flat(question).some((b) => b.text === t)) && question.text.includes("до "),
+        question ? JSON.stringify(flat(question).map((b) => b.text)) : "нет карточки");
+
+  // приложение: поле «Ваш ответ», «Ответить» и сколько осталось — вместо кнопки «Ответить»
+  const opened = await (async () => {
+    const ctx = await browser.newContext({ ...phone, viewport: { width: 390, height: 844 }, colorScheme: "light" });
+    const p = await ctx.newPage();
+    const errs = [];
+    p.on("console", (m) => { if (m.type() === "error") errs.push(m.text()); });
+    // Telegram на телефоне: события страницы уходят в TelegramWebviewProxy — запоминаем их
+    await p.addInitScript(() => {
+      window.__events = [];
+      window.TelegramWebviewProxy = { postEvent: (type, data) => window.__events.push([type, data]) };
+    });
+    await p.goto(launchUrl(await control("/init-data?who=owner"), { tgWebAppThemeParams: JSON.stringify(THEME_LIGHT) }));
+    await p.waitForSelector("#screen-approvals:not([hidden])");
+    return { ctx, p, errs };
+  })();
+  const { p } = opened;
+  const qcard = p.locator(".card", { has: p.locator(".answer") }).first();
+  check("приложение: у «Вопроса ассистента» — поле «Ваш ответ», кнопка «Ответить» и сколько осталось",
+        await qcard.count() === 1 && (await qcard.locator("label").first().textContent()) === "Ваш ответ"
+        && /Осталось/.test(await qcard.locator(".left").textContent())
+        && !(await qcard.locator(".actions button").allTextContents()).includes("Ответить"));
+  await qcard.screenshot({ path: path.join(P2_OUT, "app-question-answer-390-light.png") });
+  // «Открыть настройки в браузере» — через Telegram (web_app_open_link), адрес только https
+  const setupButtons = p.locator("#screen-approvals .open-setup");
+  if (process.env.E2E_SETUP_ORIGIN) {
+    await setupButtons.click();
+    const events = await p.evaluate(() => window.__events.filter(([t]) => t === "web_app_open_link"));
+    check("приложение: «Открыть настройки в браузере» открывает адрес страницы через Telegram",
+          events.length === 1 && JSON.parse(events[0][1]).url === process.env.E2E_SETUP_ORIGIN + "/shturman-setup/",
+          JSON.stringify(events));
+  } else {
+    check("приложение: без внешнего адреса https кнопки «Открыть настройки в браузере» нет", !(await setupButtons.isVisible()));
+  }
+
+  // бот: «Ответить» — просьба с полем ответа; ответ ответом на неё уходит ассистенту
+  const answerData = flat(question).find((b) => b.text === "Ответить").callback_data;
+  await post("/bot/press?data=" + encodeURIComponent(answerData));
+  const prompt = (await waitSent((m) => m.reply_markup && m.reply_markup.force_reply)).pop();
+  check("бот: «Ответить» присылает поле для ответа (ForceReply)", !!prompt && prompt.text.includes("одним сообщением"),
+        prompt ? prompt.text : "");
+  await post("/bot/reply?text=" + encodeURIComponent("Поблагодарите и спросите про сроки по корпусу 3."));
+  const thanks = (await waitSent((m) => (m.text || "").startsWith("Спасибо, ассистент продолжает"))).length > 0;
+  check("бот: ответ принят тем же путём, что /replytask N answer", thanks);
+  await p.reload();
+  await p.waitForSelector("#screen-approvals:not([hidden])");
+  check("приложение: после ответа в боте вопроса в списке нет", await p.locator(".card .answer").count() === 0);
+
+  // «Остановить всё» из приложения — сразу; «Продолжить…» — только карточка в боте
+  check("приложение: в шапке — «Остановить всё»", await p.isVisible("#halt-stop"));
+  await p.click("#halt-stop");
+  await p.waitForSelector("#halt-banner:not([hidden])");
+  check("приложение: остановлено сразу — полоса «Остановлено …»", (await p.textContent("#halt-banner")).includes("Остановлено"));
+  const stopped = (await waitSent((m) => (m.text || "").startsWith("⏸ Ассистент остановлен"))).pop();
+  check("бот: после остановки — что остановлено, сколько отменено, «Продолжить…» и «Открыть «Штурман»»",
+        !!stopped && flat(stopped).some((b) => b.text === "Продолжить…") && flat(stopped).some((b) => b.web_app),
+        stopped ? JSON.stringify(flat(stopped).map((b) => b.text)) : "");
+  await p.screenshot({ path: path.join(P2_OUT, "app-halt-390-light.png"), fullPage: false });
+  await p.click("#halt-resume");
+  await p.waitForSelector("#halt-note:not([hidden])");
+  await p.waitForTimeout(400);
+  const resumeCard = p.locator(".card", { hasText: "Продолжить работу ассистента" });
+  check("приложение: «Продолжить…» — карточка без кнопок, подтвердить можно только в боте",
+        await resumeCard.count() === 1 && await resumeCard.locator(".actions button").count() === 0
+        && (await resumeCard.textContent()).includes("только кнопкой"));
+  await p.screenshot({ path: path.join(P2_OUT, "app-halt-resume-pending-390-light.png"), fullPage: true });
+  const confirmCard = (await waitSent((m) => (m.text || "").includes("Продолжить работу ассистента"))).pop();
+  const yes = flat(confirmCard).find((b) => b.text === "Да, сделать");
+  await post("/bot/press?data=" + encodeURIComponent(yes.callback_data));
+  await p.reload();
+  await p.waitForSelector("#screen-approvals:not([hidden])");
+  await p.waitForTimeout(400);
+  check("приложение: «Да, сделать» в боте сняло остановку", !(await p.isVisible("#halt-banner")) && await p.isVisible("#halt-stop"));
+
+  // вкладка «Репетиция»: включить, добавить человека по имени; бот сообщает с командой отката
+  await p.click("#tab-rehearsal");
+  await p.waitForSelector("#rh-body:not([hidden])");
+  await p.fill("#rh-q", "Анна");
+  await p.waitForSelector("#rh-found li");
+  await p.click("#rh-found li button");
+  await p.waitForFunction(() => document.querySelector("#rh-people").textContent.includes("Анна Ким"));
+  await p.click("#rh-enabled");
+  await p.waitForFunction(() => document.querySelector("#rh-count").textContent === "включена");
+  await waitSent((m) => (m.text || "").startsWith("В приложении изменена репетиция") && m.text.includes("/rehearsal off"));
+  const told = (await control("/bot/sent")).filter((m) => (m.text || "").startsWith("В приложении изменена репетиция"));
+  check("приложение, «Репетиция»: добавлен человек и включено сразу; бот каждый раз пишет, как вернуть",
+        told.length === 2 && told.some((m) => m.text.includes("/rehearsal remove 5101")) && told.some((m) => m.text.includes("/rehearsal off")),
+        told.map((m) => m.text).join(" | "));
+  await p.fill("#rh-q", "");
+  for (const [width, scheme, theme] of [[390, "light", THEME_LIGHT], [360, "dark", THEME]]) {
+    const o = width === 390 ? opened : await openApp(width, scheme, theme);
+    if (o !== opened) { await o.p.click("#tab-rehearsal"); await o.p.waitForSelector("#rh-body:not([hidden])"); }
+    const wide = await o.p.evaluate(() => {
+      const out = [...document.querySelectorAll("main button, main input, .tabs button, header button")]
+        .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+      return { wide: document.documentElement.scrollWidth <= window.innerWidth + 1, out };
+    });
+    check(`приложение, «Репетиция» ${width}-${scheme}: страница не шире экрана, вкладки и кнопки в экране`,
+          wide.wide && wide.out === 0, JSON.stringify(wide));
+    await o.p.screenshot({ path: path.join(P2_OUT, `app-rehearsal-${width}-${scheme}.png`), fullPage: true });
+    if (o !== opened) await o.ctx.close();
+  }
+  check("приложение, пакет 2: в консоли нет ошибок", opened.errs.length === 0, opened.errs.join(" | "));
+  writeFileSync(path.join(P2_OUT, "bot-sent.json"), JSON.stringify(await control("/bot/sent"), null, 1));
+  await opened.ctx.close();
 }
 
 // --- 6. сбои и пустой список -----------------------------------------------------------------------

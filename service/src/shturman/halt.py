@@ -112,7 +112,7 @@ async def refuse_if_stopped(conn: asyncpg.Connection) -> None:
 
 
 def since_words(halt: dict[str, Any], config: Any) -> str:
-    """«Остановлено с сегодня в 14:03 в боте согласований» — для /status и сообщений."""
+    """«сегодня в 14:03 в боте согласований» — для /status и сообщений («Остановлено сегодня в 14:03 …»)."""
     from .executor import owner_views
     return owner_views.moment(halt.get("since"), config) + (" " + VIA_WORDS[halt["via"]] if halt.get("via") in VIA_WORDS else "")
 
@@ -253,7 +253,7 @@ def stopped_message(result: dict[str, Any], config: Any) -> str:
     """Сообщение владельцу в бот после остановки: что остановлено, что отменено, как продолжить."""
     counts, halt = result["counts"], result["halt"]
     lines = ["⏸ Ассистент остановлен" + (" (уже был остановлен)" if result.get("already") else "") + ".",
-             "С " + since_words(halt, config) + ".", "",
+             "Когда: " + since_words(halt, config) + ".", "",
              "Остановлено: ответы и черновики, вопросы ассистента, репетиция, автоответ, наблюдатель, "
              "просьбы подтвердить действия и отправка — даже если она включена на сервере. Настройки не "
              "изменились: после «Продолжить» всё вернётся как было."]
@@ -281,7 +281,7 @@ async def resume_prompt(conn: asyncpg.Connection, state: Any) -> dict[str, Any] 
         return None
     nonce = secrets.token_urlsafe(9)
     await conn.execute("UPDATE assistant_halt SET resume_nonce = $1, updated_at = now() WHERE id = 1", nonce)
-    text = ("Продолжить работу ассистента?\nОстановлен с " + since_words(halt, state.config) + ".\n\n"
+    text = ("Продолжить работу ассистента?\nОстановлен " + since_words(halt, state.config) + ".\n\n"
             "Снова заработает:\n" + "\n".join(await what_resumes(conn, state)))
     # Кнопки — парами (подпись, данные): сообщение отправляет сам бот (owner_chat), не очередь заданий.
     buttons = [[("Продолжить", bridge.callback_data(CALLBACK_MODULE, f"r:{nonce}"))]]
@@ -403,7 +403,7 @@ async def request_resume(conn: asyncpg.Connection, state: Any, *, via: str, read
     halt = await current(conn)
     if not halt["stopped"]:
         raise confirm.Refused("Ассистент не остановлен — продолжать нечего.", 409, "not_stopped")
-    summary = ("Продолжить работу ассистента (запрошено " + VIA_WORDS[via] + ").\nОстановлен с "
+    summary = ("Продолжить работу ассистента (запрошено " + VIA_WORDS[via] + ").\nОстановлен "
                + since_words(halt, state.config) + ".\n\nСнова заработает:\n"
                + "\n".join(await what_resumes(conn, state, reading=reading)))
     return await confirm.request_card(conn, RESUME_KIND, summary, {"reading": bool(reading), "via": via})

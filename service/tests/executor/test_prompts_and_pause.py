@@ -103,7 +103,7 @@ async def test_pause_stops_at_once_and_resume_needs_a_press(rig):
     rig.tg.text("/status")
     await rig.bot.poll_once()
     status = rig.tg.sent()[-1]
-    assert status["text"].splitlines()[2].startswith("⏸ Остановлено с ")
+    assert status["text"].splitlines()[2].startswith("⏸ Остановлено сегодня в ")
     assert "Продолжить" in buttons_of(status) and "Пауза" not in buttons_of(status)
     # /resume — только вопрос с кнопками; сам по себе ничего не снимает
     rig.tg.text("/resume")

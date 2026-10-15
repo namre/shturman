@@ -38,6 +38,7 @@ class Mutation:
 
 CONTROLS = "tests/replies/test_controls.py::"
 AUTHORITY = "tests/test_authority.py::"
+CODE_LOGIN = "tests/setup_page/test_code_login.py::"
 MUTATIONS = (
     Mutation("background_owner_context", "src/shturman/authority.py",
              "    context.run(_owner.set, None)", "    # mutation: retain inherited owner context",
@@ -194,6 +195,61 @@ MUTATIONS = (
              "                if hold == \"hold\":\n                    due = max(due, now + rehearsal.NOTIFY_HOLD)",
              "                if False:\n                    due = max(due, now + rehearsal.NOTIFY_HOLD)",
              "tests/rehearsal/test_rehearsal_core.py::test_listed_person_gets_one_card_with_ratings_and_nothing_is_sent",
+             database=True),
+    # Вход на страницу по коду из бота (Р-88): код действует только в браузере, который его запросил,
+    # пять минут и один раз; не больше трёх запросов за 15 минут и пяти попыток на код; с Hermes — только
+    # через сокет обратного прокси; две cookie попытки — не вход.
+    Mutation("code_login_browser_binding", "src/shturman/setup_page/auth.py",
+             "row = await conn.fetchrow(\"SELECT * FROM setup_codes WHERE attempt_hash = $1 FOR UPDATE\", token_hash(attempt))",
+             "row = await conn.fetchrow(\"SELECT * FROM setup_codes WHERE attempt_hash = $1 OR delivered ORDER BY id DESC LIMIT 1 FOR UPDATE\", token_hash(attempt))",
+             CODE_LOGIN + "test_code_of_one_browser_does_not_work_in_another",
+             database=True),
+    Mutation("code_login_expiry", "src/shturman/setup_page/auth.py",
+             "        if await conn.fetchval(\"SELECT $1::timestamptz <= now()\", row[\"expires_at\"]):",
+             "        if False:",
+             CODE_LOGIN + "test_expired_code_does_not_work",
+             database=True),
+    Mutation("code_login_one_time", "src/shturman/setup_page/auth.py",
+             "        if row is None or row[\"used_at\"] is not None or row[\"cancelled_at\"] is not None:",
+             "        if row is None or row[\"cancelled_at\"] is not None:",
+             CODE_LOGIN + "test_code_from_the_bot_logs_in_once_in_the_browser_that_asked",
+             database=True),
+    Mutation("code_login_request_limit", "src/shturman/setup_page/auth.py",
+             "        if len(recent) >= REQUEST_LIMIT:", "        if False:",
+             CODE_LOGIN + "test_three_requests_per_15_minutes_for_everyone",
+             database=True),
+    Mutation("code_login_tries_limit", "src/shturman/setup_page/auth.py",
+             "        if tries < CODE_MAX_ATTEMPTS:", "        if True:",
+             CODE_LOGIN + "test_five_wrong_codes_cancel_the_code_and_pause_code_login",
+             database=True),
+    Mutation("code_login_proxy_socket_only", "src/shturman/setup_page/service.py",
+             "    return request.scope.get(\"client\") is None or not state.config.dashboard_origin",
+             "    return True",
+             CODE_LOGIN + "test_dashboard_origin_and_service_port_cannot_ask_or_enter_a_code",
+             database=True),
+    Mutation("code_login_single_cookie", "src/shturman/setup_page/code_login.py",
+             "    return found[0] if len(found) == 1 and auth.well_formed(found[0]) else None",
+             "    return found[-1] if found and auth.well_formed(found[-1]) else None",
+             CODE_LOGIN + "test_two_cookies_with_the_same_name_mean_no_attempt",
+             database=True),
+    # «Остановить всё» (Р-87): пока остановлено, подтверждения не заводятся и отправка не проходит;
+    # «Продолжить» и включение входа по коду подтверждаются только в самом боте, не из приложения.
+    # Код и база проверяют флаг оба: выключенная проверка в коде упирается в триггер (это не «убита»
+    # и не «выжила» — ошибка базы), поэтому вторая линия проверяется отдельно.
+    Mutation("halt_database_guard", "src/shturman/migrations/0035_stop_answer_code.sql",
+             "    IF shturman_halted() THEN\n        RAISE EXCEPTION 'assistant_stopped'",
+             "    IF false THEN\n        RAISE EXCEPTION 'assistant_stopped'",
+             "tests/test_halt.py::test_database_is_the_second_line",
+             database=True),
+    Mutation("halt_refuses_sending", "src/shturman/outbox/policy.py",
+             "    decision = await check_halt(conn)\n    if not decision.ok:\n        return decision\n    decision = check_switch(rules)",
+             "    decision = check_switch(rules)",
+             "tests/test_halt.py::test_every_point_where_the_assistant_acts_refuses_while_stopped[send_check]",
+             database=True),
+    Mutation("bot_only_not_from_app", "src/shturman/confirm.py",
+             "    if row[\"kind\"] in BOT_ONLY and principal.action == \"telegram.miniapp\":",
+             "    if False:",
+             CODE_LOGIN + "test_managed_bot_has_code_login_off_until_the_owner_presses_in_the_bot",
              database=True),
 )
 

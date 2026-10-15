@@ -203,7 +203,11 @@
 
   /* Возвращает {ok, status, data, error}. Не бросает. При устаревшем входе показывает экран входа. */
   function call(method, path, body, quiet) {
-    var options = { method: method, credentials: "omit", cache: "no-store", redirect: "error", referrerPolicy: "no-referrer", headers: headers(body !== undefined) };
+    // Cookie браузер не шлёт и не принимает — кроме маршрутов входа по коду: там cookie попытки (Р-88)
+    // привязывает код к этому браузеру. Её путь — только эти маршруты, а скрипту она не видна (HttpOnly).
+    var withAttempt = path.indexOf("login/code") === 0;
+    var options = { method: method, credentials: withAttempt ? "same-origin" : "omit", cache: "no-store", redirect: "error",
+                    referrerPolicy: "no-referrer", headers: headers(body !== undefined) };
     if (body !== undefined) options.body = JSON.stringify(body);
     return fetch(API + path, options).then(function (res) {
       return res.text().then(function (raw) {
@@ -690,7 +694,7 @@
       text("halt-note", "Подтверждение «Продолжить» ждёт в боте согласований — нажмите там «Да, сделать». Здесь продолжить нельзя: так ассистент не снимет остановку сам.");
       text("halt-resume", "Отправить подтверждение ещё раз");
     } else {
-      text("halt-note", "Продолжить можно только нажатием в боте согласований: кнопка ниже пришлёт туда подтверждение.");
+      text("halt-note", "Продолжить можно только нажатием в боте согласований: кнопка «Продолжить…» пришлёт туда подтверждение.");
       text("halt-resume", "Продолжить…");
     }
   }
