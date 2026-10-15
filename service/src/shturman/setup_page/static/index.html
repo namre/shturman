@@ -872,6 +872,57 @@
             <p class="note warn" id="notify-error" role="alert" hidden></p>
             <div class="row"><button class="btn" id="notify-save" type="submit">Сохранить</button><span class="hint" id="notify-stats"></span></div>
           </form>
+          <!-- Разбор входящих (Р-90): рисует setup.js (раздел «разбор входящих»). Блок живёт внутри карточки «Уведомления». -->
+          <section class="triage" id="triage-box" aria-labelledby="h-triage">
+            <div class="card-head">
+              <h3 id="h-triage">Разбор входящих</h3>
+              <span class="pill" id="st-triage"></span>
+            </div>
+            <p>Вместо «Вам написали» на каждое сообщение модель читает новые входящие и пишет вам только о <b>срочном и важном</b>, а о вопросе без ответа напоминает через <span id="tr-remind-words">2 ч</span>. Обращения в группах — коротко, с сутью ветки. Остальное — тишина.</p>
+            <ul class="triage-goes" id="tr-goes"></ul>
+            <p class="note info" id="tr-estimate" hidden></p>
+            <p class="note warn" id="tr-nobot" hidden>Разбор пишет в бот согласований — сначала настройте его (шаг 1).</p>
+            <p class="note warn" id="tr-stopped" hidden>Ассистент остановлен: разбор не идёт, сообщения приходят обычными уведомлениями «Вам написали».</p>
+            <p class="note info" id="tr-pending" hidden>Карточка «Включить разбор входящих» ждёт вашего нажатия в боте согласований. Включается только там — не здесь и не в приложении.</p>
+            <div class="row">
+              <button class="btn" id="tr-enable" type="button">Включить разбор…</button>
+              <button class="btn ghost" id="tr-disable" type="button" hidden>Выключить разбор</button>
+              <span class="hint" id="tr-stats"></span>
+            </div>
+            <form class="mem-form" id="triage-form" autocomplete="off" novalidate>
+              <fieldset class="mem-fieldset">
+                <legend>Люди</legend>
+                <p class="hint">⭐ Важный — пишу сразу обо всём, что ждёт вашего ответа, а «срочно» — даже ночью. 🔕 Реже беспокоить — сразу только срочное (так отмечает кнопка «Не важно»). 💤 Тихий — не беспокою, только напомню о вопросе без ответа.</p>
+                <ul class="mem-items" id="tr-people"></ul>
+                <div class="field">
+                  <label for="tr-people-q">Найти человека из ваших личных чатов</label>
+                  <input id="tr-people-q" type="search" placeholder="Имя или @имя" autocomplete="off">
+                </div>
+                <ul class="mem-items sph-found" id="tr-people-found"></ul>
+              </fieldset>
+              <fieldset class="mem-fieldset">
+                <legend>Группы</legend>
+                <ul class="mem-items" id="tr-chats"></ul>
+                <div class="field">
+                  <label for="tr-chats-q">Найти группу</label>
+                  <input id="tr-chats-q" type="search" placeholder="Название группы" autocomplete="off">
+                </div>
+                <ul class="mem-items sph-found" id="tr-chats-found"></ul>
+              </fieldset>
+              <fieldset class="mem-fieldset">
+                <legend>Важные сферы</legend>
+                <div class="sph-pick-list" id="tr-spheres"></div>
+                <p class="hint" id="tr-spheres-empty" hidden>Сфер пока нет — заведите их в разделе «Сферы».</p>
+              </fieldset>
+              <div class="field">
+                <label for="tr-remind">Напомнить о вопросе без ответа через</label>
+                <select id="tr-remind"></select>
+                <p class="hint">Считается рабочее время — вне тихих часов уведомлений. Ответили сами в этом чате — напоминания не будет.</p>
+              </div>
+              <p class="note warn" id="triage-error" role="alert" hidden></p>
+              <div class="row"><button class="btn" id="triage-save" type="submit">Сохранить правила</button></div>
+            </form>
+          </section>
           <details class="faq">
             <summary>Вопросы про уведомления</summary>
             <dl>
@@ -885,6 +936,14 @@
               <dd>Нет. Это только сообщение «вам написали». Отвечаете вы сами в Telegram.</dd>
               <dt>Кто ещё может менять эти настройки?</dt>
               <dd>Ассистент может попросить: сузить — сразу, а расширить (например, «от всех» или показывать текст) — только после вашего «Да» в боте. В приложении «Штурман» можно только сузить или поменять время.</dd>
+              <dt>Разбор входящих: что делает кнопка «Не важно»?</dt>
+              <dd>Об этом сообщении больше не напоминаю, а человека (в группе — саму группу) беспокою на ступень реже: важный становится обычным, обычный — «реже беспокоить» (сразу только срочное), «реже» — тихим. Вернуть — здесь, в списке «Люди» или «Группы»: выберите другую отметку или «Убрать».</dd>
+              <dt>Разбор входящих: а ночью?</dt>
+              <dd>В тихие часы карточки ждут утра. Будит только «срочно» от важных людей. Слово «срочно» в чужом сообщении само по себе ничего не решает — срочность оценивает модель по сути, и не больше трёх карточек на чат в час.</dd>
+              <dt>Разбор входящих: а если модель не ответила или я нажал «Остановить всё»?</dt>
+              <dd>Тогда сообщения приходят обычными уведомлениями «Вам написали», как без разбора. О сбое модели бот скажет не чаще раза в 6 часов.</dd>
+              <dt>Кто может включить разбор?</dt>
+              <dd>Только вы — нажатием в боте согласований. Ассистент, дашборд и приложение «Штурман» его не включают и правила не меняют. Отправлять что-либо собеседникам разбор не может.</dd>
             </dl>
           </details>
         </div>

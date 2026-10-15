@@ -3331,9 +3331,10 @@
     };
   }
 
-  function showNotify() { return refreshNotify().then(drawNotify); }
+  function showNotify() { showTriage(); return refreshNotify().then(drawNotify); }
 
   function wireNotify() {
+    wireTriage();
     $("notify-details").addEventListener("toggle", function () { if ($("notify-details").open) showNotify(); });
     $("notify-form").addEventListener("change", ntToggle);
     $("nt-people-q").addEventListener("input", function () { clearTimeout(nt.timer); nt.timer = setTimeout(searchNtPeople, 300); });
@@ -3349,6 +3350,200 @@
         drawNotify();
         refreshNotify();
         toast(body.personal === "off" && !body.groups ? "Уведомления выключены." : "Уведомления сохранены.");
+      });
+    });
+  }
+
+  /* ------------------------------------------------------- разбор входящих (Р-90) */
+  /* Блок внутри карточки «Уведомления». Включить — только нажатием в боте согласований: кнопка здесь
+   * присылает туда карточку. Выключить и правила — сразу. */
+
+  var tr = { data: null, people: [], chats: [], timer: null, chatTimer: null };
+  var TR_LEVELS = [["important", "⭐ Важный"], ["lower", "🔕 Реже беспокоить"], ["quiet", "💤 Тихий"]];
+  var TR_PEOPLE = { important: "important_people", lower: "lower_people", quiet: "quiet_people" };
+  var TR_CHATS = { important: "important_chats", lower: "lower_chats", quiet: "quiet_chats" };
+
+  function trHours(minutes) {
+    var h = Math.floor(minutes / 60), m = minutes % 60;
+    return h && m ? h + " ч " + m + " мин" : h ? h + " ч" : m + " мин";
+  }
+
+  function trNum(value, digits) { return Number(value).toFixed(digits).replace(".", ","); }
+
+  function refreshTriage() {
+    return call("GET", "triage", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      tr.data = r.data;
+      var on = r.data.settings.enabled;
+      pill("triage", !r.data.own_bot ? "нет бота" : r.data.stopped && on ? "на паузе — остановлено" : on ? "включён" :
+           r.data.pending ? "ждёт нажатия в боте" : "выключен", !r.data.own_bot ? "todo" : on ? "done" : "");
+    });
+  }
+
+  function drawTriage() {
+    var d = tr.data;
+    if (!d) return;
+    var s = d.settings, on = s.enabled;
+    show("tr-nobot", !d.own_bot);
+    show("tr-stopped", d.stopped && on);
+    show("tr-pending", !on && !!d.pending);
+    show("tr-enable", !on && d.own_bot);
+    $("tr-enable").disabled = !!d.pending || d.stopped;
+    $("tr-enable").textContent = d.pending ? "Ждёт нажатия в боте" : "Включить разбор…";
+    show("tr-disable", on);
+    text("tr-remind-words", trHours(s.remind_minutes));
+    var goes = $("tr-goes");
+    goes.textContent = "";
+    (d.what_goes || []).forEach(function (line) { goes.appendChild(el("li", { text: line })); });
+    var e = d.estimate;
+    note("tr-estimate", "info", "Сколько примерно: за последние 7 дней — " + number(e.incoming_7d) + " " +
+         plural(e.incoming_7d, "входящее личное", "входящих личных", "входящих личных") + " (≈ " + number(e.batches_7d) +
+         " " + plural(e.batches_7d, "разбор", "разбора", "разборов") + ") и " + number(e.mentions_7d) + " " +
+         plural(e.mentions_7d, "обращение", "обращения", "обращений") + " в группах. Это ≈ " + trNum(e.per_day, 1) +
+         " разбора в сутки, ≈ " + number(Math.round(e.tokens_per_day / 1000)) + " тыс. токенов в сутки, ≈ " +
+         trNum(e.tokens_per_month / 1e6, 1) + " млн в месяц. Цена — по тарифу вашей модели: при 1 $ за миллион " +
+         "токенов это около " + trNum(e.tokens_per_month / 1e6, 1) + " $ в месяц.");
+    var c = d.counts;
+    text("tr-stats", on ? "За сутки: разобрано " + number(c.analyzed_24h) + ", показано " + number(c.shown_24h + c.reminded_24h) +
+         ", ждут ответа " + number(c.waiting) + (c.failed_24h ? ", модель не ответила " + number(c.failed_24h) +
+         " (они пришли обычными уведомлениями)" : "") + "." : "");
+    tr.people = d.people.slice();
+    tr.chats = d.chats.slice();
+    drawTrPeople();
+    drawTrChats();
+    var list = $("tr-spheres");
+    list.textContent = "";
+    d.spheres.forEach(function (sp) {
+      list.appendChild(el("label", { class: "check" }, [
+        el("input", { type: "checkbox", value: String(sp.id), checked: s.important_spheres.indexOf(sp.id) >= 0 }),
+        el("span", { text: sp.title })]));
+    });
+    show("tr-spheres-empty", !d.spheres.length);
+    var remind = $("tr-remind");
+    remind.textContent = "";
+    d.remind_choices.forEach(function (m) {
+      remind.appendChild(el("option", { value: String(m), text: trHours(m), selected: m === s.remind_minutes }));
+    });
+  }
+
+  function trChatName(c) { return c.title || "Группа № " + c.id; }
+
+  function drawTrPeople() {
+    drawTrList("tr-people", tr.people, personName, "Пока никого. Найдите человека ниже.", drawTrPeople);
+  }
+
+  function drawTrChats() {
+    drawTrList("tr-chats", tr.chats, trChatName,
+               "Пока нет. «Не важно» под карточкой из группы добавит её сюда; найти группу можно и ниже.", drawTrChats);
+  }
+
+  function drawTrList(id, items, name, empty, redraw) {
+    var list = $(id);
+    list.textContent = "";
+    if (!items.length) list.appendChild(el("li", { class: "mem-chat mem-note", text: empty }));
+    items.forEach(function (item, i) {
+      var select = el("select", { "aria-label": "Отметка: " + name(item), onchange: function () { item.level = this.value; } },
+        TR_LEVELS.map(function (l) { return el("option", { value: l[0], text: l[1], selected: item.level === l[0] }); }));
+      list.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", { class: "tr-name" }, [name(item)]), select,
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать " + name(item),
+          onclick: function () { items.splice(i, 1); redraw(); } })
+      ]));
+    });
+  }
+
+  function trFound(box, found, items, key, name, added) {
+    found.forEach(function (x) {
+      var chosen = items.some(function (y) { return y[key] === x[key]; });
+      box.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", { class: "tr-name" }, [name(x)]),
+        chosen ? el("span", { class: "badge ok", text: "в списке" }) : el("span", { class: "tr-add" }, TR_LEVELS.map(function (l) {
+          return el("button", { class: "btn ghost small-btn", type: "button", text: l[1],
+            onclick: function () { items.push(Object.assign({}, x, { level: l[0] })); added(); } });
+        }))
+      ]));
+    });
+  }
+
+  function searchTrPeople() {
+    var q = $("tr-people-q").value.trim(), found = $("tr-people-found");
+    found.textContent = "";
+    if (!q) return;
+    call("GET", "notify/people?limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+      found.textContent = "";
+      if (!r.ok) { found.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+      if (!r.data.items.length) { found.appendChild(el("li", { class: "mem-chat mem-note", text: "Ничего не нашлось среди ваших личных чатов." })); return; }
+      trFound(found, r.data.items, tr.people, "tg_id", personName, function () { drawTrPeople(); searchTrPeople(); });
+    });
+  }
+
+  function searchTrChats() {
+    var q = $("tr-chats-q").value.trim(), found = $("tr-chats-found");
+    found.textContent = "";
+    if (!q) return;
+    call("GET", "watch/chats?limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+      found.textContent = "";
+      if (!r.ok) { found.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+      var groups = r.data.items.filter(function (c) { return c.type !== "public_channel" && c.type !== "private_channel"; });
+      if (!groups.length) { found.appendChild(el("li", { class: "mem-chat mem-note", text: "Такой группы нет в архиве." })); return; }
+      trFound(found, groups, tr.chats, "id", trChatName, function () { drawTrChats(); searchTrChats(); });
+    });
+  }
+
+  function triageBody() {
+    var body = { remind_minutes: Number($("tr-remind").value),
+                 important_spheres: Array.prototype.map.call(document.querySelectorAll("#tr-spheres input:checked"), function (n) { return Number(n.value); }) };
+    Object.keys(TR_PEOPLE).forEach(function (level) {
+      body[TR_PEOPLE[level]] = tr.people.filter(function (p) { return p.level === level; }).map(function (p) { return p.tg_id; });
+      body[TR_CHATS[level]] = tr.chats.filter(function (c) { return c.level === level; }).map(function (c) { return c.id; });
+    });
+    return body;
+  }
+
+  function showTriage() { return refreshTriage().then(drawTriage); }
+
+  function wireTriage() {
+    $("tr-people-q").addEventListener("input", function () { clearTimeout(tr.timer); tr.timer = setTimeout(searchTrPeople, 300); });
+    $("tr-chats-q").addEventListener("input", function () { clearTimeout(tr.chatTimer); tr.chatTimer = setTimeout(searchTrChats, 300); });
+    $("tr-enable").addEventListener("click", function () {
+      var button = this;
+      ask(button, "Включить разбор входящих?", { yes: "Прислать карточку в бот",
+        note: "Новые входящие и последние сообщения их чатов начнут уходить провайдеру вашей модели. Включается только нажатием «Да, сделать» в боте согласований." }).then(function (yes) {
+        if (!yes) return;
+        busy(button, true);
+        call("POST", "triage/enable", {}).then(function (r) {
+          busy(button, false);
+          if (!r.ok) { toast(r.error, true); return; }
+          tr.data = r.data;
+          drawTriage();
+          refreshTriage();
+          toast("Карточка в боте согласований. Разбор включится, когда вы нажмёте «Да, сделать».");
+        });
+      });
+    });
+    $("tr-disable").addEventListener("click", function () {
+      var button = this;
+      busy(button, true);
+      call("PUT", "triage", { enabled: false }).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { toast(r.error, true); return; }
+        tr.data = r.data;
+        drawTriage();
+        refreshTriage();
+        toast("Разбор выключен: снова приходят уведомления «Вам написали».");
+      });
+    });
+    $("triage-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var save = $("triage-save");
+      busy(save, true);
+      note("triage-error", "warn", "");
+      call("PUT", "triage", triageBody()).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { note("triage-error", "warn", r.error); return; }
+        tr.data = r.data;
+        drawTriage();
+        toast("Правила разбора сохранены.");
       });
     });
   }

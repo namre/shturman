@@ -49,10 +49,10 @@ cat <<EOF
 
 ЧТО ПОДКЛЮЧАЕТСЯ
   Сервер MCP «shturman»: $url — только на этом сервере (127.0.0.1), наружу не опубликован.
-  Транспорт — streamable HTTP, принимаются только запросы POST. Тринадцать инструментов, все только
+  Транспорт — streamable HTTP, принимаются только запросы POST. Четырнадцать инструментов, все только
   читают: search_messages, get_context, list_chats, get_chat_history, find_person,
   list_commitments, get_commitment, get_person_page, search_pages, list_projects,
-  get_project_page, get_owner_profile, list_spheres. Каждый результат помечен сферами владельца;
+  get_project_page, get_owner_profile, list_spheres, list_awaiting_reply. Каждый результат помечен сферами владельца;
   по умолчанию ищите в сфере, о которой разговор (параметр spheres).
   Токен — в переменной окружения $var у клиента; в файлах настроек клиента его нет.
 
