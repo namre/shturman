@@ -139,9 +139,9 @@ def test_forwarded_text_gives_no_fact_signal():
 
 
 def test_prompt_version_and_instructions():
-    assert extract.PROMPT_VERSION == "3"
+    assert extract.PROMPT_VERSION == "4"
     assert '"facts": [' in extract.EXTRACT_INSTRUCTIONS and '"projects": [' in extract.EXTRACT_INSTRUCTIONS
-    assert "Пароли, коды подтверждения и номера карт не извлекай" in extract.EXTRACT_INSTRUCTIONS
+    assert "Пароли, ключи, токены, коды подтверждения и номера карт не извлекай" in extract.EXTRACT_INSTRUCTIONS
     text = extract.build_extract_input(EPISODE, LABELS, timezone.utc, chat_kind="личный",
                                        projects=["ЖК Северный", "<script>", ""])
     assert "Проекты владельца: ЖК Северный; ‹script›." in text and text.endswith("</переписка>")

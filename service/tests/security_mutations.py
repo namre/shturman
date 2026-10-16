@@ -333,6 +333,25 @@ MUTATIONS = (
              "    if False:\n        return _result(False, error=\"Это решает владелец.\"",
              APP_4A + "test_agent_cannot_mark_wrong_or_move_by_date",
              database=True),
+    # Договорённости (Р-96): тихо, без владельца, снимается только ещё не принятое им — принятое (open)
+    # меняется только нажатием (модель лишь предлагает изменение); «сделано» засчитывается только по
+    # сообщению ПОЗЖЕ обещания; «Скрыть» в «В команде» — только владелец.
+    Mutation("quiet_close_never_open", "src/shturman/processing/pipeline.py",
+             "        if row[\"status\"] in commitments.QUIET_CLOSABLE:",
+             "        if True:",
+             "tests/processing/test_commitments_quality.py::"
+             "test_resolve_quietly_drops_proposed_but_only_proposes_change_for_open",
+             database=True),
+    Mutation("evidence_after_promise", "src/shturman/processing/extract.py",
+             "            if valid and not is_later(evidence, message):",
+             "            if False:",
+             "tests/processing/test_commitments_quality.py::test_evidence_checks_in_validation"),
+    Mutation("team_hide_owner_only", "src/shturman/processing/commitments.py",
+             "    if not authority.is_owner():\n        return _result(False, error=\"Скрыть может только владелец.\"",
+             "    if False:\n        return _result(False, error=\"Скрыть может только владелец.\"",
+             "tests/processing/test_commitments_quality.py::"
+             "test_others_go_to_team_not_to_digest_and_owner_involvement_is_not_others",
+             database=True),
     # Пакет 4б (Р-95): из приложения ослабление — только карточкой в бот; «Вернуть как было», если возврат
     # расширяет, — тоже только карточкой (и со страницы); `owner.widen` применяется только нажатием в боте;
     # разрешить группу и добавить обращение — ослабления, решает функция применения.

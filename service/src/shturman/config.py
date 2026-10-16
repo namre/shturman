@@ -63,6 +63,13 @@ class Config:
     timezone: str = "Europe/Moscow"
     # Время ночной обработки по часам владельца, «ЧЧ:ММ».
     nightly_at: str = "03:30"
+    # Частая обработка днём (Р-96): раз в столько минут вне тихих часов (0 — только ночью); пределы
+    # запросов к модели у дневных прогонов — в час и в сутки; лишнее ждёт ночного прогона.
+    processing_every: int = 60
+    processing_hourly_cap: int = 40
+    processing_daily_cap: int = 300
+    # Когда сводка договорённостей с кнопками уходит в бот: не чаще этих моментов, «ЧЧ:ММ,ЧЧ:ММ».
+    digest_at: str = "13:00,19:00"
     # Главный выключатель отправки. Задаётся ТОЛЬКО окружением сервиса (на сервере — в .env),
     # через API его изменить нельзя: тот, кто завладел токеном API, не может включить отправку сам.
     # Пока выключено, сервис не отправляет ничего и никому: ни согласованных черновиков, ни автоответов.
@@ -221,6 +228,10 @@ class Config:
             embeddings_dim=_int("SHTURMAN_EMBEDDINGS_DIM", 384),
             timezone=_env("SHTURMAN_TIMEZONE", "Europe/Moscow"),
             nightly_at=_env("SHTURMAN_NIGHTLY_AT", "03:30"),
+            processing_every=min(24 * 60, max(0, _int("SHTURMAN_PROCESSING_EVERY", 60))),
+            processing_hourly_cap=min(1000, max(0, _int("SHTURMAN_PROCESSING_HOURLY_CAP", 40))),
+            processing_daily_cap=min(10000, max(0, _int("SHTURMAN_PROCESSING_DAILY_CAP", 300))),
+            digest_at=_env("SHTURMAN_DIGEST_AT", "13:00,19:00"),
             # Отправка возможна только со своим ботом согласований: без него нажатие «Отправить»
             # проходит через Hermes и может быть подделано ассистентом. Токен бота здесь —
             # именно из окружения: токен, введённый на странице настройки, отправку не включает,

@@ -132,6 +132,7 @@
     <div class="segmented" id="cm-dirs" role="tablist" aria-label="Чьи обещания">
       <button type="button" role="tab" id="cm-dir-owner_owes" aria-selected="true"><span class="seg-label" id="cm-dir-owner_owes-label">Я обещал</span></button>
       <button type="button" role="tab" id="cm-dir-owed_to_owner" aria-selected="false"><span class="seg-label" id="cm-dir-owed_to_owner-label">Мне обещали</span></button>
+      <button type="button" role="tab" id="cm-dir-team" aria-selected="false"><span class="seg-label" id="cm-dir-team-label">В команде</span></button>
     </div>
     <p class="muted" id="cm-loading">Загружаю договорённости…</p>
     <div class="panel" id="cm-failed" hidden>
@@ -147,9 +148,9 @@
       <div class="groups" id="cm-groups" aria-live="polite"></div>
       <p class="empty" id="cm-empty" hidden></p>
       <p class="muted small" id="cm-truncated" hidden>Показаны первые 500 договорённостей — с самым ранним сроком.</p>
-      <p class="muted foot">«Выполнено», «Перенести» и «Не так» действуют сразу: это ваши записи. Каждое действие
-        пишется в журнал «Настроек Штурмана». Новые договорённости появляются после ночного разбора переписки — сначала
-        вопросом «Верно ли записано?» в «Согласованиях».</p>
+      <p class="muted foot" id="cm-promised-note">«Выполнено», «Перенести» и «Не так» действуют сразу: это ваши записи. Каждое действие
+        пишется в журнал «Настроек Штурмана». Новые договорённости появляются после разбора переписки (днём — раз в час)
+        — сначала вопросом «Верно ли записано?» в «Согласованиях». Уже сделанное до этого не предлагается.</p>
     </div>
   </section>
 

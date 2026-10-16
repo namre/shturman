@@ -253,7 +253,14 @@ async def overview(state: AppState) -> dict[str, Any]:
         stopped = halt.public(await halt.current(conn))
         from . import summaries
         scheduled = await summaries.overview(conn)
+        from .processing import commitment_stats, pipeline as processing_pipeline
+        processing = await processing_pipeline.overview(conn)
+        processing.update(await commitment_stats.status_fields(conn))
     out = dict(row)
+    # Разбор переписки (Р-96): прогонов и запросов к модели за сутки, оценка объёма, упёрлись ли в предел;
+    # договорённости по статусам и выполнена ли перепроверка. Только числа; строки processing и
+    # commitments в ./ops/doctor.sh.
+    out.update(processing)
     # Утренняя сводка и обзор недели (Р-95): выбрал ли владелец, совпадает ли с Hermes, следующий запуск.
     # Только признаки и время; строка summaries в ./ops/doctor.sh.
     out.update(scheduled)
