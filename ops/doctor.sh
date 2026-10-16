@@ -20,7 +20,9 @@
 # Hermes запись mcp_servers.shturman разворачивается штатной функцией Hermes так, как её получает
 # шлюз, и с этим заголовком идёт один запрос к 127.0.0.1:8765/mcp — смотрится только код ответа;
 # в журнале ошибок Hermes (logs/errors.log) считаются строки отказа 401 архива за последний час —
-# печатается только число. Строка jobs-failing — задания модели за час по счётчику сервиса
+# печатается только число. Строка jobs — очередь заданий: всего ждут, неудачных за всё время и по
+# группам «модель» и «бот» — ждут, давность самого старого готового, выполнено за час (jobs_queue в
+# /api/status, только числа; Д-24). Строка jobs-failing — задания модели за час по счётчику сервиса
 # (llm_jobs в /api/status: числа и виды ошибок, без текстов). Строка stopped (Р-87) — остановил ли
 # владелец ассистента кнопкой «Остановить всё» (WARN, пока остановлено); setup-code-login (Р-88) —
 # включён ли вход на страницу по коду из бота и сколько было таких входов за 7 суток, без кодов.
@@ -737,11 +739,55 @@ EOF5
   if [ -n "$st" ]; then
     pass archive "сообщений: $(num messages), чатов: $(num chats), исключено чатов: $(num chats_excluded)"
     waiting="$(num jobs_waiting)"; failed="$(num jobs_failed)"
-    if [ "${waiting:-0}" -gt 50 ] && [ "$MODE" = hermes ]; then
-      warn jobs "в очереди $waiting заданий — Hermes их не забирает (бот не подключён или плагин не запущен)"
+    # Очередь по группам (Д-24): модель и бот — сколько ждут, сколько секунд ждёт исполнителя самое
+    # старое готовое задание и сколько выполнено за час (объект jobs_queue ответа /api/status, только
+    # числа). Стоит — группа, у которой готовое задание ждёт 15 минут и дольше, а за час не выполнено
+    # ни одного: это WARN при любой длине очереди. Длинная очередь, которая разбирается, — PASS.
+    # Сервис прежней версии объекта не отдаёт — прежнее правило: больше 50 ждут — WARN.
+    jq_line="$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, sys
+try:
+    q = json.load(sys.stdin).get("jobs_queue")
+except Exception:
+    sys.exit(0)
+if not isinstance(q, dict):
+    sys.exit(0)
+num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+out = []
+for g in ("llm", "bot"):
+    x = q.get(g) if isinstance(q.get(g), dict) else {}
+    out += [num(x.get("waiting")), num(x.get("ready_age_s")), num(x.get("done_hour"))]
+print(" ".join(map(str, out)))' 2>/dev/null)"
+    jobs_all="неудачных за всё время: ${failed:-0}"
+    if [ -n "$jq_line" ]; then
+      read -r q_lw q_la q_ld q_bw q_ba q_bd <<EOF7
+$jq_line
+EOF7
+      q_done=$((q_ld + q_bd)); q_stuck=""
+      case "$st" in *'"own_llm":true'*) q_own_llm=yes ;; *) q_own_llm=no ;; esac
+      case "$st" in *'"own_bot":true'*) q_own_bot=yes ;; *) q_own_bot=no ;; esac
+      if [ "$q_lw" -gt 0 ] && [ "$q_la" -ge 900 ] && [ "$q_ld" -eq 0 ]; then
+        if [ "$MODE" = hermes ] && [ "$q_own_llm" = no ]; then q_hint="Hermes их не забирает или они не удаются: строки hermes, plugin, plugin-code, jobs-failing"
+        else q_hint="строки model и jobs-failing"; fi
+        q_stuck="модели — ждут $q_lw, самое старое $((q_la / 60)) мин ($q_hint)"
+      fi
+      if [ "$q_bw" -gt 0 ] && [ "$q_ba" -ge 900 ] && [ "$q_bd" -eq 0 ]; then
+        if [ "$MODE" = hermes ] && [ "$q_own_bot" = no ]; then q_hint="Hermes их не забирает (бот не подключён или плагин не запущен): строки bot-live, plugin"
+        else q_hint="строка approvals-bot"; fi
+        q_stuck="${q_stuck:+$q_stuck; }бота — ждут $q_bw, самое старое $((q_ba / 60)) мин ($q_hint)"
+      fi
+      if [ -n "$q_stuck" ]; then
+        warn jobs "в очереди $waiting заданий, за час не выполнено ни одного: $q_stuck; $jobs_all"
+      elif [ "${waiting:-0}" -gt 50 ]; then
+        pass jobs "в очереди $waiting заданий — разбираются: за час выполнено $q_done (модели — $q_ld, бота — $q_bd); $jobs_all"
+      else
+        pass jobs "очередь заданий: ${waiting:-0}, за час выполнено: $q_done; $jobs_all"
+      fi
+    elif [ "${waiting:-0}" -gt 50 ] && [ "$MODE" = hermes ]; then
+      warn jobs "в очереди $waiting заданий — Hermes их не забирает (бот не подключён или плагин не запущен); $jobs_all"
     elif [ "${waiting:-0}" -gt 50 ]; then
-      warn jobs "в очереди $waiting заданий — их некому выполнять: смотрите строки approvals-bot и model"
-    else pass jobs "очередь заданий: ${waiting:-0}, неудачных: ${failed:-0}"; fi
+      warn jobs "в очереди $waiting заданий — их некому выполнять: смотрите строки approvals-bot и model; $jobs_all"
+    else pass jobs "очередь заданий: ${waiting:-0}, $jobs_all"; fi
     # Задания модели за последний час (Р-83): сколько попыток не удалось и чаще всего почему —
     # объект llm_jobs ответа /api/status (только числа и виды ошибок: имя класса или короткий код).
     # Не меньше половины попыток (и хотя бы 10) не удались — FAIL; не меньше пятой части (и хотя

@@ -204,3 +204,48 @@ async def cancel(conn: asyncpg.Connection, job_id: int, reason: str) -> bool:
         job_id, reason[:2000],
     )
     return done.endswith(" 1")
+
+
+# Очередь по группам — для строки `jobs` в `./ops/doctor.sh` (Д-24): движется ли она, а не только
+# сколько в ней. Модель — задания `llm.*`; бот — уведомления владельцу, их правка и отправка через
+# бизнес-бота. `hermes.cron` в группы не входит: без Hermes его никто не забирает, и это норма (гаснет
+# за час); у расписания сводок своя строка `summaries`.
+QUEUE_GROUPS = {
+    "llm": ("llm.structured", "llm.text"),
+    "bot": ("notify.owner", "notify.edit", "business.send"),
+}
+
+
+async def queue_overview(conn: asyncpg.Connection) -> dict[str, Any]:
+    """Одним проходом по `jobs`: всего ждут, неудачных за всё время и по группам — сколько ждут
+    (`waiting`), сколько секунд ждёт исполнителя самое старое готовое задание (`ready_age_s`; 0 — таких
+    нет; отложенные повтором и тихими часами не считаются) и сколько выполнено за последний час
+    (`done_hour`, по `finished_at` — переживает перезапуск сервиса). Только числа."""
+    llm, bot = list(QUEUE_GROUPS["llm"]), list(QUEUE_GROUPS["bot"])
+    row = await conn.fetchrow(
+        """SELECT count(*) FILTER (WHERE status IN ('queued', 'running')) AS waiting,
+                  count(*) FILTER (WHERE status = 'failed') AS failed,
+                  count(*) FILTER (WHERE status IN ('queued', 'running') AND kind = ANY($1)) AS llm_waiting,
+                  min(run_after) FILTER (WHERE status = 'queued' AND run_after <= now() AND kind = ANY($1)) AS llm_ready,
+                  count(*) FILTER (WHERE status = 'done' AND finished_at > now() - interval '1 hour'
+                                   AND kind = ANY($1)) AS llm_done_hour,
+                  count(*) FILTER (WHERE status IN ('queued', 'running') AND kind = ANY($2)) AS bot_waiting,
+                  min(run_after) FILTER (WHERE status = 'queued' AND run_after <= now() AND kind = ANY($2)) AS bot_ready,
+                  count(*) FILTER (WHERE status = 'done' AND finished_at > now() - interval '1 hour'
+                                   AND kind = ANY($2)) AS bot_done_hour,
+                  now() AS now
+             FROM jobs""",
+        llm, bot,
+    )
+
+    def age(ready: datetime | None) -> int:
+        return max(0, int((row["now"] - ready).total_seconds())) if ready is not None else 0
+
+    return {
+        "waiting": int(row["waiting"]), "failed": int(row["failed"]),
+        "groups": {
+            g: {"waiting": int(row[f"{g}_waiting"]), "ready_age_s": age(row[f"{g}_ready"]),
+                "done_hour": int(row[f"{g}_done_hour"])}
+            for g in QUEUE_GROUPS
+        },
+    }

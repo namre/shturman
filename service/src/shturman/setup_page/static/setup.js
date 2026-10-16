@@ -2508,7 +2508,7 @@
           (a.guard_problem ? ". Модель сейчас не отвечает." : "");
       return [
         fact("Последнее новое сообщение", a.last_message_seen_at ? when(a.last_message_seen_at) : "ещё не было"),
-        fact("Очередь заданий", "ждут: " + number(a.jobs_waiting) + ", не выполнено: " + number(a.jobs_failed)),
+        fact("Очередь заданий", "ждут: " + number(a.jobs_waiting) + ", не выполнено за всё время: " + number(a.jobs_failed)),
         fact("Поиск по смыслу", search, !a.embeddings_enabled ? "./ops/embeddings.sh on" : a.embeddings_problem ? "./ops/embeddings.sh status" : null),
         fact("Защита от внедрённых инструкций", guard, !a.guard_enabled ? "./ops/guard.sh on" : null),
         fact("Голосовые и «кружки»", !a.voice_enabled

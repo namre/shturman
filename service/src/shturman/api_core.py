@@ -230,10 +230,9 @@ async def overview(state: AppState) -> dict[str, Any]:
                       (SELECT count(*) FROM chats WHERE excluded) AS chats_excluded,
                       (SELECT count(*) FROM messages) AS messages,
                       (SELECT max(first_seen_at) FROM messages) AS last_message_seen_at,
-                      (SELECT count(*) FROM jobs WHERE status IN ('queued', 'running')) AS jobs_waiting,
-                      (SELECT count(*) FROM jobs WHERE status = 'failed') AS jobs_failed,
                       (SELECT value IS NOT NULL FROM settings WHERE key = 'owner') AS owner_known"""
         )
+        queue = await jobs.queue_overview(conn)
         guard = await guard_service.overview(conn, state.config)
         search = await embeddings.overview(conn, state)
         setup = await setup_summary.overview(conn, state)
@@ -257,6 +256,10 @@ async def overview(state: AppState) -> dict[str, Any]:
         processing = await processing_pipeline.overview(conn)
         processing.update(await commitment_stats.status_fields(conn))
     out = dict(row)
+    # Очередь заданий: всего ждут, неудачных за всё время (jobs_failed — не за час) и по группам —
+    # модель и бот: сколько ждут, давность самого старого готового, выполнено за час (Д-24; строка jobs
+    # в ./ops/doctor.sh — «разбираются» или «за час не выполнено ни одного»). Только числа.
+    out.update(jobs_waiting=queue["waiting"], jobs_failed=queue["failed"], jobs_queue=queue["groups"])
     # Разбор переписки (Р-96): прогонов и запросов к модели за сутки, оценка объёма, упёрлись ли в предел;
     # договорённости по статусам и выполнена ли перепроверка. Только числа; строки processing и
     # commitments в ./ops/doctor.sh.
