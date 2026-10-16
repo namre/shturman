@@ -272,7 +272,13 @@ async def request_structured(
     """Просит модель вернуть JSON по схеме. Результат придёт в `on_result(handler)`.
 
     images — картинки JPEG к запросу (фото, страницы скана; media/). В задании они лежат
-    base64 в поле images; модуль-владелец стирает задание после ответа, как и текст."""
+    base64 в поле images; модуль-владелец стирает задание после ответа, как и текст.
+
+    Ключи и токены из переписки модели не уходят (Р-96): в `input` строки, похожие на секрет,
+    заменяются на «[ключ скрыт]» здесь — в одном месте для всех заданий обработки."""
+    from .sanitize import redact_secrets
+
+    input = redact_secrets(input)
     payload: dict[str, Any] = {"instructions": instructions, "input": input, "json_schema": json_schema,
                                "schema_name": schema_name, "task": task, "max_tokens": max_tokens}
     if images:
@@ -290,6 +296,11 @@ async def request_text(
     task: str = "shturman_reply", max_tokens: int = 1500,
     context: dict[str, Any] | None = None, dedup_key: str | None = None,
 ) -> int | None:
+    from .sanitize import redact_secrets
+
+    # ключи и токены из переписки модели не уходят (Р-96) — как в request_structured
+    messages = [{**m, "content": redact_secrets(m["content"])} if isinstance(m.get("content"), str) else m
+                for m in messages]
     return await jobs.enqueue(
         conn, LLM_TEXT, {"messages": messages, "task": task, "max_tokens": max_tokens},
         handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_TEXT),

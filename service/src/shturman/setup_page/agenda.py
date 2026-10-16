@@ -9,8 +9,9 @@
                                             и сколько ждут подтверждения «Верно / Не так» в «Согласованиях»
   POST app/commitments/{id}/done            «Выполнено»: {v}
   POST app/commitments/{id}/move            «Перенести»: {v, to: tomorrow | week | date, date?: ГГГГ-ММ-ДД}
-  POST app/commitments/{id}/wrong           «Не так» — записано неверно: {v}
+  POST app/commitments/{id}/wrong           «Не так» — записано неверно: {v, reason?} (причина — Р-96)
   POST app/commitments/{id}/reopen          «Вернуть» сразу после «Выполнено» или «Не так» из приложения
+  POST app/commitments/{id}/hide            «Скрыть» в списке «В команде» (Р-96): {v}
 
 `v` — начало отпечатка договорённости, которую владелец видел (`agenda.view`): если она с тех пор
 изменилась (перенесли в боте, на странице, ассистент предложил и владелец принял), действие не
@@ -120,7 +121,8 @@ async def app_now(request: Request) -> JSONResponse:
 async def app_commitments(request: Request) -> JSONResponse:
     state = state_of(request)
     async with state.ro_pool.acquire() as conn:
-        out = await agenda.board(conn, today=_today(state))
+        out = await agenda.board(conn, today=_today(state), tz=state.config.timezone)
+    out["reasons"] = [{"code": code, "label": label} for code, label in commitments.WRONG_REASONS.items()]
     return JSONResponse(out)
 
 
@@ -128,11 +130,18 @@ def _id(request: Request) -> int:
     return int(request.path_params["commitment_id"])
 
 
-async def _shown(conn: Any, commitment_id: int, v: Any, today: date) -> dict[str, Any]:
-    """Договорённость, которую владелец видел в списке: принятая, его сторона, отпечаток тот же."""
+async def _shown(conn: Any, commitment_id: int, v: Any, today: date, *, team: bool = False) -> dict[str, Any]:
+    """Договорённость, которую владелец видел в списке: принятая, его сторона, отпечаток тот же.
+    `team` — из списка «В команде»: обещание между другими людьми (статус team)."""
     if not isinstance(v, str) or not 8 <= len(v) <= 64:
         raise BadRequest("Обновите список и попробуйте ещё раз.", 400, "bad_version")
     item = await commitments.get_commitment(conn, commitment_id, today=today)
+    if team:
+        if item is None or item["status"] != "team":
+            raise BadRequest(GONE, 409, "gone")
+        if item["approval_fingerprint"][:agenda.SHOWN] != v:
+            raise BadRequest(CHANGED, 409, "changed")
+        return item
     if item is None or item["status"] != "open" or item["direction"] not in agenda.DIRECTIONS:
         raise BadRequest(GONE, 409, "gone")
     if item["approval_fingerprint"][:agenda.SHOWN] != v:
@@ -173,16 +182,24 @@ async def _act(request: Request, action: str) -> JSONResponse:
                 out, said = await _reopen(conn, commitment_id, today), "Вернул в список."
                 detail = f"договорённость № {commitment_id}"
             else:
-                item = await _shown(conn, commitment_id, data.get("v"), today)
+                item = await _shown(conn, commitment_id, data.get("v"), today, team=action == "hide")
                 expected = item["approval_fingerprint"]
-                if action == "done":
+                if action == "hide":
+                    out = await commitments.hide(conn, commitment_id, details=via, expected_fingerprint=expected)
+                    said, detail = "Скрыто из «В команде».", f"договорённость № {commitment_id}"
+                elif action == "done":
                     out = await commitments.close(conn, commitment_id, actor="owner", details=via, today=today,
                                                   expected_fingerprint=expected)
                     said, detail = "Отмечено: выполнено.", f"договорённость № {commitment_id}"
                 elif action == "wrong":
-                    out = await commitments.mark_wrong(conn, commitment_id, actor="owner", details=via, today=today,
-                                                       expected_fingerprint=expected)
-                    said, detail = "Убрал: записано неверно.", f"договорённость № {commitment_id}"
+                    reason = data.get("reason")
+                    if reason is not None and reason not in commitments.WRONG_REASONS:
+                        raise BadRequest("Неизвестная причина.", 400, "bad_reason")
+                    details = {**via, "reason": reason} if reason else via
+                    out = await commitments.mark_wrong(conn, commitment_id, actor="owner", details=details,
+                                                       today=today, expected_fingerprint=expected)
+                    said, detail = "Убрал: записано неверно.", f"договорённость № {commitment_id}" + (
+                        f"; причина: {reason}" if reason else "")
                 else:
                     new = _new_date(data, today)
                     out = await commitments.reschedule_to(conn, commitment_id, new, actor="owner", details=via,
@@ -197,7 +214,7 @@ async def _act(request: Request, action: str) -> JSONResponse:
             raise BadRequest(CHANGED, 409, "changed")
         raise BadRequest(out.get("error") or GONE, 409, code or "gone")
     await page._log(request, name, detail=detail)
-    return JSONResponse({"ok": True, "answer": said, "undo": action in ("done", "wrong")})
+    return JSONResponse({"ok": True, "answer": said, "undo": action in ("done", "wrong", "hide")})
 
 
 async def _reopen(conn: Any, commitment_id: int, today: date) -> dict[str, Any]:
@@ -208,8 +225,10 @@ async def _reopen(conn: Any, commitment_id: int, today: date) -> dict[str, Any]:
            FROM commitment_events WHERE commitment_id = $1 ORDER BY at DESC, id DESC LIMIT 1""",
         commitment_id, float(REOPEN_WINDOW))
     if last is None or not (last["actor"] == "owner" and last["via"] == "app" and last["fresh"]
-                            and last["action"] in ("closed", "marked_wrong")):
+                            and last["action"] in ("closed", "marked_wrong", "hidden")):
         return {"ok": False, "code": "too_late", "error": "Вернуть можно только сразу после действия здесь."}
+    if last["action"] == "hidden":
+        return await commitments.unhide(conn, commitment_id, today=today)
     return await commitments.reopen(conn, commitment_id, actor="owner", details={"via": "app"}, today=today)
 
 
@@ -229,6 +248,10 @@ async def app_reopen(request: Request) -> JSONResponse:
     return await _act(request, "reopen")
 
 
+async def app_hide(request: Request) -> JSONResponse:
+    return await _act(request, "hide")
+
+
 def routes() -> list[BaseRoute]:
     from . import miniapp
 
@@ -240,4 +263,5 @@ def routes() -> list[BaseRoute]:
         Route(one + "/move", miniapp.endpoint(app_move), methods=["POST"]),
         Route(one + "/wrong", miniapp.endpoint(app_wrong), methods=["POST"]),
         Route(one + "/reopen", miniapp.endpoint(app_reopen), methods=["POST"]),
+        Route(one + "/hide", miniapp.endpoint(app_hide), methods=["POST"]),
     ]

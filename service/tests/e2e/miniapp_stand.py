@@ -56,6 +56,10 @@
   GET  /pack4a/seen                          статусы и сроки этих договорённостей, последние события их журнала,
                                              журнал app.commitment_*
   POST /bot/text?text=…                      владелец написал боту (например, /today)
+  Договорённости (Р-96):
+  POST /r96/seed                             принятые договорённости с датой обещания и сроком-событием, два обещания
+                                             «В команде» (между другими людьми) и одно предложение, ещё не ушедшее сводкой
+  GET  /r96/seen                             их статусы и последние события журнала
 
   Пакет 4б (Р-95) — маршруты /pack4b/… из pack4b_stand.py: люди, доверенные, разрешения, ответ плагина
   Hermes о сводках, что стало.
@@ -533,6 +537,63 @@ async def main() -> None:
             "audit": [dict(r) for r in await conn.fetch(
                 "SELECT action, outcome, detail FROM setup_audit WHERE action LIKE 'app.commitment%' ORDER BY id")]})
 
+    async def r96_seed(request):
+        from shturman import authority
+        from shturman.processing import commitments
+
+        account = seeded["owner_account"]
+        owner_peer = await store.ensure_peer(conn, "user", 1000, name="Евгений")
+        SENDERS.update({6201: "Анна Белова", 6202: "Олег Сафин"})
+        anna, a = await _chat(conn, account, 6201, "Анна Белова", [
+            (6201, "Регламент приёмки пришлю к уикли.", 23),
+            (1000, "Договор поставки подпишу в пятницу.", 9),
+            (6201, "Ок, смету по лифтам проверю сегодня.", 0.3)])
+        team, t = await _chat(conn, account, 6203, "Планёрка отдела", [
+            (6201, "К обеду привезу пироги.", 2),
+            (6202, "Схожу привиться завтра, буду после обеда.", 1),
+            (6202, "Завтра бонусная закрытая встреча для участников.", 0.5)], group=True)
+        anna_peer = await conn.fetchval("SELECT id FROM peers WHERE class = 'user' AND tg_id = 6201")
+        oleg_peer = await conn.fetchval("SELECT id FROM peers WHERE class = 'user' AND tg_id = 6202")
+        today = datetime.now(timezone.utc).date()
+
+        async def promise(chat_id, msg, debtor, creditor, direction, what, *, status, expression=None, reason="no_deadline",
+                          due=None):
+            cid = await conn.fetchval(
+                """INSERT INTO commitments (chat_id, source_message_id, debtor_peer_id, creditor_peer_id, direction, what,
+                                            source_quote, due_expression, due_reason, due_date, status, prompt_version)
+                   VALUES ($1, $2, $3, $4, $5, $6, 'цитата из сообщения', $7, $8, $9, 'proposed', '4') RETURNING id""",
+                chat_id, msg, debtor, creditor, direction, what, expression, reason, due)
+            if status == "open":
+                with authority.setup_context("stand", action="stand.seed"):
+                    await commitments.accept(conn, cid)
+            elif status == "team":
+                await conn.execute("UPDATE commitments SET status = 'team' WHERE id = $1", cid)
+            return cid
+
+        out = {
+            "event": await promise(anna, a[0], anna_peer, owner_peer, "owed_to_owner", "прислать регламент приёмки",
+                                   status="open", expression="к уикли", reason="event"),
+            "mine": await promise(anna, a[1], owner_peer, anna_peer, "owner_owes", "подписать договор поставки",
+                                  status="open", expression="в пятницу", reason="ok", due=today + timedelta(days=2)),
+            "proposed": await promise(anna, a[2], anna_peer, owner_peer, "owed_to_owner", "проверить смету по лифтам",
+                                      status="proposed", expression="сегодня", reason="ok", due=today),
+            "pies": await promise(team, t[0], anna_peer, None, "others", "привезти пироги", status="team",
+                                  expression="К обеду", reason="ok", due=today),
+            "vaccine": await promise(team, t[1], oleg_peer, None, "others", "сходить привиться", status="team",
+                                     expression="завтра", reason="ok", due=today + timedelta(days=1)),
+        }
+        seeded["r96"] = out
+        return JSONResponse(out)
+
+    async def r96_seen(request):
+        ids = seeded.get("r96") or {}
+        rows = {r["id"]: r["status"] for r in await conn.fetch(
+            "SELECT id, status FROM commitments WHERE id = ANY($1::bigint[])", list(ids.values()))}
+        events = {name: [dict(e) | {"details": json.loads(e["details"])} for e in await conn.fetch(
+            """SELECT actor, action, details FROM commitment_events WHERE commitment_id = $1
+               ORDER BY id DESC LIMIT 2""", cid)] for name, cid in ids.items()}
+        return JSONResponse({"status": {name: rows.get(cid) for name, cid in ids.items()}, "events": events})
+
     async def bot_text(request):
         telegram.text(request.query_params["text"], user=exec_fakes.OWNER_USER)
         await asyncio.sleep(0.6)
@@ -705,6 +766,7 @@ async def main() -> None:
                                 Route("/bot/text", bot_text, methods=["POST"]),
                                 Route("/pack4a/seed", pack4a_seed, methods=["POST"]),
                                 Route("/pack4a/seen", pack4a_seen),
+                                Route("/r96/seed", r96_seed, methods=["POST"]), Route("/r96/seen", r96_seen),
                                 Route("/rehearsal/capped", rehearsal_capped, methods=["POST"]),
                                 Route("/rehearsal/settings", rehearsal_settings),
                                 Route("/spheres/seed", spheres_seed, methods=["POST"]),

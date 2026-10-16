@@ -133,7 +133,10 @@ async def test_approvals_come_in_sections_with_counts(stand, conn):
     assert counts == {"answers": 0, "permissions": 1, "commitments": 1, "memory": 0, "guard": 0}
     # кнопки карточек — прежние
     (item,) = [i for i in body["items"] if i["kind"] == "commitment"]
-    assert [a["label"] for a in item["actions"]] == ["Верно", "Не так"]
+    assert [a["label"] for a in item["actions"] if not a.get("why")] == ["Верно", "Не так"]
+    # «Не так» с причиной (Р-96): причины — отдельные кнопки, приложение показывает их после «Не так»
+    assert [a["label"] for a in item["actions"] if a.get("why")] == [
+        "не обещание", "не тот человек", "неверно что", "неверный срок", "дубль", "уже сделано"]
 
 
 def test_every_kind_has_its_section():

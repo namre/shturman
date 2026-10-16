@@ -385,14 +385,43 @@
     if (until) node.appendChild(el("div", "note", "Ждёт решения до " + until + "."));
     if (item.answer) node.appendChild(answerBox(item));
     var actions = el("div", "actions");
+    // У договорённости «Не так» — с причиной (Р-96): кнопка открывает причины; «Без причины» — прежнее «Не так».
+    var why = (item.actions || []).filter(function (action) { return action.why; });
     (item.actions || []).forEach(function (action) {
+      if (action.why) return;
       var button = el("button", action.primary ? "primary" : "secondary", action.label);
       button.type = "button";
-      button.addEventListener("click", function () { decide(action.ref, actions); });
+      if (why.length && action.ref.indexOf("sh:cm:r:") === 0) {
+        button.addEventListener("click", function () { whyBox(node, action, why, actions, button); });
+      } else {
+        button.addEventListener("click", function () { decide(action.ref, actions); });
+      }
       actions.appendChild(button);
     });
     node.appendChild(actions);
     return node;
+  }
+
+  function whyBox(node, plain, why, actions, opener) {
+    var had = node.querySelector(".why");
+    if (had) { had.parentNode.removeChild(had); opener.focus(); return; }
+    var box = el("div", "confirm why");
+    box.appendChild(el("p", null, "Что не так? Причина поможет точнее находить договорённости."));
+    var chips = el("div", "chips");
+    why.forEach(function (action) {
+      var b = el("button", "chip-btn", action.label);
+      b.type = "button";
+      b.addEventListener("click", function () { decide(action.ref, actions); });
+      chips.appendChild(b);
+    });
+    box.appendChild(chips);
+    var rest = el("div", "actions");
+    var skip = el("button", "secondary", "Без причины");
+    skip.type = "button";
+    skip.addEventListener("click", function () { decide(plain.ref, actions); });
+    rest.appendChild(skip);
+    box.appendChild(rest);
+    node.appendChild(box);
   }
 
   // Сколько осталось до срока — словами: «осталось 12 мин», «осталось меньше минуты».
@@ -2092,8 +2121,8 @@
   // «Выполнено», «Перенести», «Не так» — сразу (это записи самого владельца), с «Вернуть» после
   // «Выполнено» и «Не так». Каждое действие несёт начало отпечатка того, что владелец видел (v):
   // если договорённость с тех пор изменилась, сервер его не выполнит.
-  var CM_DIRS = ["owner_owes", "owed_to_owner"];
-  var CM_DIR_TITLES = { owner_owes: "Я обещал", owed_to_owner: "Мне обещали" };
+  var CM_DIRS = ["owner_owes", "owed_to_owner", "team"];
+  var CM_DIR_TITLES = { owner_owes: "Я обещал", owed_to_owner: "Мне обещали", team: "В команде" };
   var CM_GROUPS = [["overdue", "Просрочено"], ["today", "Сегодня"], ["week", "На неделе"], ["later", "Позже"],
                    ["no_date", "Без срока"]];
   var CM_DIR_NAME = "shturman-app-cm-dir";
@@ -2127,6 +2156,7 @@
   }
 
   function cmCount(dir) {
+    if (dir === "team") return ((cm.data && cm.data.team) || []).length;
     var lists = (cm.data && cm.data.lists && cm.data.lists[dir]) || {};
     return CM_GROUPS.reduce(function (n, g) { return n + (lists[g[0]] || []).length; }, 0);
   }
@@ -2139,7 +2169,15 @@
     show("tab-commitments-count", n > 0);
   }
 
+  // «обещано 23.09» (Р-96): день сообщения, в котором дано обещание.
+  function promisedText(item) {
+    if (!item.promised) return "";
+    var p = item.promised.split("-");
+    return "обещано " + p[2] + "." + p[1];
+  }
+
   function dueText(item) {
+    if (!item.due_date && item.due_event) return "по событию: «" + item.due_event + "»";
     if (!item.due_date) return item.due_vague ? "назван неточно" : "не назван";
     var when = item.due_words || item.due_date;
     if (item.days < 0) {
@@ -2158,6 +2196,7 @@
     var meta = el("div", "cm-meta");
     if (item.who) meta.appendChild(el("span", null, (item.direction === "owner_owes" ? "Кому: " : "Кто: ") + item.who));
     meta.appendChild(el("span", "cm-due" + (item.days !== null && item.days < 0 ? " late" : ""), "Срок: " + dueText(item)));
+    if (item.promised) meta.appendChild(el("span", "cm-promised", promisedText(item)));
     li.appendChild(meta);
     var from = el("div", "cm-meta");
     var chat = item.chat || {};
@@ -2219,9 +2258,26 @@
     if (had) return;
     var box = el("div", "confirm");
     box.appendChild(el("p", null, "Записано неверно? Договорённость уйдёт из списка и из сводок, а это же обещание " +
-      "из того же сообщения больше не будет предложено."));
+      "из того же сообщения больше не будет предложено. Что не так — по желанию:"));
+    var picked = { reason: null };
+    var chips = el("div", "chips cm-reasons");
+    ((cm.data && cm.data.reasons) || []).forEach(function (r) {
+      var b = el("button", "chip-btn", r.label);
+      b.type = "button";
+      b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", function () {
+        var on = picked.reason !== r.code;
+        picked.reason = on ? r.code : null;
+        Array.prototype.forEach.call(chips.querySelectorAll("button"), function (x) { x.setAttribute("aria-pressed", "false"); });
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      chips.appendChild(b);
+    });
+    box.appendChild(chips);
     var actions = el("div", "actions");
-    actions.appendChild(button("danger", "Убрать", function () { cmAct(item, "wrong", {}, this, "Убрано: записано неверно."); }));
+    actions.appendChild(button("danger", "Убрать", function () {
+      cmAct(item, "wrong", picked.reason ? { reason: picked.reason } : {}, this, "Убрано: записано неверно.");
+    }));
     actions.appendChild(button("secondary", "Отмена", function () { closeInline(li); opener.focus(); }));
     box.appendChild(actions);
     li.appendChild(box);
@@ -2272,6 +2328,40 @@
     toastTimer = setTimeout(function () { node.hidden = true; }, 8000);
   }
 
+  // «В команде» (Р-96): обещания между другими людьми — только для сведения, одна кнопка «Скрыть».
+  function cmTeamItem(item) {
+    var li = el("li", "cm cm-team");
+    li.id = "cm-item-" + item.id;
+    li.appendChild(el("div", "cm-what", item.what));
+    var meta = el("div", "cm-meta");
+    var who = (item.who || "кто-то") + (item.to ? " → " + item.to : "");
+    meta.appendChild(el("span", null, who));
+    meta.appendChild(el("span", "cm-due", "Срок: " + dueText(item)));
+    if (item.promised) meta.appendChild(el("span", "cm-promised", promisedText(item)));
+    li.appendChild(meta);
+    var from = el("div", "cm-meta");
+    var chat = item.chat || {};
+    from.appendChild(el("span", null, "Откуда: " + (chat.title ? "«" + chat.title + "»" : "чат без названия") +
+      (chat.kind ? ", " + chat.kind : "")));
+    (item.spheres || []).forEach(function (name) { from.appendChild(el("span", "chip", name)); });
+    li.appendChild(from);
+    var actions = el("div", "actions");
+    actions.appendChild(button("secondary", "Скрыть", function () { cmAct(item, "hide", {}, this, "Скрыто из «В команде»."); }));
+    li.appendChild(actions);
+    return li;
+  }
+
+  function drawTeam(box) {
+    var items = (cm.data && cm.data.team) || [];
+    if (!items.length) return false;
+    box.appendChild(el("p", "muted small cm-team-note", "Обещания между другими людьми из ваших чатов — только для " +
+      "сведения: подтверждать их не нужно, в сводку они не идут. Через две недели уходят сами."));
+    var ul = el("ul", "cm-list");
+    items.forEach(function (item) { ul.appendChild(cmTeamItem(item)); });
+    box.appendChild(ul);
+    return true;
+  }
+
   function drawCommitments() {
     var d = cm.data;
     CM_DIRS.forEach(function (dir) {
@@ -2280,16 +2370,17 @@
       $("cm-dir-" + dir).setAttribute("aria-selected", dir === cm.dir ? "true" : "false");
     });
     var total = cmCount("owner_owes") + cmCount("owed_to_owner");
+    $("cm-promised-note").hidden = cm.dir === "team";
     $("cm-count").textContent = total ? String(total) : "";
     if (d.waiting) {
       $("cm-waiting-text").textContent = "Ещё " + d.waiting + " " + plural(d.waiting, "ждёт", "ждут", "ждут") +
         " подтверждения «Верно / Не так» — в «Согласованиях».";
     }
-    show("cm-waiting", Boolean(d.waiting));
+    show("cm-waiting", Boolean(d.waiting) && cm.dir !== "team");
     var box = $("cm-groups");
     clear(box);
     var lists = d.lists[cm.dir] || {};
-    var any = false;
+    var any = cm.dir === "team" ? drawTeam(box) : false;
     CM_GROUPS.forEach(function (g) {
       var items = lists[g[0]] || [];
       if (!items.length) return;
@@ -2310,9 +2401,11 @@
       head.addEventListener("click", function () { rememberOpen(key, !sect.open); });
       box.appendChild(sect);
     });
-    $("cm-empty").textContent = cm.dir === "owner_owes"
-      ? "Ваших обещаний пока нет. Они появляются после ночного разбора переписки и вашего «Верно» в «Согласованиях»."
-      : "Обещаний вам пока нет. Они появляются после ночного разбора переписки и вашего «Верно» в «Согласованиях».";
+    $("cm-empty").textContent = cm.dir === "team"
+      ? "Обещаний между другими людьми пока нет. Они появляются после разбора переписки — без вашего подтверждения."
+      : cm.dir === "owner_owes"
+      ? "Ваших обещаний пока нет. Они появляются после разбора переписки и вашего «Верно» в «Согласованиях»."
+      : "Обещаний вам пока нет. Они появляются после разбора переписки и вашего «Верно» в «Согласованиях».";
     show("cm-empty", !any);
     show("cm-truncated", Boolean(d.truncated));
   }

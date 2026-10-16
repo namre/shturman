@@ -91,8 +91,9 @@ async def test_full_round_trip_from_message_to_closed_commitment(conn):
     # 3. одна сводка владельцу, под каждым пунктом «верно» и «не так» (данные кнопок прежние)
     digest, = await digest_jobs(conn)
     text = digest["payload"]["text"]
-    assert "1. Вы → Иван Петров: отправить договор\nСрок: ср, 7 октября («завтра»)\n«Договор отправлю завтра»" in text
-    assert "2. Иван Петров → вам: прислать смету по фасадам\nСрок: пт, 9 октября («к пятнице»)" in text
+    assert ("1. Вы → Иван Петров: отправить договор\nСрок: ср, 7 октября («завтра») · обещано 06.10\n"
+            "«Договор отправлю завтра»") in text
+    assert "2. Иван Петров → вам: прислать смету по фасадам\nСрок: пт, 9 октября («к пятнице») · обещано 06.10" in text
     assert buttons_of(digest) == [
         ("1 — верно", f"sh:cm:a:{second['id']}:{second['digest_fingerprint'][:24]}"), ("1 — не так", f"sh:cm:r:{second['id']}"),
         ("2 — верно", f"sh:cm:a:{first['id']}:{first['digest_fingerprint'][:24]}"), ("2 — не так", f"sh:cm:r:{first['id']}"),
@@ -101,10 +102,19 @@ async def test_full_round_trip_from_message_to_closed_commitment(conn):
     # 4. владелец принимает одно и отклоняет другое
     assert await press(conn, f"sh:cm:a:{first['id']}") == {"answer": "Принято.", "edit_text": None, "remove_buttons": False}
     assert (await press(conn, f"sh:cm:a:{first['id']}"))["answer"] == "Уже решено: открыто."
-    done = await press(conn, f"sh:cm:r:{second['id']}")
-    assert done["answer"] == "Отклонено." and done["remove_buttons"] is True
+    # «Не так»: отклонено сразу; под сводкой — причины (по желанию, Р-96)
+    asked = await press(conn, f"sh:cm:r:{second['id']}")
+    assert asked["answer"].startswith("Отклонено.") and asked["remove_buttons"] is False and asked["edit_text"] is None
+    assert [b["text"] for row in asked["buttons"] for b in row] == [
+        "1: не обещание", "1: не тот человек", "1: неверно что", "1: неверный срок", "1: дубль", "1: уже сделано"]
+    done = await press(conn, f"sh:cm:w:{second['id']}:wrong_due")
+    assert done["answer"] == "Спасибо, причина записана." and done["remove_buttons"] is True
     assert done["edit_text"] == ("Договорённости из переписки — решено:\n"
                                  "1. отправить договор — ✗ отклонено\n2. прислать смету по фасадам — ✓ принято")
+    assert (await press(conn, f"sh:cm:w:{second['id']}:duplicate"))["answer"].startswith("Причина уже записана")
+    why = await conn.fetchval("SELECT details FROM commitment_events WHERE commitment_id = $1 AND action = 'wrong_reason'",
+                              second["id"])
+    assert pipeline._loads(why) == {"reason": "wrong_due", "via": "bot"}
     assert (await bridge.dispatch_callback(conn, f"sh:cm:a:{second['id']}", 6666))["answer"] == "Кнопка недоступна."
     opened = await commitments.list_commitments(conn, view="open", today=TODAY)
     assert [(c["id"], c["what"], c["debtor"]["name"], c["creditor"]["is_owner"]) for c in opened] == \
@@ -120,7 +130,8 @@ async def test_full_round_trip_from_message_to_closed_commitment(conn):
     assert (out["planned"], out["resolve_planned"]) == (0, 1)
     job, = await claim(conn)
     assert job["payload"]["schema_name"] == "commitment_updates"
-    assert "Обязательства:\n1. У1: прислать смету по фасадам (срок: «к пятнице»)" in job["payload"]["input"]
+    assert ("Обязательства:\n1. У1: прислать смету по фасадам (срок: «к пятнице»), обещано 06.10 14:00"
+            in job["payload"]["input"])
     await answer(conn, job, {"updates": [upd(1, "fulfilled", 1, "Смету отправил")]})
     assert (await rows(conn))[0]["status"] == "open"          # молча ничего не закрывается
     change = dict(await conn.fetchrow("SELECT * FROM commitment_changes"))
@@ -175,8 +186,11 @@ async def test_deadline_taken_from_the_request_is_anchored_to_that_message(conn)
         (OWNER, "Евгений Тестов", "Пришлите, пожалуйста, смету до пятницы"),
         (IVAN, "Иван Петров", "Хорошо", {"at": T0 + timedelta(minutes=20)}),
     ])
-    await extract_once(conn, [item(2, "Хорошо", "прислать смету", "до пятницы", due_message=1)])
+    await extract_once(conn, [item(2, "Хорошо", "прислать смету", "до пятницы", due_message=1, request_message=1,
+                                   request_quote="Пришлите, пожалуйста, смету")])
     row, = await rows(conn)
+    assert (row["request_message_id"], row["request_quote"]) == (ids[0], "Пришлите, пожалуйста, смету")
+    assert row["direction"] == "owed_to_owner"
     assert (row["source_message_id"], row["due_message_id"], row["due_date"]) == (ids[1], ids[0], date(2026, 10, 9))
     # удалили просьбу, из которой взят срок, — выведенное из неё уходит целиком
     await conn.execute("DELETE FROM messages WHERE id = $1", ids[0])
@@ -361,7 +375,8 @@ async def test_retried_request_succeeds_and_malformed_answer_is_retried_too(conn
         await bridge.deliver_failure(conn, job["id"], "сбой", retry_in=None)
     await store.mark_deleted(conn, ivan_chat, [5])
     out = await plan(conn, now=T0 + timedelta(hours=6))
-    assert (out["retried"], out["retry_dropped"]) == (0, 1)
+    # извлечение и проверка закрытия (Р-96: проверяются и предложения) — оба по удалённому сообщению
+    assert (out["retried"], out["retry_dropped"]) == (0, 2)
 
 
 def test_request_schemas_are_permissive():
@@ -594,16 +609,20 @@ async def test_group_chat_directions(conn):
     ivan, petr, owner = [await peer_id(conn, x) for x in (IVAN, PETR, OWNER)]
     assert [(r["direction"], r["debtor_peer_id"], r["creditor_peer_id"]) for r in await rows(conn)] == [
         ("others", ivan, petr), ("owed_to_owner", petr, owner), ("owner_owes", owner, None), ("others", petr, None)]
+    # «между другими» (Р-96) — в «В команде», без кнопок: в сводку владельцу не идут
+    assert [r["status"] for r in await rows(conn)] == ["team", "proposed", "proposed", "team"]
     digest, = await digest_jobs(conn)
     text = digest["payload"]["text"]
     assert "Вы (чат «Объект: фасады»): сделать отчёт заказчику" in text
-    assert "Иван Петров → Пётр Петренко: прислать чертежи" in text
-    assert "Пётр Петренко (чат «Объект: фасады»): выставить счёт" in text
+    assert "прислать чертежи" not in text and "выставить счёт" not in text
+    assert len(digest["payload"]["buttons"]) == 2
     petr_person = await people.person_for_peer(conn, petr)
     mine = await commitments.list_commitments(conn, view="proposed", today=TODAY, person_id=petr_person)
-    assert sorted(c["what"] for c in mine) == ["выставить счёт", "подготовить акт", "прислать чертежи"]
+    assert [c["what"] for c in mine] == ["подготовить акт"]
+    team = await commitments.list_commitments(conn, view="team", today=TODAY, chat_id=group)
+    assert sorted(c["what"] for c in team) == ["выставить счёт", "прислать чертежи"]
     assert len(await commitments.list_commitments(conn, view="proposed", today=TODAY, direction="owner_owes")) == 1
-    assert len(await commitments.list_commitments(conn, view="proposed", today=TODAY, chat_id=group)) == 4
+    assert len(await commitments.list_commitments(conn, view="proposed", today=TODAY, chat_id=group)) == 2
 
 
 async def test_digest_is_one_per_run_in_small_messages_with_overflow(conn):
@@ -633,10 +652,11 @@ async def test_unanswered_proposals_expire_quietly(conn):
     with authority.owner_context(OWNER, chat_id=OWNER):
         await commitments.accept(conn, smeta["id"])
     await digest_jobs(conn)
-    assert await commitments.expire_stale(conn) == {"commitments": 0, "changes": 0}
+    assert await commitments.expire_stale(conn) == {"commitments": 0, "team": 0, "changes": 0}
     await conn.execute("UPDATE commitments SET notified_at = now() - interval '8 days'")
     out = await plan(conn, now=T0 + timedelta(days=8))
-    assert out["expired"] == {"commitments": 1, "changes": 0}
+    assert out["expired"] == {"commitments": 1, "team": 0, "changes": 0}
+    assert await conn.fetchval("SELECT quiet_reason FROM commitments WHERE id = $1", dogovor["id"]) == "unanswered"
     assert [(r["id"], r["status"]) for r in await rows(conn)] == [(smeta["id"], "open"), (dogovor["id"], "expired")]
     assert await digest_jobs(conn) == []                                         # без сообщений владельцу
     log = (await commitments.get_commitment(conn, dogovor["id"], with_events=True))["events"]
@@ -744,7 +764,7 @@ async def test_queue_keeps_no_copy_of_correspondence_after_processing(conn):
     await say(conn, ivan_chat, [(IVAN, "Иван Петров", "Договор подпишу завтра")], first_id=5, start=T0 + timedelta(hours=2))
     await plan(conn, now=T0 + timedelta(hours=3))
     await conn.execute("UPDATE jobs SET status = 'failed' WHERE status = 'queued'")
-    assert await pipeline.scrub_closed_jobs(conn) == 1
+    assert await pipeline.scrub_closed_jobs(conn) == 2          # извлечение и проверка закрытия (Р-96)
     assert "подпишу" not in str(await conn.fetch("SELECT payload FROM jobs"))
 
 

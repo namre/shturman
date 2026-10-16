@@ -693,7 +693,8 @@ details.sect[open] > summary::before { transform: rotate(45deg); }
 /* ---------------------------------------------------------------- «Договорённости» (Р-94) */
 
 #cm-dirs button { align-items: center; text-align: center; min-height: 44px; }
-#cm-dirs .seg-label { font-weight: 600; }
+#cm-dirs .seg-label { font-weight: 600; white-space: normal; overflow: visible; text-align: center; line-height: 1.2; }
+#cm-dirs button { padding: 6px 6px; }
 .cm-waiting { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 0 0 12px; }
 .link-btn {
   background: none; color: var(--accent); text-decoration: underline; text-underline-offset: 3px;
@@ -706,6 +707,10 @@ details.sect[open] > summary::before { transform: rotate(45deg); }
 .cm-what { font-weight: 600; }
 .cm-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; font-size: 14px; color: var(--text); margin-top: 2px; }
 .cm-due.late { color: var(--danger); font-weight: 600; }
+.cm-team-note { margin: 0 0 10px; }
+.cm-reasons { margin-top: 8px; }
+.chip-btn[aria-pressed="true"] { outline: 2px solid var(--accent, currentColor); }
+.why .chips { margin-top: 8px; }
 .cm .actions { margin-top: 8px; }
 .cm .actions button { min-height: 40px; }
 .cm .pick, .cm .confirm { margin-top: 10px; }

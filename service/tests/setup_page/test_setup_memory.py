@@ -215,7 +215,7 @@ async def test_pending_pages_and_commitments_are_decided_from_the_page(stand, co
     assert got["pages"] == [{"person_id": w.maria, "name": "Мария Сидорова", "reason": "сообщений за 30 дн.: 25"}]
     by_id = {c["id"]: c for c in got["commitments"]}
     assert by_id[proposed]["who"] == "Мария Сидорова → вам" and by_id[proposed]["what"] == "подписать акт сверки"
-    assert by_id[proposed]["due"] == "Срок: «в понедельник» — дата не определена"
+    assert by_id[proposed]["due"].startswith("Срок: «в понедельник» — дата не определена · обещано ")
     assert by_id[proposed]["quote"] == "Акт сверки подпишу в понедельник."
     assert re.fullmatch(r"[0-9a-f]{64}", by_id[proposed]["fingerprint"])
     assert "msg:" not in json.dumps(got, ensure_ascii=False)

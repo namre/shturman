@@ -63,6 +63,8 @@ class Reason(str, Enum):
     NOT_A_DEADLINE = "not_a_deadline"          # прошлое или повторяющееся («по пятницам»)
     NO_ANCHOR = "no_anchor"                    # нет времени сообщения, от которого считать
     NOT_IN_SOURCE = "not_in_source"            # формулировки нет в исходном тексте — выдумана
+    IMMEDIATE = "immediate"                    # «сейчас», «ща», «через 10 минут» — быстрое обещание (дата есть)
+    EVENT = "event"                            # срок — событие, а не дата: «к уикли», «как прилечу»
 
 
 REASON_TEXT: dict[Reason, str] = {
@@ -79,6 +81,8 @@ REASON_TEXT: dict[Reason, str] = {
     Reason.NOT_A_DEADLINE: "Формулировка говорит о прошлом или о повторяющемся событии.",
     Reason.NO_ANCHOR: "Нет времени сообщения, от которого считать срок.",
     Reason.NOT_IN_SOURCE: "Срока нет в тексте сообщения, он отброшен.",
+    Reason.IMMEDIATE: "Быстрое обещание: «сейчас», «через несколько минут».",
+    Reason.EVENT: "Срок назван событием, а не датой.",
 }
 
 
@@ -103,6 +107,15 @@ class Resolution:
     @classmethod
     def unresolved(cls, reason: Reason) -> "Resolution":
         return cls(DueStatus.NEEDS_CONFIRMATION, reason)
+
+    @classmethod
+    def immediate(cls, due_date: date, due_time: time | None = None) -> "Resolution":
+        """Быстрое обещание: срок — сегодня (или через минуты), дата определена."""
+        return cls(DueStatus.RESOLVED, Reason.IMMEDIATE, due_date, due_time)
+
+    @property
+    def is_immediate(self) -> bool:
+        return self.reason is Reason.IMMEDIATE
 
 
 # --- словарь -----------------------------------------------------------------
@@ -176,7 +189,7 @@ _VAGUE_RE = re.compile(
     r"\b(?:примерно|ориентировочно|приблизительно|где-то|гдето|около|или|либо|нескольк\w+|"
     r"не\s+раньше|не\s+ранее|ближе\s+к|начал[аеоу]|середин[аеуы]|на\s+днях|скоро|"
     r"ближайш\w+\s+(?:время|дни|дней|день|час\w*|недел\w+)|как\s+только|когда|если|"
-    r"после(?!\s+обеда)|(?<!конц[ау]\s)рабоч\w+\s+дн\w+|выходн\w+|праздник\w*|возможно|наверное|может)\b"
+    r"после(?!\s+обеда)|(?<!конц[ау]\s)(?<!конец\s)рабоч\w+\s+дн\w+|выходн\w+|праздник\w*|возможно|наверное|может)\b"
 )
 # отрицание, кроме «не позднее / не позже»
 _NEGATION_RE = re.compile(r"\bне\b(?!\s+(?:позднее|позже|дольше))")
@@ -186,10 +199,36 @@ _PART_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bв\s+течени[ие]\s+дня\b", "eod"),
     (r"\bпосле\s+обеда\b", "afternoon"),
     (r"\b(?:до\s+обеда|к\s+обеду|в\s+обед|обед(?:а|у|ом)?)\b", "noon"),
-    (r"\b(?:с\s+утра|утр(?:о|ом|а|у)|с\s+утреца)\b", "morning"),
+    (r"\b(?:с\s+утра|утр(?:о|ом|а|у)|с\s+утреца|поутру)\b", "morning"),
     (r"\bдн[её]м\b", "day"),
-    (r"\b(?:вечер(?:ом|у|а)?)\b", "evening"),
+    (r"\b(?:вечер(?:ом|у|а)?|вечерк(?:ом|у|а))\b", "evening"),
     (r"\b(?:ночь(?:ю)?|ночи)\b", "night"),
+)
+
+# Быстрые обещания (Р-96): «сейчас», «ща», «сразу» — срок сегодня, дата определена, а показ владельцу
+# откладывается на сутки (processing/pipeline.py). «Через N минут / часов» и «в течение часа» — тоже
+# быстрые, если не дальше IMMEDIATE_MAX от сообщения.
+IMMEDIATE_MAX = timedelta(hours=3)
+_IMMEDIATE_RE = re.compile(
+    r"^(?:(?:прямо|вот|да|ну)\s+)?(?:сейчас|щас|ща|сча|счас|щаз|сейчас\s+же|сразу(?:\s+же)?|немедленно|"
+    r"сию\s+(?:минуту|секунду)|сей\s+момент|мигом|"
+    r"в\s+ближайш(?:ий|ие|ую)\s+(?:час|полчаса|минут\w*|пару\s+минут))$"
+)
+# «минут через 15» -> «через 15 минут»
+_DELTA_INVERTED_RE = re.compile(r"^(минут\w*|мин|час\w*)\s+через\s+(\S+)$")
+# Время по другому поясу: «в 08:35 UTC», «к 15:00 по Москве».
+_ZONE_RE = re.compile(r"\s*(?:\b(?P<utc>utc|gmt)\b|\bпо\s+(?:мск|москве)\b|\b(?P<msk>мск)\b)")
+# Срок — событие, а не дата: «к уикли», «как прилечу», «по готовности», «после созвона», «к ней».
+_EVENT_NOUNS = (r"уикли|weekly|дейли|daily|планерк\w*|летучк\w*|встреч\w*|созвон\w*|звонк\w*|совещани\w*|"
+                r"митинг\w*|собрани\w*|релиз\w*|запуск\w*|презентаци\w*|демо|приезд\w*|отъезд\w*|"
+                r"поездк\w*|вылет\w*|прилет\w*|возвращени\w*|старт\w*|сдач\w*|защит\w*|экзамен\w*")
+_EVENT_RE = re.compile(
+    rf"^(?:(?:к|ко|до|перед)\s+(?:(?:\w+\s+)?(?:{_EVENT_NOUNS})|нему|ней|ним|этому|этой|тому|той)|"
+    rf"(?:сразу\s+)?после\s+(?:\w+\s+)?(?:{_EVENT_NOUNS})|"
+    r"по\s+(?:готовност\w*|факту(?:\s+\w+)?|приезд\w*|возвращени\w*|прилет\w*|итогам(?:\s+\w+){1,2}|"
+    r"результатам(?:\s+\w+){1,2}|окончани\w+(?:\s+\w+)?|завершени\w+(?:\s+\w+)?)|"
+    r"как\s+(?:только\s+)?(?!получит\w*|выйдет|смогу|сможем|успе\w+)[а-я]+(?:\s+[а-я]+){0,3}|"
+    r"когда\s+(?!получит\w*|смогу|сможем|успе\w+)[а-я]+(?:\s+[а-я]+){0,3})$"
 )
 
 # Последний час, до которого голая часть дня ещё относится к сегодня.
@@ -215,7 +254,14 @@ def _normalize(expression: str) -> str:
     text = expression.lower().replace("ё", "е").strip()
     text = re.sub(r"[«»\"'()\[\]!?;]", " ", text)
     text = re.sub(r"[‐‑‒–—−]", "-", text)
-    return re.sub(r"\s+", " ", text).strip(" .,:-")
+    text = re.sub(r"\s+", " ", text).strip(" .,:-")
+    # «на конец дня рабочего», «конец дня» -> «к концу рабочего дня», «к концу дня»
+    text = re.sub(r"\bдня\s+рабоч\w+", "рабочего дня", text)
+    text = re.sub(r"\b(?:(?:на|в|к)\s+)?конец\b", "к концу", text)
+    text = _DELTA_INVERTED_RE.sub(r"через \2 \1", text)
+    # «сегодня в течение часа» — то же, что «в течение часа»
+    text = re.sub(r"^сегодня\s+(?=в\s+течени[ие]\s+(?:\S+\s+)?(?:час|минут))", "", text)
+    return text
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:
@@ -582,7 +628,18 @@ def resolve_due_expression(
     text = _normalize(expression)
     if not text:
         return Resolution.unresolved(Reason.UNPARSEABLE)
+    zone = _ZONE_RE.search(text)
+    if zone is not None:
+        rest = (text[: zone.start()] + " " + text[zone.end():]).strip()
+        return _in_zone(rest, anchor, ZoneInfo("UTC") if zone["utc"] else ZoneInfo("Europe/Moscow"), tz)
     local = to_local(anchor, tz)
+
+    if _IMMEDIATE_RE.match(text):
+        if local is None:
+            return Resolution.unresolved(Reason.NO_ANCHOR)
+        return Resolution.immediate(local.date())
+    if _EVENT_RE.match(text) and not re.search(r"\d", text):
+        return Resolution.unresolved(Reason.EVENT)
 
     if _NOT_DEADLINE_RE.search(text) or _WEEKDAY_PLURAL_RE.search(text):
         return Resolution.unresolved(Reason.NOT_A_DEADLINE)
@@ -598,6 +655,9 @@ def resolve_due_expression(
         if text.startswith("через") and not parts.dates:
             fallback = _via_dateparser(text, local)
             if fallback is not None:
+                if fallback.due_time is not None and local is not None and \
+                        datetime.combine(fallback.due_date, fallback.due_time) - local <= IMMEDIATE_MAX:
+                    return Resolution.immediate(fallback.due_date, fallback.due_time)
                 return fallback
         return Resolution.unresolved(leftover)
 
@@ -635,6 +695,9 @@ def resolve_due_expression(
         if kind == "dm" and data[2] and data[3]:
             return Resolution.unresolved(Reason.AMBIGUOUS_TIME)  # «в 10.10» — время или дата
         outcome = _one_date(kind, data, local, parts)
+        if outcome.resolved and kind == "delta" and data[0] in ("minutes", "hours") and clock is None \
+                and part is None and timedelta(**{data[0]: data[1]}) <= IMMEDIATE_MAX:
+            return Resolution.immediate(outcome.due_date, outcome.due_time)
     else:
         # допустимые пары: день недели или «завтра» вместе с числом — и только если они совпадают
         soft = next((item for item in dates if item[0] in ("weekday", "rel")), None)
@@ -671,6 +734,27 @@ def resolve_due_expression(
     if part == "night":
         return Resolution.unresolved(Reason.AMBIGUOUS_TIME)  # ночь переходит через полночь
     return Resolution.ok(outcome.due_date, clock or outcome.due_time, part)
+
+
+def _in_zone(text: str, anchor: datetime | None, zone: ZoneInfo, tz: tzinfo | str | None) -> Resolution:
+    """Срок, названный по другому поясу («в 08:35 UTC»): считается по часам того пояса, а дата и
+    время переводятся в пояс владельца."""
+    found = resolve_due_expression(text, anchor, zone)
+    if not found.resolved or found.due_time is None or found.due_date is None or tz is None:
+        return found
+    owner = ZoneInfo(tz) if isinstance(tz, str) else tz
+    moment = datetime.combine(found.due_date, found.due_time, tzinfo=zone).astimezone(owner)
+    return Resolution(found.status, found.reason, moment.date(), moment.time().replace(second=0, microsecond=0),
+                      found.part_of_day)
+
+
+def describe(reason: str | None) -> str | None:
+    """Короткое пояснение к сроку без даты — для карточек: «по событию», «неточно»."""
+    if reason == Reason.EVENT.value:
+        return "по событию"
+    if reason in (None, Reason.OK.value, Reason.NO_DEADLINE.value, Reason.IMMEDIATE.value):
+        return None
+    return "дата не определена"
 
 
 # --- поиск формулировки срока в тексте ------------------------------------------

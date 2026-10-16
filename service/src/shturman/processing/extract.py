@@ -36,7 +36,7 @@ from typing import Any, Sequence
 
 from .dates import find_due_expression
 
-PROMPT_VERSION = "3"
+PROMPT_VERSION = "4"
 
 OWNER_LABEL = "ВЛАДЕЛЕЦ"
 EPISODE_GAP = timedelta(minutes=45)   # пауза, после которой начинается новый эпизод
@@ -47,6 +47,9 @@ MAX_ITEMS = 20                        # больше обязательств и
 WHAT_LIMIT = 200
 QUOTE_LIMIT = 400
 MAX_FACTS = 8                         # больше фактов из одного эпизода не принимаем
+AFTER_MARK = "П"                      # номера сообщений блока «После»: [П1], [П2]…
+AFTER_CHARS = 400                     # сколько знаков одного сообщения «После» видит модель
+DUPLICATE_WINDOW = timedelta(minutes=30)   # пары «предложил — согласился» склеиваются в этих пределах
 MAX_PROJECTS = 5                      # и упоминаний проектов
 FACT_LIMIT = 240
 PROJECT_TITLE_LIMIT = 80
@@ -85,6 +88,8 @@ class Msg:
     tg_id: int | None = None   # messages.tg_message_id
     # сообщение от имени владельца отправил сам сервис (автоответ): это не обещание владельца
     by_service: bool = False
+    # ответ (reply) на сообщение владельца: обещание в нём дано владельцу, а не «между другими»
+    reply_to_owner: bool = False
 
     @property
     def is_source(self) -> bool:
@@ -103,6 +108,9 @@ class Episode:
     chat_id: int
     messages: list[Msg]
     context: list[Msg] = field(default_factory=list)   # несколько предыдущих сообщений — только для понимания
+    # что было в чате после эпизода до момента разбора (Р-96): по ним модель говорит, не сделано ли
+    # обещанное уже до показа владельцу; обязательства отсюда не извлекаются
+    after: list[Msg] = field(default_factory=list)
 
     @property
     def first_id(self) -> int:
@@ -147,7 +155,7 @@ def build_episodes(
 # Основы глаголов-обещаний в первом лице будущего времени.
 _PROMISE_STEMS = (
     r"отправл?|вышл|пришл|направл?|подготовл?|сдела|додела|доработа|исправл?|поправл?|почин|"
-    r"посчита|рассчита|предоставл?|верн|провер|уточн|выставл?|оплат|оплач|заплач|перевед|настро|запуст|"
+    r"посчита|рассчита|предоставл?|верн|провер|пополн|уточн|выставл?|оплат|оплач|заплач|перевед|настро|запуст|"
     r"выкат|выкач|закро|опиш|отпиш|напиш|согласу|подпиш|перезвон|созвон|позвон|набер|обновл?|скин|"
     r"сброш|закин|завед|добавл?|покаж|расскаж|ответ|отвеч|организу|оформл?|привез|завез|довез|подвез|"
     r"закаж|купл?|реш|узна|выясн|напомн|подъед|приед|заед|зайд|забер|принес|занес|подойд|долож|"
@@ -281,7 +289,7 @@ def speaker_labels(episode: Episode) -> dict[tuple, str]:
     """Метки говорящих: владелец — ВЛАДЕЛЕЦ, остальные — У1, У2… по порядку появления."""
     labels: dict[tuple, str] = {}
     n = 0
-    for message in [*episode.context, *episode.messages]:
+    for message in [*episode.context, *episode.messages, *episode.after]:
         key = message.speaker_key
         if key in labels:
             continue
@@ -309,7 +317,7 @@ def render_conversation(
 ) -> str:
     lines = [f"Чат: {chat_kind}."]
     people = []
-    for message in [*episode.context, *episode.messages]:
+    for message in [*episode.context, *episode.messages, *episode.after]:
         label = labels[message.speaker_key]
         if label != OWNER_LABEL and not any(p.startswith(label + " ") for p in people):
             name = clean_name(message.sender_name)
@@ -324,6 +332,12 @@ def render_conversation(
     for n, message in enumerate(episode.messages, start=1):
         lines.append(f"[{n}] {_stamp(message.sent_at, tz)} {labels[message.speaker_key]}{_mark(message)}: "
                      f"{clean_text(message.text) or '(без текста)'}")
+    if episode.after:
+        lines.append("После (что было в этом чате дальше — только чтобы понять, сделано ли обещанное; "
+                     "обязательства отсюда не извлекать):")
+        for n, message in enumerate(episode.after, start=1):
+            lines.append(f"[{AFTER_MARK}{n}] {_stamp(message.sent_at, tz)} {labels[message.speaker_key]}{_mark(message)}: "
+                         f"{clean_text(message.text, AFTER_CHARS) or '(без текста)'}")
     return "\n".join(lines)
 
 
@@ -336,35 +350,60 @@ _UNTRUSTED = (
 EXTRACT_INSTRUCTIONS = f"""\
 Ты извлекаешь ОБЯЗАТЕЛЬСТВА из деловой переписки.
 
-Обязательство — высказывание, которым участник берёт на себя обязанность что-то сделать: прислать \
-документ, подготовить расчёт, позвонить, оплатить, исправить. Согласие на прямую просьбу («хорошо, \
-сделаю», «ок, пришлю») — тоже обязательство того, кто согласился.
+Обязательство — высказывание, которым участник берёт на себя обязанность сделать конкретное дело \
+с результатом: прислать документ, подготовить расчёт, позвонить, оплатить, исправить. Согласие на \
+прямую просьбу («хорошо, сделаю», «ок, пришлю») — тоже обязательство того, кто согласился, если сама \
+просьба с сутью есть в блоке «Сообщения».
 
 {_UNTRUSTED}
 
 Правила для обязательств — соблюдай все:
-1. Только явные обязательства. Вопросы, мнения, планы без обязательства, просьбы без согласия и \
-высказывания с оговорками («постараюсь», «попробую», «если получится», «возможно», «наверное») — \
-НЕ обязательства.
+1. Только явные обязательства. НЕ обязательства:
+   - вопросы, мнения, просьбы без согласия и высказывания с оговорками («постараюсь», «попробую», \
+«если получится», «возможно», «наверное»);
+   - решения и договорённости о том, КАК будет («запускать всё же будем на новом сервере», «делаем \
+через подрядчика») — это решения: запиши их в facts с kind decision, а не в commitments;
+   - отношение и толкование («буду воспринимать как шеринг информации», «будем считать, что согласовано»);
+   - процесс без результата («будем мониторить», «будем разбираться», «буду параллельно править», \
+«посмотрим по ситуации»);
+   - условные («пусть сделает заявку, и мы дадим доступ», «если пришлёшь ТЗ — сделаю»).
 2. Обязательство принадлежит автору сообщения. Пересказ чужих обещаний («Иван обещал прислать») \
 не извлекай. Пересланные сообщения (помечены «переслано») и сообщения, написанные ассистентом \
 за владельца (помечены «написано ассистентом»), не извлекай.
-3. message — номер сообщения в квадратных скобках, в котором дано обещание. Сообщения из блока \
-«Ранее» номеров не имеют: из них ничего не извлекай.
+3. message — номер сообщения в квадратных скобках из блока «Сообщения», в котором дано обещание. \
+Из блоков «Ранее» и «После» обязательства не извлекай.
 4. source_quote — фрагмент этого сообщения, скопированный ДОСЛОВНО, без пересказа и исправлений.
-5. due_expression — формулировка срока, скопированная ДОСЛОВНО («завтра», «до пятницы», «к 10-му», \
-«до конца недели»). Если срок назван в другом сообщении (в просьбе, на которую согласились), \
+5. Согласие без сути («Ок», «Окей», «Принял», «Да, конечно», «Проверю», «Поправим», «Сейчас гляну») — \
+обязательство, только если в блоке «Сообщения» РАНЬШЕ есть просьба другого участника, на которую \
+это ответ. Тогда request_message — номер сообщения с просьбой, request_quote — фрагмент просьбы \
+ДОСЛОВНО, а what — суть этой просьбы. Если такой просьбы в блоке «Сообщения» нет (она только в \
+«Ранее» или её нет вовсе) — это НЕ обязательство: не додумывай, что обещано. У остальных \
+обязательств request_message и request_quote — null, если обещание не ответ на просьбу.
+6. due_expression — формулировка срока, скопированная ДОСЛОВНО («завтра», «до пятницы», «сейчас», \
+«к уикли», «до конца недели»). Если срок назван в другом сообщении (в просьбе, на которую согласились), \
 скопируй оттуда и укажи номер того сообщения в due_message. Если срок не назван — null.
-6. НИКОГДА не вычисляй и не придумывай дату. Не пиши дату цифрами, если именно так не написано \
+7. НИКОГДА не вычисляй и не придумывай дату. Не пиши дату цифрами, если именно так не написано \
 в сообщении. Дату посчитает программа.
-7. recipient — метка того, кому обещано ({OWNER_LABEL}, У1, У2…), если это ясно из переписки; иначе null.
-8. what — что обещано: одна короткая фраза в начальной форме («прислать смету по фасадам»), \
-на языке переписки, без имён и без срока.
-9. duplicate_of — если это то же обязательство, что уже есть в списке «Уже записано», укажи его \
+8. recipient — метка того, кому обещано ({OWNER_LABEL}, У1, У2…), если это ясно из переписки (в том \
+числе если обещание — ответ на просьбу или сообщение {OWNER_LABEL}); иначе null.
+9. what — что обещано: одна короткая фраза в начальной форме («прислать смету по фасадам»), \
+на языке переписки, без имён и без срока. Ничего не додумывай сверх сказанного.
+10. duplicate_of — если это то же обязательство, что уже есть в списке «Уже записано», укажи его \
 номер; иначе null.
-10. project — название проекта (объекта, сделки), к которому относится обязательство, как оно \
+11. same_as — если это то же самое дело, что обязательство раньше в ТВОЁМ списке commitments (один \
+предложил созвониться, другой ответил «окей, сейчас назначу»; «гляну цену» и «утром сообщу цену»; \
+«сейчас найду» и «сейчас скину»), укажи его порядковый номер в твоём списке (с 1); иначе null.
+12. project — название проекта (объекта, сделки), к которому относится обязательство, как оно \
 написано в переписке или в списке «Проекты владельца»; если не ясно — null.
-11. Если обязательств нет, верни пустой список.
+13. Состояние на сегодня. Блок «После» — что было в чате дальше, до сегодняшнего дня. Для каждого \
+обязательства по сообщениям ПОЗЖЕ обещания (в «Сообщения» и «После») определи status: open — не \
+видно, что сделано; fulfilled — сделано (прислали, оплатили, «поправил», «сделал», «пополнил», \
+появилась обещанная ссылка или файл) или получатель это подтвердил; cancelled — отменено или больше \
+не нужно; rescheduled — срок перенесён. Для fulfilled, cancelled и rescheduled: status_message — \
+номер сообщения-основания (число из «Сообщения» или «{AFTER_MARK}3» из «После»), status_quote — его \
+фрагмент ДОСЛОВНО; для rescheduled ещё new_due_expression — новый срок ДОСЛОВНО из того же \
+сообщения. Обещание сделать — не выполнение; напоминание или вопрос — не изменение. Сомневаешься — open.
+14. Если обязательств нет, верни пустой список.
 
 Кроме обязательств, извлеки ФАКТЫ и РЕШЕНИЯ, которые стоит помнить: о человеке — должность, \
 компания, телефон, адрес, город («я теперь в „Альфе“», «мой новый номер …»); о проекте — цена, \
@@ -372,27 +411,29 @@ EXTRACT_INSTRUCTIONS = f"""\
 о своих постоянных правилах; РЕШЕНИЕ по проекту — что именно решили, договорились, утвердили.
 
 Правила для фактов — соблюдай все:
-12. message — номер сообщения в квадратных скобках, где факт сказан; source_quote — фрагмент \
-этого сообщения, скопированный ДОСЛОВНО. Из блока «Ранее», пересланных сообщений и сообщений, \
-написанных ассистентом, ничего не извлекай.
-13. about — о ком или о чём факт: {OWNER_LABEL}, метка участника (У1, У2…) или ПРОЕКТ. Для ПРОЕКТ \
+15. message — номер сообщения в квадратных скобках из блока «Сообщения», где факт сказан; \
+source_quote — фрагмент этого сообщения, скопированный ДОСЛОВНО. Из блоков «Ранее» и «После», \
+пересланных сообщений и сообщений, написанных ассистентом, ничего не извлекай.
+16. about — о ком или о чём факт: {OWNER_LABEL}, метка участника (У1, У2…) или ПРОЕКТ. Для ПРОЕКТ \
 обязательно укажи project.
-14. slot — что за сведение, если оно сменяет прежнее: должность, компания, телефон, почта, адрес, \
+17. slot — что за сведение, если оно сменяет прежнее: должность, компания, телефон, почта, адрес, \
 город, цена, бюджет, срок, статус, площадь, подрядчик, ответственный. Если факт ничего не \
 сменяет — null.
-15. text — сам факт одной короткой фразой до 200 знаков на языке переписки. Ничего не додумывай \
+18. text — сам факт одной короткой фразой до 200 знаков на языке переписки. Ничего не додумывай \
 и не вычисляй: только то, что прямо сказано.
-16. kind: decision — решение по проекту; fact — всё остальное.
-17. Не больше 8 фактов. Предположения, слухи, вопросы и высказывания с оговорками — не факты. \
-Пароли, коды подтверждения и номера карт не извлекай никогда.
-18. projects — названия проектов, объектов и сделок, которые обсуждаются в сообщениях, ровно \
+19. kind: decision — решение по проекту; fact — всё остальное.
+20. Не больше 8 фактов. Предположения, слухи, вопросы и высказывания с оговорками — не факты. \
+Пароли, ключи, токены, коды подтверждения и номера карт не извлекай никогда.
+21. projects — названия проектов, объектов и сделок, которые обсуждаются в сообщениях, ровно \
 так, как они написаны. Если таких нет — пустой список.
 
 Ответ — один JSON-объект: {{"commitments": [{{"message": 1, "source_quote": "…", "what": "…", \
 "due_expression": "…" или null, "due_message": номер или null, "recipient": "У1" или null, \
-"duplicate_of": номер или null, "project": "…" или null}}], "facts": [{{"message": 1, \
-"source_quote": "…", "about": "У1", "project": "…" или null, "slot": "должность" или null, \
-"text": "…", "kind": "fact"}}], "projects": ["…"]}}
+"request_message": номер или null, "request_quote": "…" или null, "duplicate_of": номер или null, \
+"same_as": номер или null, "project": "…" или null, "status": "open", "status_message": номер, \
+"{AFTER_MARK}2" или null, "status_quote": "…" или null, "new_due_expression": "…" или null}}], \
+"facts": [{{"message": 1, "source_quote": "…", "about": "У1", "project": "…" или null, \
+"slot": "должность" или null, "text": "…", "kind": "fact"}}], "projects": ["…"]}}
 """
 
 # Схема намеренно нестрогая. Исполнитель сверяет ответ модели со схемой и при любом расхождении
@@ -403,7 +444,10 @@ EXTRACT_SCHEMA: dict[str, Any] = {
     "required": ["commitments"],
     "description": "commitments: array of objects {message: integer, source_quote: string, what: string, "
                    "due_expression: string or null, due_message: integer or null, "
-                   "recipient: string or null, duplicate_of: integer or null, project: string or null}; "
+                   "recipient: string or null, request_message: integer or null, request_quote: string or null, "
+                   "duplicate_of: integer or null, same_as: integer or null, project: string or null, "
+                   "status: open | fulfilled | cancelled | rescheduled, status_message: integer or string or null, "
+                   "status_quote: string or null, new_due_expression: string or null}; "
                    "facts: array of objects {message: integer, source_quote: string, about: string, "
                    "project: string or null, slot: string or null, text: string, kind: fact | decision}; "
                    "projects: array of strings",
@@ -414,7 +458,8 @@ RESOLVE_INSTRUCTIONS = f"""\
 
 {_UNTRUSTED}
 
-Для каждого обязательства из списка «Обязательства» реши, следует ли из НОВЫХ сообщений одно из трёх:
+Для каждого обязательства из списка «Обязательства» реши, следует ли из сообщений ПОЗЖЕ обещания \
+(время обещания указано в списке) одно из трёх:
 - fulfilled — обещанное сделано (прислали, оплатили, позвонили) или получатель это подтвердил;
 - cancelled — обязательство отменено или больше не нужно;
 - rescheduled — срок перенесён.
@@ -441,9 +486,10 @@ RESOLVE_SCHEMA: dict[str, Any] = {
 }
 
 
-def _known_line(n: int, item: dict[str, Any]) -> str:
+def _known_line(n: int, item: dict[str, Any], tz: tzinfo | None = None) -> str:
     due = f" (срок: «{clean_text(item['due_expression'], 60)}»)" if item.get("due_expression") else ""
-    return f"{n}. {item.get('who') or 'кто-то'}: {clean_text(item['what'], WHAT_LIMIT)}{due}"
+    when = f", обещано {_stamp(item['promised_at'], tz)}" if isinstance(item.get("promised_at"), datetime) else ""
+    return f"{n}. {item.get('who') or 'кто-то'}: {clean_text(item['what'], WHAT_LIMIT)}{due}{when}"
 
 
 def build_extract_input(
@@ -470,7 +516,7 @@ def build_resolve_input(
     commitments: Sequence[dict[str, Any]],
 ) -> str:
     parts = ["<переписка>", "Обязательства:"]
-    parts.extend(_known_line(n, item) for n, item in enumerate(commitments, start=1))
+    parts.extend(_known_line(n, item, tz) for n, item in enumerate(commitments, start=1))
     parts.append(render_conversation(episode, labels, tz, chat_kind=chat_kind))
     parts.append("</переписка>")
     return "\n".join(parts)
@@ -532,11 +578,91 @@ class Candidate:
     recipient_key: tuple | None     # ключ говорящего (speaker_key), которому обещано
     duplicate_of: int | None        # номер в списке «Уже записано»
     project: str | None = None      # метка проекта от модели (чужой текст, ещё не сопоставлена)
+    # Состояние на момент разбора (Р-96): open | fulfilled | cancelled. Основание — сообщение ПОЗЖЕ
+    # обещания с дословной цитатой (проверено кодом); перенос срока сразу превращается в новый срок.
+    status: str = "open"
+    evidence: Msg | None = None
+    evidence_quote: str | None = None
+    # Просьба, на которую это обещание — согласие (проверена кодом: дословно, раньше, другой автор).
+    request: Msg | None = None
+    request_quote: str | None = None
+    same_as: int | None = None      # номер (с 1) в том же ответе модели: то же дело
+    position: int = 0               # порядковый номер в ответе модели (с 1)
 
 
 def well_formed(parsed: Any, key: str) -> bool:
     """Ответ вообще похож на то, что просили: объект со списком под нужным ключом."""
     return isinstance(parsed, dict) and isinstance(parsed.get(key), list)
+
+
+# --- не обязательства и голое согласие (Р-96) ----------------------------------------------------
+
+# Процесс без результата и толкование: «будем мониторить», «буду воспринимать как …».
+_PROCESS_RE = re.compile(
+    r"\b(?:будем|буду|продолжим|продолжу|продолжаем|продолжаю)\s+(?:и\s+дальше\s+|пока\s+|тогда\s+)?"
+    r"(?:мониторить|отслеживать|следить|наблюдать|разбираться|думать|смотреть\s+по\s+ситуации|"
+    r"воспринимать|считать|держать\s+(?:в\s+курсе|руку\s+на\s+пульсе)|параллельно\s+\w+|"
+    r"иметь\s+в\s+виду|присматриваться|прорабатывать)\b",
+    flags=re.IGNORECASE)
+# Условное: «если …», «пусть сделает …, и мы …».
+_CONDITIONAL_RE = re.compile(r"\bесли\b|^\W*пусть\b|\bкак\s+только\b|\bпри\s+условии\b", flags=re.IGNORECASE)
+# Решение «как будет»: «запускать всё же будем на …» — инфинитив перед «будем».
+_DECISION_RE = re.compile(r"\b[а-я]+ть(?:ся)?\s+(?:все\s+же\s+|все-таки\s+|все\s+таки\s+)?будем\b",
+                          flags=re.IGNORECASE)
+# Слова согласия и связки, которые не несут сути обещания.
+_ACK_WORDS = frozenset((
+    "ок окей ok окейси хорошо да ага угу ладно добро принято принял приняла приняли понял поняла поняли "
+    "договорились конечно без проблем есть так точно сделаем сделаю давай давайте отлично супер спасибо "
+    "тогда сейчас ща щас сча счас щаз сразу я мы все это и а ну уже тоже вот же буду будем ясно норм гуд"
+).split())
+_WORD_RE = re.compile(r"[a-zа-яё0-9]+", flags=re.IGNORECASE)
+_STOP = frozenset("это для что как все его она они меня тебя нам вам там тут где когда тогда мне нас вас".split())
+
+
+def _words(text: str) -> list[str]:
+    return [w.lower().replace("ё", "е") for w in _WORD_RE.findall(text or "")]
+
+
+# Глаголы, полные сами по себе: «подойду», «перезвоню» — суть ясна без просьбы.
+_SELF_SUFFICIENT = ("подойд", "приду", "приед", "заед", "зайд", "подъед", "перезвон", "позвон", "набер",
+                    "выезж", "выед", "выйд", "спущ", "отзвон")
+
+
+def is_bare_ack(text: str) -> bool:
+    """Согласие без сути: после слов согласия остаётся не больше одного слова («Проверю», «Сейчас гляну»),
+    и это не глагол, полный сам по себе («подойду», «перезвоню»)."""
+    left = [w for w in _words(text) if w not in _ACK_WORDS]
+    return len(left) == 0 or (len(left) == 1 and not left[0].startswith(_SELF_SUFFICIENT))
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:5] for w in _words(text) if len(w) >= 4 and w not in _STOP}
+
+
+def rests_on(what: str, request_quote: str) -> bool:
+    """`what` опирается на просьбу: у них есть общее значимое слово (по началу слова)."""
+    return bool(_stems(what) & _stems(request_quote))
+
+
+def is_later(message: Msg, than: Msg) -> bool:
+    """Сообщение позже другого: основание выполнения — только сообщение после обещания."""
+    return message.id != than.id and (message.sent_at, message.id) > (than.sent_at, than.id)
+
+
+def _ref(value: Any, episode: Episode) -> Msg | None:
+    """Номер сообщения из ответа модели: число — блок «Сообщения», «П3» — блок «После»."""
+    if isinstance(value, str):
+        raw = value.strip().strip("[]").upper()
+        if raw[:1] in (AFTER_MARK, "P") and raw[1:].isdigit():
+            n = int(raw[1:])
+            return episode.after[n - 1] if 1 <= n <= len(episode.after) else None
+        if not raw.isdigit():
+            return None
+        value = int(raw)
+    n = _int(value)
+    if n is None:
+        return None
+    return episode.messages[n - 1] if 1 <= n <= len(episode.messages) else None
 
 
 def validate_extraction(
@@ -546,16 +672,20 @@ def validate_extraction(
 
     Схему ответа поставщик модели строго не проверяет, поэтому здесь проверяется всё: типы,
     номера, дословность цитаты и срока. Автор обязательства берётся из сообщения, а не из ответа.
+    Состояние на сегодня (Р-96) принимается, только если основание — сообщение позже обещания
+    и цитата из него дословна; иначе обязательство считается открытым.
     """
     dropped = {"malformed": 0, "bad_index": 0, "forwarded": 0, "by_service": 0, "ungrounded_quote": 0,
-               "hedged": 0, "question": 0, "empty": 0, "ungrounded_due": 0, "over_limit": 0}
+               "hedged": 0, "question": 0, "empty": 0, "ungrounded_due": 0, "over_limit": 0,
+               "not_a_promise": 0, "bare_ack": 0, "ungrounded_status": 0}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("commitments"), list):
         dropped["malformed"] += 1
         return [], dropped
-    key_by_label = {label: key for key, label in labels.items()}
+    # владелец — получатель, даже если сам в эпизоде не писал («Евгению скину смету»), Р-96
+    key_by_label = {OWNER_LABEL: ("owner",), **{label: key for key, label in labels.items()}}
     accepted: list[Candidate] = []
     seen: set[tuple[int, str]] = set()
-    for item in parsed["commitments"]:
+    for position, item in enumerate(parsed["commitments"], start=1):
         if len(accepted) >= MAX_ITEMS:
             dropped["over_limit"] += 1
             continue
@@ -584,10 +714,29 @@ def validate_extraction(
         if any(part.rstrip().endswith("?") for part in around):
             dropped["question"] += 1
             continue
+        said = _plain(" ".join([quote, *around]))
+        if _PROCESS_RE.search(said) or _CONDITIONAL_RE.search(said) or _DECISION_RE.search(said):
+            dropped["not_a_promise"] += 1
+            continue
         what = sanitize_what(what)
         if len(what) < 3:
             dropped["empty"] += 1
             continue
+
+        # Просьба, на которую это согласие: раньше обещания, в блоке «Сообщения», другой автор,
+        # цитата дословна. Голое согласие без неё — не обязательство: `what` было бы додумано.
+        request = _ref(_int(item.get("request_message")), episode)
+        request_quote = item.get("request_quote")
+        request_quote = request_quote.strip()[:QUOTE_LIMIT] if isinstance(request_quote, str) else None
+        if request is None or not request_quote or not request.is_source \
+                or request.speaker_key == message.speaker_key or not is_later(message, request) \
+                or not grounded(request_quote, request.text):
+            request, request_quote = None, None
+        bare = is_bare_ack(" ".join(around)) and is_bare_ack(quote)
+        if bare and (request is None or not rests_on(what, request_quote)):
+            dropped["bare_ack"] += 1
+            continue
+
         marker = (message.id, normalize(quote))
         if marker in seen:
             continue
@@ -604,9 +753,11 @@ def validate_extraction(
             elif grounded(due, message.text):
                 due_message = message
             else:
-                # срок из просьбы, на которую согласились: только из сообщения не позже обещания
+                # срок из просьбы, на которую согласились: только из сообщения не позже обещания;
+                # у голого согласия — только из блока «Сообщения», не из «Ранее»
                 hinted = _int(item.get("due_message"))
-                pool = [m for m in [*episode.context, *episode.messages[:index]] if m.is_source]
+                earlier = episode.messages[:index] if bare else [*episode.context, *episode.messages[:index]]
+                pool = [m for m in earlier if m.is_source]
                 hinted_message = episode.messages[hinted - 1] if hinted and 1 <= hinted <= index else None
                 if hinted_message is not None and hinted_message.is_source and grounded(due, hinted_message.text):
                     due_message = hinted_message
@@ -622,12 +773,111 @@ def validate_extraction(
         recipient_key = key_by_label.get(recipient.strip()) if isinstance(recipient, str) else None
         if recipient_key == message.speaker_key:
             recipient_key = None
+        if recipient_key is None and request is not None:
+            recipient_key = request.speaker_key       # согласие на просьбу — обещано тому, кто просил
+
+        # Состояние на сегодня: основание — сообщение ПОЗЖЕ обещания (не оно само и не раньше),
+        # годное как источник, с дословной цитатой; перенос — с новым сроком дословно из него же.
+        status = item.get("status") if item.get("status") in ("fulfilled", "cancelled", "rescheduled") else "open"
+        evidence: Msg | None = None
+        evidence_quote: str | None = None
+        if status != "open":
+            evidence = _ref(item.get("status_message"), episode)
+            raw_quote = item.get("status_quote")
+            evidence_quote = raw_quote.strip()[:QUOTE_LIMIT] if isinstance(raw_quote, str) else None
+            valid = (evidence is not None and evidence.is_source and bool(evidence_quote)
+                     and grounded(evidence_quote, evidence.text))
+            if valid and not is_later(evidence, message):
+                valid = False
+            if valid and status == "rescheduled":
+                new_due = item.get("new_due_expression")
+                new_due = new_due.strip() if isinstance(new_due, str) and new_due.strip() else None
+                valid = new_due is not None and len(new_due) <= 80 and grounded(new_due, evidence.text)
+                if valid:
+                    # обещание остаётся открытым, срок — новый, из сообщения-основания
+                    due, due_message, due_dropped = new_due, evidence, False
+                    status, evidence, evidence_quote = "open", None, None
+            if not valid:
+                dropped["ungrounded_status"] += 1
+                status, evidence, evidence_quote = "open", None, None
         accepted.append(Candidate(
             message=message, quote=quote, what=what, due_expression=due, due_message=due_message,
             due_dropped=due_dropped, recipient_key=recipient_key, duplicate_of=_int(item.get("duplicate_of")),
-            project=project_label(item.get("project")),
+            project=project_label(item.get("project")), status=status, evidence=evidence,
+            evidence_quote=evidence_quote, request=request, request_quote=request_quote,
+            same_as=_int(item.get("same_as")), position=position,
         ))
     return accepted, dropped
+
+
+# --- дубли внутри одного ответа (Р-96) ------------------------------------------------------------
+
+# Одно и то же дело разными словами: «созвониться» и «назначить созвон», «найти» и «скинуть».
+_ACTION_CLASSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("call", ("созвон", "звон", "позвон", "перезвон", "набер", "набра", "встрет", "встреч", "митинг")),
+    ("send", ("присл", "пришл", "скин", "сброс", "сбро", "отправ", "перешл", "пересл", "найд", "найт", "закин",
+              "кину", "выслат", "вышл", "подел", "предостав")),
+    ("tell", ("выясн", "узна", "сообщ", "отрапорт", "уточн", "отпиш", "расскаж", "гляну", "глянут",
+              "посмотр", "провер")),
+)
+_ACTION_WORDS = tuple(stem for _, stems in _ACTION_CLASSES for stem in stems) + (
+    "назнач", "сдела", "сейча", "сегод", "завтр", "утром")
+
+
+def _action(what: str) -> str | None:
+    for word in _words(what):
+        for name, stems in _ACTION_CLASSES:
+            if any(word.startswith(stem) for stem in stems):
+                return name
+    return None
+
+
+def _objects(what: str) -> set[str]:
+    return {w[:5] for w in _words(what) if len(w) >= 3 and w not in _STOP and not w.startswith(_ACTION_WORDS)}
+
+
+def same_deed(a: Candidate, b: Candidate) -> bool:
+    """Пара «предложил — согласился» об одном деле: близко по времени (DUPLICATE_WINDOW), одно
+    действие (созвон или встреча; прислать или найти; узнать или сообщить) и общий предмет — или
+    у одного из двух предмета нет вовсе («сейчас найду» и «сейчас скину ссылку»)."""
+    if a.message.id == b.message.id or abs(a.message.sent_at - b.message.sent_at) > DUPLICATE_WINDOW:
+        return False
+    kind = _action(a.what)
+    if kind is None or kind != _action(b.what):
+        return False
+    if sorted(re.findall(r"\d+", a.what)) != sorted(re.findall(r"\d+", b.what)):
+        return False        # «счёт 15» и «счёт 16» — разные дела
+    first, second = _objects(a.what), _objects(b.what)
+    return not first or not second or bool(first & second)
+
+
+def merge_duplicates(
+    candidates: Sequence[Candidate], rank: Any = None,
+) -> tuple[list[Candidate], list[tuple[Candidate, Candidate]]]:
+    """Оставляет одно обязательство из пары об одном деле. Пара — по отметке модели `same_as` (на
+    обязательство раньше в том же ответе) и по правилу `same_deed`: модель подсказывает, код решает
+    и склеивает и то, что модель пропустила. Остаётся то, у чего `rank` меньше (по умолчанию — раньше
+    сказанное). Возвращает оставшееся и пары (оставлено, убрано)."""
+    order = rank or (lambda c: (c.message.sent_at, c.message.id))
+    by_position = {c.position: c for c in candidates}
+    kept: list[Candidate] = []
+    pairs: list[tuple[Candidate, Candidate]] = []
+    for candidate in candidates:
+        twin = by_position.get(candidate.same_as) if candidate.same_as not in (None, candidate.position) else None
+        pair = None
+        if twin is not None and abs(twin.message.sent_at - candidate.message.sent_at) <= DUPLICATE_WINDOW * 4:
+            pair = next((k for k in kept if k is twin or same_deed(k, twin)), None)
+        if pair is None:
+            pair = next((k for k in kept if same_deed(k, candidate)), None)
+        if pair is None:
+            kept.append(candidate)
+            continue
+        if order(candidate) < order(pair):
+            kept[kept.index(pair)] = candidate
+            pairs.append((candidate, pair))
+        else:
+            pairs.append((pair, candidate))
+    return kept, pairs
 
 
 # --- факты, решения, проекты -------------------------------------------------------------------

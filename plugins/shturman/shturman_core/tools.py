@@ -36,7 +36,7 @@ from .service_client import NotAllowed, ServiceClient, ServiceError, ServiceUnav
 TOOLSET_READ = "shturman_read"
 TOOLSET_ASSIST = "shturman_assist"
 
-VIEWS = ("open", "overdue", "today", "week", "next_week", "proposed", "closed", "all")
+VIEWS = ("open", "overdue", "today", "week", "next_week", "proposed", "closed", "team", "all")
 DIRECTIONS = ("owner_owes", "owed_to_owner", "others")
 COMMITMENT_ACTIONS = ("close", "cancel", "reopen", "reschedule")
 PEOPLE_ACTIONS = ("search", "card", "add_alias")
@@ -118,7 +118,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         "description": (
             "Список обязательств и договорённостей из переписки владельца: что должен он и что должны ему. "
             "view: open — открытые, overdue — просроченные, today — на сегодня, week — с сегодня до "
-            "воскресенья, next_week — на следующую неделю (понедельник—воскресенье), proposed — найденные, но ещё не подтверждённые владельцем, closed — закрытые, all — все. "
+            "воскресенья, next_week — на следующую неделю (понедельник—воскресенье), proposed — найденные, но ещё не подтверждённые владельцем, closed — закрытые, team — «В команде»: "
+            "обещания между другими людьми из чатов владельца, только для сведения (в сводку их не включай), all — все. "
             "С commitment_id возвращает одно обязательство с историей. Только чтение. " + SPHERE_RULE + " "
             + _UNTRUSTED
         ),

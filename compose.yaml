@@ -103,6 +103,10 @@ services:
       SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
       SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
       SHTURMAN_NIGHTLY_AT: ${SHTURMAN_NIGHTLY_AT:-03:30}
+      SHTURMAN_PROCESSING_EVERY: ${SHTURMAN_PROCESSING_EVERY:-60}
+      SHTURMAN_PROCESSING_HOURLY_CAP: ${SHTURMAN_PROCESSING_HOURLY_CAP:-40}
+      SHTURMAN_PROCESSING_DAILY_CAP: ${SHTURMAN_PROCESSING_DAILY_CAP:-300}
+      SHTURMAN_DIGEST_AT: ${SHTURMAN_DIGEST_AT:-13:00,19:00}
       # Страница настройки переписки (/shturman-setup/): сервис отдаёт её сам, за собственным входом,
       # и только на ОТДЕЛЬНОМ адресе — не на том, где дашборд Hermes. Ассистент может добавлять свои
       # страницы на адрес дашборда; на общем адресе он действовал бы на странице настройки от имени

@@ -1226,6 +1226,33 @@ EOF3
       pass retry "повторять нечего$r_last"
     fi
   fi
+
+  # Разбор переписки (Р-96): ночью и днём раз в час; за сутки — прогонов, запросов к модели и грубая оценка
+  # объёма во входных токенах (цену считает владелец по тарифу своей модели). Упёрлись в предел — остаток ждёт ночи.
+  p_runs="$(num processing_runs_24h)"
+  if [ -n "$p_runs" ]; then
+    p_req="$(num processing_requests_24h)"; p_tok="$(num processing_tokens_24h)"
+    p_line="за сутки прогонов: ${p_runs}, запросов к модели: ${p_req:-0}, на входе ~$(( ${p_tok:-0} / 1000 )) тыс. токенов (оценка)"
+    case "$st" in
+      *'"processing_capped":true'*) warn processing "$p_line — дневной предел запросов исчерпан, остальное разберёт ночной прогон (SHTURMAN_PROCESSING_HOURLY_CAP, SHTURMAN_PROCESSING_DAILY_CAP)" ;;
+      *) pass processing "$p_line" ;;
+    esac
+  fi
+  # Договорённости: по статусам; перепроверка по новым правилам — по решению владельца (тратит запросы).
+  c_prop="$(num commitments_proposed)"
+  if [ -n "$c_prop" ]; then
+    c_line="ждут решения: ${c_prop}, приняты: $(num commitments_open), «В команде»: $(num commitments_team), сняты без владельца (сделано до показа и т. п.): $(num commitments_quiet)"
+    c_old="$(num old_prompt_items)"
+    case "$st" in
+      *'"recheck_done":false'*)
+        if [ "${c_old:-0}" -gt 0 ]; then
+          warn commitments "$c_line; найдено прежними правилами и не перепроверено: ${c_old} — по решению владельца: ./ops/commitments.sh recheck --dry-run (оценка), затем recheck (тратит запросы к модели); числа «было/стало» — ./ops/commitments.sh stats"
+        else
+          pass commitments "$c_line"
+        fi ;;
+      *) pass commitments "$c_line; перепроверка по новым правилам выполнена" ;;
+    esac
+  fi
 elif [ "$MODE" = standalone ]; then
   fail service "сервис переписки не развёрнут — запустите ./ops/up.sh"
 else

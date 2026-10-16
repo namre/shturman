@@ -70,10 +70,11 @@ def _item(raw: dict, marks: dict[int, list[str]] | None = None) -> Commitment:
 @mcp.tool(annotations=READ_ONLY, title="List commitments")
 async def list_commitments(
     ctx: Context,
-    view: Annotated[Literal["open", "overdue", "today", "week", "next_week", "proposed", "closed", "all"], Field(
+    view: Annotated[Literal["open", "overdue", "today", "week", "next_week", "proposed", "closed", "team", "all"], Field(
         description="open: accepted and not closed; overdue; today: due today; week: due from today "
                     "to Sunday; next_week: due Monday to Sunday of next week; proposed: waiting for "
-                    "the owner's decision; closed; all")] = "open",
+                    "the owner's decision; closed; team: promises between other people in the "
+                    "owner's chats, for information only; all")] = "open",
     direction: Annotated[Literal["owner_owes", "owed_to_owner", "others"] | None, Field(
         description="owner_owes: what the owner promised; owed_to_owner: what was promised to the owner")] = None,
     person_id: Annotated[int | None, Field(

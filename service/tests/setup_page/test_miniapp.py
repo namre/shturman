@@ -297,6 +297,8 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
         (miniapp.APP_API + "/commitments/{commitment_id:int}/move", ["POST"]),
         (miniapp.APP_API + "/commitments/{commitment_id:int}/wrong", ["POST"]),
         (miniapp.APP_API + "/commitments/{commitment_id:int}/reopen", ["POST"]),
+        # «Скрыть» в «В команде» (Р-96)
+        (miniapp.APP_API + "/commitments/{commitment_id:int}/hide", ["POST"]),
         # пакет 4б (Р-95, tests/setup_page/test_pack4b.py): «История», доверие — расширение только
         # карточкой в бот, расписание сводок
         (miniapp.APP_API + "/history", ["GET"]), (miniapp.APP_API + "/history/{item_id:int}/revert", ["POST"]),
@@ -708,9 +710,10 @@ async def test_digests_and_hidden_messages_are_decided_with_the_buttons_the_bot_
     await s.app.sign_in(signed())
     listed = (await s.app.get("/approvals")).json()
     kinds = sorted(i["kind"] for i in listed["items"])
-    assert kinds == ["commitment", "commitment", "hidden", "owner_fact", "project"], listed
-    assert listed["later"]["commitment"] == 1
-    assert later not in [i["id"] for i in listed["items"] if i["kind"] == "commitment"]
+    # новое предложение видно в приложении сразу, ещё до сводки в боте (Р-96)
+    assert kinds == ["commitment", "commitment", "commitment", "hidden", "owner_fact", "project"], listed
+    assert listed["later"]["commitment"] == 0
+    assert later in [i["id"] for i in listed["items"] if i["kind"] == "commitment"]
     refs = {(i["kind"], i["id"], a["label"]): a["ref"] for i in listed["items"] for a in i["actions"]}
     # что увидит человек: заголовок — вопрос, а не повтор вида карточки; без дат ISO, кодов кнопок,
     # пустых значений и словарей
@@ -744,7 +747,9 @@ async def test_digests_and_hidden_messages_are_decided_with_the_buttons_the_bot_
     await _delivered(s)
     assert any(e["message_id"] == card_id for e in s.telegram.calls("editMessageText"))
     left = (await s.app.get("/approvals")).json()["items"]
-    assert [(i["kind"], i["id"]) for i in left] == [("commitment", changed)]
+    assert sorted((i["kind"], i["id"]) for i in left) == [("commitment", changed), ("commitment", later)]
+    # не ушедшее сводкой принимается из приложения тем, что на карточке сейчас
+    assert await press("commitment", later, "Верно") == "Принято."
     dumped = json.dumps(await app_audit(conn), ensure_ascii=False)
     assert not any(word in dumped for word in ("Мария", "Иван", "смет", "Береговой", "директор"))
 

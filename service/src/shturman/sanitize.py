@@ -17,7 +17,9 @@
   clean_query(text)            — строка поиска от агента перед передачей в базу;
   untrusted_text(text, limit)  — вычищенное тело сообщения в рамке;
   untrusted_snippet(text)      — вычищенный фрагмент в одну строку в рамке;
-  UNTRUSTED_NOTICE             — напоминание, которое кладётся в каждый ответ инструмента.
+  UNTRUSTED_NOTICE             — напоминание, которое кладётся в каждый ответ инструмента;
+  redact_secrets(text)         — строки, похожие на ключи, токены и пароли, заменены на «[ключ скрыт]»
+                                 (перед любым запросом к модели, Р-96).
 """
 
 # Основано на chigwell/telegram-mcp (Apache-2.0), sanitize.py@c4f9b23:
@@ -237,3 +239,73 @@ def untrusted_text(text: str | None, limit: int = MAX_TEXT) -> str | None:
 def untrusted_snippet(text: str | None, limit: int = MAX_SNIPPET) -> str:
     """Фрагмент сообщения в одну строку в рамке «чужой текст»."""
     return f"{UNTRUSTED_OPEN} {clean_line(text, limit)} {UNTRUSTED_CLOSE}"
+
+
+# --- ключи и токены в тексте для модели (Р-96) -------------------------------------------------
+#
+# В переписке открытым текстом лежат ключи API, токены доступа и пароли. Модели они не нужны ни для
+# одного задания обработки, а провайдер модели их видеть не должен. Поэтому перед тем, как текст
+# уходит в запрос (обработка переписки, разбор входящих, черновики, репетиция, сводки страниц),
+# строки, похожие на секрет, заменяются меткой. Правила узкие: известные виды ключей по их началу,
+# «Bearer …», пароль после «пароль:», длинная случайная строка рядом со словом «ключ», «токен»,
+# «key», «token», «secret». Ссылки, номера телефонов, суммы и номера заказов не трогаются.
+# Это не фильтр утечек: ключ без узнаваемого вида пройдёт. Проверка — tests/test_redact_secrets.py.
+
+SECRET_MARK = "[ключ скрыт]"
+
+_SECRET_PATTERNS = [re.compile(p) for p in (
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+    r"(?<![A-Za-z0-9_-])sk-(?:proj-|ant-(?:api\d\d-)?|live-|test-|or-v1-)?[A-Za-z0-9_-]{20,}",
+    r"(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20,})",
+    r"(?<![A-Za-z0-9_-])xox[abposr]-[A-Za-z0-9-]{10,}",
+    r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])",
+    r"(?<![A-Za-z0-9_-])(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}",
+    # JWT (три части через точку) и токены вида base64 от JSON — например, туннеля Cloudflare
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+    r"(?<![A-Za-z0-9+/_-])eyJ[A-Za-z0-9+/_-]{40,}={0,2}",
+    # токен бота Telegram: «123456789:AA…»
+    r"(?<![0-9A-Za-z])\d{8,10}:AA[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])",
+)]
+_BEARER = re.compile(r"(?i)\b(bearer|token|basic)(\s+)([A-Za-z0-9._~+/=-]{16,})")
+_PASSWORD = re.compile(
+    r"(?i)\b(парол[ьяюе]м?|password|passwd|pwd|pass|пасс|pin|пин(?:-?код)?|код\s+доступа)"
+    r"((?:\s+(?:от|для|к)\s+[^\s:=]{1,30})?\s*[:=—-]\s*)(\S{3,})")
+_KEYWORD = re.compile(
+    r"(?i)(?:ключ\w*|токен\w*|секрет\w*|\bkey\b|\bkeys\b|api[_ -]?key|token|secret|apikey|access[_ -]?key|"
+    r"client[_ -]?secret|auth\w*|bearer|парол\w*|password)")
+_LONG = re.compile(r"(?<![A-Za-z0-9+/_=.-])[A-Za-z0-9+/_=-]{32,}(?![A-Za-z0-9+/_=-])")
+
+
+def _random_looking(token: str) -> bool:
+    """Длинная строка похожа на ключ: и буквы, и цифры (или только hex), а не слово и не число."""
+    body = token.strip("=")
+    if body.isdigit() or len(set(body)) < 8:
+        return False
+    has_digit = any(c.isdigit() for c in body)
+    has_alpha = any(c.isalpha() for c in body)
+    return has_digit and has_alpha
+
+
+def redact_secrets(text: str | None) -> str:
+    """Текст, в котором строки, похожие на ключи, токены и пароли, заменены на SECRET_MARK."""
+    if not text:
+        return text or ""
+    out = text
+    for pattern in _SECRET_PATTERNS:
+        out = pattern.sub(SECRET_MARK, out)
+    out = _BEARER.sub(lambda m: m[1] + m[2] + SECRET_MARK, out)
+    out = _PASSWORD.sub(lambda m: m[1] + m[2] + SECRET_MARK, out)
+
+    def long_near_keyword(m: re.Match) -> str:
+        token = m[0]
+        start = m.start()
+        before = out[max(0, start - 48): start]
+        # часть ссылки (путь, параметр) — не ключ: идентификаторы документов бывают длинными
+        if re.search(r"(?:https?://|www\.|t\.me/)\S*$", before):
+            return token
+        if _random_looking(token) and _KEYWORD.search(before):
+            return SECRET_MARK
+        return token
+
+    return _LONG.sub(long_near_keyword, out)

@@ -11,8 +11,13 @@
   proposed  — извлечено моделью, ждёт решения владельца (новые обязательства идут через одобрение);
   open      — принято владельцем;
   done / cancelled — закрыто;
-  rejected  — владелец отклонил предложение;
-  expired   — предложение осталось без ответа.
+  rejected  — владелец отклонил предложение (или скрыл из «В команде»);
+  expired   — снято без владельца: осталось без ответа, сделано или отменено ещё до показа или до
+              решения, заменено перепроверкой — причина в `quiet_reason` (Р-96);
+  team      — «В команде»: обещание между другими людьми, только для сведения (Р-96).
+
+Тихо — без владельца — снимается только то, что он ещё не принял: proposed и team (`quiet_close`).
+Принятое (open) меняется только его нажатием: модель лишь предлагает изменение (`propose_change`).
 
 Всё, что возвращается наружу, — обычные словари, готовые к JSON. Каждое изменение статуса
 пишется в журнал `commitment_events` (кто: owner, auto, model); текста сообщений в журнале нет.
@@ -44,11 +49,23 @@ SIMILAR_SAME_MESSAGE = 70  # для двух пунктов из одного и
 DIGEST_BUDGET = bridge.MESSAGE_LIMIT - 200   # единиц UTF-16 на сообщение-сводку; запас — на шапку и хвост
 DIGEST_MAX_SENDS = 3       # сколько раз пункт уходит владельцу, если сводка не доставляется
 
-VIEWS = ("open", "overdue", "today", "week", "next_week", "proposed", "closed", "all")
+VIEWS = ("open", "overdue", "today", "week", "next_week", "proposed", "closed", "team", "all")
+
+# Тихо, без владельца, снимается только ещё не принятое им (Р-96). Принятое — только его нажатием.
+QUIET_CLOSABLE = ("proposed", "team")
+TEAM_TTL_DAYS = 14         # «В команде» обещание держится столько дней после того, как дано
+IMMEDIATE_HOLD = timedelta(hours=24)   # быстрое обещание показывается, только если не сделано за сутки
+
+# «Не так» с причиной (Р-96): код -> подпись кнопки. Причина пишется в журнал (`commitment_events.details`).
+WRONG_REASONS: dict[str, str] = {
+    "not_promise": "не обещание", "wrong_person": "не тот человек", "wrong_what": "неверно что",
+    "wrong_due": "неверный срок", "duplicate": "дубль", "already_done": "уже сделано",
+}
 
 # Поля словаря обязательства, взятые из чужого текста (сообщения, имена, названия чатов).
 # Тот, кто показывает словарь агенту, обязан подавать их как данные, а не как указания.
-UNTRUSTED_FIELDS = ["what", "source_quote", "due_expression", "debtor.name", "creditor.name", "chat.title"]
+UNTRUSTED_FIELDS = ["what", "source_quote", "due_expression", "debtor.name", "creditor.name", "chat.title",
+                    "request_quote"]
 
 # Видимость. Обязательство не показывается никому — ни владельцу в сводке, ни агенту, ни
 # маршрутам, — если его чат исключён из архива или удалено сообщение, из которого оно выведено
@@ -60,8 +77,10 @@ UNTRUSTED_FIELDS = ["what", "source_quote", "due_expression", "debtor.name", "cr
 # Псевдонимы: c — commitments, ch — chats, m — сообщение-источник.
 VISIBLE = """NOT ch.excluded AND m.deleted_at IS NULL AND m.agent_visible
              AND NOT EXISTS (SELECT 1 FROM messages dm
-                             WHERE dm.id = c.due_message_id
+                             WHERE dm.id IN (c.due_message_id, c.request_message_id)
                                AND (dm.deleted_at IS NOT NULL OR NOT dm.agent_visible))"""
+# Показано или будет показано владельцу: быстрое обещание до конца суток ожидания — нет (Р-96).
+NOT_HELD = "(c.hold_until IS NULL OR c.hold_until <= now())"
 
 _SELECT = """
 SELECT c.*, ch.title AS chat_title, ch.type AS chat_type,
@@ -118,6 +137,9 @@ def to_dict(row: asyncpg.Record, today: date | None = None) -> dict[str, Any]:
         "due_reason": row["due_reason"],
         "overdue": bool(today and row["status"] == "open" and row["due_date"] and row["due_date"] < today),
         "source_quote": row["source_quote"],
+        "request_quote": row["request_quote"],
+        "quiet_reason": row["quiet_reason"],
+        "hold_until": row["hold_until"].isoformat() if row["hold_until"] else None,
         "source": {"message_id": row["source_message_id"], "tg_message_id": row["source_tg_message_id"],
                    "sent_at": row["source_sent_at"].isoformat(), "ref": f"msg:{row['source_message_id']}"},
         "chat": {"id": row["chat_id"], "title": row["chat_title"], "type": row["chat_type"]},
@@ -157,7 +179,8 @@ async def list_commitments(
 
     view: open — принятые и не закрытые; overdue — просроченные; today — срок сегодня;
     week — срок с сегодня до конца недели; next_week — срок с понедельника по воскресенье
-    следующей недели; proposed — ждут решения владельца; closed — выполненные и отменённые; all — все.
+    следующей недели; proposed — ждут решения владельца; closed — выполненные и отменённые;
+    team — «В команде», обещания между другими людьми (Р-96); all — все.
     `person_id` — обязательства, где человек должен или ему должны (по всем его учётным записям);
     `peer_id` — то же по одной учётной записи Telegram (peers.id); `project_id` — обязательства проекта.
     Обязательства исключённых чатов и удалённых сообщений не возвращаются.
@@ -173,7 +196,10 @@ async def list_commitments(
     if view in ("open", "overdue", "today", "week", "next_week"):
         where.append("c.status = 'open'")
     elif view == "proposed":
-        where.append("c.status = 'proposed'")
+        # быстрое обещание, которое ещё ждёт суток проверки, владельцу не показано и здесь не видно
+        where.append(f"c.status = 'proposed' AND {NOT_HELD}")
+    elif view == "team":
+        where.append(f"c.status = 'team' AND {NOT_HELD}")
     elif view == "closed":
         where.append("c.status IN ('done', 'cancelled')")
     if view == "overdue":
@@ -251,7 +277,7 @@ def find_duplicate(
                     or (same_numbers and fuzz.token_set_ratio(what_n, row_what) >= SIMILAR_SAME_MESSAGE):
                 return row["id"]
             continue
-        if row["status"] not in ("proposed", "open") or row["debtor_peer_id"] != debtor_peer_id:
+        if row["status"] not in ("proposed", "open", "team") or row["debtor_peer_id"] != debtor_peer_id:
             continue
         if _dates_conflict(row["due_date"], due_date) or not same_numbers:
             continue
@@ -280,29 +306,115 @@ def candidate_due(candidate: Candidate, tz: tzinfo | str | None) -> dates.Resolu
     return dates.Resolution.unresolved(dates.Reason.NO_DEADLINE)
 
 
+QUIET_BEFORE_SHOWN = {"fulfilled": "done_before_shown", "cancelled": "cancelled_before_shown"}
+QUIET_BEFORE_DECISION = {"fulfilled": "done_before_decision", "cancelled": "cancelled_before_decision"}
+QUIET_TEAM = {"fulfilled": "team_done", "cancelled": "team_cancelled"}
+
+
 async def propose(
     conn: asyncpg.Connection, *, chat_id: int, candidate: Candidate, debtor_peer_id: int | None,
     creditor_peer_id: int | None, direction: str, tz: tzinfo | str | None,
     run_id: int | None = None, model: str | None = None, project_id: int | None = None,
-) -> int:
-    """Записывает обязательство как предложение владельцу (статус proposed). project_id — проект,
-    к которому оно относится (projects.for_commitment), или None."""
+    now: datetime | None = None, checked: Any = None, prompt_version: str | None = None,
+) -> tuple[int, str]:
+    """Записывает обязательство из ответа модели. project_id — проект, к которому оно относится
+    (projects.for_commitment), или None. Возвращает номер и что с ним стало:
+
+      proposed  — предложение владельцу (статус proposed);
+      held      — быстрое обещание: предложение, но показ отложен до суток после обещания (`hold_until`);
+      team      — «В команде»: между другими людьми, только для сведения;
+      done_before_shown / cancelled_before_shown (и team_done / team_cancelled) — по сообщениям после
+                  обещания уже сделано или отменено: записано тихо (expired с причиной), владельцу не
+                  показывается; основание — номер сообщения в журнале (Р-96).
+
+    `checked` — последнее сообщение чата, по которое модель уже видела переписку (Msg): с него
+    продолжит проверка закрытия."""
+    now = now or datetime.now(timezone.utc)
     due = candidate_due(candidate, tz)
+    status, quiet, hold = ("team" if direction == "others" else "proposed"), None, None
+    if candidate.status in ("fulfilled", "cancelled") and candidate.evidence is not None:
+        quiet = (QUIET_TEAM if status == "team" else QUIET_BEFORE_SHOWN)[candidate.status]
+        status = "expired"
+    elif due.is_immediate:
+        until = candidate.message.sent_at + IMMEDIATE_HOLD
+        if until > now:
+            hold = until
     commitment_id = await conn.fetchval(
         """INSERT INTO commitments (chat_id, source_message_id, due_message_id, debtor_peer_id, creditor_peer_id,
                                     direction, what, source_quote, due_expression, due_date, due_time, due_part,
-                                    due_reason, status, run_id, model, project_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'proposed', $14, $15, $16)
+                                    due_reason, status, run_id, model, project_id, quiet_reason, hold_until,
+                                    checked_until_at, checked_until_id, request_message_id, request_quote,
+                                    prompt_version, closed_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                   $21, $22, $23, $24, CASE WHEN $14 = 'expired' THEN now() END)
            RETURNING id""",
         chat_id, candidate.message.id,
         candidate.due_message.id if candidate.due_expression and candidate.due_message else None,
         debtor_peer_id, creditor_peer_id, direction, candidate.what, candidate.quote,
         candidate.due_expression, due.due_date, due.due_time, due.part_of_day, due.reason.value,
-        run_id, (model or "")[:120] or None, project_id,
+        status, run_id, (model or "")[:120] or None, project_id, quiet, hold,
+        checked.sent_at if checked is not None else None, checked.id if checked is not None else None,
+        candidate.request.id if candidate.request is not None else None, candidate.request_quote,
+        prompt_version,
     )
+    details: dict[str, Any] = {"due_reason": due.reason.value}
+    if hold is not None:
+        details["held_until"] = hold.isoformat()
     await log_event(conn, commitment_id, actor="model", action="proposed", from_status=None,
-                    to_status="proposed", details={"due_reason": due.reason.value})
-    return commitment_id
+                    to_status="team" if quiet and direction == "others" else ("proposed" if quiet else status),
+                    details=details)
+    if quiet:
+        await log_event(conn, commitment_id, actor="model", action="quiet_closed",
+                        from_status="team" if direction == "others" else "proposed", to_status="expired",
+                        details={"reason": quiet, "evidence_message_id": candidate.evidence.id})
+        return commitment_id, quiet
+    return commitment_id, "held" if hold is not None else status
+
+
+async def quiet_close(
+    conn: asyncpg.Connection, commitment_id: int, *, kind: str, evidence_message_id: int | None,
+    reason: str | None = None, actor: str = "model",
+) -> str | None:
+    """Тихо снимает ещё не принятое владельцем (proposed, team): сделано или отменено до его решения,
+    заменено перепроверкой. Принятое (open) не трогается никогда: его меняет только нажатие владельца.
+    Показанный в сводке пункт снимается с показа (кнопка ответит «Уже решено»). Возвращает причину
+    или None, если снимать нечего."""
+    row = await conn.fetchrow("SELECT status FROM commitments WHERE id = $1 FOR UPDATE", commitment_id)
+    if row is None or row["status"] not in QUIET_CLOSABLE:
+        return None
+    if reason is None:
+        reason = (QUIET_TEAM if row["status"] == "team" else QUIET_BEFORE_DECISION).get(kind)
+    if reason is None:
+        return None
+    done = await conn.execute(
+        """UPDATE commitments SET status = 'expired', quiet_reason = $2, updated_at = now(), closed_at = now()
+           WHERE id = $1 AND status = ANY($3::text[])""", commitment_id, reason, list(QUIET_CLOSABLE))
+    if done.split()[-1] == "0":
+        return None
+    await log_event(conn, commitment_id, actor=actor, action="quiet_closed", from_status=row["status"],
+                    to_status="expired", details={"reason": reason, "evidence_message_id": evidence_message_id})
+    return reason
+
+
+async def quiet_reschedule(
+    conn: asyncpg.Connection, commitment_id: int, *, expression: str, due: dates.Resolution,
+    evidence_message_id: int,
+) -> bool:
+    """Срок ещё не принятого владельцем перенесён в переписке: новый срок записывается сразу. Если пункт
+    уже ушёл в сводке, он уйдёт ещё раз — с новым сроком (кнопка под старой карточкой устарела)."""
+    row = await conn.fetchrow("SELECT status, due_date FROM commitments WHERE id = $1 FOR UPDATE", commitment_id)
+    if row is None or row["status"] not in QUIET_CLOSABLE or not due.resolved:
+        return False
+    await _set_due(conn, commitment_id, expression=expression, due=due, due_message_id=evidence_message_id)
+    await conn.execute(
+        """UPDATE commitments SET digest_batch = NULL, digest_pos = NULL, notified_at = NULL, hold_until = NULL,
+                  digest_fingerprint = NULL
+           WHERE id = $1 AND status = 'proposed'""", commitment_id)
+    await log_event(conn, commitment_id, actor="model", action="rescheduled", from_status=row["status"],
+                    to_status=row["status"],
+                    details={"from": row["due_date"].isoformat() if row["due_date"] else None,
+                             "to": due.due_date.isoformat(), "evidence_message_id": evidence_message_id})
+    return True
 
 
 # --- изменения статуса --------------------------------------------------------------------------
@@ -391,7 +503,7 @@ async def _move(
 
 STATUS_TEXT = {
     "proposed": "ждёт решения", "open": "открыто", "done": "выполнено", "cancelled": "отменено",
-    "rejected": "отклонено", "expired": "не подтверждено",
+    "rejected": "отклонено", "expired": "не подтверждено", "team": "в команде",
 }
 
 
@@ -589,15 +701,26 @@ async def reject_change(conn: asyncpg.Connection, change_id: int, *, actor: str 
 async def expire_stale(conn: asyncpg.Connection, *, days: int = PROPOSAL_TTL_DAYS) -> dict[str, int]:
     """Тихо снимает показанные владельцу предложения, оставшиеся без ответа."""
     rows = await conn.fetch(
-        """UPDATE commitments SET status = 'expired', updated_at = now()
+        """UPDATE commitments SET status = 'expired', quiet_reason = 'unanswered', updated_at = now()
            WHERE status = 'proposed' AND notified_at < now() - make_interval(days => $1)
            RETURNING id""", days)
     for r in rows:
-        await log_event(conn, r["id"], actor="auto", action="expired", from_status="proposed", to_status="expired")
+        await log_event(conn, r["id"], actor="auto", action="expired", from_status="proposed", to_status="expired",
+                        details={"reason": "unanswered"})
+    # «В команде» — только для сведения: давнее уходит из списка само (Р-96)
+    team = await conn.fetch(
+        """UPDATE commitments c SET status = 'expired', quiet_reason = 'team_stale', updated_at = now()
+           FROM messages m
+           WHERE m.id = c.source_message_id AND c.status = 'team'
+             AND m.sent_at < now() - make_interval(days => $1)
+           RETURNING c.id""", TEAM_TTL_DAYS)
+    for r in team:
+        await log_event(conn, r["id"], actor="auto", action="expired", from_status="team", to_status="expired",
+                        details={"reason": "team_stale"})
     changes = await conn.execute(
         """UPDATE commitment_changes SET status = 'expired', decided_at = now()
            WHERE status = 'proposed' AND notified_at < now() - make_interval(days => $1)""", days)
-    return {"commitments": len(rows), "changes": int(changes.split()[-1])}
+    return {"commitments": len(rows), "team": len(team), "changes": int(changes.split()[-1])}
 
 
 async def purge_for_messages(conn: asyncpg.Connection, message_ids: Sequence[int]) -> dict[str, int]:
@@ -612,7 +735,8 @@ async def purge_for_messages(conn: asyncpg.Connection, message_ids: Sequence[int
     changes = await conn.execute(
         "DELETE FROM commitment_changes WHERE evidence_message_id = ANY($1::bigint[])", ids)
     gone = await conn.execute(
-        "DELETE FROM commitments WHERE source_message_id = ANY($1::bigint[]) OR due_message_id = ANY($1::bigint[])", ids)
+        """DELETE FROM commitments WHERE source_message_id = ANY($1::bigint[]) OR due_message_id = ANY($1::bigint[])
+                                      OR request_message_id = ANY($1::bigint[])""", ids)
     return {"commitments": int(gone.split()[-1]), "changes": int(changes.split()[-1])}
 
 
@@ -622,7 +746,8 @@ async def purge_orphans(conn: asyncpg.Connection) -> dict[str, int]:
     gone = await conn.execute(
         """DELETE FROM commitments c
            WHERE EXISTS (SELECT 1 FROM messages m
-                         WHERE m.id IN (c.source_message_id, c.due_message_id) AND m.deleted_at IS NOT NULL)
+                         WHERE m.id IN (c.source_message_id, c.due_message_id, c.request_message_id)
+                           AND m.deleted_at IS NOT NULL)
               OR EXISTS (SELECT 1 FROM chats ch WHERE ch.id = c.chat_id AND ch.excluded)""")
     changes = await conn.execute(
         """DELETE FROM commitment_changes x
@@ -650,24 +775,38 @@ def who_line(item: dict[str, Any]) -> str:
     return f"{debtor} → {creditor}" if creditor else (f"{debtor} (чат «{_short(title, 40)}»)" if title else debtor)
 
 
-def due_line(item: dict[str, Any], today: date | None = None) -> str:
+def promised_on(item: dict[str, Any], tz: tzinfo | str | None = None) -> str:
+    """«обещано 23.09» — день сообщения-источника по часам владельца (Р-96)."""
+    sent = datetime.fromisoformat(item["source"]["sent_at"])
+    local = dates.to_local(sent, tz) if tz is not None else sent
+    return f"обещано {local:%d.%m}"
+
+
+def due_line(item: dict[str, Any], today: date | None = None, tz: tzinfo | str | None = None) -> str:
+    promised = f" · {promised_on(item, tz)}"
+    if item["due_reason"] == dates.Reason.IMMEDIATE.value:
+        return f"Быстрое обещание («{_short(item['due_expression'], 40)}»){promised} — похоже, так и не сделано"
     if item["due_date"]:
         when = dates.format_due(date.fromisoformat(item["due_date"]),
                                 time.fromisoformat(item["due_time"]) if item["due_time"] else None, today=today)
-        return f"Срок: {when} («{_short(item['due_expression'], 60)}»)"
+        return f"Срок: {when} («{_short(item['due_expression'], 60)}»){promised}"
     if item["due_expression"]:
-        return f"Срок: «{_short(item['due_expression'], 60)}» — дата не определена"
-    return "Срок не назван"
+        note = dates.describe(item["due_reason"]) or "дата не определена"
+        return f"Срок: «{_short(item['due_expression'], 60)}» — {note}{promised}"
+    return f"Срок не назван{promised}"
 
 
 _CHANGE_TEXT = {"fulfilled": "Похоже, выполнено", "cancelled": "Похоже, отменено", "rescheduled": "Похоже, срок перенесён"}
 _MARK = {"open": "✓ принято", "rejected": "✗ отклонено", "expired": "— без ответа", "done": "✓ выполнено",
          "cancelled": "✓ отменено", "accepted": "✓ применено", "proposed": "… ждёт"}
+# Снятое без владельца, пока карточка ждала его решения (Р-96).
+_QUIET_MARK = {"done_before_decision": "— уже сделано", "cancelled_before_decision": "— уже отменено",
+               "recheck": "— заменено перепроверкой"}
 
 
-def _render_commitment(item: dict[str, Any], today: date | None) -> str:
+def _render_commitment(item: dict[str, Any], today: date | None, tz: tzinfo | str | None = None) -> str:
     return (f"{who_line(item)}: {_short(item['what'], 200)}\n"
-            f"{due_line(item, today)}\n«{_short(item['source_quote'], 160)}»")
+            f"{due_line(item, today, tz)}\n«{_short(item['source_quote'], 160)}»")
 
 
 def _render_change(change: asyncpg.Record, item: dict[str, Any], today: date | None) -> str:
@@ -680,7 +819,7 @@ def _render_change(change: asyncpg.Record, item: dict[str, Any], today: date | N
 
 async def build_digests(
     conn: asyncpg.Connection, *, run_id: int, today: date, max_items: int = DIGEST_MAX_ITEMS,
-    per_message: int = DIGEST_PER_MESSAGE, budget: int = DIGEST_BUDGET,
+    per_message: int = DIGEST_PER_MESSAGE, budget: int = DIGEST_BUDGET, tz: tzinfo | str | None = None,
 ) -> list[dict[str, Any]]:
     """Собирает сводку для владельца: несколько пронумерованных пунктов на сообщение, под каждым
     пунктом кнопки ✓ и ✗. Помечает показанное. Возвращает [{"text", "buttons", "batch"}].
@@ -689,8 +828,11 @@ async def build_digests(
     сообщение, не влезающее в предел, делится на несколько, а пункт, который не влезает даже
     один, обрезается. Пункт, уже уходивший `DIGEST_MAX_SENDS` раз, больше не отправляется.
     """
+    # В сводку с кнопками — только то, где владелец сторона; «В команде» (team) сюда не попадает,
+    # быстрое обещание — только после суток ожидания (Р-96).
     new = await conn.fetch(
-        _SELECT + """ AND c.status = 'proposed' AND c.digest_batch IS NULL AND c.digest_attempts < $2
+        _SELECT + f""" AND c.status = 'proposed' AND c.direction <> 'others' AND {NOT_HELD}
+                      AND c.digest_batch IS NULL AND c.digest_attempts < $2
                       ORDER BY (c.direction = 'owner_owes') DESC, c.due_date NULLS LAST, c.id LIMIT $1""",
         max_items, DIGEST_MAX_SENDS)
     waiting_changes = f"""FROM commitment_changes x JOIN commitments c ON c.id = x.commitment_id
@@ -699,7 +841,7 @@ async def build_digests(
              AND c.status = 'open' AND {VISIBLE}"""
     changes = await conn.fetch(
         f"SELECT x.* {waiting_changes} ORDER BY x.id LIMIT $1", max(0, max_items - len(new)))
-    entries: list[tuple[str, int, str]] = [("c", row["id"], _render_commitment(to_dict(row, today), today))
+    entries: list[tuple[str, int, str]] = [("c", row["id"], _render_commitment(to_dict(row, today), today, tz))
                                            for row in new]
     prints = {("c", row["id"]): fingerprint(row) for row in new}
     for row in changes:
@@ -712,7 +854,8 @@ async def build_digests(
     waiting = await conn.fetchval(
         f"""SELECT (SELECT count(*) FROM commitments c JOIN chats ch ON ch.id = c.chat_id
                     JOIN messages m ON m.id = c.source_message_id
-                    WHERE c.status = 'proposed' AND c.digest_batch IS NULL
+                    WHERE c.status = 'proposed' AND c.direction <> 'others' AND {NOT_HELD}
+                      AND c.digest_batch IS NULL
                       AND c.digest_attempts < {DIGEST_MAX_SENDS} AND {VISIBLE})
                  + (SELECT count(*) {waiting_changes})""") - len(entries)
 
@@ -777,11 +920,11 @@ async def unmark_batch(conn: asyncpg.Connection, batch: str) -> dict[str, int]:
 async def batch_summary(conn: asyncpg.Connection, batch: str) -> tuple[bool, str]:
     """Состояние одного сообщения-сводки: все ли пункты решены и итоговый текст."""
     rows = await conn.fetch(
-        f"""SELECT c.digest_pos AS pos, c.status, c.what, NULL::text AS kind
+        f"""SELECT c.digest_pos AS pos, c.status, c.what, NULL::text AS kind, c.quiet_reason
             FROM commitments c JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
             WHERE c.digest_batch = $1 AND {VISIBLE}
             UNION ALL
-            SELECT x.digest_pos, x.status, c.what, x.kind FROM commitment_changes x
+            SELECT x.digest_pos, x.status, c.what, x.kind, NULL FROM commitment_changes x
             JOIN commitments c ON c.id = x.commitment_id
             JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
             WHERE x.digest_batch = $1 AND {VISIBLE}
@@ -792,30 +935,47 @@ async def batch_summary(conn: asyncpg.Connection, batch: str) -> tuple[bool, str
         mark = _MARK.get(r["status"], r["status"])
         if r["kind"] is None and r["status"] in ("done", "cancelled", "open"):
             mark = "✓ принято"
+        elif r["kind"] is None and r["quiet_reason"] in _QUIET_MARK:
+            mark = _QUIET_MARK[r["quiet_reason"]]
         lines.append(f"{r['pos']}. {prefix}{_short(r['what'], 120)} — {mark}")
     done = bool(rows) and all(r["status"] != "proposed" for r in rows)
     return done, bridge.fit_message("Договорённости из переписки — решено:\n" + "\n".join(lines))
 
 
-async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit: int = 100) -> dict[str, Any]:
+def why_buttons(target: int, *, pos: int | None = None, reject: bool = False) -> list[list[dict[str, str]]]:
+    """Кнопки причины «Не так» (Р-96): по три в ряд. `reject` — нажатие сразу отклоняет с причиной
+    (приложение, `rw:`); иначе — дописывает причину к уже отклонённому (бот, `w:`)."""
+    code = "rw" if reject else "w"
+    lead = f"{pos}: " if pos is not None else ""
+    buttons = [bridge.button(lead + label, CALLBACK_MODULE, f"{code}:{target}:{key}")
+               for key, label in WRONG_REASONS.items()]
+    return [buttons[:3], buttons[3:]]
+
+
+async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit: int = 100,
+                         tz: tzinfo | str | None = None) -> dict[str, Any]:
     """Пункты сводок, которые уже ушли владельцу и ждут его решения, — для Mini App бота
     согласований (`setup_page/approvals.py`). Текст пункта — как в сводке, кнопки — те же данные,
     что под сводкой (с отпечатком того, что было показано), подписи словами вместо «N ✓».
-    Решение приходит обратно в `handle_callback` — тем же путём, что нажатие в боте.
+    Решение приходит обратно в `handle_callback` — тем же путём, что нажатие в боте. У «Не так» —
+    причины (`why`): приложение показывает их после нажатия «Не так» (Р-96).
 
-    Пункт, ещё не ушедший сводкой, кнопки не имеет (у него нет отпечатка показанного): такие
-    пункты только считаются (`later`) и придут со следующей сводкой."""
+    Новое предложение видно здесь сразу, ещё до сводки в боте (Р-96: сводка с кнопками уходит только
+    в свои часы): отпечаток кнопки «Верно» — того, что показано сейчас. «В команде» и быстрые
+    обещания, ждущие суток проверки, сюда не попадают. `later` — 0: ждать сводки больше нечему."""
     items: list[dict[str, Any]] = []
     rows = await conn.fetch(
-        _SELECT + """ AND c.status = 'proposed' AND c.digest_batch IS NOT NULL AND c.digest_fingerprint IS NOT NULL
+        _SELECT + f""" AND c.status = 'proposed' AND c.direction <> 'others' AND {NOT_HELD}
                       ORDER BY c.notified_at NULLS LAST, c.id LIMIT $1""", limit)
     for row in rows:
         target = row["id"]
+        shown = row["digest_fingerprint"] or fingerprint(row)
         items.append({
             "id": target, "title": "Верно ли записана договорённость?",
-            "text": _render_commitment(to_dict(row, today), today),
-            "buttons": [[bridge.button(words.COMMITMENT_YES, CALLBACK_MODULE, f"a:{target}:{row['digest_fingerprint'][:24]}"),
+            "text": _render_commitment(to_dict(row, today), today, tz),
+            "buttons": [[bridge.button(words.COMMITMENT_YES, CALLBACK_MODULE, f"a:{target}:{shown[:24]}"),
                          bridge.button(words.COMMITMENT_NO, CALLBACK_MODULE, f"r:{target}")]],
+            "why": [b for line in why_buttons(target, reject=True) for b in line],
             "card_message_id": None})
     changes = await conn.fetch(
         f"""SELECT x.* FROM commitment_changes x JOIN commitments c ON c.id = x.commitment_id
@@ -832,36 +992,120 @@ async def awaiting_owner(conn: asyncpg.Connection, *, today: date | None, limit:
             "buttons": [[bridge.button("Применить", CALLBACK_MODULE, f"ca:{target}:{change['digest_fingerprint'][:24]}"),
                          bridge.button("Оставить как есть", CALLBACK_MODULE, f"cr:{target}")]],
             "card_message_id": None})
-    later = await conn.fetchval(
-        f"""SELECT (SELECT count(*) FROM commitments c JOIN chats ch ON ch.id = c.chat_id
-                    JOIN messages m ON m.id = c.source_message_id
-                    WHERE c.status = 'proposed' AND c.digest_batch IS NULL
-                      AND c.digest_attempts < {DIGEST_MAX_SENDS} AND {VISIBLE})""")
-    return {"items": items, "later": int(later or 0)}
+    return {"items": items, "later": 0}
+
+
+async def batch_keyboard(conn: asyncpg.Connection, batch: str, *, asking: int | None = None
+                         ) -> list[list[dict[str, str]]]:
+    """Кнопки под сообщением-сводкой после нажатия: у нерешённых пунктов — прежние, у только что
+    отклонённого (`asking`) — причины «Не так» (необязательно), у решённых — ничего."""
+    rows = await conn.fetch(
+        f"""SELECT 'c' AS kind, c.id, c.digest_pos AS pos, c.status, c.digest_fingerprint
+            FROM commitments c JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+            WHERE c.digest_batch = $1 AND {VISIBLE}
+            UNION ALL
+            SELECT 'x', x.id, x.digest_pos, x.status, x.digest_fingerprint FROM commitment_changes x
+            JOIN commitments c ON c.id = x.commitment_id
+            JOIN chats ch ON ch.id = c.chat_id JOIN messages m ON m.id = c.source_message_id
+            WHERE x.digest_batch = $1 AND {VISIBLE}
+            ORDER BY pos""", batch)
+    keyboard: list[list[dict[str, str]]] = []
+    for r in rows:
+        pos, target = r["pos"], r["id"]
+        if r["kind"] == "c" and target == asking and r["status"] == "rejected":
+            keyboard += why_buttons(target, pos=pos)
+        elif r["status"] == "proposed" and r["digest_fingerprint"]:
+            if r["kind"] == "c":
+                keyboard.append([bridge.button(f"{pos} — верно", CALLBACK_MODULE, f"a:{target}:{r['digest_fingerprint'][:24]}"),
+                                 bridge.button(f"{pos} — не так", CALLBACK_MODULE, f"r:{target}")])
+            else:
+                keyboard.append([bridge.button(f"{pos} — применить", CALLBACK_MODULE, f"ca:{target}:{r['digest_fingerprint'][:24]}"),
+                                 bridge.button(f"{pos} — оставить", CALLBACK_MODULE, f"cr:{target}")])
+    return keyboard
+
+
+async def add_reason(conn: asyncpg.Connection, commitment_id: int, reason: str, *, via: str) -> bool:
+    """Причина «Не так» к договорённости, которую владелец только что отклонил или отметил неверной.
+    Пишется в журнал один раз; ничего не меняет в самой договорённости. Только владелец."""
+    if reason not in WRONG_REASONS or not authority.is_owner():
+        return False
+    last = await conn.fetchrow(
+        """SELECT action FROM commitment_events WHERE commitment_id = $1 ORDER BY at DESC, id DESC LIMIT 1""",
+        commitment_id)
+    status = await conn.fetchval("SELECT status FROM commitments WHERE id = $1", commitment_id)
+    if last is None or status != "rejected" or last["action"] not in ("rejected", "marked_wrong"):
+        return False
+    await log_event(conn, commitment_id, actor="owner", action="wrong_reason", from_status=status,
+                    to_status=status, details={"reason": reason, "via": via})
+    return True
+
+
+async def hide(conn: asyncpg.Connection, commitment_id: int, *, details: dict[str, Any] | None = None,
+               expected_fingerprint: str | None = None) -> dict[str, Any]:
+    """«Скрыть» в списке «В команде» (Р-96): обещание между другими людьми уходит из списка и больше не
+    предлагается (то же сообщение — `find_duplicate`). Только владелец; меняет только статус team."""
+    if not authority.is_owner():
+        return _result(False, error="Скрыть может только владелец.", code="approval_required")
+    return await _move(conn, commitment_id, allowed=("team",), to="rejected", action="hidden", actor="owner",
+                       details=details, expected_fingerprint=expected_fingerprint)
+
+
+async def unhide(conn: asyncpg.Connection, commitment_id: int, *, today: date | None = None) -> dict[str, Any]:
+    """«Вернуть» сразу после «Скрыть»: обещание снова в «В команде». Только владелец."""
+    if not authority.is_owner():
+        return _result(False, error="Вернуть может только владелец.", code="approval_required")
+    return await _move(conn, commitment_id, allowed=("rejected",), to="team", action="unhidden", actor="owner",
+                       details={"via": "app"}, today=today)
+
+
+def _done_reply(answer: str, done: bool, text: str | None, keyboard: list[list[dict[str, str]]] | None
+                ) -> dict[str, Any]:
+    if done and not keyboard:
+        return {"answer": answer, "edit_text": text, "remove_buttons": True}
+    out: dict[str, Any] = {"answer": answer, "edit_text": None, "remove_buttons": False}
+    if keyboard is not None:
+        out["buttons"] = keyboard
+    return out
 
 
 async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]:
-    """Нажатие кнопки под сводкой. Данные: a:<id> принять, r:<id> отклонить,
-    ca:<id> применить изменение, cr:<id> оставить как есть."""
+    """Нажатие кнопки под сводкой. Данные: a:<id> принять, r:<id> отклонить, rw:<id>:<причина> отклонить
+    с причиной (приложение), w:<id>:<причина> — причина к только что отклонённому (бот), ca:<id> применить
+    изменение, cr:<id> оставить как есть."""
     action, _, raw = rest.partition(":")
     raw, _, shown_fingerprint = raw.partition(":")
-    if action not in ("a", "r", "ca", "cr") or not raw.isdigit():
+    if action not in ("a", "r", "rw", "w", "ca", "cr") or not raw.isdigit():
         return {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
     target = int(raw)
-    if action in ("a", "r"):
-        row = await conn.fetchrow("SELECT status, digest_batch, digest_fingerprint FROM commitments WHERE id = $1", target)
+    asking = None
+    if action == "w":
+        batch = await conn.fetchval("SELECT digest_batch FROM commitments WHERE id = $1", target)
+        if not await add_reason(conn, target, shown_fingerprint, via="bot"):
+            return {"answer": "Причина уже записана или договорённость не отклонена.", "edit_text": None,
+                    "remove_buttons": False}
+        answer = "Спасибо, причина записана."
+    elif action in ("a", "r", "rw"):
+        row = await conn.fetchrow("SELECT * FROM commitments WHERE id = $1", target)
         if row is None or not await is_visible(conn, target):
             return {"answer": "Эта договорённость уже удалена.", "edit_text": None, "remove_buttons": False}
         if row["status"] != "proposed":
             answer = f"Уже решено: {STATUS_TEXT[row['status']]}."
         elif action == "a":
-            if not row["digest_fingerprint"] or shown_fingerprint != row["digest_fingerprint"][:24]:
+            # показанное — из сводки или (до сводки) из приложения: то, что было на карточке
+            shown = row["digest_fingerprint"] or fingerprint(row)
+            if not shown_fingerprint or shown_fingerprint != shown[:24]:
                 return {"answer": "Карточка устарела. Запросите новое подтверждение.", "edit_text": None, "remove_buttons": True}
-            outcome = await accept(conn, target, expected_fingerprint=row["digest_fingerprint"])
+            outcome = await accept(conn, target, expected_fingerprint=shown)
             answer = "Принято." if outcome["ok"] else outcome["error"]
+        elif action == "rw":
+            if shown_fingerprint not in WRONG_REASONS:
+                return {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
+            await reject(conn, target, details={"reason": shown_fingerprint})
+            answer = f"Отклонено: {WRONG_REASONS[shown_fingerprint]}."
         else:
             await reject(conn, target)
-            answer = "Отклонено."
+            answer = "Отклонено. Почему — по желанию, кнопкой ниже."
+            asking = target
         batch = row["digest_batch"]
     else:
         row = await conn.fetchrow("SELECT status, kind, digest_batch, digest_fingerprint FROM commitment_changes WHERE id = $1", target)
@@ -881,7 +1125,8 @@ async def handle_callback(conn: asyncpg.Connection, rest: str) -> dict[str, Any]
         batch = row["digest_batch"]
     if batch:
         done, text = await batch_summary(conn, batch)
-        if done:
-            return {"answer": answer, "edit_text": text, "remove_buttons": True}
+        keyboard = await batch_keyboard(conn, batch, asking=asking)
+        if asking is None and not done and action not in ("w", "r"):
+            keyboard = None      # остальные кнопки под сводкой прежние — клавиатуру не трогаем
+        return _done_reply(answer, done, text, keyboard)
     return {"answer": answer, "edit_text": None, "remove_buttons": False}
-

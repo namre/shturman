@@ -60,7 +60,7 @@ REF = re.compile(
     r"|cf:[yn]:\d{1,18}:[A-Za-z0-9_-]{8,43}"
     r"|rp:[yrn]:\d{1,18}:[A-Za-z0-9_-]{8,43}"
     r"|gd:[rc]:\d{1,18}:[A-Za-z0-9_-]{8,43}"
-    r"|cm:(?:a:\d{1,18}:[0-9a-f]{24}|r:\d{1,18}|ca:\d{1,18}:[0-9a-f]{24}|cr:\d{1,18})"
+    r"|cm:(?:a:\d{1,18}:[0-9a-f]{24}|r:\d{1,18}|rw:\d{1,18}:[a-z_]{3,20}|ca:\d{1,18}:[0-9a-f]{24}|cr:\d{1,18})"
     r"|of:(?:a:\d{1,18}:[0-9a-f]{24}|r:\d{1,18})"
     r"|pg:[ar]:\d{1,18}"
     r"|pj:[ar]:\d{1,18}"
@@ -119,6 +119,9 @@ def _item(kind: str, kind_title: str, entry: dict[str, Any], *, note: str | None
     answer = [b["data"] for row in entry["buttons"] for b in row if b["data"].startswith(workflow.ANSWER_PREFIX)]
     actions = [{"label": b["text"], "ref": b["data"], "primary": b["text"] in PRIMARY}
                for row in entry["buttons"] for b in row if not b["data"].startswith(workflow.ANSWER_PREFIX)]
+    # Причины «Не так» у договорённости (Р-96): приложение показывает их после нажатия «Не так»;
+    # каждая — та же кнопка сервиса, что отклоняет с причиной.
+    actions += [{"label": b["text"], "ref": b["data"], "primary": False, "why": True} for b in entry.get("why") or []]
     return {
         "key": f"{kind}:{entry['id']}", "kind": kind, "kind_title": kind_title, "id": entry["id"],
         "group": group_of(kind, kind_title),
@@ -163,7 +166,8 @@ async def collect(conn: asyncpg.Connection, config: Any) -> dict[str, Any]:
         items.append(_item("hidden", "Скрытое сообщение", entry))
     later: dict[str, int] = {"hidden": await alerts.waiting(conn)}
     for kind, kind_title, found in (
-        ("commitment", "Договорённость", await commitments.awaiting_owner(conn, today=today_of(config))),
+        ("commitment", "Договорённость", await commitments.awaiting_owner(conn, today=today_of(config),
+                                                                    tz=getattr(config, "timezone", None))),
         ("owner_fact", "Факт о вас", await facts.awaiting_owner(conn)),
         ("page", "Страница памяти", await pages_build.awaiting_owner(conn, days=pages_build.Options().propose_days)),
         ("project", "Проект", await projects.awaiting_owner(conn)),

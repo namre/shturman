@@ -396,6 +396,56 @@ async def _retry_failed(since_text: str | None, dry_run: bool) -> None:
           "Повторный разбор снова уходит провайдеру модели и тратит запросы.")
 
 
+async def _commitments(action: str, *, as_json: bool, dry_run: bool, limit: int, force: bool,
+                       price_in: float | None, price_out: float | None) -> None:
+    """Договорённости (Р-96): `stats` — только агрегаты; `recheck` — перепроверка уже найденного по новым
+    правилам. Перепроверка отправляет переписку провайдеру модели и тратит запросы — запускается по
+    решению владельца; сначала `--dry-run`."""
+    import json as _json
+
+    from .processing import commitment_stats, pipeline
+
+    conn = await db.connect(_dsn())
+    try:
+        await db.migrate(conn)
+        if action == "stats":
+            stats = await commitment_stats.collect(conn)
+            print(_json.dumps(stats, ensure_ascii=False, indent=2) if as_json else commitment_stats.render(stats))
+            return
+        tz = os.environ.get("SHTURMAN_TIMEZONE", "").strip() or "Europe/Moscow"
+        out = await pipeline.recheck(conn, tz=tz, limit=limit, dry_run=dry_run, force=force)
+        if dry_run or out.get("status") == "planned":
+            await conn.execute(
+                "INSERT INTO setup_audit (action, outcome, detail) VALUES ('commitments.recheck', 'ok', $1)",
+                f"из терминала{'; только оценка' if dry_run else ''}; запросов: {out.get('requests', 0)}")
+    finally:
+        await conn.close()
+    if as_json:
+        print(_json.dumps(out, ensure_ascii=False, indent=2))
+        return
+    if out["status"] == "already_done":
+        print(f"Перепроверка по правилам версии {out['prompt_version']} уже выполнялась ({out.get('at')}). "
+              "Ещё раз — с --force.")
+        return
+    if out["status"] == "already_running":
+        print("Сейчас идёт прогон обработки — повторите через несколько минут.")
+        return
+    print(("Оценка (ничего не поставлено): " if dry_run else "Поставлено: ")
+          + f"запросов к модели — {out['requests']} (извлечение заново — {out['extract_planned']}, "
+            f"проверка «уже сделано?» — {out['resolve_planned']}).")
+    print(f"Предложений к перепроверке: {out['proposals_to_recheck']}; не собрался эпизод: "
+          f"{out['proposals_not_found']}; не вошло в предел {out['limit']}: {out['proposals_over_limit']}.")
+    cost = ""
+    if price_in is not None and price_out is not None:
+        dollars = out["tokens_in_estimate"] / 1e6 * price_in + out["tokens_out_estimate"] / 1e6 * price_out
+        cost = f" — примерно ${dollars:.2f} по ценам {price_in} и {price_out} за миллион"
+    print(f"Объём (грубо): на входе ~{out['tokens_in_estimate']:,} токенов, на выходе ~{out['tokens_out_estimate']:,}"
+          .replace(",", " ") + cost + ".")
+    if not dry_run:
+        print("Ответы модели разберутся по мере выполнения; новые предложения — в приложении сразу, "
+              "сводкой в боте — в ближайший час сводки. «Похоже, уже сделано» по принятым — тоже там.")
+
+
 def _serve() -> None:
     import logging
 
@@ -454,6 +504,15 @@ def main() -> None:
                                              "(по решению владельца: снова тратит запросы к модели)")
     rf.add_argument("--since", metavar="ГГГГ-ММ-ДД", help="с какой даты считать сбой (по умолчанию — всё)")
     rf.add_argument("--dry-run", action="store_true", help="только показать, сколько вернётся")
+    cm = sub.add_parser("commitments", help="договорённости: stats — числа «было/стало»; recheck — перепроверка "
+                                            "по новым правилам (по решению владельца: тратит запросы к модели)")
+    cm.add_argument("action", choices=["stats", "recheck"])
+    cm.add_argument("--json", action="store_true", help="вывести JSON")
+    cm.add_argument("--dry-run", action="store_true", help="recheck: только посчитать запросы и объём")
+    cm.add_argument("--limit", type=int, default=300, help="recheck: не больше стольких запросов к модели")
+    cm.add_argument("--force", action="store_true", help="recheck: ещё раз для той же версии правил")
+    cm.add_argument("--price-in", type=float, help="цена миллиона входных токенов, для оценки в долларах")
+    cm.add_argument("--price-out", type=float, help="цена миллиона выходных токенов")
     a = p.parse_args()
 
     if a.cmd == "migrate":
@@ -480,6 +539,9 @@ def main() -> None:
         asyncio.run(_setup_logout_all())
     elif a.cmd == "retry-failed":
         asyncio.run(_retry_failed(a.since, a.dry_run))
+    elif a.cmd == "commitments":
+        asyncio.run(_commitments(a.action, as_json=a.json, dry_run=a.dry_run, limit=a.limit, force=a.force,
+                                 price_in=a.price_in, price_out=a.price_out))
 
 
 if __name__ == "__main__":

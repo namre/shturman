@@ -32,7 +32,8 @@
 текст»), а не как указания: в них может быть написано что угодно.
 
 view для /api/commitments: open, overdue, today, week (с сегодня до воскресенья), next_week
-(с понедельника по воскресенье следующей недели), proposed, closed, all. Кроме person_id
+(с понедельника по воскресенье следующей недели), proposed, closed, team («В команде» — обещания между
+другими людьми, только для сведения, Р-96), all. Кроме person_id
 (people.id) принимается peer_id (peers.id — учётная запись Telegram).
 
 Подтверждение владельцем (см. `confirm.py`). Новое обязательство и новая страница становятся
@@ -535,19 +536,27 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
             async with state.pool.acquire() as conn:
                 await commitments.purge_for_messages(conn, ids)
 
+    schedule = pipeline.Schedule.from_config(state.config)
+
     async def nightly() -> None:
         while True:
             # сначала пауза: сразу после запуска сервис ещё принимает пропущенные сообщения
             await asyncio.sleep(TICK_SECONDS)
-            try:
-                async with state.pool.acquire() as conn:
-                    await pipeline.finish_stale_runs(conn)
-                    await pipeline.nightly_tick(conn, tz=state.config.timezone, at=at)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # только вид ошибки: в тексте ошибки базы может оказаться фрагмент переписки
-                logger.error("ночной прогон обработки не запустился: %s", type(exc).__name__)
+            tz = state.config.timezone
+            for name, step in (
+                    ("ночной прогон", lambda conn: pipeline.nightly_tick(conn, tz=tz, at=at)),
+                    # днём — чаще (Р-96): закрытые эпизоды, проверка закрытия; сводка — в свои часы
+                    ("дневной прогон", lambda conn: pipeline.hourly_tick(conn, tz=tz, schedule=schedule)),
+                    ("сводка договорённостей", lambda conn: pipeline.digest_tick(conn, tz=tz, slots=schedule.digest_at))):
+                try:
+                    async with state.pool.acquire() as conn:
+                        await pipeline.finish_stale_runs(conn)
+                        await step(conn)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # только вид ошибки: в тексте ошибки базы может оказаться фрагмент переписки
+                    logger.error("%s обработки не запустился: %s", name, type(exc).__name__)
 
     async def on_chat_excluded(payload: dict[str, Any]) -> None:
         """Владелец исключил чат: выведенные из него обязательства убираются сразу, не дожидаясь ночи.

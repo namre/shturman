@@ -350,7 +350,7 @@ async def test_next_week_view_and_untrusted_fields(make_client, conn):
     assert body["view"] == "next_week"
     one = (await client.get("/api/commitments", params={"view": "all"})).json()["commitments"][0]
     assert one["untrusted_fields"] == ["what", "source_quote", "due_expression", "debtor.name",
-                                       "creditor.name", "chat.title"]
+                                       "creditor.name", "chat.title", "request_quote"]
     person = (await client.get("/api/people")).json()["people"][0]
     assert "display_name" in person["untrusted_fields"] and "aliases[].alias" in person["untrusted_fields"]
     out, error = await mcp(client, "list_commitments", view="next_week")
