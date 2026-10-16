@@ -85,6 +85,33 @@ def _for_app(text: str, has_answer: bool) -> str:
     return _BOT_HOW.sub("Ответьте в поле ниже.", text) if has_answer else text
 
 
+# Разделы экрана «Согласования» (П3, Р-94): по смыслу решения, а не по модулю, который прислал карточку.
+GROUPS = (("answers", "Ответы"), ("permissions", "Разрешения"), ("commitments", "Договорённости"),
+          ("memory", "Память"), ("guard", "Защита"))
+_GROUP_OF = {"draft": "answers", "action": "permissions", "hidden": "guard", "commitment": "commitments",
+             "owner_fact": "memory", "page": "memory", "project": "memory"}
+
+
+def group_of(kind: str, kind_title: str) -> str:
+    """Раздел карточки: «Ответы» — черновики и вопросы ассистента; «Разрешения» — просьбы прочитать и
+    подтверждения действий; «Договорённости»; «Память» — факты о вас, страницы о людях, проекты;
+    «Защита» — скрытые сообщения."""
+    if kind == "reply":
+        return "permissions" if kind_title == words.REPLY_SOURCE else "answers"
+    return _GROUP_OF.get(kind, "permissions")
+
+
+def group_counts(collected: dict[str, Any]) -> list[dict[str, Any]]:
+    """Сколько в каждом разделе и сколько ещё придёт сводкой (`later` по видам → по разделам)."""
+    counts = {key: 0 for key, _ in GROUPS}
+    for item in collected["items"]:
+        counts[item["group"]] += 1
+    later = {key: 0 for key, _ in GROUPS}
+    for kind, n in (collected.get("later") or {}).items():
+        later[group_of(kind, "")] += int(n or 0)
+    return [{"key": key, "title": title, "count": counts[key], "later": later[key]} for key, title in GROUPS]
+
+
 def _item(kind: str, kind_title: str, entry: dict[str, Any], *, note: str | None = None) -> dict[str, Any]:
     from ..replies import workflow
     # «Ответить» на вопрос ассистента (П1): в приложении это не кнопка, а поле «Ваш ответ» с кнопкой
@@ -94,6 +121,7 @@ def _item(kind: str, kind_title: str, entry: dict[str, Any], *, note: str | None
                for row in entry["buttons"] for b in row if not b["data"].startswith(workflow.ANSWER_PREFIX)]
     return {
         "key": f"{kind}:{entry['id']}", "kind": kind, "kind_title": kind_title, "id": entry["id"],
+        "group": group_of(kind, kind_title),
         "title": entry.get("title") or kind_title, "head": list(entry.get("head") or []),
         "text": _for_app(entry.get("text") or "", bool(answer)), "note": note or entry.get("note"), "actions": actions,
         "expires_at": _iso(entry.get("expires_at")),

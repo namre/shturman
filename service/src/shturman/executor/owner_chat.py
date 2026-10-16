@@ -32,7 +32,7 @@ OPEN_APP = "Открыть «Штурман»"
 # Главное меню. «Согласования» открывает приложение «Штурман», когда оно доступно (кнопка web_app —
 # только в ответах самого бота, `menu_buttons`); иначе — сводка того, что ждёт решения.
 MENU = [
-    [("Сейчас", "status"), (words.APPROVALS, "approvals")],
+    [("Сейчас", "status"), (words.APPROVALS, "approvals"), ("Сегодня", "today")],
     [(PAUSE_BUTTON, "pause"), ("Помощь", "help"), ("Ещё", "more")],
 ]
 MORE = [
@@ -58,6 +58,7 @@ HELP = f"""Как пользоваться ботом
 • «Пауза» (/pause) — остановить всё, что ассистент делает сам, сразу. Продолжить — /resume, с подтверждением кнопкой.
 • «Сейчас» — что работает и сколько ждёт решения.
 • «{words.APPROVALS}» — всё, что ждёт вашего решения, одним списком.
+• «Сегодня» (/today) — договорённости на сегодня и просроченные: «Я обещал» и «Мне обещали».
 • Подключение аккаунтов, выбор чатов и уведомления — {words.IN_SETUP_PAGE} в браузере.
 • Репетиция ответов — /rehearsal; сколько карточек в сутки — /rehearsal cap 50 (от 1 до 300).
 • От вашего имени ничего не уходит без вашего нажатия «Отправить», и только если отправка включена на сервере. Исключение — автоответ доверенным людям, если вы его включили.
@@ -66,6 +67,7 @@ HELP = f"""Как пользоваться ботом
 
 ADVANCED = """Все команды (для точной настройки)
 /menu — кнопки; /status — что работает; /config — настройки словами, /config json — как есть
+/today — договорённости на сегодня и просроченные
 /pause (или /stop) — остановить ассистента; /pause all — и перестать читать переписку; /resume — продолжить
 /replytasks (или /tasks) — вопросы ассистента и ответы на сообщения
 /replytask НОМЕР answer ТЕКСТ — ответить ассистенту; /replytask НОМЕР cancel — отменить
@@ -117,9 +119,12 @@ def menu_buttons(state: Any = None, *, stopped: bool = False) -> Buttons:
     return rows
 
 
-def app_row(state: Any) -> list[tuple[str, Any]] | None:
-    """Строка с кнопкой «Открыть «Штурман»» (web_app) — когда приложение доступно."""
+def app_row(state: Any, screen: str | None = None) -> list[tuple[str, Any]] | None:
+    """Строка с кнопкой «Открыть «Штурман»» (web_app) — когда приложение доступно. `screen` — экран,
+    который приложение откроет первым (`?open=…`; данных в адресе нет)."""
     url = menu_button.app_url(state.config) if state is not None else None
+    if url and screen:
+        url += "?open=" + screen
     return [(OPEN_APP, {"web_app": url})] if url else None
 
 
@@ -198,6 +203,10 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
     if command in ("replytasks", "replytask", "tasks"):
         from ..replies import owner
         return await owner.handle_command(conn, state, text.replace("/tasks", "/replytasks", 1), user_id)
+    if command == "today":
+        row = app_row(state, "commitments")
+        return {"text": await owner_views.today_text(conn, state, app=bool(row)),
+                "buttons": ([row] if row else []) + list(menu)}
     if command == "status":
         buttons = list(menu)
         row = app_row(state)

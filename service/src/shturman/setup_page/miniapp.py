@@ -62,6 +62,9 @@ Hermes нет, поэтому данные входа ассистент под�
     изменение отсюда сервис сообщает владельцу отдельным сообщением в бот согласований (`_tell`) и
     пишет в журнал действий страницы с пометкой «из приложения».
 
+  * блок «Сейчас» и экран «Договорённости» (Р-94) — `agenda.py`: числа и состояния; принятые договорённости
+    владельца и «Выполнено», «Перенести», «Не так» над ними — сразу, с журналом.
+
 Журнал действий: `app.login`, `app.login_failed` (не чаще раза в минуту; повтор уже использованных
 данных входа — всегда, и владельцу уходит сообщение в бот), `app.logout`,
 `app.decide` — вид и номер пункта и подпись кнопки, без имён и текстов; `app.sync_on`,
@@ -326,7 +329,8 @@ async def approvals_list(request: Request) -> JSONResponse:
         collected = await approvals.collect(conn, state.config)
         stopped = halt.public(await halt.current(conn))
         mode = await owner_views.work_mode(conn)
-    return JSONResponse({**approvals.public(collected), "sending": _sending(state.config), "halt": stopped,
+    return JSONResponse({**approvals.public(collected), "groups": approvals.group_counts(collected),
+                         "sending": _sending(state.config), "halt": stopped,
                          "setup_url": setup_url(state.config), "mode": mode})
 
 
