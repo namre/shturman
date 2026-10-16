@@ -160,6 +160,9 @@ pg_wait() {
 # Запустить только контейнер базы (если ещё не запущен) и дождаться его.
 pg_start() {
   local out
+  # Каталог данных создаём сами, как ./ops/up.sh: иначе Docker создаст точку подключения базы от root,
+  # и на новом сервере восстановить каталоги data/ будет нельзя.
+  mkdir -p data && chmod 700 data || { echo "Не удалось создать каталог data (права?)." >&2; return 1; }
   if ! pg_running; then
     out="$(docker compose up -d postgres 2>&1)" || { printf '%s\n' "$out" | tail -n 5 >&2; return 1; }
   fi
@@ -341,12 +344,21 @@ restore_data() {
     echo "Архив данных не распаковался (подробности — $run/tar.log). Данные не тронуты." >&2
     return 1
   fi
-  mkdir -p data; chmod 700 data
+  if ! { mkdir -p data && chmod 700 data && [ -w data ]; }; then
+    echo "Каталог data недоступен на запись этому пользователю (создан от root?) — каталоги не восстановлены; база, если восстанавливалась, уже на месте. Стоп: права — стоп-точка (sudo), скажите владельцу." >&2
+    return 1
+  fi
   local done_list=""
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    if [ -e "data/$name" ]; then mv "data/$name" "$run/replaced/$name"; fi
-    mv "$run/stage/data/$name" "data/$name"
+    if [ -e "data/$name" ] && ! mv "data/$name" "$run/replaced/$name"; then
+      echo "Не удалось отодвинуть data/$name — каталоги восстановлены не все (готово: ${done_list:-ничего}). Прежнее — в $run/replaced." >&2
+      return 1
+    fi
+    if ! mv "$run/stage/data/$name" "data/$name"; then
+      echo "Не удалось положить data/$name из копии — прежний каталог в $run/replaced/$name, копия — в $run/stage/data/$name (агенту не открывать). Стоп: скажите владельцу." >&2
+      return 1
+    fi
     done_list="${done_list:+$done_list, }data/$name"
   done <<EOF_DATA
 $(find "$run/stage/data" -mindepth 1 -maxdepth 1 -printf '%f\n')
@@ -381,8 +393,8 @@ restore_env() {
     echo "В архиве копии нет файла .env." >&2
     return 1
   fi
-  [ -f .env ] && mv .env "$run/replaced/.env"
-  chmod 600 "$run/env/.env"; mv "$run/env/.env" .env
+  if [ -f .env ] && ! mv .env "$run/replaced/.env"; then echo "Не удалось отодвинуть нынешний .env." >&2; return 1; fi
+  chmod 600 "$run/env/.env" && mv "$run/env/.env" .env || { echo "Не удалось положить .env из копии; прежний — в $run/replaced/.env." >&2; return 1; }
   echo "Файл .env восстановлен из копии."
 }
 
