@@ -130,7 +130,8 @@ async def test_approvals_come_in_sections_with_counts(stand, conn):
     assert [g["key"] for g in body["groups"]] == ["answers", "permissions", "commitments", "memory", "guard"]
     assert [g["title"] for g in body["groups"]] == ["Ответы", "Разрешения", "Договорённости", "Память", "Защита"]
     counts = {g["key"]: g["count"] for g in body["groups"]}
-    assert counts == {"answers": 0, "permissions": 1, "commitments": 1, "memory": 0, "guard": 0}
+    # «Защита»: сводка скрытого (Р-99) — сообщение стенда скрыто защитой и ждёт решения
+    assert counts == {"answers": 0, "permissions": 1, "commitments": 1, "memory": 0, "guard": 1}
     # кнопки карточек — прежние
     (item,) = [i for i in body["items"] if i["kind"] == "commitment"]
     assert [a["label"] for a in item["actions"] if not a.get("why")] == ["Верно", "Не так"]

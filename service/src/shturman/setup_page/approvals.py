@@ -21,6 +21,7 @@
   | Подтверждение действия | `confirm.py` | «Да, сделать», «Нет» | `confirm._pressed` |
   | Ответ на сообщение (нужно разрешение прочитать) или вопрос ассистента | `replies/workflow.py` | «Прочитать один раз», «на 30 дней», «Отказать» / «Не отвечать» | `replies/owner.on_button` |
   | Скрытое сообщение | `guard/alerts.py` | «Показать ассистенту», «Оставить скрытым» | `alerts._pressed` |
+  | Сводка скрытого (Р-99) | `guard/alerts.py` | «Показать ассистенту все», «Все, кроме сильных правил», «Оставить все скрытыми», «Разбирать по одной» | `alerts._pressed` → карточка подтверждения `confirm` |
   | Договорённость и изменение договорённости | `processing/commitments.py` | «Верно», «Не так» / «Применить», «Оставить как есть» | `commitments.handle_callback` |
   | Факт о владельце | `processing/facts.py` | «Запомнить», «Не запоминать» | `facts.on_button` |
   | Страница о человеке | `processing/pages_build.py` | «Завести страницу», «Не нужно» | `pages_build.on_button` |
@@ -60,6 +61,7 @@ REF = re.compile(
     r"|cf:[yn]:\d{1,18}:[A-Za-z0-9_-]{8,43}"
     r"|rp:[yrn]:\d{1,18}:[A-Za-z0-9_-]{8,43}"
     r"|gd:[rc]:\d{1,18}:[A-Za-z0-9_-]{8,43}"
+    r"|gd:b:[axko]"
     r"|cm:(?:a:\d{1,18}:[0-9a-f]{24}|r:\d{1,18}|rw:\d{1,18}:[a-z_]{3,20}|ca:\d{1,18}:[0-9a-f]{24}|cr:\d{1,18})"
     r"|of:(?:a:\d{1,18}:[0-9a-f]{24}|r:\d{1,18})"
     r"|pg:[ar]:\d{1,18}"
@@ -88,7 +90,8 @@ def _for_app(text: str, has_answer: bool) -> str:
 # Разделы экрана «Согласования» (П3, Р-94): по смыслу решения, а не по модулю, который прислал карточку.
 GROUPS = (("answers", "Ответы"), ("permissions", "Разрешения"), ("commitments", "Договорённости"),
           ("memory", "Память"), ("guard", "Защита"))
-_GROUP_OF = {"draft": "answers", "action": "permissions", "hidden": "guard", "commitment": "commitments",
+_GROUP_OF = {"draft": "answers", "action": "permissions", "hidden": "guard", "hidden_summary": "guard",
+             "commitment": "commitments",
              "owner_fact": "memory", "page": "memory", "project": "memory"}
 
 
@@ -162,6 +165,10 @@ async def collect(conn: asyncpg.Connection, config: Any) -> dict[str, Any]:
     for entry in await workflow.awaiting_owner(conn):
         title = words.REPLY_SOURCE if entry.get("subkind") == "source" else words.REPLY_QUESTION
         items.append(_item("reply", title, entry))
+    summary = await alerts.summary_item(conn)
+    if summary is not None:
+        # Р-99: сначала сводка с решением разом, затем карточки по одной.
+        items.append(_item("hidden_summary", "Скрытые сообщения", summary))
     for entry in await alerts.awaiting_owner(conn):
         items.append(_item("hidden", "Скрытое сообщение", entry))
     later: dict[str, int] = {"hidden": await alerts.waiting(conn)}

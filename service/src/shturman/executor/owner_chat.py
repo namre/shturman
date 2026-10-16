@@ -61,6 +61,7 @@ HELP = f"""Как пользоваться ботом
 • «Сейчас» — что работает и сколько ждёт решения.
 • «{words.APPROVALS}» — всё, что ждёт вашего решения, одним списком.
 • «Сегодня» (/today) — договорённости на сегодня и просроченные: «Я обещал» и «Мне обещали».
+• Скрытые защитой сообщения — /guard: сколько и почему, «Показать все» или «Разбирать по одной».
 • Подключение аккаунтов, выбор чатов и уведомления — {words.IN_SETUP_PAGE} в браузере.
 • Репетиция ответов — /rehearsal; сколько карточек в сутки — /rehearsal cap 50 (от 1 до 300).
 • Доверенные, группы и обращения — кнопками: /trusted, /groups, /addressing. Что менялось и что ассистент делал — «История» в приложении «Штурман» и в «Настройках Штурмана».
@@ -71,6 +72,7 @@ HELP = f"""Как пользоваться ботом
 ADVANCED = """Все команды (для точной настройки)
 /menu — кнопки; /status — что работает; /config — настройки словами, /config json — как есть
 /today — договорённости на сегодня и просроченные
+/guard — скрытые защитой сообщения: сколько и почему, решение разом или по одному
 /pause (или /stop) — остановить ассистента; /pause all — и перестать читать переписку; /resume — продолжить
 /replytasks (или /tasks) — вопросы ассистента и ответы на сообщения
 /replytask НОМЕР answer ТЕКСТ — ответить ассистенту; /replytask НОМЕР cancel — отменить
@@ -211,6 +213,11 @@ async def handle_command(conn: asyncpg.Connection, state: Any, text: str, user_i
         row = app_row(state, "commitments")
         return {"text": await owner_views.today_text(conn, state, app=bool(row)),
                 "buttons": ([row] if row else []) + list(menu)}
+    if command == "guard":
+        from ..guard import alerts
+        found = await alerts.overview(conn, card_hours=alerts._settings()[2])
+        rows = [[(b["text"], b["data"]) for b in row] for row in alerts.summary_buttons(found)]
+        return {"text": alerts.summary_text(found), "buttons": rows + list(menu)}
     if command == "status":
         buttons = list(menu)
         row = app_row(state)

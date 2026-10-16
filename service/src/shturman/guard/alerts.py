@@ -13,6 +13,17 @@
     а смысл проверки — чтобы скрытый текст до него не дошёл;
   * текст сообщения здесь не хранится: в таблице уведомлений только его md5 и шапка карточки.
 
+История без поштучных карточек (Р-99). Отдельная карточка — только живому потоку и свежему
+(`messages.guard_card`, правило — в core._WRITE). Скрытое из импорта и догрузки старых сообщений
+владелец видит одной сводкой: сколько, почему (модель, правила, сильные правила), откуда (каналы,
+группы, личные) — и решает разом: «Показать ассистенту все скрытые», «Все, кроме сильных правил»,
+«Оставить все скрытыми» — через подтверждение вторым нажатием (`confirm`, виды `guard.release_all`
+и `guard.keep_all`), — или «Разбирать по одной» (следующие карточки, в том числе из истории).
+Решение разом пишется так же, как поштучное: на каждый текст, с памятью «по тексту», с отметкой
+`guard_alerts.via = 'bulk'` — чтобы статистика (`stats.py`) не смешивала его с поштучным.
+Сводка приходит в бот не чаще раза в сутки и по команде /guard; в приложении — всегда сверху
+раздела «Защита».
+
 Решение принимает только нажатие владельца. Со своим ботом сервиса нажатие приходит от Telegram
 напрямую и подделать его из Hermes нельзя; без своего бота оно идёт через плагин — с тем же
 ограничением, что и остальные подтверждения (см. confirm.py).
@@ -29,7 +40,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from .. import bridge, sanitize
+from .. import bridge, confirm, sanitize
 from . import rules
 
 CALLBACK_MODULE = "gd"
@@ -37,6 +48,15 @@ CARD_HANDLER = "guard.card"
 QUOTE_LIMIT = 280
 MORE = 5                 # сколько карточек приходит по кнопке «Показать следующие»
 DEFAULT_PER_HOUR = 5
+# Сколько часов от отправки (правки) до проверки сообщение считается свежим и получает свою карточку.
+# Сутки: карточка нужна, пока сообщение ещё «в разговоре» (автоответ, разбор входящих, сводка дня);
+# сообщение из импорта или догрузки старше суток — память, а не срочность: ему хватает сводки.
+DEFAULT_CARD_HOURS = 24
+# Сколько часов сводка ждёт конца фоновой проверки истории, прежде чем прийти с промежуточными числами.
+SUMMARY_WAIT = 6
+RELEASE_ALL = "guard.release_all"
+KEEP_ALL = "guard.keep_all"
+SUMMARY_HANDLER = "guard.summary"
 
 _SCHEME = re.compile(r"://")
 _DOMAIN_DOT = re.compile(r"(?<=[\w-])\.(?=[^\W\d_]{2,})")
@@ -130,16 +150,24 @@ def card(head: str, text: str | None) -> str:
     ])
 
 
-_WAITING = """
+# Нужна ли сообщению своя карточка: отметка проверки (с 0040) либо, у проверенного раньше, то же
+# правило по времени отправки и проверки. $1 — часы свежести.
+CARD_WORTHY = """COALESCE(m.guard_card,
+    greatest(m.sent_at, COALESCE(m.edited_at, m.sent_at)) >= m.guard_checked_at - make_interval(hours => $1), true)"""
+
+# Скрытые сообщения, которые ждут решения владельца (общая часть всех выборок ниже).
+HIDDEN = """NOT m.agent_visible AND m.guard_label = 'suspect' AND m.deleted_at IS NULL AND NOT c.excluded"""
+
+_WAITING = f"""
 WITH hidden AS (
     SELECT md5(m.text) AS text_hash, min(m.id) AS first_id, count(*) AS same,
-           count(DISTINCT m.chat_id) AS chats
+           count(DISTINCT m.chat_id) AS chats, bool_or({CARD_WORTHY}) AS card
     FROM messages m JOIN chats c ON c.id = m.chat_id
-    WHERE NOT m.agent_visible AND m.guard_label = 'suspect' AND m.deleted_at IS NULL AND NOT c.excluded
+    WHERE {HIDDEN}
     GROUP BY 1
 )
 SELECT h.* FROM hidden h
-WHERE NOT EXISTS (SELECT 1 FROM guard_alerts a WHERE a.text_hash = h.text_hash)
+WHERE ($2 OR h.card) AND NOT EXISTS (SELECT 1 FROM guard_alerts a WHERE a.text_hash = h.text_hash)
 ORDER BY h.first_id
 """
 
@@ -155,18 +183,21 @@ WHERE m.id = $1
 """
 
 
-async def waiting(conn: asyncpg.Connection) -> int:
-    """Сколько скрытых текстов ещё ждут своей карточки."""
-    return len(await conn.fetch(_WAITING))
+async def waiting(conn: asyncpg.Connection, card_hours: int = DEFAULT_CARD_HOURS) -> int:
+    """Сколько скрытых текстов из живого потока ещё ждут своей карточки (историю решают сводкой)."""
+    return len(await conn.fetch(_WAITING, card_hours, False))
 
 
 async def pump(
     conn: asyncpg.Connection, *, per_hour: int = DEFAULT_PER_HOUR, tz: str = "UTC", extra: int = 0,
+    card_hours: int = DEFAULT_CARD_HOURS,
 ) -> dict[str, int]:
-    """Отправляет владельцу карточки о скрытых сообщениях, сколько позволяет предел в час.
+    """Отправляет владельцу карточки о скрытых сообщениях живого потока, сколько позволяет предел
+    в час, и раз в сутки — сводку обо всём, что ждёт решения без отдельной карточки (Р-99).
 
-    extra — сверх предела: владелец сам нажал «Показать следующие». Возвращает счётчики:
-    sent — отправлено карточек, waiting — осталось ждать, digest — ушла ли сводка.
+    extra — сверх предела: владелец сам нажал «Разбирать по одной» («Показать следующие»); тогда
+    карточки идут и по истории. Возвращает счётчики: sent — отправлено карточек, waiting — осталось
+    ждать карточки, digest — ушла ли сводка.
     """
     out = {"sent": 0, "waiting": 0, "digest": 0}
     async with conn.transaction():
@@ -174,12 +205,12 @@ async def pump(
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.guard.alerts'))")
         if await bridge.get_owner(conn) is None:
             # Уведомлять некого: сообщения остаются скрытыми, карточки уйдут, когда владелец привяжется.
-            out["waiting"] = await waiting(conn)
+            out["waiting"] = await waiting(conn, card_hours)
             return out
         recent = await conn.fetchval(
-            "SELECT count(*) FROM guard_alerts WHERE notified_at > now() - interval '1 hour'")
+            "SELECT count(*) FROM guard_alerts WHERE via = 'card' AND notified_at > now() - interval '1 hour'")
         room = max(0, per_hour - recent) + max(0, extra)
-        groups = await conn.fetch(_WAITING)
+        groups = await conn.fetch(_WAITING, card_hours, extra > 0)
         for group in groups[:room]:
             row = await conn.fetchrow(_FIRST, group["first_id"])
             if row is None:
@@ -197,17 +228,219 @@ async def pump(
                 buttons=_card_buttons(alert_id, nonce), handler=CARD_HANDLER, context={"alert_id": alert_id})
             out["sent"] += 1
         out["waiting"] = max(0, len(groups) - out["sent"])
-        if out["waiting"] and not extra:
-            hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-            job = await bridge.notify_owner(
-                conn,
-                f"Скрыто от ассистента ещё сообщений с подозрительным текстом: {out['waiting']}.\n"
-                f"Карточки о них придут позже: не больше {per_hour} в час, чтобы не засыпать вас "
-                "уведомлениями. До вашего решения ассистент этих сообщений не видит.",
-                buttons=[[bridge.button(f"Показать следующие {MORE}", CALLBACK_MODULE, "more")]],
-                silent=True, dedup_key=f"guard-digest:{hour}")
-            out["digest"] = int(job is not None)
+        if not extra:
+            found = await overview(conn, card_hours=card_hours)
+            # Сводка — когда фоновая проверка истории дошла до конца (числа в ней итоговые) либо, если
+            # очередь большая, не позже SUMMARY_WAIT часов после первого скрытого без карточки.
+            busy = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM messages m WHERE m.guard_label IS NULL AND m.is_outgoing IS NOT TRUE "
+                "AND m.kind = 'message' AND m.text <> '' AND m.deleted_at IS NULL)")
+            if found["uncarded"] and (not busy or found["waited_hours"] >= SUMMARY_WAIT):
+                # Не чаще раза в сутки (по местной дате): история скрывается сотнями, а решение одно.
+                day = datetime.now(_zone(tz)).strftime("%Y%m%d")
+                job = await bridge.notify_owner(
+                    conn, summary_text(found), buttons=summary_buttons(found), silent=True,
+                    dedup_key=f"guard-summary:{day}")
+                out["digest"] = int(job is not None)
     return out
+
+
+def _zone(tz: str) -> Any:
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return timezone.utc
+
+
+# --- сводка и решение разом (Р-99) ---
+
+_OVERVIEW = f"""
+SELECT count(*) AS total, count(DISTINCT md5(m.text)) AS texts, COALESCE(max(m.id), 0) AS upto,
+       count(*) FILTER (WHERE m.guard_model LIKE 'rules-%') AS by_rules,
+       count(*) FILTER (WHERE m.guard_model LIKE '%+rules-%') AS by_both,
+       count(*) FILTER (WHERE m.guard_model NOT LIKE 'rules-%' AND m.guard_model NOT LIKE '%+rules-%') AS by_model,
+       count(*) FILTER (WHERE c.type LIKE '%channel') AS channels,
+       count(*) FILTER (WHERE c.type IN ('personal_chat', 'bot_chat')) AS personal,
+       count(*) FILTER (WHERE NOT {CARD_WORTHY}) AS history,
+       count(*) FILTER (WHERE EXISTS (SELECT 1 FROM guard_alerts a
+                                      WHERE a.text_hash = md5(m.text) AND a.status = 'sent')) AS carded,
+       COALESCE(extract(epoch FROM now() - min(m.guard_checked_at)) / 3600, 0)::int AS waited_hours
+FROM messages m JOIN chats c ON c.id = m.chat_id
+WHERE {HIDDEN}
+"""
+
+
+async def overview(conn: asyncpg.Connection, *, card_hours: int = DEFAULT_CARD_HOURS,
+                   upto: int | None = None) -> dict[str, int]:
+    """Что ждёт решения владельца — только числа: всего, разных текстов, по оценщику, откуда, из
+    истории, с карточкой в боте, по сильным правилам (`rules.HIGH_WEIGHT`, нынешние правила)."""
+    row = dict(await conn.fetchrow(_OVERVIEW, card_hours))
+    out = {k: int(v or 0) for k, v in row.items()}
+    out["groups"] = out["total"] - out["channels"] - out["personal"]
+    out["uncarded"] = out["total"] - out["carded"]
+    limit = upto if upto is not None else out["upto"]
+    strong = 0
+    for r in await conn.fetch(
+            f"""SELECT m.text, count(*) AS n FROM messages m JOIN chats c ON c.id = m.chat_id
+                WHERE {HIDDEN} AND m.id <= $1 GROUP BY m.text""", limit):
+        if rules.high_weight(r["text"] or ""):
+            strong += int(r["n"])
+    out["strong"] = strong
+    return out
+
+
+def _n(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+def summary_text(found: dict[str, int]) -> str:
+    """Сводка скрытого, которое ждёт решения, — для бота, приложения и /guard. Только числа."""
+    if not found["total"]:
+        return "Скрытых сообщений, которые ждут вашего решения, нет."
+    lines = [
+        f"Скрыто от ассистента и ждут вашего решения: {_n(found['total'])} сообщ. "
+        f"(разных текстов: {_n(found['texts'])}).",
+        "",
+        f"Почему: оценка модели — {_n(found['by_model'])}, правила — {_n(found['by_rules'])}, "
+        f"модель и правила — {_n(found['by_both'])}. Сильные правила (просьба отменить или раскрыть "
+        f"инструкции) — {_n(found['strong'])}.",
+        f"Откуда: каналы — {_n(found['channels'])}, группы — {_n(found['groups'])}, "
+        f"личные чаты — {_n(found['personal'])}.",
+        f"Из истории, без отдельных карточек — {_n(found['history'])}; карточки уже в боте — {_n(found['carded'])}.",
+        "",
+        "Проверка ошибается в обе стороны. В разговорах про ИИ, новостях из каналов и рабочих фразах про "
+        "доступы и права большая часть скрытого — обычные сообщения. Числа по причинам — ./ops/guard.sh stats "
+        "(можно попросить оператора: команда текстов не показывает).",
+        "",
+        "Решите разом — каждое нажатие ещё раз спросит подтверждение с итоговым числом — или по одному.",
+    ]
+    return "\n".join(lines)
+
+
+def summary_buttons(found: dict[str, int]) -> list[list[dict[str, str]]]:
+    if not found["total"]:
+        return []
+    rows = [[bridge.button(f"Показать ассистенту все ({_n(found['total'])})", CALLBACK_MODULE, "b:a")]]
+    if 0 < found["strong"] < found["total"]:
+        rows.append([bridge.button(f"Все, кроме сильных правил ({_n(found['total'] - found['strong'])})",
+                                   CALLBACK_MODULE, "b:x")])
+    rows.append([bridge.button("Оставить все скрытыми", CALLBACK_MODULE, "b:k"),
+                 bridge.button("Разбирать по одной", CALLBACK_MODULE, "b:o")])
+    return rows
+
+
+async def summary_item(conn: asyncpg.Connection) -> dict[str, Any] | None:
+    """Сводка для приложения «Штурман» (раздел «Защита»): тот же текст и те же кнопки, что в боте."""
+    found = await overview(conn, card_hours=_settings()[2])
+    if not found["total"]:
+        return None
+    return {"id": 0, "title": f"Скрыто и ждёт решения: {_n(found['total'])}", "text": summary_text(found),
+            "buttons": summary_buttons(found), "card_message_id": None}
+
+
+def _bulk_request(found: dict[str, int], choice: str) -> tuple[str, str, dict[str, Any], int]:
+    """Вид действия, текст карточки подтверждения, содержимое и сколько сообщений затронет."""
+    total, strong = found["total"], found["strong"]
+    tail = (" Решение запоминается по тексту: такие же сообщения потом не скрываются. Сообщения, скрытые "
+            "после этого запроса, не затрагиваются.")
+    if choice == "a":
+        return (RELEASE_ALL,
+                f"Показать ассистенту все скрытые сообщения, которые ждут решения: {_n(total)} "
+                f"(разных текстов: {_n(found['texts'])}). Ассистент начнёт их видеть: поиск, история "
+                "чатов, сводки." + tail,
+                {"upto": found["upto"], "except_strong": False}, total)
+    if choice == "x":
+        return (RELEASE_ALL,
+                f"Показать ассистенту скрытые сообщения, кроме сработавших по сильным правилам: "
+                f"{_n(total - strong)} из {_n(total)}. Остальные {_n(strong)} (просьба отменить или раскрыть "
+                "инструкции) останутся скрытыми и будут ждать решения по одному." + tail,
+                {"upto": found["upto"], "except_strong": True}, total - strong)
+    return (KEEP_ALL,
+            f"Оставить скрытыми от ассистента все {_n(total)} сообщений, которые ждут решения (разных текстов: "
+            f"{_n(found['texts'])}). Такие же тексты потом будут скрываться молча, без карточки. Отменить "
+            "это решение нельзя.",
+            {"upto": found["upto"]}, total)
+
+
+async def _bulk(conn: asyncpg.Connection, payload: dict[str, Any], status: str) -> str:
+    """Решение разом: на каждый текст — так же, как кнопка под карточкой (`_pressed`)."""
+    upto = int(payload.get("upto") or 0)
+    rows = await conn.fetch(
+        f"""SELECT md5(m.text) AS text_hash, min(m.id) AS first_id, min(m.text) AS text
+            FROM messages m JOIN chats c ON c.id = m.chat_id
+            WHERE {HIDDEN} AND m.id <= $1 GROUP BY 1""", upto)
+    kept = 0
+    if payload.get("except_strong"):
+        strong = {r["text_hash"] for r in rows if rules.high_weight(r["text"] or "")}
+        kept = len(strong)
+        rows = [r for r in rows if r["text_hash"] not in strong]
+    hashes = [r["text_hash"] for r in rows]
+    if not hashes:
+        return "Скрытых сообщений, которые ждут решения, уже нет."
+    if status == "released":
+        done = await conn.execute(
+            """UPDATE messages SET agent_visible = true, guard_label = 'released', guard_checked_at = now()
+               WHERE NOT agent_visible AND guard_label = 'suspect' AND md5(text) = ANY($1::text[])""", hashes)
+    else:
+        done = await conn.execute(
+            """UPDATE messages SET guard_label = 'confirmed', guard_checked_at = now()
+               WHERE NOT agent_visible AND guard_label = 'suspect' AND md5(text) = ANY($1::text[])""", hashes)
+    count = int(done.split()[-1])
+    # Карточки, которые уже в боте: решение то же, кнопки убираются.
+    note = "Решение: показано ассистенту (сводкой)" if status == "released" else \
+        "Решение: оставлено скрытым от ассистента (сводкой)"
+    for card_row in await conn.fetch(
+            """UPDATE guard_alerts SET status = $2, decided_at = now(), via = 'bulk'
+               WHERE text_hash = ANY($1::text[]) AND status = 'sent'
+               RETURNING summary, card_message_id""", hashes, status):
+        if card_row["card_message_id"]:
+            await bridge.edit_owner_message(conn, card_row["card_message_id"], f"{card_row['summary']}\n\n{note}.")
+    # Тексты без карточки: запись решения — та же память «по тексту», с отметкой «сводкой».
+    await conn.execute(
+        """INSERT INTO guard_alerts (text_hash, message_id, summary, nonce, status, via, decided_at)
+           SELECT h, f, 'Решено сводкой, без отдельной карточки.', n, $4, 'bulk', now()
+           FROM unnest($1::text[], $2::bigint[], $3::text[]) AS v (h, f, n)
+           ON CONFLICT (text_hash) DO NOTHING""",
+        hashes, [r["first_id"] for r in rows], [secrets.token_urlsafe(9) for _ in rows], status)
+    word = "Показано ассистенту" if status == "released" else "Оставлено скрытым"
+    out = f"{word}: {_n(count)} сообщ. (разных текстов: {_n(len(hashes))})."
+    if kept:
+        out += f" Ждут решения по одному (сильные правила): текстов — {_n(kept)}; «Разбирать по одной» — /guard."
+    return out
+
+
+@confirm.applier(RELEASE_ALL)
+async def _apply_release(conn: asyncpg.Connection, payload: dict[str, Any]) -> str:
+    # Расширяет то, что видит ассистент: только нажатием владельца (BOT_ONLY в confirm.py).
+    confirm.must_not_widen(True)
+    return await _bulk(conn, payload, "released")
+
+
+@confirm.applier(KEEP_ALL)
+async def _apply_keep(conn: asyncpg.Connection, payload: dict[str, Any]) -> str:
+    return await _bulk(conn, payload, "confirmed")
+
+
+async def _summary_press(conn: asyncpg.Connection, choice: str) -> dict[str, Any]:
+    per_hour, tz, card_hours = _settings()
+    if choice == "o":
+        done = await pump(conn, per_hour=per_hour, tz=tz, extra=MORE, card_hours=card_hours)
+        answer = f"Отправляю карточек: {done['sent']}." if done["sent"] else "Скрытых сообщений без карточки нет."
+        return {"answer": answer, "edit_text": None, "remove_buttons": False}
+    found = await overview(conn, card_hours=card_hours)
+    if not found["total"]:
+        return {"answer": "Скрытых сообщений, которые ждут решения, нет.", "edit_text": None, "remove_buttons": True}
+    kind, text, payload, affected = _bulk_request(found, choice)
+    if not affected:
+        return {"answer": "Таких сообщений нет.", "edit_text": None, "remove_buttons": False}
+    try:
+        await confirm.request_card(conn, kind, text, payload)
+    except confirm.TooManyPending:
+        return {"answer": "Слишком много карточек ждут решения — сначала ответьте на них.", "edit_text": None,
+                "remove_buttons": False}
+    except confirm.NoOwner:
+        return {"answer": "Нужен свой бот согласований.", "edit_text": None, "remove_buttons": False}
+    return {"answer": f"Подтвердите в боте: {_n(affected)} сообщ.", "edit_text": None, "remove_buttons": False}
 
 
 def _card_buttons(alert_id: int, nonce: str) -> list[list[dict[str, str]]]:
@@ -249,23 +482,25 @@ async def _card_failed(conn: asyncpg.Connection, job: dict[str, Any], error: str
                        job["context"].get("alert_id"))
 
 
-def _settings() -> tuple[int, str]:
+def _settings() -> tuple[int, str, int]:
     from . import current
 
     guard = current()
     if guard is None:
-        return DEFAULT_PER_HOUR, "UTC"
-    return guard.settings.notify_per_hour, guard.tz
+        return DEFAULT_PER_HOUR, "UTC", DEFAULT_CARD_HOURS
+    return guard.settings.notify_per_hour, guard.tz, guard.settings.card_hours
 
 
 @bridge.on_callback(CALLBACK_MODULE)
 async def _pressed(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[str, Any]:
     gone = {"answer": "Кнопка уже недоступна.", "edit_text": None, "remove_buttons": True}
-    if rest == "more":
-        per_hour, tz = _settings()
-        done = await pump(conn, per_hour=per_hour, tz=tz, extra=MORE)
+    if rest == "more":   # кнопка прежних сводок «Показать следующие»
+        per_hour, tz, card_hours = _settings()
+        done = await pump(conn, per_hour=per_hour, tz=tz, extra=MORE, card_hours=card_hours)
         answer = f"Отправляю: {done['sent']}." if done["sent"] else "Скрытых сообщений без карточки нет."
         return {"answer": answer, "edit_text": None, "remove_buttons": True}
+    if rest in ("b:a", "b:x", "b:k", "b:o"):
+        return await _summary_press(conn, rest[2])
     choice, _, tail = rest.partition(":")
     raw_id, _, nonce = tail.partition(":")
     if choice not in ("r", "c") or not raw_id.isdigit():

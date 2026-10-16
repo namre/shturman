@@ -270,4 +270,17 @@ run ./ops/update.sh; want 0; has "Обновлений нет"
 run ./ops/update.sh --check --channel main; want 0; has "Цель:     origin/main"
 ok "последний выпуск — «обновлений нет»; main — только явно"
 
+# --- Порог защиты: только человек в терминале (Р-99) ---
+d="$(mkinst guard)"; cd "$d"
+printf '#!/bin/sh\necho "подставной up.sh"\nexit 0\n' > ops/up.sh
+run ./ops/guard.sh threshold 0.97; want 4; has "ssh -t shturman-app"; hasnt "подставной up.sh"
+grep -q SHTURMAN_GUARD_THRESHOLD .env && die "без терминала порог записан"
+run_tty wrong ./ops/guard.sh threshold 0.97; want 4; has "Не подтверждено"
+grep -q SHTURMAN_GUARD_THRESHOLD .env && die "с неверной фразой порог записан"
+run ./ops/guard.sh threshold 0.2; want 2; has "от 0.5 до 1"
+run_tty right ./ops/guard.sh threshold 0,97; want 0 "порог: код $code"; has "подставной up.sh"
+grep -q '^SHTURMAN_GUARD_THRESHOLD=0.97$' .env || die "порог не записан"
+grep -q 'secret-token-one' .env || die "остальные строки .env тронуты"
+ok "порог защиты меняет только человек фразой в терминале; без неё — код 4 и команда для человека"
+
 echo "Все проверки пройдены: $n."

@@ -321,6 +321,19 @@ MUTATIONS = (
              "    if False:",
              CODE_LOGIN + "test_managed_bot_has_code_login_off_until_the_owner_presses_in_the_bot",
              database=True),
+    # Решение разом по скрытому защитой (Р-99): «Показать все» — только нажатием владельца в самом боте.
+    Mutation("guard_release_all_needs_press", "src/shturman/guard/alerts.py",
+             "    confirm.must_not_widen(True)\n    return await _bulk(conn, payload, \"released\")",
+             "    return await _bulk(conn, payload, \"released\")",
+             "tests/guard/test_guard_review.py::"
+             "test_bulk_kinds_have_no_route_and_cannot_be_applied_without_the_owner",
+             database=True),
+    Mutation("guard_release_all_bot_only", "src/shturman/confirm.py",
+             "\"owner.widen\", \"guard.release_all\"})",
+             "\"owner.widen\"})",
+             "tests/guard/test_guard_review.py::"
+             "test_release_all_needs_a_second_press_in_the_bot_and_is_remembered",
+             database=True),
     # Договорённости в приложении (Р-94): отсюда трогаются только принятые владельцем и только его стороны —
     # не неподтверждённые, не скрытые защитой и не «между другими»; «Не так» и перенос датой — только владелец.
     Mutation("app_commitments_only_accepted_own", "src/shturman/setup_page/agenda.py",

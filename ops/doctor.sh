@@ -1149,6 +1149,8 @@ EOF4
   case "$st" in
     *'"guard_enabled":true'*)
       unchecked="$(num guard_unchecked)"; hidden="$(num guard_hidden)"; waiting="$(num guard_waiting_owner)"
+      # Р-99: скрытое, которое ждёт решения, владелец решает разом — сводкой в боте; причины — в stats.
+      gnext=""; [ "${waiting:-0}" -gt 0 ] && gnext=" — решить разом: /guard в боте согласований; почему скрыто: ./ops/guard.sh stats"
       case "$st" in
         *'"guard_problem":"unreachable"'*)
           fail guard "модель-классификатор не отвечает (контейнер: $grd) — входящие сообщения видны ассистенту НЕПРОВЕРЕННЫМИ: ${unchecked:-0}; docker logs --tail 50 shturman-guard" ;;
@@ -1160,9 +1162,9 @@ EOF4
           if [ "$grd" != "running" ]; then
             fail guard "контейнер классификатора в состоянии: $grd — запустите ./ops/guard.sh on"
           elif [ "${unchecked:-0}" -gt 500 ]; then
-            warn guard "защита включена; ещё не проверено сообщений: $unchecked (очередь разбирается фоном), скрыто: ${hidden:-0}, ждут вашего решения: ${waiting:-0}"
+            warn guard "защита включена; ещё не проверено сообщений: $unchecked (очередь разбирается фоном), скрыто: ${hidden:-0}, ждут вашего решения: ${waiting:-0}$gnext"
           else
-            pass guard "защита от внедрённых инструкций включена; скрыто: ${hidden:-0}, ждут вашего решения: ${waiting:-0}, не проверено: ${unchecked:-0}"
+            pass guard "защита от внедрённых инструкций включена; скрыто: ${hidden:-0}, ждут вашего решения: ${waiting:-0}, не проверено: ${unchecked:-0}$gnext"
           fi ;;
       esac ;;
     "") ;;

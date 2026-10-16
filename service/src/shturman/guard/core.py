@@ -56,6 +56,8 @@ class Settings:
     sweep_timeout: float = 120.0
     cooldown: float = 30.0       # после сбоя модели живой путь столько секунд её не ждёт
     notify_per_hour: int = alerts.DEFAULT_PER_HOUR
+    # Скрытое из истории старше стольких часов — без поштучной карточки, только в сводке (Р-99).
+    card_hours: int = alerts.DEFAULT_CARD_HOURS
     notify_every: float = 60.0   # как часто обход досылает отложенные карточки
     backoff_base: float = 2.0
     backoff_max: float = 300.0
@@ -82,6 +84,7 @@ class Settings:
             batch=int(number("SHTURMAN_GUARD_BATCH", 16, 1, 128, int)),
             pause=number("SHTURMAN_GUARD_PAUSE_MS", 300, 0, 60_000, int) / 1000,
             notify_per_hour=int(number("SHTURMAN_GUARD_NOTIFY_PER_HOUR", alerts.DEFAULT_PER_HOUR, 1, 60, int)),
+            card_hours=int(number("SHTURMAN_GUARD_CARD_HOURS", alerts.DEFAULT_CARD_HOURS, 1, 720, int)),
         )
 
 
@@ -118,12 +121,18 @@ ORDER BY m.id DESC LIMIT $1
 
 # Итог пишется, только если строка всё ещё ждёт и текст тот же, что оценивали: правка или
 # решение владельца, случившиеся за это время, не затираются.
+# guard_card (Р-99): скрытому сообщению нужна своя карточка, если оно из живого потока (проверено
+# сразу при записи или было придержано до проверки) либо свежее — отправлено или исправлено не раньше
+# чем за `card_hours` часов. Остальное — история: только сводка с решением разом (alerts.py).
 _WRITE = """
 UPDATE messages m
 SET guard_label = v.label, agent_visible = v.visible, guard_score = v.score, guard_model = v.model,
-    guard_checked_at = CASE WHEN v.label IS NULL THEN NULL ELSE now() END
-FROM unnest($1::bigint[], $2::text[], $3::text[], $4::boolean[], $5::real[], $6::text[])
-     AS v (id, digest, label, visible, score, model)
+    guard_checked_at = CASE WHEN v.label IS NULL THEN NULL ELSE now() END,
+    guard_card = CASE WHEN v.label = 'suspect' THEN
+        v.live OR greatest(m.sent_at, COALESCE(m.edited_at, m.sent_at)) >= now() - make_interval(hours => $8)
+    END
+FROM unnest($1::bigint[], $2::text[], $3::text[], $4::boolean[], $5::real[], $6::text[], $7::boolean[])
+     AS v (id, digest, label, visible, score, model, live)
 WHERE m.id = v.id AND m.guard_label IS NULL AND md5(m.text) = v.digest
 RETURNING m.id, m.guard_label, m.agent_visible
 """
@@ -229,10 +238,13 @@ class Guard:
         visible: list[bool] = []
         scores: list[float | None] = []
         models: list[str | None] = []
+        lives: list[bool] = []
 
         def put(row: Mapping[str, Any], label: str | None, shown: bool, score: float | None, model: str | None) -> None:
             ids.append(row["id"]); digests.append(row["digest"]); labels.append(label)
             visible.append(shown); scores.append(score); models.append(model)
+            # живой поток: проверка при записи либо придержанное до проверки сообщение
+            lives.append(live or not row["agent_visible"])
 
         for row in rows:
             decided = known.get(row["digest"])
@@ -255,7 +267,8 @@ class Guard:
         if not ids:
             return out
         async with self.pool.acquire() as conn:
-            written = await conn.fetch(_WRITE, ids, digests, labels, visible, scores, models)
+            written = await conn.fetch(_WRITE, ids, digests, labels, visible, scores, models, lives,
+                                       self.settings.card_hours)
         hidden = [r["id"] for r in written if not r["agent_visible"]]
         out.hidden = len(hidden)
         out.ok = sum(1 for r in written if r["guard_label"] in ("ok", "released"))
@@ -269,7 +282,8 @@ class Guard:
 
     async def notify(self, *, extra: int = 0) -> dict[str, int]:
         async with self.pool.acquire() as conn:
-            return await alerts.pump(conn, per_hour=self.settings.notify_per_hour, tz=self.tz, extra=extra)
+            return await alerts.pump(conn, per_hour=self.settings.notify_per_hour, tz=self.tz, extra=extra,
+                                     card_hours=self.settings.card_hours)
 
     # --- живой путь ---
 

@@ -13,6 +13,9 @@
   hf=путь_или_имя[@рев]  модель напрямую через transformers и torch, без TEI. Нужна только там,
                          где нет Docker; сами библиотеки в образ сервиса не входят:
                          pip install torch transformers sentencepiece
+  onnx=каталог           те же файлы, что `./ops/guard.sh on` кладёт в data/guard/model (квантованный
+                         model.onnx или model_quantized.onnx, tokenizer.json, config.json), через
+                         onnxruntime без TEI и без torch: pip install onnxruntime tokenizers
 С ключом `--with-rules` для каждой модели печатается и вариант «модель ИЛИ правила».
 
 Примеры (из каталога service/):
@@ -90,6 +93,45 @@ class HfScorer:
         return out
 
 
+class OnnxScorer:
+    """Квантованные веса с сервера (ONNX) через onnxruntime — те же окна, что у клиента TEI. Нужен там,
+    где нет Docker (стенд разработки); решения те же, что у TEI с этими весами, — сверено на наборе."""
+
+    def __init__(self, folder: str, window: int, overlap: int) -> None:
+        import numpy
+        import onnxruntime
+        from tokenizers import Tokenizer
+
+        root = Path(folder)
+        weights = next((root / n for n in ("model.onnx", "model_quantized.onnx") if (root / n).exists()), None)
+        if weights is None:
+            raise SystemExit(f"{folder}: нет model.onnx")
+        config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+        self.labels = {int(k): str(v) for k, v in config["id2label"].items()}
+        self._benign = [i for i, name in self.labels.items() if name.strip().lower() in BENIGN_LABELS]
+        if not self._benign:
+            raise SystemExit(f"{folder}: не понял, какой класс «обычный текст»: {self.labels}")
+        self._np = numpy
+        self._tok = Tokenizer.from_file(str(root / "tokenizer.json"))
+        self._tok.enable_truncation(512)
+        self._tok.enable_padding(pad_id=int(config.get("pad_token_id") or 0))
+        self._session = onnxruntime.InferenceSession(str(weights), providers=["CPUExecutionProvider"])
+        self.name = f"onnx:{weights.name}"
+        self.window, self.overlap = window, overlap
+
+    def _predict(self, pieces: list[str]) -> list[float]:
+        np = self._np
+        enc = self._tok.encode_batch(pieces)
+        ids = np.array([e.ids for e in enc], dtype=np.int64)
+        mask = np.array([e.attention_mask for e in enc], dtype=np.int64)
+        logits = self._session.run(["logits"], {"input_ids": ids, "attention_mask": mask})[0]
+        exp = np.exp(logits - logits.max(-1, keepdims=True))
+        probs = exp / exp.sum(-1, keepdims=True)
+        return (1 - probs[:, self._benign].sum(-1)).tolist()
+
+    score = HfScorer.score
+
+
 def build(spec: str, window: int, overlap: int):
     """Возвращает (имя, оценщик модели или None — тогда это правила)."""
     if spec == "rules":
@@ -103,6 +145,8 @@ def build(spec: str, window: int, overlap: int):
         return spec, scorer
     if kind == "hf":
         return spec, HfScorer(arg, window, overlap)
+    if kind == "onnx":
+        return spec, OnnxScorer(arg, window, overlap)
     raise SystemExit(f"неизвестный оценщик: {spec}")
 
 

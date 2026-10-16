@@ -225,22 +225,26 @@ async def test_cards_are_rate_limited_then_trickle_out_and_digest_comes_once(con
     first = await cards(conn)
     assert len(first) == 3 and [bool(c["buttons"] and len(c["buttons"][0]) == 2) for c in first] == [True, True, False]
     digest = first[2]
-    assert "ещё сообщений с подозрительным текстом: 5" in digest["text"] and "взлом" not in digest["text"]
+    # Р-99: вместо «скрыто ещё N» — сводка обо всём, что ждёт решения, с решением разом; только числа
+    assert "ждут вашего решения: 7 сообщ." in digest["text"] and "карточки уже в боте — 2" in digest["text"]
+    assert "взлом" not in digest["text"] and "Иван" not in digest["text"]
+    assert [b["text"] for row in digest["buttons"] for b in row] == [
+        "Показать ассистенту все (7)", "Оставить все скрытыми", "Разбирать по одной"]
     assert digest["silent"] is True
-    # в тот же час — ни новых карточек, ни второй сводки
+    # в тот же день — ни новых карточек, ни второй сводки
     assert (await guarded.guard.notify()) == {"sent": 0, "waiting": 5, "digest": 0} and await cards(conn) == []
 
     # владелец сам просит следующие — предел в час на его просьбу не действует
-    out = await press(conn, button(digest, "Показать следующие"))
-    assert out["answer"] == f"Отправляю: {alerts.MORE}."
+    out = await press(conn, button(digest, "Разбирать по одной"))
+    assert out["answer"] == f"Отправляю карточек: {alerts.MORE}."
     assert len(await cards(conn)) == alerts.MORE
-    assert (await press(conn, button(digest, "Показать следующие")))["answer"] == "Скрытых сообщений без карточки нет."
+    assert (await press(conn, button(digest, "Разбирать по одной")))["answer"] == "Скрытых сообщений без карточки нет."
 
     # прошёл час — обход досылает то, что ждало (здесь ждать уже нечего)
     more = await put(conn, ivan, [rec(n, f"{ATTACK} номер {n}", at=T0 + timedelta(minutes=n)) for n in range(20, 23)],
                      hold=True)
     assert await guard.screen(more) == set(more)
-    assert await cards(conn) == []          # предел в час выбран, сводка в этом часе уже была
+    assert await cards(conn) == []          # предел в час выбран, сводка в этот день уже была
     await conn.execute("UPDATE guard_alerts SET notified_at = now() - interval '2 hours'")
     assert (await guarded.guard.notify())["sent"] == 2
     later = await cards(conn)
@@ -396,7 +400,11 @@ async def test_sweep_checks_imports_in_the_background_newest_first(conn, guarded
     assert all(labels[n] == (True, "ok") for n in (1, 3, 4, 5, 6))
     # исходящие, служебные и удалённые в очередь не попадают никогда
     assert await state(conn, *ids[7:]) == [(True, None)] * 3
-    assert sorted(guarded.hidden) == sorted([ids[1], ids[6]]) and len(await cards(conn)) == 2
+    # история (импорт старых сообщений) — без поштучных карточек: одна сводка с решением разом (Р-99)
+    assert sorted(guarded.hidden) == sorted([ids[1], ids[6]])
+    summary, = await cards(conn)
+    assert "ждут вашего решения: 2 сообщ." in summary["text"] and "без отдельных карточек — 2" in summary["text"]
+    assert await conn.fetchval("SELECT count(*) FROM guard_alerts") == 0
     assert await core.counters(conn) == {"guard_checked": 8, "guard_hidden": 2, "guard_waiting_owner": 2,
                                          "guard_released": 0, "guard_unchecked": 0}
 
@@ -498,7 +506,7 @@ async def test_service_wires_the_guard_and_reports_numbers_only(conn, config, ma
 
     body = (await client.get("/api/status")).json()
     assert {k: v for k, v in body.items() if k.startswith("guard_")} == {
-        "guard_enabled": True, "guard_scorer": "fake/guard+rules-1", "guard_model_used": True, "guard_problem": None,
+        "guard_enabled": True, "guard_scorer": f"fake/guard+{rules.NAME}", "guard_model_used": True, "guard_problem": None,
         "guard_checked": 3, "guard_hidden": 1, "guard_waiting_owner": 1, "guard_released": 1, "guard_unchecked": 1}
     detail = (await client.get("/api/guard/status")).json()
     assert detail["guard_threshold"] == core.DEFAULT_THRESHOLD and detail["guard_waiting_notice"] == 0
@@ -527,7 +535,7 @@ async def test_without_a_model_only_rules_work_and_say_so(conn, config, make_cli
     # без модели «взлом» правилам ничего не говорит — в этом и слабость режима
     assert await state(conn, plain, attack, blatant) == [(True, "ok"), (True, "ok"), (False, "suspect")]
     body = (await client.get("/api/status")).json()
-    assert (body["guard_scorer"], body["guard_model_used"], body["guard_problem"]) == ("rules-1", False, None)
+    assert (body["guard_scorer"], body["guard_model_used"], body["guard_problem"]) == (rules.NAME, False, None)
 
 
 def test_settings_come_from_the_environment_and_are_validated():

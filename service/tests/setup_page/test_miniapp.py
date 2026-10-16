@@ -711,7 +711,11 @@ async def test_digests_and_hidden_messages_are_decided_with_the_buttons_the_bot_
     listed = (await s.app.get("/approvals")).json()
     kinds = sorted(i["kind"] for i in listed["items"])
     # новое предложение видно в приложении сразу, ещё до сводки в боте (Р-96)
-    assert kinds == ["commitment", "commitment", "commitment", "hidden", "owner_fact", "project"], listed
+    # Р-99: над карточкой скрытого — сводка с решением разом
+    assert kinds == ["commitment", "commitment", "commitment", "hidden", "hidden_summary", "owner_fact", "project"], listed
+    summary = next(i for i in listed["items"] if i["kind"] == "hidden_summary")
+    assert summary["group"] == "guard" and [a["label"] for a in summary["actions"]] == [
+        "Показать ассистенту все (1)", "Оставить все скрытыми", "Разбирать по одной"]
     assert listed["later"]["commitment"] == 0
     assert later in [i["id"] for i in listed["items"] if i["kind"] == "commitment"]
     refs = {(i["kind"], i["id"], a["label"]): a["ref"] for i in listed["items"] for a in i["actions"]}
