@@ -2,12 +2,14 @@
 
 У сервиса нет ни модели, ни бота: то и другое есть только у Hermes. Сервис ставит задания
 в очередь, а этот исполнитель в процессе шлюза забирает их, выполняет и сообщает итог.
-Видов заданий пять (договор — `service/src/shturman/bridge.py`), и зачем они нужны сервису,
+Видов заданий шесть (договор — `service/src/shturman/bridge.py`), и зачем они нужны сервису,
 исполнитель не знает:
 
   llm.structured, llm.text          — обращение к модели Hermes;
   notify.owner, notify.edit         — сообщение владельцу в управляющий чат и его правка;
-  business.send                     — отправка от имени владельца через бизнес-бота.
+  business.send                     — отправка от имени владельца через бизнес-бота;
+  hermes.cron                       — расписание утренней сводки и обзора недели (Р-95, `summaries.py`):
+                                      своя дорожка «hermes», реже опрашивается; функцию даёт мост.
 
 Две независимые дорожки, чтобы долгий ответ модели не задерживал нажатие владельца «Отправить»:
 дорожка бота берёт по одному заданию и выполняет их по порядку, дорожка модели — до двух сразу.
@@ -55,8 +57,11 @@ LLM_TEXT = "llm.text"
 NOTIFY_OWNER = "notify.owner"
 NOTIFY_EDIT = "notify.edit"
 BUSINESS_SEND = "business.send"
+HERMES_CRON = "hermes.cron"
 LLM_KINDS = (LLM_STRUCTURED, LLM_TEXT)
 BOT_KINDS = (NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND)
+HERMES_KINDS = (HERMES_CRON,)
+HERMES_IDLE = 20.0                 # секунд между опросами дорожки «hermes»: расписание не торопится
 
 NOT_SENT_PREFIX = "not_sent:"
 CALLBACK_PREFIX = "sh:"           # чужие префиксы кнопок (ядра Hermes, плагина бизнес-режима) не пропускаются
@@ -298,6 +303,7 @@ class Executor:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         llm_scope: Callable[[], AsyncContextManager[Any]] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        cron: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         self.call = call
         self.llm = llm
@@ -312,6 +318,7 @@ class Executor:
         self.bot_timeout = bot_timeout
         self._sleep = sleep
         self._llm_scope = llm_scope or _no_scope
+        self.cron = cron              # расписание сводок в Hermes (мост); None — дорожки «hermes» нет
         self._failures = FailureLog(logger, clock=clock)
         self._wake: dict[str, asyncio.Event] = {}
         # Клавиатуры отправленных сообщений: Telegram снимает кнопки при правке текста,
@@ -323,6 +330,8 @@ class Executor:
     def kinds(self, lane: str) -> tuple[str, ...]:
         if lane == "llm":
             return LLM_KINDS if self.llm is not None else ()
+        if lane == "hermes":
+            return HERMES_KINDS if self.cron is not None else ()
         try:
             return BOT_KINDS if self.bot is not None and self.bot.ready() else ()
         except Exception:
@@ -351,7 +360,8 @@ class Executor:
                     logger.warning("shturman: очередь заданий недоступна (%s)", type(exc).__name__)
             if handled:
                 continue          # была работа — сразу проверяем очередь снова
-            pause = self.idle if not failures else min(MAX_BACKOFF, self.idle * 2 ** min(failures, 6))
+            idle = max(self.idle, HERMES_IDLE) if lane == "hermes" else self.idle
+            pause = idle if not failures else min(MAX_BACKOFF, idle * 2 ** min(failures, 6))
             await self._pause(lane, pause)
 
     async def _pause(self, lane: str, seconds: float) -> None:
@@ -434,7 +444,8 @@ class Executor:
         if kind == BUSINESS_SEND:
             return await self._business_send(payload)
         handler = {LLM_STRUCTURED: self._llm_structured, LLM_TEXT: self._llm_text,
-                   NOTIFY_OWNER: self._notify_owner, NOTIFY_EDIT: self._notify_edit}.get(kind)
+                   NOTIFY_OWNER: self._notify_owner, NOTIFY_EDIT: self._notify_edit,
+                   HERMES_CRON: self._hermes_cron}.get(kind)
         if handler is None:
             return Outcome(error="исполнитель не знает такого вида заданий", retry_in=None)
         try:
@@ -449,6 +460,16 @@ class Executor:
     @staticmethod
     def _backoff(attempt: int) -> int:
         return int(min(600, 30 * 2 ** max(0, attempt - 1)))
+
+    # --- расписание сводок (Р-95) ---
+
+    async def _hermes_cron(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
+        if self.cron is None:
+            raise _Fail("в этом процессе Hermes расписание недоступно", None)
+        out = await self.cron(payload)
+        if not isinstance(out, dict):
+            raise _Fail("расписание: неожиданный ответ", None)
+        return out
 
     # --- модель ---
 

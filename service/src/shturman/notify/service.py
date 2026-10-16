@@ -68,8 +68,12 @@ async def _apply(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.D
     confirm.must_not_widen(bool(ns.widening(before, after)))
     await ns.save(conn, after)
     if after != before:
-        await confirm.tell(conn, "Изменены уведомления о новых сообщениях:\n"
-                           + "\n".join(ns.describe(after, sphere_titles=await sphere_titles(conn))), silent=True)
+        lines = ns.describe(after, sphere_titles=await sphere_titles(conn))
+        await confirm.tell(conn, "Изменены уведомления о новых сообщениях:\n" + "\n".join(lines), silent=True)
+        from .. import history
+        changed = {k: before[k] for k in ns.DEFAULTS if before.get(k) != after.get(k)}
+        await history.record(conn, "notify", "notify", "Уведомления: " + "; ".join(x.lstrip("• ") for x in lines),
+                             {"kind": SETTINGS, "payload": {"changes": changed}})
     return confirm.Done(result={"settings": after})
 
 

@@ -98,6 +98,7 @@ async def triage_put(request: Request) -> JSONResponse:
             mod = triage.current()
             if fallback and mod is not None:
                 await mod.fallback(conn, fallback)
+            await triage_service.record_page_change(conn, before, after)
     if off:
         await page._log(request, "triage.disable", detail=ts.audit_detail(after, "страница")
                         + (f"; обычным уведомлением: {len(fallback)}" if fallback else ""))

@@ -1,6 +1,6 @@
 """Мост к Hermes: что сервис просит сделать плагин и как разбирает ответы.
 
-Плагин умеет ровно пять вещей (виды заданий) и ничего не знает о том, зачем они нужны:
+Плагин умеет ровно шесть вещей (виды заданий) и ничего не знает о том, зачем они нужны:
 
   llm.structured  {instructions, input, json_schema, schema_name, task, max_tokens}
                   -> {parsed: {...} | null, text, model}
@@ -12,6 +12,12 @@
                   -> {}
   business.send   {business_connection_id, chat_id, text, reply_to_message_id | null}
                   -> {message_id}
+  hermes.cron     {apply, revision, desired?: {morning-brief: {enabled, time}, weekly-review: {enabled, time, day}}}
+                  -> {jobs: {morning-brief|weekly-review: {exists, enabled, time, day, expr, next_run_at,
+                      next_local}}, timezone, applied, revision, error?}
+                  Расписание утренней сводки и обзора недели (Р-95, `summaries.py`): плагин приводит задачи
+                  Hermes к выбранному (apply) или только сообщает, что есть. Шестой вид: исполнителя
+                  в сервисе у него нет, в режиме без Hermes задание гаснет по сроку.
 
 Про business.send: если Telegram точно отказал (сообщение не ушло), исполнитель сообщает
 неудачу с текстом, начинающимся на «not_sent:». Любая другая неудача значит «исход неизвестен»:
@@ -45,7 +51,9 @@ MAX_IMAGE_BYTES = 2_500_000           # их общий размер до base64
 NOTIFY_OWNER = "notify.owner"
 NOTIFY_EDIT = "notify.edit"
 BUSINESS_SEND = "business.send"
-EXECUTOR_KINDS = (LLM_STRUCTURED, LLM_TEXT, NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND)
+# hermes.cron (Р-95) — расписание сводок: только плагин в Hermes, у сервиса своего исполнителя для него нет.
+HERMES_CRON = "hermes.cron"
+EXECUTOR_KINDS = (LLM_STRUCTURED, LLM_TEXT, NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND, HERMES_CRON)
 LLM_KINDS = (LLM_STRUCTURED, LLM_TEXT)
 NOT_SENT_PREFIX = "not_sent:"
 

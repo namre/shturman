@@ -56,6 +56,11 @@
                                                         маршруты в `notify.py`
   GET|POST /shturman-setup/api/halt, …/halt/resume      «Остановить всё» и «Продолжить» (Р-87) — `halt.py`
   GET|PUT  /shturman-setup/api/code-login               вход по коду из бота: включён ли (Р-88) — `code_login.py`
+  GET|POST /shturman-setup/api/history…                 «История»: решения, действия ассистента, входы; «Вернуть
+                                                        как было», «Отозвать» (Р-95) — `history.py`
+  GET|POST|PUT|DELETE /shturman-setup/api/replies…      «Ответы и доверие»: доверенные, автоответ, черновики по
+                                                        чатам, группы, обращения (Р-95) — `replies.py`
+  GET|PUT  /shturman-setup/api/summaries                утренняя сводка и обзор недели (Р-95) — `summaries.py`
 
   Mini App бота согласований — своя узкая роль и свой ключ сессии, маршруты в `miniapp.py`:
   GET    /shturman-setup/app/                           приложение (единственное, что можно открыть в рамке
@@ -1465,9 +1470,12 @@ def routes() -> list[BaseRoute]:
     from . import code_login, memory, miniapp
     from . import agenda as agenda_page
     from . import halt as halt_page
+    from . import history as history_page
     from . import notify as notify_page
     from . import rehearsal as rehearsal_page
+    from . import replies as replies_page
     from . import spheres as spheres_page
+    from . import summaries as summaries_page
 
     account = API + "/tg/accounts/{account_id:int}"
     upload = API + "/imports/{import_id}"
@@ -1526,6 +1534,9 @@ def routes() -> list[BaseRoute]:
         *halt_page.routes(),
         *code_login.routes(),
         *agenda_page.routes(),
+        *history_page.routes(),        # «История» и «Отозвать» (Р-95)
+        *replies_page.routes(),        # «Ответы и доверие» без JSON (Р-95)
+        *summaries_page.routes(),      # утренняя сводка и обзор недели (Р-95)
     ]
 
 
@@ -1554,6 +1565,8 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
                     await auth.cleanup(conn)
                     await miniapp_cleanup(conn)
                     await audit.trim(conn)
+                    from .. import history
+                    await history.trim(conn)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001

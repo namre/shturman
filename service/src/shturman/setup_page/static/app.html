@@ -55,6 +55,10 @@
           aria-label="Уведомления" title="Уведомления">
     <span aria-hidden="true">🔔</span>
   </button>
+  <button type="button" role="tab" id="tab-history" aria-controls="screen-history" aria-selected="false"
+          aria-label="История" title="История">
+    <span aria-hidden="true">🕘</span>
+  </button>
 </nav>
 
 <main id="main">
@@ -294,6 +298,26 @@
     </div>
     <div id="nt-body" hidden>
       <p class="banner" id="nt-nobot" hidden>Бот согласований не настроен — уведомлений не будет.</p>
+      <!-- утренняя сводка и обзор недели (Р-95): только когда ассистент в Hermes отвечает -->
+      <form class="panel sm-panel" id="sm-form" autocomplete="off" novalidate hidden>
+        <h2>Сводки от ассистента</h2>
+        <div class="sm-line">
+          <label class="check"><input type="checkbox" id="sm-morning-on"><span>Утренняя сводка в</span></label>
+          <input type="time" id="sm-morning-time" step="60" aria-label="Время утренней сводки" required>
+        </div>
+        <p class="muted small" id="sm-morning-next"></p>
+        <div class="sm-line">
+          <label class="check"><input type="checkbox" id="sm-weekly-on"><span>Обзор недели</span></label>
+          <select id="sm-weekly-day" aria-label="День обзора недели">
+            <option value="1">пн</option><option value="2">вт</option><option value="3">ср</option><option value="4">чт</option>
+            <option value="5">пт</option><option value="6">сб</option><option value="0">вс</option>
+          </select>
+          <input type="time" id="sm-weekly-time" step="60" aria-label="Время обзора недели" required>
+        </div>
+        <p class="muted small" id="sm-weekly-next"></p>
+        <p class="banner" id="sm-sync" hidden></p>
+        <button type="submit" class="primary wide" id="sm-save">Сохранить</button>
+      </form>
       <div class="panel">
         <h2>Сейчас</h2>
         <ul class="lines nt-now" id="nt-now"></ul>
@@ -385,6 +409,29 @@
         командой, которой его вернуть. Предел можно поднять и кнопкой в боте, когда он исчерпан, или командой
         /rehearsal cap ЧИСЛО.</p>
     </div>
+  </section>
+
+  <!-- экран «История» (Р-95): решения, действия ассистента, входы; доверие — сузить сразу, расширить — в боте -->
+  <section id="screen-history" role="tabpanel" aria-labelledby="tab-history" hidden>
+    <div class="title-row">
+      <h1>История</h1>
+      <span class="count" id="hs-count"></span>
+    </div>
+    <div class="segmented hs-seg" id="hs-seg" role="tablist" aria-label="Раздел истории">
+      <button type="button" role="tab" data-hs="decisions" aria-selected="true">Решения</button>
+      <button type="button" role="tab" data-hs="assistant" aria-selected="false">Ассистент</button>
+      <button type="button" role="tab" data-hs="logins" aria-selected="false">Входы</button>
+      <button type="button" role="tab" data-hs="trust" aria-selected="false">Доверие</button>
+    </div>
+    <p class="muted" id="hs-loading">Загружаю…</p>
+    <div class="panel" id="hs-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="hs-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="hs-retry">Повторить</button>
+    </div>
+    <div id="hs-body" hidden></div>
+    <p class="muted foot" id="hs-foot">Отозвать и убрать — сразу. Вернуть то, что расширяет возможности ассистента, или
+      добавить доверенного — только нажатием «Да» в самом боте согласований: отсюда уходит карточка.</p>
   </section>
 </main>
 

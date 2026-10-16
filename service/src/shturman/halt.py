@@ -221,6 +221,10 @@ async def stop(state: Any, *, via: str, reading: bool = False) -> dict[str, Any]
                 await conn.execute(
                     """UPDATE assistant_halt SET stopped = true, since = now(), via = $1, resume_nonce = NULL,
                               paused_accounts = '{}', updated_at = now() WHERE id = 1""", via)
+                # «История» (Р-95): вернуть — это «Продолжить», только нажатием в боте
+                from . import history
+                await history.record(conn, "halt", "halt", "Ассистент остановлен " + VIA_WORDS[via] + ".",
+                                     {"kind": "halt.resume"})
             counts = await _cancel_waiting(conn)
     paused = await _pause_reading(state) if reading else []
     async with state.pool.acquire() as conn:
@@ -322,6 +326,8 @@ async def resume(conn: asyncpg.Connection, *, reading: bool, via: str) -> dict[s
     await conn.execute(
         """UPDATE assistant_halt SET stopped = false, since = NULL, via = NULL, resume_nonce = NULL,
                   paused_accounts = '{}', resumed_at = now(), updated_at = now() WHERE id = 1""")
+    from . import history
+    await history.record(conn, "halt", "halt", "Ассистент продолжил работу — подтверждено в боте.", {"kind": "halt.stop"})
     return {"accounts": halt["paused_accounts"] if reading else [], "kept": [] if reading else halt["paused_accounts"],
             "via": via}
 

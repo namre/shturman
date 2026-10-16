@@ -313,7 +313,9 @@ async def config_text(conn: asyncpg.Connection, state: Any) -> str:
         lines.append("Обращения к ассистенту в группах: " + ", ".join(f"«{a}»" for a in aliases[:10]) + ".")
     reply = await autoreply.load(conn)
     lines.append(f"Автоответ: не больше {reply['daily_cap']} в сутки, пауза {reply['pause_seconds']:g} с.")
-    lines += ["", "Изменить — командами из /advanced. Все значения как есть — /config json."]
+    lines += ["", "Изменить — кнопками: доверенные — /trusted, автоответ — /autoreply, группы — /groups, обращения — "
+              "/addressing, черновики в чате — /drafting; или в «Настройках Штурмана», раздел «Ответы и доверие». "
+              "Точные команды — /advanced, все значения как есть — /config json."]
     return "\n".join(lines)
 
 
@@ -388,14 +390,14 @@ async def groups_text(conn: asyncpg.Connection) -> str:
     found = [s for s in await scopes.list_scopes(conn) if s.get("enabled", True)]
     if not found:
         return ("Группы и темы для ответов: сейчас ничего не разрешено — ассистент не отвечает ни в одной "
-                "группе. Разрешить группу — /groupallow (см. /advanced).")
+                "группе. Разрешить — кнопкой «Разрешить группу…» ниже.")
     lines = [f"Группы и темы для ответов: {len(found)}", ""]
     for s in found[:LIST_LIMIT]:
         topic = f", тема № {s['topic_tg_id']}" if s.get("topic_tg_id") else ""
         lines.append(f"№ {s['id']} — {_name(s.get('title'), 'чат без названия')}{topic} · "
                      f"аккаунт «{_name(s.get('account_label'), 'без имени', 40)}»")
     lines += _more(len(found), LIST_LIMIT)
-    lines += ["", "Убрать разрешение — /groupdeny номер."]
+    lines += ["", "Запретить — кнопкой ниже; разрешить ещё — «Разрешить группу…»."]
     return "\n".join(lines)
 
 
@@ -423,7 +425,7 @@ async def sources_text(conn: asyncpg.Connection, state: Any) -> str:
                      + f" для ответа в «{_name(r['title'], 'чат без названия')}»"
                      + (" (можно пересказать собеседнику)" if r["mode"] == "disclose" else "")
                      + f" · до {moment(r['expires_at'], state.config)}")
-    lines += ["", "Отозвать — /sourcerevoke номер."]
+    lines += ["", "Отозвать — кнопкой ниже: сразу, ассистент больше не читает по этому разрешению."]
     return "\n".join(lines)
 
 
@@ -437,7 +439,7 @@ async def mcp_text(conn: asyncpg.Connection, state: Any) -> str:
     for g in grants[:LIST_LIMIT]:
         lines.append(f"№ {g['id']} — «{_name(g.get('name'), 'без имени')}» · с {moment(g.get('created_at'), state.config)}"
                      + (f" · до {moment(g['expires_at'], state.config)}" if g.get("expires_at") else ""))
-    lines += ["", "Отозвать доступ — /mcprevoke номер."]
+    lines += ["", "Отозвать доступ — кнопкой ниже: сразу."]
     return "\n".join(lines)
 
 

@@ -26,7 +26,7 @@ import asyncpg
 from . import binding
 
 STATE_KEY = "prompt"
-KINDS = frozenset({"reply", "variant"})
+KINDS = frozenset({"reply", "variant", "alias"})   # alias — «Добавить обращение» (Р-95, owner_settings.py)
 MAX_TTL = 30 * 60           # секунд — дольше просьба не ждёт, даже если срок карточки больше
 
 # Часы. Тесты подменяют.

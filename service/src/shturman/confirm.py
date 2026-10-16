@@ -93,6 +93,9 @@ _from_card: contextvars.ContextVar[bool] = contextvars.ContextVar("shturman_conf
 # его ужесточением). Функция применения в этом случае обязана сама, под своей блокировкой,
 # убедиться, что ничего не расширяет: см. `must_not_widen`.
 _unconfirmed: contextvars.ContextVar[bool] = contextvars.ContextVar("shturman_confirm_unconfirmed", default=False)
+# Истина, пока действие применяется нажатием «Да, сделать» под карточкой (в боте или в приложении):
+# для «Истории» (Р-95) — откуда пришло изменение.
+_card_press: contextvars.ContextVar[bool] = contextvars.ContextVar("shturman_confirm_card_press", default=False)
 
 
 class TooManyPending(Exception):
@@ -139,7 +142,12 @@ CARD_WARNING = ("Запрос пришёл не из этого бота — о�
 # нельзя. Это ослабления, которые владелец просит сам: «Продолжить» после остановки (Р-87), вход
 # на страницу по коду при боте, созданном через посредника (Р-88), и включение разбора входящих —
 # переписка начинает уходить провайдеру модели (Р-92).
-BOT_ONLY = frozenset({"halt.resume", "setup.code_login", "triage.enable"})
+#
+# `owner.widen` (Р-95) — ослабление, о котором владелец попросил из приложения «Штурман» (добавить
+# доверенного, разрешить группу, включить автоответ, расширить обращения) или «Вернуть как было», если
+# возврат расширяет то, что может ассистент (со страницы и из приложения). В карточке — вид и
+# содержимое настоящего действия; применяет его та же функция, что и всегда (`owner_changes.py`).
+BOT_ONLY = frozenset({"halt.resume", "setup.code_login", "triage.enable", "owner.widen"})
 BOT_ONLY_NOTE = "Подтвердить можно только кнопкой под этой карточкой в боте согласований — не в приложении."
 BOT_ONLY_CARD = ("Вы попросили об этом сами — в «Настройках Штурмана» или в приложении «Штурман». "
                  "Если не просили — нажмите «Нет».")
@@ -226,6 +234,54 @@ async def apply_owner(conn: asyncpg.Connection, kind: str, payload: dict[str, An
         _unconfirmed.reset(confirmed)
     await _run_after(done.after)
     return {"status": APPLIED, "note": done.note, "result": done.result}
+
+
+WIDENS = "changed_meanwhile"     # код отказа `must_not_widen`: действие расширяет, без нажатия нельзя
+
+
+async def apply_narrowing(conn: asyncpg.Connection, kind: str, payload: dict[str, Any], *,
+                          quiet: bool = False) -> dict[str, Any]:
+    """Применяет действие владельца, только если оно ничего не расширяет (Р-95).
+
+    Для решений из приложения «Штурман» (войти в него может и держатель токена бота согласований,
+    Р-80) и для «Вернуть как было»: ужесточение — сразу, ослабление — нет. Решает сама функция
+    применения под своей блокировкой (`must_not_widen`): при расширении она бросает `Refused` с кодом
+    `WIDENS`, транзакция откатывается, и вызывающий сам ставит карточку в бот (`request_card`).
+    quiet — не сообщать владельцу в бот отдельным сообщением (со страницы: он сам это сделал).
+    Вызывать вне транзакции, в контексте владельца."""
+    authority.requires_owner()
+    fn = _appliers.get(kind)
+    if fn is None:
+        raise KeyError(f"нет обработчика для действия {kind}")
+    strict = _unconfirmed.set(True)
+    told = _from_card.set(True) if quiet else None
+    try:
+        async with conn.transaction():
+            done = _done(await fn(conn, payload))
+    finally:
+        if told is not None:
+            _from_card.reset(told)
+        _unconfirmed.reset(strict)
+    await _run_after(done.after)
+    return {"status": APPLIED, "note": done.note, "result": done.result}
+
+
+def widens(exc: BaseException) -> bool:
+    """Отказ `apply_narrowing` значит «это ослабление — только нажатием в боте»."""
+    return isinstance(exc, Refused) and exc.code == WIDENS
+
+
+async def run_inner(conn: asyncpg.Connection, kind: str, payload: dict[str, Any]) -> Done:
+    """Функция применения другого вида — в текущей транзакции и с текущими признаками (для `owner.widen`)."""
+    fn = _appliers.get(kind)
+    if fn is None:
+        raise Refused("Такого действия нет.", 400, "unknown_kind")
+    return _done(await fn(conn, payload))
+
+
+def card_press() -> bool:
+    """Действие применяется нажатием «Да, сделать» под карточкой."""
+    return _card_press.get()
 
 
 def _waiting(row: Any, *, duplicate: bool) -> dict[str, Any]:
@@ -364,7 +420,7 @@ async def _pressed(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[st
         return {"answer": "Подтвердить можно только в боте согласований.", "edit_text": None, "remove_buttons": False}
     fn = _appliers.get(row["kind"])
     payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
-    token = _from_card.set(True)
+    token, pressed = _from_card.set(True), _card_press.set(True)
     try:
         if fn is None:
             raise RuntimeError("обработчик действия не найден")
@@ -383,6 +439,7 @@ async def _pressed(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[st
                 "edit_text": "Не получилось выполнить:\n" + row["summary"]
                              + (f"\n\nПричина: {reason}" if reason else "")}
     finally:
+        _card_press.reset(pressed)
         _from_card.reset(token)
     await conn.execute("UPDATE pending_actions SET status = 'applied', decided_at = now() WHERE id = $1", row["id"])
     text = "Сделано:\n" + row["summary"] + (f"\n\n{done.note}" if done.note else "")

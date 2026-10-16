@@ -116,8 +116,9 @@
         <a href="#s-spheres" data-go="s-spheres">Сферы</a>
         <a href="#s-notify" data-go="s-notify">Уведомления</a>
         <a href="#s-rehearsal" data-go="s-rehearsal">Репетиция</a>
+        <a href="#s-replies" data-go="s-replies">Доверие</a>
         <a href="#s-memory" data-go="s-memory">Память</a>
-        <a href="#s-audit" data-go="s-audit">Журнал</a>
+        <a href="#s-audit" data-go="s-audit">История</a>
       </nav>
 
       <!-- ===================================================== «Сейчас» (пульт, С4) -->
@@ -156,7 +157,7 @@
           <dt>Можно ли всё отключить?</dt>
           <dd>Да, в любой момент. Здесь — кнопками «Пауза» и «Выйти из аккаунта». В Telegram — «Настройки» → «Устройства» (сервис там называется «Shturman») или «Telegram для бизнеса» → «Чат-боты». Сохранённое можно стереть по чатам.</dd>
           <dt>Как понять, что никто, кроме меня, здесь ничего не менял?</dt>
-          <dd>Каждое действие на этой странице записывается в журнал — он внизу, в карточке «Журнал действий». Если увидите там то, чего не делали, нажмите «Выйти на всех устройствах».</dd>
+          <dd>Каждое действие на этой странице записывается в журнал — он внизу, в карточке «История», вкладка «Входы». Если увидите там то, чего не делали, нажмите «Выйти на всех устройствах».</dd>
           <dt>Где посмотреть, что ассистент помнит о людях?</dt>
           <dd>Ниже шагов — карточка «Память ассистента»: страницы о людях и проектах, ваш профиль с правилами для ассистента и решения, которые ждут вас.</dd>
         </dl>
@@ -1104,6 +1105,64 @@
       </details>
     </section>
 
+    <!-- ============================================ утренняя сводка и обзор недели (Р-95, Х3) -->
+    <!-- Рисует setup.js (раздел «сводки»). Виден, только когда ассистент в Hermes хоть раз ответил: без Hermes его нет. -->
+    <section class="card memory" id="s-summaries" aria-labelledby="h-summaries" hidden>
+      <details id="summaries-details">
+        <summary>
+          <span class="memory-head">
+            <span class="card-head">
+              <span class="h2" id="h-summaries" role="heading" aria-level="2">Утренняя сводка и обзор недели</span>
+              <span class="pill" id="st-summaries"></span>
+            </span>
+            <span class="memory-lead" id="sm-lead">Ассистент присылает в свой чат утром — что сегодня и что просрочено, в конце недели — итоги.</span>
+          </span>
+        </summary>
+        <div class="memory-body" id="summaries-body">
+          <form class="mem-form" id="summaries-form" autocomplete="off" novalidate>
+            <fieldset class="mem-fieldset">
+              <legend>Утренняя сводка</legend>
+              <div class="row sm-row">
+                <label class="check"><input type="checkbox" id="sm-morning-on"><span>Присылать каждый день в</span></label>
+                <label class="field sm-time" for="sm-morning-time"><span class="sr-only">Время утренней сводки</span><input id="sm-morning-time" type="time" step="60" required></label>
+              </div>
+              <p class="hint" id="sm-morning-next"></p>
+            </fieldset>
+            <fieldset class="mem-fieldset">
+              <legend>Обзор недели</legend>
+              <div class="row sm-row">
+                <label class="check"><input type="checkbox" id="sm-weekly-on"><span>Присылать раз в неделю:</span></label>
+                <label class="field sm-day" for="sm-weekly-day"><span class="sr-only">День недели</span>
+                  <select id="sm-weekly-day"><option value="1">в понедельник</option><option value="2">во вторник</option><option value="3">в среду</option><option value="4">в четверг</option><option value="5">в пятницу</option><option value="6">в субботу</option><option value="0">в воскресенье</option></select></label>
+                <label class="field sm-time" for="sm-weekly-time"><span>в</span><input id="sm-weekly-time" type="time" step="60" required></label>
+              </div>
+              <p class="hint" id="sm-weekly-next"></p>
+            </fieldset>
+            <p class="hint" id="sm-tz"></p>
+            <p class="note" id="sm-sync" role="status" hidden></p>
+            <p class="note warn" id="summaries-error" role="alert" hidden></p>
+            <div class="row">
+              <button class="btn" id="summaries-save" type="submit">Сохранить</button>
+              <button class="btn ghost" id="summaries-again" type="button" hidden>Применить снова</button>
+            </div>
+          </form>
+          <details class="faq">
+            <summary>Вопросы про сводки</summary>
+            <dl>
+              <dt>Куда приходит сводка?</dt>
+              <dd>В ваш чат с ассистентом, а не в бот согласований. Пишет её ассистент: по обязательствам, ответам, которых ждут от вас, и вопросам без ответа. Читает он только архив — ни терминала, ни поиска в интернете у сводки нет.</dd>
+              <dt>Когда применится новое время?</dt>
+              <dd>В течение минуты: ассистент сам переставит задачу и сообщит здесь, когда следующая сводка. Время — по часовому поясу ассистента.</dd>
+              <dt>Я поменял время у самого ассистента — что будет?</dt>
+              <dd>Здесь появится «у ассистента сейчас другое расписание» и кнопка «Применить снова». Без вашего нажатия ничего не перезаписывается.</dd>
+              <dt>Кто ещё может это менять?</dt>
+              <dd>Вы — здесь и в приложении «Штурман» (вкладка 🔔). Ассистент и его панель настроек выбор не меняют. Вернуть прежнее — «История», «Вернуть как было».</dd>
+            </dl>
+          </details>
+        </div>
+      </details>
+    </section>
+
     <!-- ===================================================== наблюдатель (не шаг, Р-84) -->
     <section class="card memory" id="s-watch" aria-labelledby="h-watch">
       <details id="watch-details">
@@ -1200,6 +1259,81 @@
       </details>
     </section>
 
+    <!-- ============================================== ответы и доверие (Р-95, Б3) -->
+    <!-- Рисует setup.js (раздел «ответы и доверие»): без номеров и JSON — поиск по имени, переключатели. -->
+    <section class="card memory" id="s-replies" aria-labelledby="h-replies">
+      <details id="replies-details">
+        <summary>
+          <span class="memory-head">
+            <span class="card-head">
+              <span class="h2" id="h-replies" role="heading" aria-level="2">Ответы и доверие</span>
+              <span class="pill" id="st-replies"></span>
+            </span>
+            <span class="memory-lead">Кому ассистент может отвечать сам, где готовить черновики, в каких группах отвечать и на какие обращения откликаться.</span>
+          </span>
+        </summary>
+        <div class="memory-body" id="replies-body">
+          <p class="note info" id="rp-sending"></p>
+          <p class="note warn" id="replies-error" role="alert" hidden></p>
+          <section class="mem-block" aria-labelledby="h-rp-trusted">
+            <h4 id="h-rp-trusted">Доверенные люди</h4>
+            <p class="hint">Доверенному ассистент отвечает сам, без вашего согласования каждого ответа, — только если ниже включён автоответ и отправка включена на сервере. Остальным — только черновик на ваше решение.</p>
+            <ul class="mem-items" id="rp-trusted"></ul>
+            <div class="field">
+              <label for="rp-people-q">Добавить человека из ваших личных чатов</label>
+              <input id="rp-people-q" type="search" placeholder="Имя или @имя" autocomplete="off">
+            </div>
+            <ul class="mem-items sph-found" id="rp-people-found"></ul>
+          </section>
+          <section class="mem-block" aria-labelledby="h-rp-auto">
+            <h4 id="h-rp-auto">Автоответ доверенным</h4>
+            <ul class="mem-items" id="rp-autoreply"></ul>
+          </section>
+          <section class="mem-block" aria-labelledby="h-rp-drafting">
+            <h4 id="h-rp-drafting">Черновики по чатам</h4>
+            <p class="hint">Можно ли ассистенту готовить черновик ответа в этом чате. «Как обычно» — по общим правилам. Отправка в любом случае — только по вашему нажатию.</p>
+            <ul class="mem-items" id="rp-drafting"></ul>
+            <div class="field">
+              <label for="rp-chats-q">Задать правило для чата</label>
+              <input id="rp-chats-q" type="search" placeholder="Название чата или имя" autocomplete="off">
+            </div>
+            <ul class="mem-items sph-found" id="rp-chats-found"></ul>
+          </section>
+          <section class="mem-block" aria-labelledby="h-rp-groups">
+            <h4 id="h-rp-groups">Группы и темы для ответов</h4>
+            <p class="hint">Группы аккаунта помощника, где ассистенту можно отвечать, когда к нему обращаются: упоминают, отвечают на его сообщение или начинают реплику с обращения ниже.</p>
+            <ul class="mem-items" id="rp-groups"></ul>
+            <div class="field" id="rp-groups-search">
+              <label for="rp-groups-q">Разрешить группу</label>
+              <input id="rp-groups-q" type="search" placeholder="Название группы" autocomplete="off">
+            </div>
+            <p class="hint" id="rp-groups-none" hidden>Групп аккаунта помощника пока нет: они появятся, когда подключён аккаунт помощника (способ «Через бота и помощника») и выбраны его группы.</p>
+            <ul class="mem-items sph-found" id="rp-groups-found"></ul>
+          </section>
+          <section class="mem-block" aria-labelledby="h-rp-alias">
+            <h4 id="h-rp-alias">Обращения к ассистенту</h4>
+            <p class="hint">Если реплика в разрешённой группе начинается с такого обращения и знака — «Штурман, посмотри…», — ассистент считает, что обращаются к нему.</p>
+            <ul class="mem-items" id="rp-aliases"></ul>
+            <form class="row" id="rp-alias-form" autocomplete="off" novalidate>
+              <label class="field" for="rp-alias"><span>Новое обращение</span><input id="rp-alias" type="text" maxlength="40" placeholder="Например: Штурман"></label>
+              <button class="btn ghost" id="rp-alias-add" type="submit">Добавить</button>
+            </form>
+          </section>
+          <details class="faq">
+            <summary>Вопросы про ответы и доверие</summary>
+            <dl>
+              <dt>Что меняется сразу, а что ждёт подтверждения?</dt>
+              <dd>Здесь — всё сразу: это делаете вы. В приложении «Штурман» сузить можно сразу, а расширить (добавить доверенного, разрешить группу, включить автоответ, новое обращение) — только нажатием «Да» в самом боте согласований: войти в приложение может тот, у кого есть токен бота.</dd>
+              <dt>Как вернуть, если ошибся?</dt>
+              <dd>Ниже, в «Истории» — «Вернуть как было» у последнего изменения. Убрать или запретить — сразу; вернуть расширение — подтверждением в боте.</dd>
+              <dt>А в боте?</dt>
+              <dd>Кнопками: /trusted, /groups, /addressing, /drafting, /autoreply — без номеров. Точные команды с номерами остались в /advanced.</dd>
+            </dl>
+          </details>
+        </div>
+      </details>
+    </section>
+
     <!-- ===================================================== память ассистента (не шаг) -->
     <!-- Разделы — вкладки, их рисует setup.js (MEMORY_TABS): «Люди», «Проекты», «Профиль», «Ждут решения». -->
     <section class="card memory" id="s-memory" aria-labelledby="h-memory">
@@ -1257,27 +1391,53 @@
       <div class="row" id="retry-run-row"><button class="btn" id="retry-run" type="button">Повторить то, что не получилось</button></div>
     </section>
 
-    <!-- ===================================================== журнал действий (С2: в «Повседневном») -->
+    <!-- ===================================================== история (Р-95, С15, Х6; бывший «Журнал действий») -->
+    <!-- Вкладки рисует setup.js (раздел «история»): «Решения», «Действия ассистента», «Входы». -->
     <section class="card memory" id="s-audit" aria-labelledby="h-audit">
       <details id="audit-details">
         <summary>
           <span class="memory-head">
             <span class="card-head">
-              <span class="h2" id="h-audit" role="heading" aria-level="2">Журнал действий</span>
+              <span class="h2" id="h-audit" role="heading" aria-level="2">История</span>
+              <span class="pill" id="st-history"></span>
             </span>
-            <span class="memory-lead">Всё, что менялось в «Настройках Штурмана»: входы, ключи, аккаунты, чаты.</span>
+            <span class="memory-lead">Что ассистент просил и что вы решили, что он делал, кто входил. Отозвать разрешение и вернуть изменение — здесь.</span>
           </span>
         </summary>
         <div class="memory-body">
-          <p class="small">Если чего-то из списка вы не делали — нажмите «Выйти на всех устройствах» и попросите новую ссылку входа у того, кто обслуживает сервер.</p>
-          <details class="for-admin"><summary>Для того, кто обслуживает сервер</summary><p>Завершить все входы — <code>./ops/logout-all.sh</code>, новая ссылка входа — <code>./ops/setup-link.sh</code></p></details>
-          <h4>Входы, ключи и аккаунты</h4>
-          <ol class="audit" id="audit-key"></ol>
-          <h4>Все последние действия</h4>
-          <ol class="audit" id="audit"></ol>
+          <div class="row hs-top">
+            <div class="tabs" id="hs-tabs" role="tablist" aria-label="Разделы истории">
+              <button class="tab" type="button" role="tab" id="hs-tab-decisions" aria-selected="true" aria-controls="hs-panel">Решения</button>
+              <button class="tab" type="button" role="tab" id="hs-tab-assistant" aria-selected="false" aria-controls="hs-panel">Действия ассистента</button>
+              <button class="tab" type="button" role="tab" id="hs-tab-logins" aria-selected="false" aria-controls="hs-panel">Входы</button>
+            </div>
+            <label class="field hs-days" for="hs-days"><span>За</span>
+              <select id="hs-days"><option value="1">сутки</option><option value="3">3 дня</option><option value="7">неделю</option><option value="14" selected>2 недели</option><option value="30">30 дней</option></select></label>
+          </div>
+          <p class="note warn" id="history-error" role="alert" hidden></p>
+          <div class="hs-panel" id="hs-panel" role="tabpanel" aria-live="polite"></div>
+          <div id="hs-logins-extra" hidden>
+            <p class="small">Если чего-то из списка вы не делали — нажмите «Выйти на всех устройствах» и попросите новую ссылку входа у того, кто обслуживает сервер.</p>
+            <details class="for-admin"><summary>Для того, кто обслуживает сервер</summary><p>Завершить все входы — <code>./ops/logout-all.sh</code>, новая ссылка входа — <code>./ops/setup-link.sh</code></p></details>
+            <h4>Входы, ключи и аккаунты</h4>
+            <ol class="audit" id="audit-key"></ol>
+            <h4>Все последние действия на странице и в приложении</h4>
+            <ol class="audit" id="audit"></ol>
+          </div>
           <div class="row">
             <button class="btn ghost" id="logout-all" type="button">Выйти на всех устройствах</button>
           </div>
+          <details class="faq">
+            <summary>Вопросы про историю</summary>
+            <dl>
+              <dt>Что значит «Вернуть как было»?</dt>
+              <dd>Вернуть настройку к тому, что было до этого изменения. Есть только у последнего изменения каждой вещи и не старше недели. Если возврат убирает или запрещает — сразу. Если возврат расширяет то, что может ассистент (снова доверенный, снова можно в группе), — только нажатием «Да» в боте согласований.</dd>
+              <dt>Что делает «Отозвать»?</dt>
+              <dd>Разрешение прочитать источник для ответа или доступ внешней программы к архиву перестаёт действовать сразу. Новое разрешение придёт карточкой, если ассистент снова попросит.</dd>
+              <dt>Видны ли здесь тексты переписки и черновиков?</dt>
+              <dd>Нет. Только кто, где, когда и чем кончилось. Тексты — в карточках бота и в самом Telegram.</dd>
+            </dl>
+          </details>
         </div>
       </details>
     </section>

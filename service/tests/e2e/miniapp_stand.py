@@ -57,6 +57,9 @@
                                              журнал app.commitment_*
   POST /bot/text?text=…                      владелец написал боту (например, /today)
 
+  Пакет 4б (Р-95) — маршруты /pack4b/… из pack4b_stand.py: люди, доверенные, разрешения, ответ плагина
+  Hermes о сводках, что стало.
+
 E2E_SETUP_ORIGIN — «внешний адрес» страницы (https): с ним в приложении есть «Открыть настройки в браузере».
 """
 
@@ -84,6 +87,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse  #
 from starlette.routing import Route  # noqa: E402
 
 import exec_fakes  # noqa: E402
+import pack4b_stand  # noqa: E402 — «История», доверие, сводки (Р-95)
 import tg_fakes  # noqa: E402
 from shturman import confirm, db, store  # noqa: E402
 from shturman.app import build_app  # noqa: E402
@@ -715,7 +719,8 @@ async def main() -> None:
                                 Route("/chats/big", chats_big, methods=["POST"]),
                                 Route("/chats/pages", chats_pages),
                                 Route("/chats/pause", chats_pause, methods=["POST"]),
-                                Route("/chats/resume", chats_resume, methods=["POST"])])
+                                Route("/chats/resume", chats_resume, methods=["POST"]),
+                                *pack4b_stand.routes(conn, telegram)])
 
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(gate.inner.router.lifespan_context(gate.inner))

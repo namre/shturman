@@ -423,6 +423,9 @@
     if ($("notify-details").open) showNotify(); else refreshNotify();
     if ($("rehearsal-details").open) showRehearsal(); else refreshRehearsal();
     if ($("watch-details").open) showWatch(); else refreshWatch();
+    if ($("summaries-details").open) showSummaries(); else refreshSummaries();
+    if ($("replies-details").open) refreshReplies().then(drawReplies); else refreshReplies();
+    if ($("audit-details").open) showHistory();
     refresh().then(function () { refreshOverview(); });
     startLoop();
   }
@@ -691,6 +694,7 @@
   /* Раскрыть шаг или карточку и перейти к ней: строка прогресса, быстрые ссылки, «Сейчас». */
   var DETAILS_OF = { "s-spheres": "spheres-details", "s-notify": "notify-details", "s-rehearsal": "rehearsal-details",
                      "s-watch": "watch-details", "s-memory": "memory-details", "s-audit": "audit-details",
+                     "s-replies": "replies-details", "s-summaries": "summaries-details",
                      "s-import": "import-details", "s-media": "media-details", "s-ready": "ready-details" };
   function goTo(id) {
     var card = $(id);
@@ -4046,6 +4050,343 @@
     });
   }
 
+  /* -------------------------------------------- утренняя сводка и обзор недели (Р-95, Х3)
+   * Выбор хранит сервис, применяет ассистент в Hermes (плагин) и сообщает, что у него на самом деле.
+   * Карточка видна, только когда ассистент хоть раз ответил: в режиме без Hermes её нет. */
+
+  var sm = { data: null };
+  var SM_STATE = {
+    unset: ["", ""], in_sync: ["совпадает", "done"], pending: ["применяется…", ""],
+    drift: ["у ассистента другое", "todo"], no_report: ["ассистент не ответил", "todo"], error: ["не применилось", "todo"]
+  };
+
+  function refreshSummaries() {
+    return call("GET", "summaries", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      sm.data = r.data;
+      show("s-summaries", !!r.data.available);
+      var c = r.data.choice, st = SM_STATE[r.data.sync.state] || ["", ""];
+      var on = [c["morning-brief"].enabled ? "утро " + c["morning-brief"].time : null,
+                c["weekly-review"].enabled ? "неделя " + DAY_SHORT[c["weekly-review"].day] + " " + c["weekly-review"].time : null]
+        .filter(Boolean).join(" · ");
+      pill("summaries", (on || "выключены") + (st[0] && r.data.sync.state !== "in_sync" ? " · " + st[0] : ""), st[1]);
+    });
+  }
+  var DAY_SHORT = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+
+  function smNext(key) {
+    var h = sm.data.hermes[key] || {};
+    if (!h.exists) return "У ассистента этой задачи пока нет — появится после «Сохранить».";
+    if (!h.enabled) return "У ассистента сейчас выключена.";
+    return h.next_local ? "Следующая — " + h.next_local + "." : "";
+  }
+
+  function drawSummaries() {
+    var d = sm.data;
+    if (!d) return;
+    var m = d.choice["morning-brief"], w = d.choice["weekly-review"];
+    $("sm-morning-on").checked = !!m.enabled;
+    $("sm-morning-time").value = m.time;
+    $("sm-weekly-on").checked = !!w.enabled;
+    $("sm-weekly-day").value = String(w.day);
+    $("sm-weekly-time").value = w.time;
+    text("sm-morning-next", smNext("morning-brief"));
+    text("sm-weekly-next", smNext("weekly-review"));
+    text("sm-tz", "Время — " + tzWords(d.timezone) + " (часовой пояс ассистента).");
+    var s = d.sync, msg = "", kind = "info";
+    if (s.state === "pending") msg = "Ассистент применяет новое время — обычно меньше минуты.";
+    else if (s.state === "drift") { msg = "У ассистента сейчас другое расписание, чем выбрано здесь (его поменяли в настройках самого ассистента). «Применить снова» вернёт выбранное."; kind = "warn"; }
+    else if (s.state === "no_report") { msg = "Ассистент давно не отвечал — расписание может быть не применено. Попросите того, кто обслуживает сервер, проверить ассистента."; kind = "warn"; }
+    else if (s.state === "error") { msg = s.error_text || "Ассистент не смог применить расписание."; kind = "warn"; }
+    var box = $("sm-sync");
+    box.hidden = !msg;
+    box.className = "note " + kind;
+    box.textContent = msg;
+    show("summaries-again", s.state === "drift" || s.state === "error" || s.state === "no_report");
+  }
+
+  function showSummaries() { return refreshSummaries().then(drawSummaries); }
+
+  function wireSummaries() {
+    $("summaries-details").addEventListener("toggle", function () { if ($("summaries-details").open) showSummaries(); });
+    function save(button, body) {
+      busy(button, true);
+      note("summaries-error", "warn", "");
+      return call("PUT", "summaries", body).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { note("summaries-error", "warn", r.error); return; }
+        sm.data = r.data;
+        drawSummaries();
+        refreshSummaries();
+        toast("Сохранено. Ассистент применит новое время в течение минуты.");
+        setTimeout(showSummaries, 8000);
+      });
+    }
+    $("summaries-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var mt = $("sm-morning-time").value, wt_ = $("sm-weekly-time").value;
+      if (!/^\d\d:\d\d$/.test(mt) || !/^\d\d:\d\d$/.test(wt_)) { note("summaries-error", "warn", "Время — часы и минуты, например 08:30."); return; }
+      save($("summaries-save"), {
+        "morning-brief": { enabled: $("sm-morning-on").checked, time: mt },
+        "weekly-review": { enabled: $("sm-weekly-on").checked, time: wt_, day: Number($("sm-weekly-day").value) }
+      });
+    });
+    $("summaries-again").addEventListener("click", function () { save(this, { again: true }); });
+  }
+
+  /* -------------------------------------------- ответы и доверие (Р-95, Б3)
+   * Без номеров и JSON: поиск по имени, переключатели. Здесь всё применяется сразу — это делаете вы. */
+
+  var rp = { data: null, timers: {} };
+  var DRAFT_WORDS = { allow: "можно", deny: "нельзя", "default": "как обычно" };
+
+  function refreshReplies() {
+    return call("GET", "replies", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      rp.data = r.data;
+      var on = r.data.autoreply.accounts.filter(function (a) { return a.enabled; }).length;
+      pill("replies", "доверенных: " + r.data.trusted.length + (on ? " · автоответ включён" : ""), on ? "done" : "");
+    });
+  }
+
+  function replyAct(button, method, path, body, said) {
+    busy(button, true);
+    note("replies-error", "warn", "");
+    return call(method, "replies/" + path, body).then(function (r) {
+      busy(button, false);
+      if (!r.ok) { note("replies-error", "warn", r.error); return; }
+      rp.data = r.data;
+      drawReplies();
+      refreshReplies();
+      if (said) toast(said);
+      ui.lastOverview = 0;
+    });
+  }
+
+  function drawReplies() {
+    var d = rp.data;
+    if (!d) return;
+    text("rp-sending", d.sending ? "Отправка на сервере включена: доверенным ассистент отвечает сам, если автоответ включён." :
+         d.prepare_only ? "Отправка на сервере выключена, черновики без отправки — включены: автоответ готовит ответ и показывает его вам, ничего не отправляя." :
+         "Отправка на сервере выключена: автоответ включить нельзя, черновики — только для просмотра.");
+    var list = $("rp-trusted");
+    list.textContent = "";
+    if (!d.trusted.length) list.appendChild(el("li", { class: "mem-chat mem-note", text: "Пока никого." }));
+    d.trusted.forEach(function (p) {
+      var who = p.name || (p.username ? "@" + p.username : "человек, которого нет в архиве");
+      list.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", {}, [who, p.note ? el("span", { class: "mem-meta", text: " · " + p.note }) : null]),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать из доверенных: " + who,
+          onclick: function () { replyAct(this, "DELETE", "trusted/" + p.tg_user_id, undefined, who + " — больше не в доверенных."); } })
+      ]));
+    });
+    var auto = $("rp-autoreply");
+    auto.textContent = "";
+    if (!d.autoreply.accounts.length) auto.appendChild(el("li", { class: "mem-chat mem-note", text: "Аккаунтов пока нет." }));
+    d.autoreply.accounts.forEach(function (a) {
+      var name = a.label || (a.role === "assistant" ? "Помощник" : "Ваш аккаунт");
+      var box = el("input", { type: "checkbox", checked: !!a.enabled, disabled: !a.enabled && !d.autoreply.available });
+      box.addEventListener("change", function () {
+        replyAct(box, "PUT", "autoreply/" + a.account_id, { enabled: box.checked },
+                 box.checked ? "Автоответ доверенным включён для «" + name + "»." : "Автоответ выключен для «" + name + "».");
+      });
+      auto.appendChild(el("li", { class: "mem-chat" }, [el("label", { class: "check" }, [box, el("span", { text: "Отвечать доверенным самому — аккаунт «" + name + "»" })])]));
+    });
+    if (!d.autoreply.available) auto.appendChild(el("li", { class: "mem-note", text: d.autoreply.why_not }));
+    var dr = $("rp-drafting");
+    dr.textContent = "";
+    if (!d.drafting.chats.length) dr.appendChild(el("li", { class: "mem-chat mem-note", text: "Особых правил нет: везде как обычно." }));
+    d.drafting.chats.forEach(function (c) { dr.appendChild(draftRow(c)); });
+    var gr = $("rp-groups");
+    gr.textContent = "";
+    if (!d.groups.length) gr.appendChild(el("li", { class: "mem-chat mem-note", text: "Сейчас ничего не разрешено — ассистент не отвечает ни в одной группе." }));
+    d.groups.forEach(function (g) {
+      var title = (g.title || "группа без названия") + (g.topic_tg_id ? ", тема № " + g.topic_tg_id : "");
+      gr.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", {}, [title, g.account ? el("span", { class: "mem-meta", text: " · " + g.account }) : null]),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Запретить",
+          onclick: function () { replyAct(this, "DELETE", "groups/" + g.chat_id + (g.topic_tg_id ? "?topic=" + g.topic_tg_id : ""), undefined, "В «" + title + "» ассистент больше не отвечает."); } })
+      ]));
+    });
+    show("rp-groups-none", !d.helper_groups);
+    show("rp-groups-search", !!d.helper_groups);
+    var al = $("rp-aliases");
+    al.textContent = "";
+    if (!d.addressing.length) al.appendChild(el("li", { class: "mem-chat mem-note", text: "Обращений нет: откликается только на упоминание и ответ на его сообщение." }));
+    d.addressing.forEach(function (a, i) {
+      al.appendChild(el("li", { class: "mem-chat" }, [el("span", { text: "«" + a + "»" }),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать",
+          onclick: function () { var rest = d.addressing.slice(); rest.splice(i, 1); replyAct(this, "PUT", "addressing", { aliases: rest }, "Обращение «" + a + "» убрано."); } })]));
+    });
+  }
+
+  function draftRow(c) {
+    var title = c.title || "чат без названия";
+    var current = c.value || c.drafting || "default";
+    var select = el("select", { "aria-label": "Черновики в «" + title + "»" }, ["default", "allow", "deny"].map(function (v) {
+      return el("option", { value: v, text: DRAFT_WORDS[v], selected: v === current });
+    }));
+    select.addEventListener("change", function () {
+      replyAct(select, "PUT", "drafting/" + c.chat_id, { value: select.value }, "Черновики в «" + title + "»: " + DRAFT_WORDS[select.value] + ".");
+    });
+    return el("li", { class: "mem-chat" }, [el("span", {}, [title, el("span", { class: "mem-meta", text: " · " + (c.kind || "чат") })]), select]);
+  }
+
+  function searchInto(input, found, path, row) {
+    var q = $(input).value.trim(), box = $(found);
+    box.textContent = "";
+    if (!q) return;
+    call("GET", "replies/" + path + (path.indexOf("?") >= 0 ? "&" : "?") + "limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+      box.textContent = "";
+      if (!r.ok) { box.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+      if (!r.data.items.length) box.appendChild(el("li", { class: "mem-chat mem-note", text: "Ничего не нашлось." }));
+      r.data.items.forEach(function (item) { box.appendChild(row(item)); });
+    });
+  }
+
+  function wireReplies() {
+    $("replies-details").addEventListener("toggle", function () { if ($("replies-details").open) refreshReplies().then(drawReplies); });
+    function debounce(id, fn) { $(id).addEventListener("input", function () { clearTimeout(rp.timers[id]); rp.timers[id] = setTimeout(fn, 300); }); }
+    debounce("rp-people-q", function () {
+      searchInto("rp-people-q", "rp-people-found", "people", function (p) {
+        return el("li", { class: "mem-chat" }, [
+          el("span", {}, [personName(p), p.username && p.name ? el("span", { class: "mem-meta", text: " · @" + p.username }) : null]),
+          p.trusted ? el("span", { class: "badge ok", text: "доверенный" }) : el("button", { class: "btn ghost small-btn", type: "button", text: "Сделать доверенным",
+            onclick: function () {
+              var button = this;
+              ask(button, "Сделать доверенным: " + personName(p) + "?", {
+                yes: "Сделать доверенным",
+                note: "Если автоответ включён, ассистент будет отвечать этому человеку сам, без вашего согласования каждого ответа."
+              }).then(function (ok) {
+                if (ok) replyAct(button, "POST", "trusted", { tg_user_id: p.tg_id }, personName(p) + " — в доверенных.").then(function () { $("rp-people-q").value = ""; $("rp-people-found").textContent = ""; });
+              });
+            } })
+        ]);
+      });
+    });
+    debounce("rp-chats-q", function () {
+      searchInto("rp-chats-q", "rp-chats-found", "chats", function (c) { return draftRow(c); });
+    });
+    debounce("rp-groups-q", function () {
+      searchInto("rp-groups-q", "rp-groups-found", "chats?groups=1", function (c) {
+        var title = c.title || "группа без названия";
+        return el("li", { class: "mem-chat" }, [el("span", { text: title }),
+          el("button", { class: "btn ghost small-btn", type: "button", text: "Разрешить отвечать",
+            onclick: function () { replyAct(this, "POST", "groups", { chat_id: c.chat_id }, "В «" + title + "» ассистенту можно отвечать, когда к нему обращаются.").then(function () { $("rp-groups-q").value = ""; $("rp-groups-found").textContent = ""; }); } })]);
+      });
+    });
+    $("rp-alias-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var value = $("rp-alias").value.trim();
+      if (!value || !rp.data) return;
+      replyAct($("rp-alias-add"), "PUT", "addressing", { aliases: rp.data.addressing.concat([value]) }, "Обращение «" + value + "» добавлено.")
+        .then(function () { $("rp-alias").value = ""; });
+    });
+  }
+
+  /* -------------------------------------------- история (Р-95, С15, Х6)
+   * «Решения» — что ассистент просил и что вы решили, изменения правил с «Вернуть как было», разрешения
+   * с «Отозвать»; «Действия ассистента»; «Входы» и весь журнал. Только слова и исходы — без текста переписки. */
+
+  var hs = { tab: "decisions", data: null };
+  var HS_TABS = ["decisions", "assistant", "logins"];
+
+  function dayWords(iso) {
+    var d = new Date(iso + "T12:00:00"), today = new Date();
+    var y = new Date(); y.setDate(today.getDate() - 1);
+    if (d.toDateString() === today.toDateString()) return "Сегодня";
+    if (d.toDateString() === y.toDateString()) return "Вчера";
+    return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long", weekday: "long" });
+  }
+
+  function timeWords(iso) {
+    return new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function showHistory() {
+    HS_TABS.forEach(function (t) { $("hs-tab-" + t).setAttribute("aria-selected", t === hs.tab ? "true" : "false"); });
+    show("hs-logins-extra", hs.tab === "logins");
+    return call("GET", "history?tab=" + hs.tab + "&days=" + $("hs-days").value).then(function (r) {
+      if (!r.ok) { note("history-error", "warn", r.error); return; }
+      note("history-error", "warn", "");
+      hs.data = r.data;
+      drawHistory();
+    });
+  }
+
+  function historyAction(button, action) {
+    var parts = action.ref.split(":");
+    var path = parts[0] === "revert" ? "history/" + parts[1] + "/revert" : "history/grants/" + parts[0] + "/" + parts[1] + "/revoke";
+    var question = parts[0] === "revert" ? "Вернуть, как было до этого изменения?" : "Отозвать это разрешение?";
+    ask(button, question, {
+      yes: parts[0] === "revert" ? "Вернуть" : "Отозвать",
+      note: parts[0] === "revert" ? "Если возврат убирает или запрещает — сразу. Если расширяет то, что может ассистент, — придёт карточка в бот согласований, подтвердите там." :
+            "Перестаёт действовать сразу. Если ассистент снова попросит, придёт новая карточка."
+    }).then(function (ok) {
+      if (!ok) return;
+      busy(button, true);
+      call("POST", path, {}).then(function (r) {
+        busy(button, false);
+        if (!r.ok) { toast(r.error, true); showHistory(); return; }
+        toast(r.data.text || "Готово.");
+        showHistory();
+        ui.lastOverview = 0;
+      });
+    });
+  }
+
+  function historyItem(item) {
+    var meta = [item.group, item.who].filter(Boolean).join(" · ");
+    var bad = item.status_code === "rejected" || item.status_code === "failed" || item.status_code === "expired";
+    return el("li", { class: "hs-item hs-" + item.kind }, [
+      el("time", { datetime: item.at, text: timeWords(item.at) }),
+      el("div", { class: "hs-body" }, [
+        el("span", { class: "hs-title", text: item.title }),
+        meta ? el("span", { class: "hs-meta", text: meta }) : null,
+        item.status ? el("span", { class: "hs-status" + (bad ? " bad" : ""), text: item.status }) : null,
+        item.note ? el("span", { class: "hs-meta", text: item.note }) : null
+      ]),
+      (item.actions || []).length ? el("div", { class: "hs-actions" }, item.actions.map(function (a) {
+        return el("button", { class: "btn ghost small-btn", type: "button", text: a.label, onclick: function () { historyAction(this, a); } });
+      })) : null
+    ]);
+  }
+
+  function drawHistory() {
+    var d = hs.data, panel = $("hs-panel");
+    panel.textContent = "";
+    if (!d) return;
+    if (d.tab === "decisions") {
+      var grants = el("section", { class: "mem-block hs-grants" }, [el("h4", { text: "Действует сейчас" })]);
+      if (!d.grants.length) grants.appendChild(el("p", { class: "hint", text: "Разрешений на источники и доступов внешних программ сейчас нет." }));
+      else grants.appendChild(el("ul", { class: "mem-items" }, d.grants.map(function (g) {
+        return el("li", { class: "mem-chat" }, [
+          el("span", {}, [g.title, el("span", { class: "mem-meta", text: " · " + g.detail + " · до " + g.until_words })]),
+          el("button", { class: "btn ghost small-btn", type: "button", text: "Отозвать", onclick: function () { historyAction(this, { ref: g.ref }); } })
+        ]);
+      })));
+      panel.appendChild(grants);
+    }
+    if (!d.days_list.length) {
+      panel.appendChild(el("p", { class: "mem-note", text: d.tab === "assistant" ? "За это время ассистент ничего не делал сам." :
+                                                           d.tab === "logins" ? "Входов за это время не было." : "За это время ничего не решалось и не менялось." }));
+    }
+    d.days_list.forEach(function (day) {
+      panel.appendChild(el("h4", { class: "hs-day", text: dayWords(day.date) }));
+      panel.appendChild(el("ol", { class: "hs-list" }, day.items.map(historyItem)));
+    });
+    var count = d.tab === "decisions" ? d.grants.length : 0;
+    pill("history", count ? "действует разрешений: " + count : "", "");
+  }
+
+  function wireHistory() {
+    $("audit-details").addEventListener("toggle", function () { if ($("audit-details").open) showHistory(); });
+    HS_TABS.forEach(function (t) {
+      $("hs-tab-" + t).addEventListener("click", function () { hs.tab = t; showHistory(); });
+    });
+    $("hs-days").addEventListener("change", showHistory);
+  }
+
   /* ------------------------------------------------------- наблюдатель (Р-84) */
 
   var wt = { data: null, editing: null, hits: [], hitsRule: null, chatTimer: null };
@@ -4351,6 +4692,7 @@
   /* ------------------------------------------------------------- запуск */
 
   wireLogin(); wireHalt(); wireCodeLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireWatch(); wireRetry(); wireMemory(); wireSession(); wirePult();
+  wireSummaries(); wireReplies(); wireHistory();
 
   function offerLink() {
     // По ссылке входим только после нажатия: предпросмотр ссылки в мессенджере её не израсходует.

@@ -160,7 +160,9 @@ async def reap(conn: asyncpg.Connection) -> list[dict[str, Any]]:
 
 # Сколько задание может ждать исполнителя. Позже оно теряет смысл: уведомление устарело,
 # ответ модели никому не нужен. Отправка через бизнес-бота здесь не значится — её срок ведёт шлюз.
-QUEUE_TTL = {"notify.owner": 24 * 3600, "notify.edit": 3600, "llm.structured": 24 * 3600, "llm.text": 3600}
+# Расписание сводок (`hermes.cron`, Р-95): без Hermes его никто не заберёт — гаснет за час.
+QUEUE_TTL = {"notify.owner": 24 * 3600, "notify.edit": 3600, "llm.structured": 24 * 3600, "llm.text": 3600,
+             "hermes.cron": 3600}
 SCRUB_AFTER = 600  # секунд после закрытия задания
 
 
