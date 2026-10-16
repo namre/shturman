@@ -30,6 +30,7 @@
 # расписания и время следующего запуска, без текста задачи. Строка summaries (Р-95) — совпадает ли
 # расписание сводок в Hermes с выбором владельца в «Настройках Штурмана» (по ответу плагина сервису;
 # только признаки). Без выбора владельца и в режиме без Hermes строки нет.
+# Строка hermes-version сверяет тег образа Hermes со списком проверенных версий config/hermes-versions.txt.
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -220,8 +221,12 @@ else
   echo; echo "ИТОГ: FAIL ($fails)"; exit 1
 fi
 
-case "$(docker inspect -f '{{.Config.Image}}' "$c")" in
+# Версия Hermes — против списка проверенных (config/hermes-versions.txt, Р-97).
+img="$(docker inspect -f '{{.Config.Image}}' "$c")"
+case "$img" in
   *:latest|*:main|*:stable) warn hermes-version "образ без явной версии — укажите HERMES_VERSION" ;;
+  *) if hermes_verified "$img"; then pass hermes-version "${img##*:} — в списке проверенных ($HERMES_VERSIONS_FILE)"
+     else warn hermes-version "${img##*:} нет в списке проверенных ($HERMES_VERSIONS_FILE): плагин с этой версией не проверен; откат Hermes — только восстановлением data/hermes из копии (./ops/restore.sh)"; fi ;;
 esac
 
 # --- права контейнера Hermes (Р-76) ---

@@ -137,6 +137,7 @@ fetch_model() {
   chmod -R a+rX data/embeddings
 }
 
+[ "$action" = status ] || ops_lock "поиск по смыслу: $action (./ops/embeddings.sh)"
 case "$action" in
   on)
     cur="$(env_get SHTURMAN_EMBEDDINGS_MODEL)"

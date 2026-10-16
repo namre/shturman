@@ -59,6 +59,7 @@ fetch_model() {
   chmod -R a+rX data/asr
 }
 
+[ "$mode" = status ] || ops_lock "расшифровка голосовых: $mode (./ops/asr.sh)"
 case "$mode" in
   on)
     case "$(uname -m)" in x86_64|amd64) ;; *)

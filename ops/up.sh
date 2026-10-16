@@ -26,19 +26,33 @@
 # «Без домена»), скрипт останавливается до перезапуска и называет строку; так же — при неизвестном часовом
 # поясе SHTURMAN_TIMEZONE. Из .env читаются только несекретные строки: режим, профили, пояс, эти два
 # адреса и — только на «задана ли и пуста ли» — строка адреса API своей модели.
+# Свежая копия перед миграциями и сменой Hermes (стоп-точки «миграции базы» и «обновление без свежей
+# проверенной копии»): если в коде есть миграции, которых нет в базе (сверка имён: файлы
+# service/src/shturman/migrations против таблицы schema_migrations; для этого контейнер базы
+# запускается первым), или образ Hermes сменится (HERMES_VERSION, новый compose.yaml), скрипт
+# требует копию моложе SHTURMAN_BACKUP_FRESH_MINUTES минут (по умолчанию 60; ./ops/backup.sh) либо
+# только что выполненное восстановление (./ops/restore.sh). Нет — остановка до перезапуска.
+#   ./ops/up.sh --skip-backup-check — без свежей копии, осознанно: только человек в своём терминале
+#                                     (фраза с одноразовым числом); без терминала — отказ, код 4.
+# Непроверенный образ Hermes (нет в config/hermes-versions.txt) — предупреждение; подтверждение
+# человека спрашивает ./ops/update.sh, копию требует и этот скрипт.
+# Работает под общим замком ops/: второй одновременный запуск отказывает с кодом 75.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
 ops_help "$@"
 pull=no
+skip_check=no
 for arg in "$@"; do
   case "$arg" in
     --pull) pull=yes ;;
+    --skip-backup-check) skip_check=yes ;;
     *) ops_unknown "$arg" ;;
   esac
 done
 
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
+ops_lock "запуск стека (./ops/up.sh)"
 
 # Служебные значения, появившиеся в новой версии (токены сервиса переписки, режим установки),
 # дописываются сами. Уже заданные значения скрипт не трогает и не печатает.
@@ -300,6 +314,53 @@ wait_dashboard() {
   done
   return 1
 }
+
+# Свежая копия перед миграциями базы и сменой образа Hermes. Новая установка (каталога базы ещё нет
+# или база пуста) — проверять нечего: терять нечего. Печатаются только имена миграций и образов.
+. ops/lib-backup.sh
+need=""
+if [ -d data/postgres ]; then
+  if ! pg_running; then
+    echo "Запускаю базу первой — сверить миграции…"
+    pg_start || { echo "База не запустилась: docker logs --tail 50 $PG. Ничего не перезапущено." >&2; exit 1; }
+  fi
+  if applied="$(db_migrations shturman 2> /dev/null)"; then
+    if [ -n "$applied" ]; then
+      pending="$(list_minus "$(repo_migrations)" "$applied")"
+      [ -z "$pending" ] || need="миграции базы: $(list_count "$pending") ($pending)"
+    fi
+  else
+    need="миграции базы: какие применены, узнать не удалось"
+  fi
+fi
+if [ "$MODE" = hermes ]; then
+  h_was="$(hermes_image_running)"; h_new="$(hermes_image_planned)"
+  if [ "$h_was" != "-" ] && [ "$h_new" != "?" ] && [ "$h_was" != "$h_new" ]; then
+    need="${need:+$need; }смена образа Hermes: $h_was → $h_new"
+  fi
+  if [ "$h_new" != "?" ] && [ "$h_new" != "-" ] && ! hermes_verified "$h_new"; then
+    echo "ВНИМАНИЕ: образа $h_new нет в списке проверенных версий Hermes ($HERMES_VERSIONS_FILE): плагин с ним не проверен; откат Hermes — только восстановлением копии data/hermes (./ops/restore.sh)." >&2
+  fi
+fi
+if [ -n "$need" ]; then
+  fresh_min="$(bk_fresh_minutes)"
+  if fresh="$(bk_fresh "$fresh_min")"; then
+    echo "Ждут: $need. Свежая копия есть: $fresh — продолжаю."
+  elif fresh="$(recently_restored "$fresh_min")"; then
+    echo "Ждут: $need. Данные только что восстановлены из копии $fresh — продолжаю."
+  elif [ "$skip_check" = yes ]; then
+    if ! has_tty; then need_human "./ops/up.sh --skip-backup-check"; exit "$OPS_NEED_HUMAN"; fi
+    echo "Ждут: $need. Свежей копии нет: если что-то пойдёт не так, вернуть базу и данные будет не из чего, кроме старых копий." > /dev/tty
+    if ! human_confirm "БЕЗ-КОПИИ"; then echo "Не подтверждено — ничего не перезапущено." >&2; exit "$OPS_NEED_HUMAN"; fi
+    ./ops/state.sh log "up.sh без свежей копии по подтверждению человека: $need" > /dev/null 2>&1 || true
+  else
+    echo "Ждут: $need." >&2
+    echo "Свежей проверенной копии (моложе $fresh_min минут) нет — это стоп-точка «обновление без свежей копии». Ничего не перезапущено." >&2
+    echo "Сделайте ./ops/backup.sh и повторите ./ops/up.sh — или обновляйтесь через ./ops/update.sh: он делает копию сам и откатывает при провале." >&2
+    echo "Осознанно без копии — только человек в своём терминале: ./ops/up.sh --skip-backup-check" >&2
+    exit 1
+  fi
+fi
 
 [ "$pull" = yes ] && docker compose pull --quiet --ignore-buildable
 

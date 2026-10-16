@@ -2,6 +2,8 @@ name: ci
 on:
   push:
     branches: [main]
+    # Выпуски (docs/releases.md): на теге дополнительно проверяется, что выпуск собран верно.
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -146,7 +148,26 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck -S warning ops/*.sh
+      - run: shellcheck -S warning ops/*.sh ops/tests/*.sh ops/tests/stub/docker
+      # Выпуск (тег vX.Y.Z или vX.Y.Z-rc.N): VERSION, CHANGELOG, UPGRADING и проверенный Hermes по умолчанию.
+      - name: выпуск — тег собран верно
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash ops/tests/release_check.sh "${GITHUB_REF#refs/tags/}"
+      # Образ Hermes по умолчанию — из списка проверенных версий (config/hermes-versions.txt, Р-97).
+      - name: ops — Hermes по умолчанию проверен
+        run: |
+          def="$(sed -n 's/.*hermes-agent:\${HERMES_VERSION:-\([^}]*\)}.*/\1/p' compose.yaml)"
+          test -n "$def"
+          bash -c '. ops/lib.sh; hermes_verified "$1"' _ "$def"
+          if bash -c '. ops/lib.sh; hermes_verified v1999.1.1'; then echo "непроверенная версия прошла"; exit 1; fi
+      # Замок от параллельного запуска (Д-9), подтверждение человеком только в терминале, копия с описью,
+      # ротация и внешний каталог, восстановление каталогов, свежая копия перед миграциями в up.sh,
+      # выпуски и откат в update.sh — на подставном docker (ops/tests/stub/docker).
+      - name: ops — замок, копии, восстановление, обновление и откат (сценарии)
+        run: bash ops/tests/test_ops.sh
+      # Настоящая база: копия → порча → восстановление → сверка числа строк; переезд на пустое место.
+      - name: ops — восстановление на настоящей базе (Postgres 16 + pgvector)
+        run: bash ops/tests/e2e_restore.sh
       # Оба режима установки. Без профилей (режим standalone) в стеке нет Hermes: его контейнер
       # не создаётся и образ не скачивается; с профилем hermes — прежний состав.
       - name: compose — режим без Hermes и режим с Hermes
@@ -590,14 +611,16 @@ jobs:
           done
           # Справка побеждает и после других параметров; лишний параметр — тоже ошибка, а не действие.
           for args in "up.sh --pull --help" "guard.sh on --help" "embeddings.sh on --model e5-small --help" \
-                      "mode.sh set standalone --help" "setup-link.sh --local --help" "backup.sh --list --help"; do
+                      "mode.sh set standalone --help" "setup-link.sh --local --help" "backup.sh --list --help" \
+                      "restore.sh --from latest --help" "update.sh --check --help" "backup.sh --verify --help"; do
             # shellcheck disable=SC2086
             run ../ops/$args
             [ "$code" -eq 0 ] || { echo "$args: код $code вместо 0"; exit 1; }
           done
           for args in "activation-link.sh сейчас" "bot-bind.sh x" "setup-link.sh x" "guard.sh on x" \
                       "backup.sh x" "doctor.sh x" "preflight.sh x" "logout-all.sh x" "up.sh x" \
-                      "set-setup-url.sh --clear https://assistant.example.com:8443" "set-setup-url.sh a b"; do
+                      "set-setup-url.sh --clear https://assistant.example.com:8443" "set-setup-url.sh a b" \
+                      "restore.sh x" "update.sh x" "update.sh --channel nightly" "restore.sh --only all x"; do
             # shellcheck disable=SC2086
             run ../ops/$args
             [ "$code" -eq 2 ] || { echo "$args: код $code вместо 2"; exit 1; }

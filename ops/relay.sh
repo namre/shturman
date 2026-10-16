@@ -282,6 +282,7 @@ PY
 relay_name="$(env_get SHTURMAN_RELAY_NAME)"
 relay_domain="$(env_get SHTURMAN_RELAY_DOMAIN)"
 
+case "$cmd" in join|on|off) ops_lock "посредник: $cmd (./ops/relay.sh)" ;; esac
 case "$cmd" in
   check)
     require_hermes "дашборда и внешнего адреса"

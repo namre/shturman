@@ -64,6 +64,7 @@ fetch_model() {
   chmod -R a+rX data/guard
 }
 
+[ "$mode" = status ] || ops_lock "защита от внедрённых инструкций: $mode (./ops/guard.sh)"
 case "$mode" in
   on)
     fetch_model || exit 1
