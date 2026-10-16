@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Проверка новых строк ./ops/doctor.sh (Р-98) с подставными Docker и curl: tg-session, pulse, disk-usage
-# в режиме без Hermes; сервис «отвечает» ответом из fixtures/status.json. Заодно ловит ошибки оболочки
+# Проверка новых строк ./ops/doctor.sh (Р-98) с подставными Docker и curl: tg-session, pulse, disk-usage,
+# jobs (Д-25) в режиме без Hermes; сервис «отвечает» ответом из fixtures/status.json. Заодно ловит ошибки оболочки
 # в doctor (как Д-2: строки ниже сломанной молча становились «не проверено»).
 # Запуск из корня репозитория: bash ops/tests/doctor_rows.sh.
 set -eu
@@ -65,4 +65,38 @@ sed -i "s|$fx/status.json|$tmp/status-nopulse.json|" "$tmp/stub/docker"
 
 grep -q '^WARN  pulse: внешнего сторожа нет' "$tmp/out.txt" || bad "нет WARN pulse без сторожа"
 grep -q '^PASS  tg-session: ваш аккаунт: на связи, сбор переписки идёт; последнее обновление от Telegram 1 мин назад' "$tmp/out.txt" || bad "нет PASS tg-session"
+grep -q '^PASS  jobs: очередь заданий: 0, неудачных за всё время: 0$' "$tmp/out.txt" || bad "нет PASS jobs у сервиса прежней версии"
+
+# Строка jobs (Д-25): длинная очередь, которая разбирается, — PASS; стоящая — WARN при любой длине;
+# неудачные — «за всё время». $1 — jobs_waiting, $2 — объект jobs_queue (JSON) или пусто.
+jobs_status() {
+  python3 - "$fx/status.json" "$1" "$2" > "$tmp/status-jobs.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["jobs_waiting"], d["jobs_failed"] = int(sys.argv[2]), 3021
+if sys.argv[3]:
+    d["jobs_queue"] = json.loads(sys.argv[3])
+print(json.dumps(d))
+PY
+  sed -i "s|$tmp/status-[a-z]*.json|$tmp/status-jobs.json|" "$tmp/stub/docker"
+  ./ops/doctor.sh > "$tmp/out.txt" 2>&1 || true
+  grep -q "line [0-9]*:" "$tmp/out.txt" && bad "ошибки оболочки в doctor (jobs)"
+  true
+}
+jobs_status 86 '{"llm": {"waiting": 86, "ready_age_s": 1500, "done_hour": 40}, "bot": {"waiting": 0, "ready_age_s": 0, "done_hour": 5}}'
+grep -q '^PASS  jobs: в очереди 86 заданий — разбираются: за час выполнено 45 (модели — 40, бота — 5); неудачных за всё время: 3021$' "$tmp/out.txt" \
+  || bad "движущаяся очередь — не PASS «разбираются»"
+jobs_status 86 '{"llm": {"waiting": 86, "ready_age_s": 1500, "done_hour": 0}, "bot": {"waiting": 0, "ready_age_s": 0, "done_hour": 0}}'
+grep -q '^WARN  jobs: в очереди 86 заданий, за час не выполнено ни одного: модели — ждут 86, самое старое 25 мин (строки model и jobs-failing); неудачных за всё время: 3021$' "$tmp/out.txt" \
+  || bad "стоящая очередь модели — не WARN"
+jobs_status 4 '{"llm": {"waiting": 0, "ready_age_s": 0, "done_hour": 9}, "bot": {"waiting": 4, "ready_age_s": 3600, "done_hour": 0}}'
+grep -q '^WARN  jobs: в очереди 4 заданий, за час не выполнено ни одного: бота — ждут 4, самое старое 60 мин (строка approvals-bot); неудачных за всё время: 3021$' "$tmp/out.txt" \
+  || bad "короткая стоящая очередь бота — не WARN"
+# Только что поставленные задания после тихого часа — не «стоит».
+jobs_status 3 '{"llm": {"waiting": 3, "ready_age_s": 60, "done_hour": 0}, "bot": {"waiting": 0, "ready_age_s": 0, "done_hour": 0}}'
+grep -q '^PASS  jobs: очередь заданий: 3, за час выполнено: 0; неудачных за всё время: 3021$' "$tmp/out.txt" || bad "свежая очередь — не PASS"
+# Сервис прежней версии (без jobs_queue) — прежнее правило: больше 50 — WARN.
+jobs_status 86 ''
+grep -q '^WARN  jobs: в очереди 86 заданий — их некому выполнять: смотрите строки approvals-bot и model; неудачных за всё время: 3021$' "$tmp/out.txt" \
+  || bad "прежний сервис, длинная очередь — не WARN"
 echo "doctor rows: ok"

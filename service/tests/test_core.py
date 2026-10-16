@@ -296,6 +296,38 @@ async def test_llm_job_outcomes_for_the_last_hour_are_counted_without_text(make_
     jobstats.reset()
 
 
+async def test_status_tells_a_moving_queue_from_a_stuck_one(make_client, conn):
+    """Д-25: строка jobs в doctor отличает очередь, которая разбирается, от той, что стоит. По группам —
+    сколько ждут, давность самого старого готового задания и выполнено за час; неудачные — за всё время."""
+    assert jobs.QUEUE_GROUPS["llm"] == bridge.LLM_KINDS
+    client, _ = await make_client("shturman.api_core")
+    ids = [await bridge.request_text(conn, handler="t.none", messages=[{"role": "user", "content": "x"}],
+                                     dedup_key=f"q{n}") for n in range(3)]
+    await bridge.notify_owner(conn, "уведомление")
+    # Уведомление отложено до утра (тихие часы) — оно ждёт, но исполнителя ещё не ждёт.
+    await jobs.enqueue(conn, "notify.owner", {"text": "утром"}, run_after=datetime.now(timezone.utc) + timedelta(hours=8))
+    await jobs.enqueue(conn, "hermes.cron", {})                                       # не входит в группы
+    await conn.execute("UPDATE jobs SET run_after = now() - interval '40 minutes' WHERE id = ANY($1)", ids)
+    status = (await client.get("/api/status")).json()
+    assert status["jobs_waiting"] == 6 and status["jobs_failed"] == 0
+    q = status["jobs_queue"]
+    assert q["llm"]["waiting"] == 3 and q["llm"]["done_hour"] == 0 and 39 * 60 <= q["llm"]["ready_age_s"] <= 41 * 60
+    assert q["bot"]["waiting"] == 2 and q["bot"]["done_hour"] == 0 and q["bot"]["ready_age_s"] < 60
+    claimed = (await client.post("/api/jobs/claim", json={"kinds": ["llm.text"], "limit": 1})).json()["jobs"]
+    await client.post(f"/api/jobs/{claimed[0]['id']}/complete", json={"result": {"text": "ok", "model": "m"}})
+    claimed = (await client.post("/api/jobs/claim", json={"kinds": ["llm.text"], "limit": 1})).json()["jobs"]
+    await client.post(f"/api/jobs/{claimed[0]['id']}/fail", json={"error": "E", "retry_in": None})
+    # Выполненное больше часа назад «за час» не считается.
+    await conn.execute("UPDATE jobs SET finished_at = now() - interval '2 hours' WHERE status = 'failed'")
+    status = (await client.get("/api/status")).json()
+    assert status["jobs_waiting"] == 4 and status["jobs_failed"] == 1
+    assert status["jobs_queue"]["llm"] == {"waiting": 1, "ready_age_s": status["jobs_queue"]["llm"]["ready_age_s"],
+                                           "done_hour": 1}
+    assert status["jobs_queue"]["llm"]["ready_age_s"] >= 39 * 60
+    await conn.execute("UPDATE jobs SET finished_at = now() - interval '2 hours' WHERE status = 'done'")
+    assert (await client.get("/api/status")).json()["jobs_queue"]["llm"]["done_hour"] == 0
+
+
 def test_job_error_labels_carry_no_free_text():
     from shturman.jobstats import label_of
 
