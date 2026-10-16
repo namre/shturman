@@ -416,8 +416,9 @@ jobs:
       # человеку (псевдотерминал программы script); адрес внешнего сторожа — только https и нигде целиком;
       # очистка по умолчанию ничего не удаляет, копии — только после «да» человека; диагностический пакет —
       # белым списком: ни одна строка из ops/tests/fixtures/secrets.txt в него не попадает; новые строки doctor
-      # (tg-session, pulse, disk-usage) с подставным Docker и без ошибок оболочки.
-      - name: ops — токен архива, сторож, очистка, диагностический пакет, строки doctor
+      # (tg-session, pulse, disk-usage, jobs — Д-25) с подставным Docker и без ошибок оболочки; память и
+      # процессор контейнеров без docker inspect без шаблона (Д-26).
+      - name: ops — токен архива, сторож, очистка, диагностический пакет, строки doctor, ресурсы
         run: |
           bash ops/tests/mcp_token.sh
           bash ops/tests/pulse.sh
@@ -426,6 +427,7 @@ jobs:
           bash ops/tests/diag.sh
           bash ops/tests/doctor_rows.sh
           bash ops/tests/doctor_hermes.sh
+          bash ops/tests/resources.sh
       # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
       # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
       # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.
