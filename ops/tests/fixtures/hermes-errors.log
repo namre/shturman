@@ -1,0 +1,7 @@
+2026-10-16 09:00:01,111 WARNING [s-1a2b] gateway.run_turn: inbound message: platform=telegram user=Иван Петров chat=79161234567 msg='Купи хлеба, смета по фасадам +7 916 123-45-67' reply_to_id=None reply_to_text=''
+2026-10-16 09:01:00,000 ERROR [s-1a2b] agent.run_agent: model call failed: 401 sk-proj-SECRETKEY1234567890abcdef
+Traceback (most recent call last):
+  File "x", line 1
+openai.AuthenticationError: Error code: 401 — Стройка: новости
+2026-10-16 09:02:00,000 ERROR tools.mcp_tool: MCP server shturman: HTTP 401 from https://setup.example.com:8443
+2026-10-15 01:00:00,000 WARNING gateway.platforms.telegram: old line ivan.petrov@example.com

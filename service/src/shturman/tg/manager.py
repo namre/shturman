@@ -680,6 +680,19 @@ class TgManager:
                             "logged_in_at": None})
         return out
 
+    async def health_rows(self) -> list[dict[str, Any]]:
+        """Для `tg/health.py`: по каждой роли — состояние сессии и сколько секунд назад от Telegram пришло
+        последнее обновление о сообщениях (None — с запуска сессии не было ни одного). Без подписей
+        аккаунтов, номеров и текстов ошибок: это уходит в `GET /api/status`, `./ops/doctor.sh` и наружу."""
+        rows = []
+        for account in await self.list_accounts():
+            rt = self.runtimes.get(account["role"])
+            age = None
+            if rt is not None and rt.live is not None and rt.live.last_update_at is not None:
+                age = max(0.0, time.monotonic() - rt.live.last_update_at)
+            rows.append({"role": account["role"], "status": account["status"], "update_age": age})
+        return rows
+
     async def detached_accounts(self, conn: asyncpg.Connection) -> list[dict[str, Any]]:
         """Аккаунты, которые есть в архиве, но без сессии: из них вышли, или переписка пришла
         только из выгрузки или бизнес-режима. Их роль в архиве остаётся и мешает подключить тот же

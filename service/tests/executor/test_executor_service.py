@@ -79,6 +79,8 @@ async def test_only_what_is_configured_is_started_and_announced(live, conn):
     await until(lambda: conn.fetchval("SELECT status = 'done' FROM jobs WHERE id = $1", job))
     assert tg.requests == [] and len(llm.requests) == 1
     status = (await client.get("/api/executor/status")).json()
+    last_ok_age = status["llm"].pop("last_ok_age")
+    assert isinstance(last_ok_age, int) and 0 <= last_ok_age < 60      # модель ответила только что
     assert status["llm"] == {"configured": True, "way": "api_key", "subscription": None, "model": "main-model",
                              "task_models": {}, "problem": None, "last_call_ok": True, "calls": 1, "failures": 0}
     assert status["jobs"]["done"] == {"llm.structured": 1} and status["bot"]["configured"] is False

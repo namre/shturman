@@ -138,6 +138,25 @@ def _cron_call(action: str, **kwargs: Any) -> None:
         raise RuntimeError(f"cron {action} refused")
 
 
+def latest_executions(jobs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Последняя запись журнала запусков Hermes (`cron.executions.latest_executions`, есть в 0.21.5) по
+    задачам `shturman:*` — только статус, итог доставки и время; поле ошибки не передаётся. Нет журнала
+    в этой версии Hermes — пусто, итог берётся из записи задачи (`cron_jobs.last_run`)."""
+    from shturman_core import cron_jobs
+
+    ids = [str(j.get("id")) for j in cron_jobs.ours(jobs) if j.get("id")]
+    if not ids:
+        return {}
+    try:
+        from cron.executions import latest_executions as latest
+        rows = latest(ids)
+    except Exception as exc:  # noqa: BLE001 — другая версия Hermes: без журнала запусков
+        logger.info("shturman: журнал запусков задач Hermes недоступен (%s)", type(exc).__name__)
+        return {}
+    keep = ("status", "delivery_outcome", "finished_at")
+    return {str(k): {f: v.get(f) for f in keep} for k, v in (rows or {}).items() if isinstance(v, dict)}
+
+
 def cron_sync(payload: dict[str, Any]) -> dict[str, Any]:
     """Задание `hermes.cron` (Р-95): привести задачи сводок к выбору владельца и сообщить, что есть.
 
@@ -171,7 +190,7 @@ def cron_sync(payload: dict[str, Any]) -> dict[str, Any]:
                 break
         applied = error is None
         jobs = list_jobs(include_disabled=True)
-    out = summaries.report(jobs, zone)
+    out = summaries.report(jobs, zone, latest_executions(jobs))
     out.update(applied=applied, revision=payload.get("revision"))
     if error:
         out["error"] = error

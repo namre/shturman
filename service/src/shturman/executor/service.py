@@ -121,6 +121,9 @@ async def status(request: Request) -> JSONResponse:
             "task_models": dict(llm.models) if llm else {},
             "problem": (llm.broken or llm.last_error) if llm else None,
             "last_call_ok": llm.last_ok if llm else None,
+            # Сколько секунд назад модель последний раз ответила успешно (с запуска сервиса); None — не было.
+            # Живой проверки модели нет нарочно: она тратит запросы, а по подписке — лимиты владельца (Р-98).
+            "last_ok_age": _age(getattr(llm, "last_ok_at", None)) if llm else None,
             "calls": llm.calls if llm else 0,
             "failures": llm.failures if llm else 0,
         },

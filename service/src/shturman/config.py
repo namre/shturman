@@ -138,6 +138,13 @@ class Config:
     # docs/approvals-bot.md). Только из окружения — ни страница, ни внутренний API его не меняют:
     # подменённый адрес отдал бы сервису бота, токен которого есть у подменившего. Пусто — выключено.
     bot_manager_api: str = DEFAULT_BOT_MANAGER_API
+    # Внешний сторож (pulse.py, Р-98): адрес, который сервис раз в pulse_every секунд зовёт «жив, всё в
+    # порядке» (а при неполадке — тот же адрес с /fail): healthchecks.io и совместимые. Только из окружения
+    # (SHTURMAN_PULSE_URL — пишет ./ops/pulse.sh), только https. Пусто — сторожа нет. Адрес не секрет
+    # уровня токена (по нему можно только отметиться «жив»), но целиком он не печатается и в журнал
+    # не пишется.
+    pulse_url: str = ""
+    pulse_every: float = 300.0
 
     @property
     def own_bot(self) -> bool:
@@ -254,6 +261,8 @@ class Config:
             pack_media_wait=float(min(600, max(0, _int("SHTURMAN_PACK_MEDIA_WAIT", 90)))),
             send_daily_hard_cap=max(0, _int("SHTURMAN_SEND_DAILY_CAP", 50)),
             bot_manager_api=bot_manager_api(_env("SHTURMAN_BOT_MANAGER_API")),
+            pulse_url=_env("SHTURMAN_PULSE_URL"),
+            pulse_every=float(min(3600, max(60, _int("SHTURMAN_PULSE_EVERY", 5) * 60))),
         )
         return with_page_values(config, os.environ)
 
