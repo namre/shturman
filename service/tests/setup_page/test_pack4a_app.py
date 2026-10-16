@@ -84,7 +84,7 @@ async def seed(conn, today: date) -> dict:
                                  QUOTES[3], today),
     }
     await conn.execute("UPDATE messages SET agent_visible = false, guard_label = 'suspect' WHERE id = $1", a[3])
-    work = await spheres.create_sphere(conn, "Работа РАЗУМ")
+    work = await spheres.create_sphere(conn, "Работа")
     await spheres.add_chats(conn, work["id"], account, [("user", ANNA)])
     return ids
 
@@ -175,7 +175,7 @@ async def test_commitments_two_lists_by_due_without_message_text(stand, conn):
     item = mine["overdue"][0]
     assert item["who"] == "Анна Ким" and item["what"] == "прислать смету по складу"
     assert item["days"] == -3 and item["chat"] == {"title": "Анна Ким", "kind": "личный чат"}
-    assert item["spheres"] == ["Работа РАЗУМ"] and len(item["v"]) == agenda.SHOWN
+    assert item["spheres"] == ["Работа"] and len(item["v"]) == agenda.SHOWN
     assert theirs["no_date"][0]["due_vague"] is True and theirs["no_date"][0]["due_words"] is None
     dump = json.dumps(body, ensure_ascii=False)
     for word in (*QUOTES, "до пятницы", "на днях", "скрытое защитой", "между ними", "source", "quote"):

@@ -904,13 +904,13 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
 
   await layout(p, "spheres");
   const sphereSections = await p.$$eval("#chats-sections .sect-title", (n) => n.map((x) => x.textContent));
-  check("приложение, «Сферы»: сферы и «Без сферы»", sphereSections.join("|") === "Работа РАЗУМ|Личное|Преподавание|Без сферы",
+  check("приложение, «Сферы»: сферы и «Без сферы»", sphereSections.join("|") === "Работа|Личное|Хобби|Без сферы",
         sphereSections.join("|"));
-  const workSphere = await openSection(p, "Работа РАЗУМ");
+  const workSphere = await openSection(p, "Работа");
   const ivan = workSphere.locator("li.chat", { hasText: "Иван Петров" }).first();
-  check("приложение: в строке чата — все его сферы", (await ivan.locator(".chip").allTextContents()).join("|") === "Работа РАЗУМ|Личное");
+  check("приложение: в строке чата — все его сферы", (await ivan.locator(".chip").allTextContents()).join("|") === "Работа|Личное");
   await ivan.locator("button.link", { hasText: "Сферы" }).click();
-  await ivan.locator(".pick label", { hasText: "Преподавание" }).locator("input").check();
+  await ivan.locator(".pick label", { hasText: "Хобби" }).locator("input").check();
   await p.screenshot({ path: path.join(SPH_OUT, "app-chat-spheres-picker-390-light.png"), fullPage: false });
   await ivan.locator(".pick button", { hasText: "Сохранить" }).click();
   check("приложение: сферы чата сохранены", await waitFor(async () =>
@@ -927,7 +927,7 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
     await p.click("#tab-spheres");
     await p.waitForSelector("#sph-list li.sph");
     const names = await p.$$eval("#sph-list .sph-name", (n) => n.map((x) => x.textContent));
-    check("приложение, «Сферы»: сферы по порядку", names.join("|") === "Работа РАЗУМ|Личное|Преподавание", names.join("|"));
+    check("приложение, «Сферы»: сферы по порядку", names.join("|") === "Работа|Личное|Хобби", names.join("|"));
     await p.fill("#sph-new-title", "Учёба");
     await p.fill("#sph-new-description", "курсы и книги");
     await p.click("#sph-new-save");
@@ -939,17 +939,17 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
           (await row.locator(".folder-pick select").inputValue()) === "" &&
           await row.locator(".folder-pick button", { hasText: /^Связать$/ }).isDisabled() &&
           await row.locator(".folder-pick input[type=checkbox]").isChecked());
-    await row.locator(".folder-pick select").selectOption({ label: "Работа РАЗУМ" });
+    await row.locator(".folder-pick select").selectOption({ label: "Работа" });
     await row.locator(".folder-pick button", { hasText: /^Связать$/ }).click();
     await waitFor(async () => (await p.locator("#sph-offers .offer").count()) > 0, 10000);
     await chatsControl("/spheres/folder-new?role=owner");
     await p.click("#tab-chats"); await p.click("#tab-spheres");
     await p.waitForFunction(() => document.querySelector("#sph-offers").textContent.includes("Новый Заказчик"), null, { timeout: 15000 });
-    const before = (await spheresSeen()).spheres.find((s) => s.title === "Работа РАЗУМ").chats;
+    const before = (await spheresSeen()).spheres.find((s) => s.title === "Работа").chats;
     const offered = Number((/Новые чаты в папке «Работа»: (\d+)/.exec(await p.textContent("#sph-offers")) || [])[1]);
     await p.screenshot({ path: path.join(SPH_OUT, "app-spheres-390-light.png"), fullPage: true });
     await p.locator("#sph-offers button", { hasText: "Добавить" }).first().click();
-    const added = await waitFor(async () => (await spheresSeen()).spheres.find((s) => s.title === "Работа РАЗУМ").chats === before + offered, 10000);
+    const added = await waitFor(async () => (await spheresSeen()).spheres.find((s) => s.title === "Работа").chats === before + offered, 10000);
     check("приложение: связанная папка предложила новый чат, принят — в сфере", offered > 0 && added, `${before} + ${offered}`);
     const audit = (await spheresSeen()).audit;
     check("приложение: изменения сфер — в журнале «из приложения», без названий",

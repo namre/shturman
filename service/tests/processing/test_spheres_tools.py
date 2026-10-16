@@ -157,13 +157,13 @@ async def test_sphere_changes_through_the_api_wait_for_the_owner(make_client, co
     async def titles():
         return [s["title"] for s in await spheres.list_spheres(conn)]
 
-    await approvals.gate(lambda: client.post("/api/spheres", json={"title": "Учёба", "description": "ММА"}), titles,
+    await approvals.gate(lambda: client.post("/api/spheres", json={"title": "Учёба", "description": "курсы"}), titles,
                          ["Работа", "Личное"], ["Работа", "Личное", "Учёба"])
     study = (await spheres.list_spheres(conn))[2]["id"]
-    action = approvals.waiting(await client.put(f"/api/spheres/{study}", json={"title": "Преподавание"}))
-    assert "«Учёба»" in await approvals.card(action) and "«Преподавание»" in await approvals.card(action)
+    action = approvals.waiting(await client.put(f"/api/spheres/{study}", json={"title": "Хобби"}))
+    assert "«Учёба»" in await approvals.card(action) and "«Хобби»" in await approvals.card(action)
     await approvals.press(action)
-    assert (await titles())[2] == "Преподавание"
+    assert (await titles())[2] == "Хобби"
 
     async def work_chats():
         return sorted(k[1] for k in await spheres.keys_of(conn, w.work["id"], w.account))
@@ -185,7 +185,7 @@ async def test_sphere_changes_through_the_api_wait_for_the_owner(make_client, co
     assert "Сами чаты, сохранённые сообщения и проекты останутся" in await approvals.card(action)
     assert len(await titles()) == 3
     await approvals.press(action)
-    assert await titles() == ["Работа", "Преподавание"]
+    assert await titles() == ["Работа", "Хобби"]
     assert await conn.fetchval("SELECT count(*) FROM chats") == 3
 
     # заведомо неисполнимое — отказ до карточки
