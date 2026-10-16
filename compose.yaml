@@ -155,6 +155,10 @@ services:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}
+      # Внешний сторож (Р-98, docs/deployment.md, «Внешний сторож»): адрес пульса — пишет ./ops/pulse.sh;
+      # пусто — сторожа нет. Раз в столько минут сервис зовёт его с итогом проверок.
+      SHTURMAN_PULSE_URL: ${SHTURMAN_PULSE_URL:-}
+      SHTURMAN_PULSE_EVERY: ${SHTURMAN_PULSE_EVERY:-5}
       # Посредник с ботом-менеджером: «создать бота согласований в одно нажатие» на странице
       # настройки переписки (docs/approvals-bot.md). Пусто — https://relay.sh.namre.app; off —
       # выключить. Только здесь: ни страница, ни API адрес не меняют.

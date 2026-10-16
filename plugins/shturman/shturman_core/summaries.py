@@ -113,8 +113,11 @@ def plan(desired: Mapping[str, Any], jobs: Iterable[Mapping[str, Any]], *,
     return actions, error
 
 
-def report(jobs: Iterable[Mapping[str, Any]], zone: str | None) -> dict[str, Any]:
-    """Что сейчас в Hermes — для сервиса. Только имя задачи, расписание и время: ни подсказок, ни вывода."""
+def report(jobs: Iterable[Mapping[str, Any]], zone: str | None,
+           executions: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Что сейчас в Hermes — для сервиса. Только имя задачи, расписание, время и код итога последнего
+    запуска (Р-98, `cron_jobs.last_run`): ни подсказок, ни вывода, ни текста сводки.
+    executions — последняя запись журнала запусков Hermes по номеру задачи, если журнал есть."""
     found = _by_key(jobs)
     out: dict[str, Any] = {}
     for key in KEYS:
@@ -133,5 +136,10 @@ def report(jobs: Iterable[Mapping[str, Any]], zone: str | None) -> dict[str, Any
         if active(job) and nxt:
             item["next_run_at"] = str(nxt)[:64]
             item["next_local"] = cron_jobs.local_run(nxt, zone)
+        execution = (executions or {}).get(str(job.get("id"))) if job.get("id") is not None else None
+        item["last"] = cron_jobs.last_run(job, execution)
+        ran = cron_jobs.last_run_at(job, execution)
+        if ran:
+            item["last_run_at"] = ran
         out[key] = item
     return {"jobs": out, "timezone": (zone or None)}

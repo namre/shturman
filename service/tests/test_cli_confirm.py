@@ -70,3 +70,26 @@ def test_login_command_goes_on_after_the_owner_agrees(monkeypatch):
     asked = answers(monkeypatch, (200, {"id": 7, "status": "pending"}), (200, {"id": 7, "status": "applied"}))
     assert cli._await_confirmation(WAITING) is None
     assert len(asked) == 2
+
+
+# --- вывод с личными данными — только человеку в терминале (Р-98) ---
+
+def test_reading_routes_with_personal_data_need_a_human_terminal(monkeypatch, capsys):
+    asked = []
+    monkeypatch.setattr(cli, "_local_api", lambda method, path, payload=None: (asked.append(path), (200, {"ok": 1}))[1])
+    monkeypatch.setattr(cli, "_human", lambda: False)          # так команду выполняет агент: без терминала
+    for path in ("/api/chats?query=x", "/api/tg/accounts", "/api/commitments", "/api/pages/search?q=x"):
+        with pytest.raises(SystemExit, match="только человеку"):
+            cli._call("GET", path, None)
+    assert asked == []                                          # запрос даже не ушёл
+    for path in cli.SAFE_GET:                                   # числа и состояния — можно
+        cli._call("GET", path, None)
+    assert asked == list(cli.SAFE_GET)
+    with pytest.raises(SystemExit, match="текст переписки"):
+        import asyncio
+        asyncio.run(cli._search("смета", 5))
+    with pytest.raises(SystemExit, match="названия чатов"):
+        cli._scan("/нет/такого/файла")
+    monkeypatch.setattr(cli, "_human", lambda: True)            # человек: docker exec -it …
+    cli._call("GET", "/api/tg/accounts", None)
+    assert asked[-1] == "/api/tg/accounts"

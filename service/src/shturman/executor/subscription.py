@@ -143,6 +143,7 @@ class ChatGptClient:
         self.failures = 0
         self.last_ok: bool | None = None
         self.last_error: str | None = None
+        self.last_ok_at: float | None = None      # time.monotonic() последнего успешного ответа модели
         self.state = OK
         self.denied_code = ""
         self._hold_until = 0.0
@@ -209,7 +210,7 @@ class ChatGptClient:
                 self.failures += 1
                 self.last_ok, self.last_error = False, exc.code
                 raise
-            self.last_ok, self.last_error = True, None
+            self.last_ok, self.last_error, self.last_ok_at = True, None, time.monotonic()
             if self.state != RELOGIN:
                 self.state = OK
             return out

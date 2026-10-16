@@ -244,3 +244,73 @@ def local_run(raw: Any, zone: str | None) -> str:
         return ""
     local = moment.astimezone(tz)
     return f"{_WEEKDAYS[local.weekday()]} {local:%d.%m %H:%M}"
+
+
+# ------------------------------------------------ итог последнего запуска (Р-98)
+
+# Коды для сервиса (`summaries.LAST_CODES`) и для строки `summary-last` в `./ops/doctor.sh`:
+#   delivered       — сводка ушла владельцу;
+#   silent          — отработала, сказать было нечего: ответ [SILENT], доставка подавлена;
+#   failed          — запуск упал (ошибка модели, инструментов, прерван перезапуском шлюза);
+#   delivery_failed — составлена, но не доставлена (Telegram не принял, некуда доставлять);
+#   queued          — ждёт доставки (шлюз переподключается к Telegram);
+#   running         — идёт сейчас;
+#   done            — отработала, а ушла или промолчала, — Hermes не записал (журнала запусков нет);
+#   never           — ещё не запускалась.
+# Источник — штатные записи Hermes 0.21.5 (`v2026.9.24`), без текста сводки: у задачи (`cron/jobs.py`,
+# `_record_run_outcome`) — `last_run_at` и `last_status` (ok | error | delivery_failed | delivery_queued |
+# blocked_config); в журнале запусков (`cron/executions.py`, таблица executions) — `status` (claimed |
+# running | completed | failed | unknown) и `delivery_outcome` (`cron/scheduler.py`,
+# `_classify_delivery_outcome`: delivered | failed | queued | suppressed | not_configured |
+# suppressed_acked). Ответ [SILENT] Hermes записывает как успех с `last_status = ok` — отличить его от
+# доставленной сводки можно только по журналу запусков: там `delivery_outcome = suppressed`.
+LAST_CODES = ("delivered", "silent", "failed", "delivery_failed", "queued", "running", "done", "never")
+
+_BY_OUTCOME = {"delivered": "delivered", "suppressed": "silent", "failed": "delivery_failed",
+               "not_configured": "delivery_failed", "queued": "queued"}
+_BY_STATUS = {"ok": "done", "error": "failed", "delivery_failed": "delivery_failed",
+              "delivery_queued": "queued", "blocked_config": "failed"}
+
+
+def last_run(job: Mapping[str, Any], execution: Mapping[str, Any] | None = None) -> str:
+    """Код итога последнего запуска задачи по её записи и последней записи журнала запусков."""
+    if isinstance(execution, Mapping):
+        status = execution.get("status")
+        if status in ("claimed", "running"):
+            return "running"
+        if status in ("failed", "unknown"):
+            return "failed"
+        if status == "completed":
+            code = _BY_OUTCOME.get(str(execution.get("delivery_outcome") or ""))
+            if code:
+                return code
+    if not job.get("last_run_at") and job.get("last_status") is None:
+        return "never"
+    return _BY_STATUS.get(str(job.get("last_status") or ""), "done")
+
+
+def last_run_at(job: Mapping[str, Any], execution: Mapping[str, Any] | None = None) -> str | None:
+    """Когда закончился последний запуск (ISO); None — не было."""
+    finished = execution.get("finished_at") if isinstance(execution, Mapping) else None
+    for raw in (finished, job.get("last_run_at")):
+        if isinstance(raw, str) and raw:
+            try:
+                moment = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if moment.tzinfo is not None:
+                return moment.isoformat()[:64]
+    return None
+
+
+def overdue(job: Mapping[str, Any], now: datetime, *, grace_s: float = 600.0) -> bool:
+    """Включённая задача, у которой следующий запуск давно в прошлом: планировщик её не запустил."""
+    if not job.get("enabled", True) or job.get("state") == "paused":
+        return False
+    try:
+        nxt = datetime.fromisoformat(str(job.get("next_run_at")))
+    except (TypeError, ValueError):
+        return False
+    if nxt.tzinfo is None:
+        return False
+    return (now - nxt).total_seconds() > grace_s

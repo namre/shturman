@@ -57,6 +57,7 @@ import base64
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 from urllib.parse import urlsplit
@@ -241,6 +242,7 @@ class LlmClient:
         self.failures = 0
         self.last_ok: bool | None = None
         self.last_error: str | None = None
+        self.last_ok_at: float | None = None      # time.monotonic() последнего успешного ответа модели
         if transport is None:
             try:
                 transport = httpx.AsyncHTTPTransport(proxy=proxy_url or None, trust_env=False, retries=0)
@@ -291,7 +293,7 @@ class LlmClient:
                 self.failures += 1
                 self.last_ok, self.last_error = False, exc.code
                 raise
-            self.last_ok, self.last_error = True, None
+            self.last_ok, self.last_error, self.last_ok_at = True, None, time.monotonic()
             return out
 
     async def _chat(self, messages: list[dict[str, Any]], model: str, max_tokens: int,

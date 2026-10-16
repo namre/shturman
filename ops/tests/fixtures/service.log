@@ -1,0 +1,13 @@
+INFO:     Started server process [1]
+INFO:     127.0.0.1:51234 - "GET /shturman-setup/api/session?k=onetime HTTP/1.1" 200 OK
+2026-10-16 09:12:01,532 INFO shturman.tg: аккаунт 4: чат user:79161234567 исключён из архива, синхронизация выключена
+2026-10-16 09:12:02,100 WARNING shturman.tg: аккаунт (owner): подключение не удалось (ConnectionError), повтор через 5 с
+2026-10-16 09:13:00,000 ERROR shturman.processing: разбор не удался: Иван Петров написал «Купи хлеба» +7 916 123-45-67 (ValueError)
+2026-10-16 09:14:00,000 WARNING shturman.executor.bot: бот согласований: опрос приостановлен (token_rejected) 123456789:AAH-secret-bot-token-ABCDEFGHIJKLMNOP HTTP 401
+2026-10-16 09:15:00,000 ERROR shturman: фоновая работа tg-owner завершилась с ошибкой
+Traceback (most recent call last):
+  File "/app/x.py", line 1, in <module>
+    raise RuntimeError("Стройка: новости — смета по фасадам ivan.petrov@example.com")
+RuntimeError: Стройка: новости — смета по фасадам ivan.petrov@example.com
+2026-10-16 09:16:00,000 WARNING shturman.tg: аккаунт (owner): ключ сессии недействителен (AuthKeyUnregisteredError) — https://setup.example.com:8443/shturman-setup/#k=onetime @ivan_p
+2026-10-16 09:17:00,000 WARNING shturman.pulse: пульс не доставлен (ConnectTimeout) https://hc-ping.com/0f0e0d0c-aaaa-bbbb-cccc-1234567890ab
