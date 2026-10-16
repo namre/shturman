@@ -29,6 +29,7 @@ case "${1:-show}" in
     [ $# -le 2 ] || ops_unknown "$3"
     [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto --mode $new" >&2; exit 1; }
     old="$(shturman_mode)" || exit 2
+    ops_lock "смена режима установки (./ops/mode.sh set $new)"
     umask 077
     env_put SHTURMAN_MODE "$new"
     env_put COMPOSE_PROFILES "$(compose_profiles "$new" keep)"

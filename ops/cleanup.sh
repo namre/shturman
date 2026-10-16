@@ -9,9 +9,12 @@
 #                                      одному; образ, который нужен контейнеру, Docker сам не удалит.
 #                                      Это не данные: нужный образ ./ops/up.sh скачает или соберёт снова.
 #   ./ops/cleanup.sh --backups [--keep N]
-#                                    — удалить резервные копии сверх N последних каждого вида (data-*.tar.gz
-#                                      и db-*.dump в local/backups; по умолчанию 5 — как хранит
-#                                      ./ops/backup.sh; N не меньше 2) и недописанные копии (*.part).
+#                                    — удалить резервные копии сверх N последних в local/backups — целиком,
+#                                      по метке времени: архив data-*.tar.gz, выгрузка db-*.dump и опись
+#                                      meta-*.txt (по умолчанию N = SHTURMAN_BACKUP_KEEP, иначе 5 — как
+#                                      хранит ./ops/backup.sh; правило одно — bk_extra в ops/lib-backup.sh;
+#                                      N не меньше 2) — и недописанные копии (*.part). Внешний каталог
+#                                      копий (SHTURMAN_BACKUP_DIR) не трогает.
 #                                      Удалённую копию не вернуть: скрипт показывает список и ждёт «да»,
 #                                      набранное ЧЕЛОВЕКОМ в его терминале. Без терминала (так выполняет
 #                                      команды ИИ-агент) — отказ.
@@ -24,7 +27,7 @@ cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
 ops_help "$@"
 
-action=show; keep=5
+action=show; keep=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) [ "$action" = show ] || ops_unknown "$1" ;;
@@ -39,16 +42,14 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-dir=local/backups
+. ops/lib-backup.sh
+dir="$BK_LOCAL"
+[ -n "$keep" ] || keep="$(bk_keep)"
 
-# Копии сверх ротации: по каждому виду — всё, кроме $keep самых новых. Печатает пути, по одному в строке.
+# Копии сверх ротации — тем же правилом, что ротация ./ops/backup.sh (bk_extra), и недописанные.
 extra_backups() {
-  local pattern
   [ -d "$dir" ] || return 0
-  for pattern in 'data-*.tar.gz' 'db-*.dump'; do
-    # shellcheck disable=SC2012,SC2086  # имена копий — только дата и время, без пробелов
-    ls -1t "$dir"/$pattern 2>/dev/null | tail -n +"$((keep + 1))"
-  done
+  bk_extra "$dir" "$keep"
   find "$dir" -maxdepth 1 -type f -name '*.part' 2>/dev/null
 }
 
@@ -72,11 +73,11 @@ case "$action" in
     extra="$(extra_backups)"
     if [ -n "$extra" ]; then
       n="$(printf '%s\n' "$extra" | grep -c .)"
-      echo "Копии сверх $keep последних каждого вида и недописанные — $n шт., $(human_mb "$(printf '%s\n' "$extra" | files_mb)"):"
+      echo "Копии сверх $keep последних и недописанные — $n шт., $(human_mb "$(printf '%s\n' "$extra" | files_mb)"):"
       printf '%s\n' "$extra" | sed 's/^/  /'
       echo "  удалить — ./ops/cleanup.sh --backups${keep:+ --keep $keep} (запускает владелец, спросит «да»)"
     else
-      echo "Копий сверх $keep последних каждого вида нет."
+      echo "Копий сверх $keep последних нет."
       echo "  Если места мало, а копий много: ./ops/cleanup.sh --dry-run --keep 2 покажет, что останется при двух."
     fi
     ids="$(dangling)"
@@ -105,21 +106,23 @@ EOF
     ;;
   backups)
     extra="$(extra_backups)"
-    if [ -z "$extra" ]; then echo "Копий сверх $keep последних каждого вида нет — удалять нечего."; exit 0; fi
+    if [ -z "$extra" ]; then echo "Копий сверх $keep последних нет — удалять нечего."; exit 0; fi
     if [ ! -t 0 ] || ! (: < /dev/tty) 2> /dev/null; then
       echo "Удаление копий подтверждает человек в своём терминале; у этого запуска терминала нет." >&2
       echo "Что было бы удалено — ./ops/cleanup.sh --dry-run --keep $keep." >&2
       exit 2
     fi
-    echo "Будут удалены (останутся $keep последних копий каждого вида):"
+    echo "Будут удалены (останутся $keep последних копий):"
     printf '%s\n' "$extra" | sed 's/^/  /'
     echo "Освободится: $(human_mb "$(printf '%s\n' "$extra" | files_mb)"). Удалённую копию не вернуть."
     printf 'Чтобы удалить, напишите «да»: '
     IFS= read -r answer < /dev/tty
     [ "$answer" = "да" ] || { echo "отменено — ничего не удалено"; exit 1; }
+    # Под общим замком ops/: не удалять копии, пока идёт копия, восстановление или обновление.
+    ops_lock "удаление копий (./ops/cleanup.sh --backups)"
     while IFS= read -r f; do
       [ -n "$f" ] || continue
-      case "$f" in "$dir"/data-*.tar.gz|"$dir"/db-*.dump|"$dir"/*.part) rm -f -- "$f" ;; esac
+      case "$f" in "$dir"/data-*.tar.gz|"$dir"/db-*.dump|"$dir"/meta-*.txt|"$dir"/*.part) rm -f -- "$f" ;; esac
     done <<EOF
 $extra
 EOF

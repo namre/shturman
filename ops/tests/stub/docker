@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Подставной docker для сценарных тестов ops/ (ops/tests/test_ops.sh): отвечает ровно на те вызовы,
+# которые делают lib.sh и lib-backup.sh, по переменным окружения. Каждый вызов пишется в $STUB_LOG.
+#   STUB_PG=running        — контейнер базы запущен (иначе его нет)
+#   STUB_APPLIED=a,b       — применённые миграции (schema_migrations); STUB_APPLIED_FILE — то же из файла
+#                            (его пишет подставной up.sh теста: «миграции применились»)
+#   STUB_HERMES_IMAGE=…    — образ работающего контейнера Hermes (пусто — контейнера нет)
+#   STUB_IMAGES=…          — вывод docker compose config --images
+#   STUB_COMPOSE_OK=1      — прочие команды docker compose завершаются успешно (иначе — отказ)
+echo "docker $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+  inspect)
+    name="${*: -1}"
+    case "$name" in
+      shturman-postgres) if [ "${STUB_PG:-}" = running ]; then echo running; exit 0; fi; exit 1 ;;
+      shturman-hermes)
+        if [ -n "${STUB_HERMES_IMAGE:-}" ]; then
+          case "$*" in *Config.Image*) echo "$STUB_HERMES_IMAGE" ;; *) echo running ;; esac
+          exit 0
+        fi
+        exit 1 ;;
+      *) exit 1 ;;
+    esac ;;
+  ps|stop) exit 0 ;;
+  exec)
+    case "$*" in
+      *pg_isready*) exit 0 ;;
+      *"string_agg(t ||"*) echo "chats=1 messages=2" ;;
+      *"to_regclass('public.schema_migrations')"*) echo t ;;
+      *"string_agg(name"*)
+        if [ -n "${STUB_APPLIED_FILE:-}" ] && [ -f "$STUB_APPLIED_FILE" ]; then cat "$STUB_APPLIED_FILE"; else echo "${STUB_APPLIED:-}"; fi ;;
+      *pg_dump*) printf 'PGDMP-stub-dump' ;;
+      *"pg_restore --list"*) cat > /dev/null; echo "215; 1259 16390 TABLE public messages shturman" ;;
+      *) exit 0 ;;
+    esac ;;
+  compose)
+    case "$*" in
+      *"config --images"*) printf '%s\n' "${STUB_IMAGES:-}" ;;
+      *"up -d postgres"*) exit 0 ;;
+      *) if [ "${STUB_COMPOSE_OK:-}" = 1 ]; then exit 0; fi; exit 1 ;;
+    esac ;;
+  *) exit 1 ;;
+esac
