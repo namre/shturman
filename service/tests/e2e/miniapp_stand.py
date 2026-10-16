@@ -710,9 +710,9 @@ async def main() -> None:
         await reload_list(role)
         account = app.extras["tg"].runtimes[role].account_id
         async with app.pool.acquire() as c:
-            work = await spheres.create_sphere(c, "Работа РАЗУМ", "стройка, продажи, совещания")
+            work = await spheres.create_sphere(c, "Работа", "стройка, продажи, совещания")
             home = await spheres.create_sphere(c, "Личное", "семья, дом, дача")
-            teach = await spheres.create_sphere(c, "Преподавание", "ММА, магистратура 09.04.03")
+            teach = await spheres.create_sphere(c, "Хобби", "фотография, походы")
             await spheres.add_chats(c, work["id"], account, [("user", tg_fakes.IVAN), ("channel", tg_fakes.SUPER),
                                                              *[("chat", g.id) for g in groups[:6]]])
             await spheres.add_chats(c, home["id"], account, [("user", tg_fakes.MARIA), ("chat", tg_fakes.GROUP),

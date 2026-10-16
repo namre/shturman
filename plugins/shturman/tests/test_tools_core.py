@@ -361,8 +361,8 @@ def test_spheres_tool_lists_and_asks_the_owner_for_changes(service, client):
     out = tools.run("shturman_spheres", client, {"action": "list"})
     assert out["spheres"] == [{"sphere_id": 2, "sphere": "Работа", "description": "стройка", "chats": 5, "projects": 1}]
     assert "[untrusted]" not in str(out["spheres"])                  # название сферы пишет владелец
-    tools.run("shturman_spheres", client, {"action": "create", "title": "Учёба", "description": "ММА"})
-    assert last(service) == ("POST", "/api/spheres", "", {"title": "Учёба", "description": "ММА"})
+    tools.run("shturman_spheres", client, {"action": "create", "title": "Учёба", "description": "курсы"})
+    assert last(service) == ("POST", "/api/spheres", "", {"title": "Учёба", "description": "курсы"})
     tools.run("shturman_spheres", client, {"action": "add_chat", "sphere_id": 2, "chat_id": 9})
     assert last(service) == ("POST", "/api/spheres/2/chats", "", {"add": [9]})
     tools.run("shturman_spheres", client, {"action": "remove_chat", "sphere_id": 2, "chat_id": 9})
