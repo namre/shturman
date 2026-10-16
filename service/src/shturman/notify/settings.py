@@ -42,7 +42,7 @@ DEFAULTS: dict[str, Any] = {
     "people": [],               # числовые ID собеседников (personal = people)
     "spheres": [],              # номера сфер (personal = spheres)
     "groups": True,             # прямые обращения в группах
-    "aliases": [],              # как к вам обращаются в начале реплики: «Евгений, …»
+    "aliases": [],              # как к вам обращаются в начале реплики: «Иван, …»
     "preview": True,            # показывать начало сообщения
     "mode": "instant",          # instant — сразу; digest — пачкой
     "gap_minutes": 10,

@@ -18,7 +18,7 @@ async def registry(conn):
         (IVAN_P, "Иван Петров", ["Иван Иванович"]),
         (IVAN_S, "Иван Сидоров", ["Иван Сергеевич"]),
         (NATASHA, "Наташа Кузнецова", ["Наталья Сергеевна"]),
-        (SASHA, "Sasha E", ["Александр Михайлович Эрман"]),
+        (SASHA, "Sasha E", ["Александр Михайлович Элькин"]),
         (PETR, "Пётр Петренко | ГК Фасад", ["Пётр Павлович"]),
         (OLEG_K, "Олег Кузнецов", []),
         (ANNA_P, "Анна Петрова", []),
@@ -44,7 +44,7 @@ async def test_mentions_resolve_through_case_forms(conn):
     assert await resolved(conn, "Наталье Сергеевне") == ("match", [ids[NATASHA]])
     assert await resolved(conn, "с Натальей Кузнецовой") == ("match", [ids[NATASHA]])
     assert await resolved(conn, "Сан Михалычу") == ("match", [ids[SASHA]])
-    assert await resolved(conn, "Эрману") == ("match", [ids[SASHA]])
+    assert await resolved(conn, "Элькину") == ("match", [ids[SASHA]])
     assert await resolved(conn, "Петру Палычу") == ("match", [ids[PETR]])
     assert await resolved(conn, "с Петренко") == ("match", [ids[PETR]])
     assert await resolved(conn, "Диме") == ("none", [])
@@ -111,8 +111,8 @@ async def test_display_names_match_across_scripts_and_decorations(conn):
     _, ids = await registry(conn)
     assert await named(conn, "Пётр Петренко | ГК Фасад") == ("match", [ids[PETR]])
     assert await named(conn, "Петр Петренко (Фасад)") == ("match", [ids[PETR]])
-    assert await named(conn, "Aleksandr Erman") == ("match", [ids[SASHA]])
-    assert await named(conn, "Александр Эрман") == ("match", [ids[SASHA]])
+    assert await named(conn, "Aleksandr Elkin") == ("match", [ids[SASHA]])
+    assert await named(conn, "Александр Элькин") == ("match", [ids[SASHA]])
     assert await named(conn, "Natasha Kuznetsova") == ("match", [ids[NATASHA]])
     assert await named(conn, "Кузнецова Наталья") == ("match", [ids[NATASHA]])
     assert await named(conn, "Ivan Petrov") == ("match", [ids[IVAN_P]])
@@ -121,7 +121,7 @@ async def test_display_names_match_across_scripts_and_decorations(conn):
     assert await named(conn, "🔥🔥🔥") == ("none", [])
     status, found = await named(conn, "Иван")
     assert status == "ambiguous" and set(found) == {ids[IVAN_P], ids[IVAN_S]}
-    score = (await people.match_display_name(conn, "Aleksandr Erman"))["candidates"][0]["score"]
+    score = (await people.match_display_name(conn, "Aleksandr Elkin"))["candidates"][0]["score"]
     assert score >= 85
 
 
@@ -216,7 +216,7 @@ async def test_forms_are_rebuilt_from_registry_only(conn):
 
 def test_fold_and_name_parsing():
     assert people.fold("Пётр Михайлович") == people.fold("петр михаилович")
-    assert people.fold("Aleksandr Erman") == people.fold("Александр Эрман")
+    assert people.fold("Aleksandr Elkin") == people.fold("Александр Элькин")
     assert people.fold("Dmitry") == people.fold("Дмитрий")
     assert people.fold("Evgeniy") == people.fold("Евгений")
     parsed = people.parse_name("Петров Иван Иванович | ООО Ромашка")
