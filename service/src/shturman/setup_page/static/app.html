@@ -38,6 +38,9 @@
   <button type="button" role="tab" id="tab-approvals" aria-controls="screen-approvals" aria-selected="true">
     <span>Согласования</span><span class="badge" id="tab-count" hidden></span>
   </button>
+  <button type="button" role="tab" id="tab-commitments" aria-controls="screen-commitments" aria-selected="false">
+    <span>Договорённости</span><span class="badge" id="tab-commitments-count" hidden></span>
+  </button>
   <button type="button" role="tab" id="tab-chats" aria-controls="screen-chats" aria-selected="false">
     <span>Чаты</span>
   </button>
@@ -86,19 +89,68 @@
 
   <!-- экран «Согласования» -->
   <section id="screen-approvals" role="tabpanel" aria-labelledby="tab-approvals" hidden>
+    <!-- «Сейчас» (пакет 4а, Р-94): что ждёт решения по разделам, договорённости на сегодня, что работает.
+         Только числа, состояния и время -->
+    <div class="panel now" id="now" aria-labelledby="now-title">
+      <h2 id="now-title">Сейчас</h2>
+      <p class="now-label" id="now-groups-label" hidden>Ждёт вашего решения:</p>
+      <div class="chips" id="now-groups" aria-label="Что ждёт решения по разделам"></div>
+      <p class="now-none" id="now-none" hidden>Ничего не ждёт вашего решения.</p>
+      <button type="button" class="now-row" id="now-commitments" hidden></button>
+      <details class="now-more" id="now-more">
+        <summary id="now-summary">Что работает</summary>
+        <ul class="lines now-lines" id="now-lines"></ul>
+        <div class="now-halt" id="now-halt"></div>
+      </details>
+    </div>
+    <div class="soon" id="soon" role="status" hidden>
+      <p class="soon-title">Скоро истечёт</p>
+      <div class="soon-list" id="soon-list"></div>
+    </div>
     <div class="title-row">
       <h1>Согласования</h1>
       <span class="count" id="count"></span>
     </div>
     <p class="banner" id="sending-off" hidden>Отправка на сервере выключена: черновики здесь — только для просмотра.
       «Понятно» убирает черновик из списка, ничего не отправляя.</p>
-    <div id="list" class="list" aria-live="polite"></div>
+    <div id="list" class="groups" aria-live="polite"></div>
     <p class="empty" id="empty" hidden>Сейчас ничего не ждёт вашего решения.</p>
     <p class="later muted" id="later" hidden></p>
     <p class="muted foot">Те же решения приходят карточками в бот согласований — решать можно и там, и здесь.
-      Отдельные экраны со списком договорённостей и состоянием сервера появятся в следующих версиях приложения.</p>
+      Раздел сворачивается нажатием на его заголовок.</p>
     <button type="button" class="secondary wide open-setup" hidden>Открыть настройки в браузере</button>
     <button type="button" class="home" id="home-screen" hidden>Добавить «Штурман» на главный экран</button>
+  </section>
+
+  <!-- экран «Договорённости» (пакет 4а, Р-94): только принятые вами; без текста сообщений -->
+  <section id="screen-commitments" role="tabpanel" aria-labelledby="tab-commitments" hidden>
+    <div class="title-row">
+      <h1>Договорённости</h1>
+      <span class="count" id="cm-count"></span>
+    </div>
+    <p class="lead muted">Что вы обещали и что обещали вам — из переписки, после вашего «Верно».</p>
+    <div class="segmented" id="cm-dirs" role="tablist" aria-label="Чьи обещания">
+      <button type="button" role="tab" id="cm-dir-owner_owes" aria-selected="true"><span class="seg-label" id="cm-dir-owner_owes-label">Я обещал</span></button>
+      <button type="button" role="tab" id="cm-dir-owed_to_owner" aria-selected="false"><span class="seg-label" id="cm-dir-owed_to_owner-label">Мне обещали</span></button>
+    </div>
+    <p class="muted" id="cm-loading">Загружаю договорённости…</p>
+    <div class="panel" id="cm-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="cm-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="cm-retry">Повторить</button>
+    </div>
+    <div id="cm-body" hidden>
+      <div class="banner cm-waiting" id="cm-waiting" hidden>
+        <span id="cm-waiting-text"></span>
+        <button type="button" class="link-btn" id="cm-waiting-open">Открыть «Согласования»</button>
+      </div>
+      <div class="groups" id="cm-groups" aria-live="polite"></div>
+      <p class="empty" id="cm-empty" hidden></p>
+      <p class="muted small" id="cm-truncated" hidden>Показаны первые 500 договорённостей — с самым ранним сроком.</p>
+      <p class="muted foot">«Выполнено», «Перенести» и «Не так» действуют сразу: это ваши записи. Каждое действие
+        пишется в журнал «Настроек Штурмана». Новые договорённости появляются после ночного разбора переписки — сначала
+        вопросом «Верно ли записано?» в «Согласованиях».</p>
+    </div>
   </section>
 
   <!-- экран «Чаты» -->

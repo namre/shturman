@@ -291,6 +291,12 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
         (miniapp.APP_API + "/halt/resume", ["POST"]),
         (miniapp.APP_API + "/rehearsal", ["GET"]), (miniapp.APP_API + "/rehearsal", ["PUT"]),
         (miniapp.APP_API + "/rehearsal/people", ["GET"]),
+        # пакет 4а (Р-94, tests/setup_page/test_pack4a_app.py): «Сейчас» и «Договорённости»
+        (miniapp.APP_API + "/now", ["GET"]), (miniapp.APP_API + "/commitments", ["GET"]),
+        (miniapp.APP_API + "/commitments/{commitment_id:int}/done", ["POST"]),
+        (miniapp.APP_API + "/commitments/{commitment_id:int}/move", ["POST"]),
+        (miniapp.APP_API + "/commitments/{commitment_id:int}/wrong", ["POST"]),
+        (miniapp.APP_API + "/commitments/{commitment_id:int}/reopen", ["POST"]),
         # пакет 4б (Р-95, tests/setup_page/test_pack4b.py): «История», доверие — расширение только
         # карточкой в бот, расписание сводок
         (miniapp.APP_API + "/history", ["GET"]), (miniapp.APP_API + "/history/{item_id:int}/revert", ["POST"]),

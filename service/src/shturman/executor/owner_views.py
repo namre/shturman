@@ -211,6 +211,50 @@ async def status_text(conn: asyncpg.Connection, state: Any) -> str:
     return "\n".join(lines)
 
 
+# --- «Сегодня» (/today, Р-94) ---------------------------------------------------------------------
+
+TODAY_LINES = 12          # строк договорённостей в одном направлении; остальное — числом
+
+
+def _today_line(item: dict[str, Any]) -> str:
+    if item["group"] == "overdue":
+        late = -int(item["days"])
+        when = "срок был вчера" if late == 1 else f"просрочено на {words.counted(late, 'день', 'дня', 'дней')}"
+    else:
+        when = "сегодня" + (f" до {item['due_time']}" if item.get("due_time") else "")
+    who = f"{item['who']} — " if item.get("who") else ""
+    return f"• {who}{item['what']} ({when})"
+
+
+async def today_text(conn: asyncpg.Connection, state: Any, *, app: bool) -> str:
+    """Договорённости на сегодня и просроченные — «Я обещал» и «Мне обещали» коротким списком.
+    Только принятые владельцем; неподтверждённые — числом (они в «Согласованиях»)."""
+    from ..processing import agenda
+    from ..setup_page import approvals
+
+    today = approvals.today_of(state.config)
+    board = await agenda.board(conn, today=today)
+    lines = [f"Сегодня, {agenda.dates.format_due(today)}", ""]
+    empty = True
+    for direction in agenda.DIRECTIONS:
+        found = board["lists"][direction]["overdue"] + board["lists"][direction]["today"]
+        if not found:
+            continue
+        empty = False
+        lines.append(agenda.DIRECTION_TITLES[direction])
+        lines += [_today_line(item) for item in found[:TODAY_LINES]]
+        lines += _more(len(found), TODAY_LINES)
+        lines.append("")
+    if empty:
+        lines += ["На сегодня договорённостей нет, просроченных тоже.", ""]
+    if board["waiting"]:
+        lines.append(f"Ещё {words.counted(board['waiting'], 'договорённость ждёт', 'договорённости ждут', 'договорённостей ждут')} "
+                     f"подтверждения «{words.COMMITMENT_YES} / {words.COMMITMENT_NO}» — в разделе «{words.APPROVALS}».")
+    if app:
+        lines.append("Отметить выполненной, перенести или убрать — в приложении «Штурман», раздел «Договорённости».")
+    return "\n".join(lines).strip()
+
+
 # --- «Согласования» -------------------------------------------------------------------------------
 
 async def approvals_text(conn: asyncpg.Connection, state: Any, *, app: bool) -> str:

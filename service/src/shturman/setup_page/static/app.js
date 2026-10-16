@@ -46,8 +46,9 @@
   var listTimer = null;
   var listShown = false;                         // список уже был на экране хотя бы раз
   var signedIn = false;                          // на экране — разделы, а не вход или его неудача
-  var tab = "approvals";                         // открытый раздел: approvals | chats | spheres | rehearsal | notify | history
-  var TABS = ["approvals", "chats", "spheres", "rehearsal", "notify", "history"];
+  var tab = "approvals";                         // открытый раздел: approvals | commitments | chats | spheres | rehearsal | notify | history
+  var TABS = ["approvals", "commitments", "chats", "spheres", "rehearsal", "notify", "history"];
+  var GROUPS_NAME = "shturman-app-groups";       // свёрнутые разделы (только эта вкладка Telegram, sessionStorage)
   var halt = { stopped: false };                 // «Остановить всё»: из списка согласований (и GET halt)
   var setupUrl = null;                           // адрес «Настроек Штурмана» — для кнопки «Открыть настройки в браузере»
 
@@ -216,9 +217,13 @@
     applyTheme(theme, Boolean(params.tgWebAppThemeParams));
   })();
 
-  // Данные входа больше не нужны в адресной строке: они уйдут на сервер один раз.
-  if (location.hash) {
-    try { history.replaceState(null, "", location.pathname + location.search); } catch (e) { /* пусть */ }
+  // Какой раздел открыть первым — из адреса кнопки бота (?open=…); других данных в адресе нет.
+  var openParam = (/[?&]open=([a-z]+)/.exec(location.search) || [])[1] || "";
+
+  // Данные входа больше не нужны в адресной строке: они уйдут на сервер один раз. Раздел из адреса —
+  // тоже: после перезагрузки откроется тот, что был открыт.
+  if (location.hash || openParam) {
+    try { history.replaceState(null, "", location.pathname); } catch (e) { /* пусть */ }
   }
 
   /* ------------------------------------------------------------ сессия и запросы */
@@ -272,6 +277,8 @@
     if (tab === "chats") { chatsOpened(); schedulePoll(); }
     if (tab === "spheres" && signedIn) loadSpheres(false);
     if (tab === "rehearsal" && signedIn) loadRehearsal(false);
+    if (tab === "notify" && signedIn) loadNotify(false);
+    if (tab === "commitments" && signedIn) loadCommitments(false);
     if (tab === "notify" && signedIn) { loadNotify(false); loadSummaries(); }
     if (tab === "history" && signedIn) loadHistory(false);
   }
@@ -358,6 +365,8 @@
 
   function card(item) {
     var node = el("article", "card");
+    node.id = cardId(item.key);
+    node.tabIndex = -1;
     node.appendChild(el("div", "kind", item.kind_title));
     if (item.title && item.title !== item.kind_title) node.appendChild(el("h2", null, item.title));
     if (item.head && item.head.length) {
@@ -450,9 +459,10 @@
     var active = document.activeElement;
     if (listShown && active && active.tagName === "TEXTAREA" && active.value.trim() && active.closest(".answer")) return;
     var items = data.items || [];
-    var list = $("list");
-    while (list.firstChild) list.removeChild(list.firstChild);
-    items.forEach(function (item) { list.appendChild(card(item)); });
+    approvalsData = data;
+    drawGroups(items, data.groups || []);
+    drawSoon(items);
+    drawNow();
     $("count").textContent = items.length ? String(items.length) : "";
     show("empty", !items.length);
     var later = laterText(data.later);
@@ -468,6 +478,8 @@
     if (first && tab === "chats") chatsOpened();
     if (first && tab === "spheres") loadSpheres(false);
     if (first && tab === "rehearsal") loadRehearsal(false);
+    if (first && tab === "notify") loadNotify(false);
+    if (first && tab === "commitments") loadCommitments(false);
     if (first && tab === "notify") { loadNotify(false); loadSummaries(); }
     if (first && tab === "history") loadHistory(false);
     if (first) refreshSphereList();
@@ -483,7 +495,7 @@
 
   function load() {
     return request("GET", "approvals").then(function (got) {
-      if (got.status === 200) { render(got.data); return; }
+      if (got.status === 200) { render(got.data); loadNow(); return; }
       if (got.status === 401) {
         saveKey("");
         if (initData) return signIn().then(function (ok) { if (ok) return load(); });
@@ -508,6 +520,205 @@
       Array.prototype.forEach.call(actions.querySelectorAll("button"), function (b) { b.disabled = false; });
       toast("Нет связи с сервером. Решение не передано — попробуйте ещё раз.");
     });
+  }
+
+  /* ------------------------------------------------- разделы «Согласований» и «Сейчас» (П3, Р-94) */
+
+  // Карточки — по разделам («Ответы», «Разрешения», «Договорённости», «Память», «Защита»), разделы
+  // сворачиваются; свёрнутое помнится до закрытия приложения. Внутри раздела сначала то, что скоро
+  // истечёт. Сверху — «Сейчас»: сколько в каждом разделе (нажатие — к разделу), договорённости на
+  // сегодня и просроченные (нажатие — экран «Договорённости») и что работает — только числа и время.
+  var SOON_MINUTES = 20;                         // «скоро истечёт» — меньше 20 минут на решение
+  var approvalsData = null;                      // последний ответ app/approvals
+  var nowData = null;                            // последний ответ app/now
+
+  function cardId(key) { return "card-" + String(key).replace(/[^a-z0-9_-]/gi, "-"); }
+
+  function stored(name) {
+    try { return JSON.parse(sessionStorage.getItem(name) || "{}") || {}; } catch (e) { return {}; }
+  }
+  function isOpen(key, fallback) {
+    var map = stored(GROUPS_NAME);
+    return Object.prototype.hasOwnProperty.call(map, key) ? Boolean(map[key]) : fallback;
+  }
+  function rememberOpen(key, open) {
+    var map = stored(GROUPS_NAME);
+    map[key] = Boolean(open);
+    try { sessionStorage.setItem(GROUPS_NAME, JSON.stringify(map)); } catch (e) { /* не страшно */ }
+  }
+
+  function minutesLeft(value) {
+    var at = new Date(value).getTime();
+    if (!value || isNaN(at)) return null;
+    return Math.floor((at - Date.now()) / 60000);
+  }
+  function leftShort(value) {
+    var m = minutesLeft(value);
+    if (m === null) return "";
+    if (m < 1) return "осталось меньше минуты";
+    if (m < 60) return "осталось " + m + " мин";
+    return "осталось " + Math.floor(m / 60) + " ч " + (m % 60) + " мин";
+  }
+  function soonItems(items) {
+    return items.filter(function (i) { var m = minutesLeft(i.expires_at); return m !== null && m >= 0 && m < SOON_MINUTES; })
+      .sort(function (a, b) { return new Date(a.expires_at) - new Date(b.expires_at); });
+  }
+
+  function drawGroups(items, groups) {
+    var list = $("list");
+    clear(list);
+    var byGroup = {};
+    items.forEach(function (item) {
+      var key = item.group || "permissions";
+      (byGroup[key] = byGroup[key] || []).push(item);
+    });
+    groups.forEach(function (g) {
+      var mine = byGroup[g.key] || [];
+      if (!mine.length) return;
+      var soon = soonItems(mine);
+      var rest = mine.filter(function (i) { return soon.indexOf(i) < 0; });
+      var box = el("details", "sect grp");
+      box.id = "grp-" + g.key;
+      box.open = isOpen("a:" + g.key, true);
+      var head = el("summary");
+      head.appendChild(el("span", "sect-title", g.title));
+      head.appendChild(el("span", "sect-count on", String(mine.length)));
+      // ближайший срок решения в разделе; меньше SOON_MINUTES — выделен
+      var timed = mine.filter(function (i) { var m = minutesLeft(i.expires_at); return m !== null && m >= 0; })
+        .sort(function (a, b) { return new Date(a.expires_at) - new Date(b.expires_at); });
+      if (timed.length) head.appendChild(el("span", "soon-tag" + (soon.length ? " hot" : ""), leftShort(timed[0].expires_at)));
+      box.appendChild(head);
+      var body = el("div", "sect-body grp-body");
+      soon.concat(rest).forEach(function (item) { body.appendChild(card(item)); });
+      box.appendChild(body);
+      head.addEventListener("click", function () { rememberOpen("a:" + g.key, !box.open); });
+      list.appendChild(box);
+    });
+  }
+
+  // Раскрыть раздел и показать карточку или сам раздел.
+  function reveal(target) {
+    if (!target) return;
+    var box = target.tagName === "DETAILS" ? target : target.closest("details");
+    if (box && !box.open) box.open = true;
+    try { target.scrollIntoView({ block: "start", behavior: "smooth" }); } catch (e) { target.scrollIntoView(); }
+    var focusable = target.tagName === "DETAILS" ? target.querySelector("summary") : target;
+    if (focusable && focusable.focus) {
+      try { focusable.focus({ preventScroll: true }); } catch (e) { focusable.focus(); }
+    }
+  }
+
+  function drawSoon(items) {
+    var soon = soonItems(items);
+    var box = $("soon-list");
+    clear(box);
+    soon.forEach(function (item) {
+      var b = el("button", "soon-item", item.kind_title + " — " + leftShort(item.expires_at));
+      b.type = "button";
+      b.addEventListener("click", function () { reveal($(cardId(item.key))); });
+      box.appendChild(b);
+    });
+    show("soon", soon.length > 0);
+  }
+
+  var ACCOUNT_ROLE = { owner: "Ваш аккаунт", assistant: "Аккаунт помощника", business: "Бизнес-бот в личных чатах" };
+  var STATE_MARK = { ok: "✓", paused: "⏸", wait: "…", off: "⚠" };
+
+  function loadNow() {
+    return request("GET", "now").then(function (got) {
+      if (got.status !== 200) return;            // о входе скажет список; «Сейчас» — по возможности
+      nowData = got.data;
+      drawNow();
+      drawCommitmentsBadge();
+    }, function () { /* список остаётся */ });
+  }
+
+  function drawNow() {
+    var groups = (approvalsData && approvalsData.groups) || [];
+    var chips = $("now-groups");
+    clear(chips);
+    var total = 0;
+    groups.forEach(function (g) {
+      if (!g.count) return;
+      total += g.count;
+      var b = el("button", "chip-btn");
+      b.type = "button";
+      b.appendChild(el("span", null, g.title));
+      b.appendChild(el("span", "chip-n", String(g.count)));
+      b.addEventListener("click", function () { reveal($("grp-" + g.key)); });
+      chips.appendChild(b);
+    });
+    show("now-groups", total > 0);
+    show("now-groups-label", total > 0);
+    show("now-none", Boolean(approvalsData) && total === 0);
+    if (!nowData) { show("now-commitments", false); show("now-more", false); return; }
+    var c = nowData.commitments || {};
+    var row = $("now-commitments");
+    clear(row);
+    row.appendChild(el("span", "now-row-title", "Договорённости на сегодня"));
+    var parts = [];
+    if (c.overdue) parts.push("просрочено " + c.overdue);
+    if (c.today) parts.push("сегодня " + c.today);
+    row.appendChild(el("span", "now-row-value" + (c.overdue ? " late" : ""), parts.length ? parts.join(" · ") : "на сегодня нет"));
+    row.appendChild(el("span", "now-row-go", "›"));
+    show("now-commitments", true);
+
+    var lines = $("now-lines");
+    clear(lines);
+    var problems = [];
+    function line(mark, text) {
+      var li = el("li", "now-line");
+      li.appendChild(el("span", "now-mark", mark));
+      li.appendChild(el("span", null, text));
+      lines.appendChild(li);
+    }
+    var ORDER = { owner: 0, assistant: 1, business: 2 };
+    var accounts = (nowData.accounts || []).slice().sort(function (a, b) { return (ORDER[a.role] || 9) - (ORDER[b.role] || 9); });
+    if (!accounts.length) {
+      line("⚠", "Аккаунт Telegram не подключён — подключается в «Настройках Штурмана»");
+      problems.push("аккаунт не подключён");
+    }
+    accounts.forEach(function (a) {
+      var label = a.label && a.role !== "business" ? " «" + a.label + "»" : "";
+      line(STATE_MARK[a.state] || "⚠", (ACCOUNT_ROLE[a.role] || "Аккаунт") + label + " — " + a.words);
+      if (a.state === "off") problems.push("нет связи с аккаунтом");
+    });
+    line("•", "Последнее сообщение в архиве: " + (nowData.last_message_at ? deadline(nowData.last_message_at) : "ещё не было"));
+    var failed = nowData.model_failed_24h || {};
+    var fails = (failed.media || 0) + (failed.requests || 0);
+    if (fails) {
+      line("⚠", "Модель: не получилось за сутки — " + fails + ". Повторить можно в «Настройках Штурмана»");
+      problems.push("сбои модели");
+    } else {
+      line("✓", "Модель: сбоев за сутки нет");
+    }
+    line("•", nowData.sending === "on" ? "Отправка: включена" : nowData.sending === "prepare_only"
+      ? "Отправка: выключена — черновики только для просмотра" : "Отправка: выключена — ничего не уходит от вашего имени");
+    line("•", nowData.triage ? "Разбор входящих: включён" : "Разбор входящих: выключен — включается в «Настройках Штурмана»");
+    var stopped = Boolean((nowData.halt || {}).stopped || halt.stopped);
+    line(stopped ? "⏸" : "✓", stopped ? "Ассистент: остановлен — продолжить можно в полосе вверху" : "Ассистент: работает");
+    if (stopped) problems.push("ассистент остановлен");
+    var haltBox = $("now-halt");
+    clear(haltBox);
+    if (!stopped) {
+      // та же кнопка, что в шапке: одно и то же действие, своей логики нет
+      var stop = el("button", "stop", "Остановить всё");
+      stop.type = "button";
+      stop.addEventListener("click", function () { $("halt-stop").click(); });
+      haltBox.appendChild(stop);
+    }
+    var seen = nowData.last_message_at ? "последнее сообщение " + deadline(nowData.last_message_at) : "сообщений ещё не было";
+    var summary = $("now-summary");
+    summary.textContent = problems.length ? "⚠ Внимание: " + problems.join(", ") : "Всё работает · " + seen;
+    summary.className = problems.length ? "warn" : "";
+    $("now-more").open = isOpen("now", problems.length > 0);
+    show("now-more", true);
+  }
+
+  function wireNow() {
+    // помнится только нажатие владельца (по умолчанию «что работает» раскрыто, когда что-то не так)
+    $("now-summary").addEventListener("click", function () { rememberOpen("now", !$("now-more").open); });
+    $("now-commitments").addEventListener("click", function () { openTab("commitments"); });
   }
 
   /* ------------------------------------------------------------ «Чаты» */
@@ -1874,6 +2085,253 @@
     });
   }
 
+  /* ------------------------------------------------------------ «Договорённости» (Р-94) */
+
+  // Два списка — «Я обещал» и «Мне обещали», внутри — «Просрочено», «Сегодня», «На неделе», «Позже»,
+  // «Без срока». Только принятые владельцем; неподтверждённые — в «Согласованиях», здесь их число.
+  // «Выполнено», «Перенести», «Не так» — сразу (это записи самого владельца), с «Вернуть» после
+  // «Выполнено» и «Не так». Каждое действие несёт начало отпечатка того, что владелец видел (v):
+  // если договорённость с тех пор изменилась, сервер его не выполнит.
+  var CM_DIRS = ["owner_owes", "owed_to_owner"];
+  var CM_DIR_TITLES = { owner_owes: "Я обещал", owed_to_owner: "Мне обещали" };
+  var CM_GROUPS = [["overdue", "Просрочено"], ["today", "Сегодня"], ["week", "На неделе"], ["later", "Позже"],
+                   ["no_date", "Без срока"]];
+  var CM_DIR_NAME = "shturman-app-cm-dir";
+  var cm = { data: null, loaded: false, dir: "owner_owes" };
+  try {
+    var savedDir = sessionStorage.getItem(CM_DIR_NAME);
+    if (CM_DIRS.indexOf(savedDir) >= 0) cm.dir = savedDir;
+  } catch (e) { /* пусть */ }
+
+  function cmPanel(name) {
+    ["cm-loading", "cm-failed", "cm-body"].forEach(function (id) { show(id, id === name); });
+  }
+
+  function loadCommitments(quiet) {
+    if (!quiet && !cm.loaded) cmPanel("cm-loading");
+    return request("GET", "commitments").then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) {
+        $("cm-failed-text").textContent = got.data.error || "Сервер не ответил. Попробуйте ещё раз через минуту.";
+        cmPanel("cm-failed");
+        return;
+      }
+      cm.data = got.data;
+      cm.loaded = true;
+      cmPanel("cm-body");
+      drawCommitments();
+    }, function () {
+      $("cm-failed-text").textContent = "Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.";
+      cmPanel("cm-failed");
+    });
+  }
+
+  function cmCount(dir) {
+    var lists = (cm.data && cm.data.lists && cm.data.lists[dir]) || {};
+    return CM_GROUPS.reduce(function (n, g) { return n + (lists[g[0]] || []).length; }, 0);
+  }
+
+  // На вкладке — сколько на сегодня и просрочено (оба списка).
+  function drawCommitmentsBadge() {
+    var c = (nowData && nowData.commitments) || null;
+    var n = c ? (c.overdue || 0) + (c.today || 0) : 0;
+    $("tab-commitments-count").textContent = n ? String(n) : "";
+    show("tab-commitments-count", n > 0);
+  }
+
+  function dueText(item) {
+    if (!item.due_date) return item.due_vague ? "назван неточно" : "не назван";
+    var when = item.due_words || item.due_date;
+    if (item.days < 0) {
+      var late = -item.days;
+      return when + " — просрочено на " + late + " " + plural(late, "день", "дня", "дней");
+    }
+    if (item.days === 0) return "сегодня" + (item.due_time ? " до " + item.due_time : "");
+    if (item.days === 1) return "завтра, " + when;
+    return when;
+  }
+
+  function cmItem(item) {
+    var li = el("li", "cm");
+    li.id = "cm-item-" + item.id;
+    li.appendChild(el("div", "cm-what", item.what));
+    var meta = el("div", "cm-meta");
+    if (item.who) meta.appendChild(el("span", null, (item.direction === "owner_owes" ? "Кому: " : "Кто: ") + item.who));
+    meta.appendChild(el("span", "cm-due" + (item.days !== null && item.days < 0 ? " late" : ""), "Срок: " + dueText(item)));
+    li.appendChild(meta);
+    var from = el("div", "cm-meta");
+    var chat = item.chat || {};
+    // личный чат с тем же человеком — без повтора имени
+    var where = chat.title && chat.title === item.who ? (chat.kind || "чат")
+      : (chat.title ? "«" + chat.title + "»" : "чат без названия") + (chat.kind ? ", " + chat.kind : "");
+    from.appendChild(el("span", null, "Откуда: " + where));
+    (item.spheres || []).forEach(function (name) { from.appendChild(el("span", "chip", name)); });
+    li.appendChild(from);
+    var actions = el("div", "actions");
+    actions.appendChild(button("primary", "Выполнено", function () {
+      cmAct(item, "done", {}, this, "Отмечено: выполнено.");
+    }));
+    actions.appendChild(button("secondary", "Перенести", function () { cmMove(item, li, this); }));
+    actions.appendChild(button("secondary", "Не так", function () { cmWrong(item, li, this); }));
+    li.appendChild(actions);
+    return li;
+  }
+
+  function closeInline(li) {
+    Array.prototype.forEach.call(li.querySelectorAll(".pick, .confirm"), function (n) { n.parentNode.removeChild(n); });
+  }
+
+  function cmMove(item, li, opener) {
+    var had = li.querySelector(".pick");
+    closeInline(li);
+    if (had) return;
+    var box = el("div", "pick cm-move");
+    box.appendChild(el("p", null, "Перенести срок:"));
+    var quick = el("div", "actions");
+    quick.appendChild(button("secondary", "На завтра", function () { cmAct(item, "move", { to: "tomorrow" }, this); }));
+    quick.appendChild(button("secondary", "Через неделю", function () { cmAct(item, "move", { to: "week" }, this); }));
+    box.appendChild(quick);
+    var row = el("div", "tools-row cm-date");
+    var label = el("label", "field");
+    var id = "cm-date-" + item.id;
+    label.setAttribute("for", id);
+    label.appendChild(el("span", null, "Или выберите дату"));
+    var input = el("input");
+    input.type = "date";
+    input.id = id;
+    if (cm.data && cm.data.today) input.min = cm.data.today;
+    label.appendChild(input);
+    row.appendChild(label);
+    row.appendChild(button("primary", "Перенести", function () {
+      if (!input.value) { toast("Выберите дату."); input.focus(); return; }
+      cmAct(item, "move", { to: "date", date: input.value }, this);
+    }));
+    box.appendChild(row);
+    var cancel = el("div", "actions");
+    cancel.appendChild(button("secondary", "Отмена", function () { closeInline(li); opener.focus(); }));
+    box.appendChild(cancel);
+    li.appendChild(box);
+  }
+
+  function cmWrong(item, li, opener) {
+    var had = li.querySelector(".confirm");
+    closeInline(li);
+    if (had) return;
+    var box = el("div", "confirm");
+    box.appendChild(el("p", null, "Записано неверно? Договорённость уйдёт из списка и из сводок, а это же обещание " +
+      "из того же сообщения больше не будет предложено."));
+    var actions = el("div", "actions");
+    actions.appendChild(button("danger", "Убрать", function () { cmAct(item, "wrong", {}, this, "Убрано: записано неверно."); }));
+    actions.appendChild(button("secondary", "Отмена", function () { closeInline(li); opener.focus(); }));
+    box.appendChild(actions);
+    li.appendChild(box);
+  }
+
+  function cmAct(item, action, body, b, done) {
+    if (busy) return;
+    busy = true;
+    if (b) b.disabled = true;
+    body.v = item.v;
+    request("POST", "commitments/" + item.id + "/" + action, body).then(function (got) {
+      busy = false;
+      if (b) b.disabled = false;
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) { toast(got.data.error || "Не получилось. Попробуйте ещё раз."); loadCommitments(true); return; }
+      var text = done || got.data.answer || "Готово.";
+      if (got.data.undo) toastAction(text, "Вернуть", function () { cmReopen(item); });
+      else toast(text);
+      loadCommitments(true);
+      loadNow();
+    }, function () {
+      busy = false;
+      if (b) b.disabled = false;
+      toast("Нет связи с сервером. Ничего не изменилось — попробуйте ещё раз.");
+    });
+  }
+
+  function cmReopen(item) {
+    request("POST", "commitments/" + item.id + "/reopen", {}).then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      toast(got.status === 200 ? "Вернул в список." : (got.data.error || "Не получилось вернуть."));
+      loadCommitments(true);
+      loadNow();
+    }, function () { toast("Нет связи с сервером."); });
+  }
+
+  // Сообщение внизу с кнопкой действия («Вернуть»): держится дольше обычного.
+  function toastAction(message, label, fn) {
+    var node = $("toast");
+    clear(node);
+    node.appendChild(el("span", null, message + " "));
+    var b = el("button", "toast-btn", label);
+    b.type = "button";
+    b.addEventListener("click", function () { node.hidden = true; fn(); });
+    node.appendChild(b);
+    node.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { node.hidden = true; }, 8000);
+  }
+
+  function drawCommitments() {
+    var d = cm.data;
+    CM_DIRS.forEach(function (dir) {
+      var n = cmCount(dir);
+      $("cm-dir-" + dir + "-label").textContent = CM_DIR_TITLES[dir] + (n ? " · " + n : "");
+      $("cm-dir-" + dir).setAttribute("aria-selected", dir === cm.dir ? "true" : "false");
+    });
+    var total = cmCount("owner_owes") + cmCount("owed_to_owner");
+    $("cm-count").textContent = total ? String(total) : "";
+    if (d.waiting) {
+      $("cm-waiting-text").textContent = "Ещё " + d.waiting + " " + plural(d.waiting, "ждёт", "ждут", "ждут") +
+        " подтверждения «Верно / Не так» — в «Согласованиях».";
+    }
+    show("cm-waiting", Boolean(d.waiting));
+    var box = $("cm-groups");
+    clear(box);
+    var lists = d.lists[cm.dir] || {};
+    var any = false;
+    CM_GROUPS.forEach(function (g) {
+      var items = lists[g[0]] || [];
+      if (!items.length) return;
+      any = true;
+      var sect = el("details", "sect cm-group" + (g[0] === "overdue" ? " late" : ""));
+      sect.id = "cm-" + g[0];
+      var key = "c:" + cm.dir + ":" + g[0];
+      sect.open = isOpen(key, true);
+      var head = el("summary");
+      head.appendChild(el("span", "sect-title", g[1]));
+      head.appendChild(el("span", "sect-count on", String(items.length)));
+      sect.appendChild(head);
+      var body = el("div", "sect-body");
+      var ul = el("ul", "cm-list");
+      items.forEach(function (item) { ul.appendChild(cmItem(item)); });
+      body.appendChild(ul);
+      sect.appendChild(body);
+      head.addEventListener("click", function () { rememberOpen(key, !sect.open); });
+      box.appendChild(sect);
+    });
+    $("cm-empty").textContent = cm.dir === "owner_owes"
+      ? "Ваших обещаний пока нет. Они появляются после ночного разбора переписки и вашего «Верно» в «Согласованиях»."
+      : "Обещаний вам пока нет. Они появляются после ночного разбора переписки и вашего «Верно» в «Согласованиях».";
+    show("cm-empty", !any);
+    show("cm-truncated", Boolean(d.truncated));
+  }
+
+  function wireCommitments() {
+    $("cm-retry").addEventListener("click", function () { loadCommitments(false); });
+    CM_DIRS.forEach(function (dir) {
+      $("cm-dir-" + dir).addEventListener("click", function () {
+        cm.dir = dir;
+        try { sessionStorage.setItem(CM_DIR_NAME, dir); } catch (e) { /* пусть */ }
+        if (cm.data) drawCommitments();
+      });
+    });
+    $("cm-waiting-open").addEventListener("click", function () {
+      openTab("approvals");
+      reveal($("grp-commitments"));
+    });
+  }
+
   /* ------------------------------------------------------------ «История» (Р-95, С15, Х6) */
 
   // «Решения», «Ассистент», «Входы» — по дням, словами, без текста переписки. «Отозвать» и сужение — сразу;
@@ -2160,6 +2618,7 @@
 
   $("refresh").addEventListener("click", function () { load(); });
   $("tab-approvals").addEventListener("click", function () { openTab("approvals"); });
+  $("tab-commitments").addEventListener("click", function () { openTab("commitments"); });
   $("tab-chats").addEventListener("click", function () { openTab("chats"); });
   $("tab-spheres").addEventListener("click", function () { openTab("spheres"); });
   $("tab-rehearsal").addEventListener("click", function () { openTab("rehearsal"); });
@@ -2170,6 +2629,8 @@
   wireNotify();
   wireHalt();
   wireRehearsal();
+  wireNow();
+  wireCommitments();
   wireHistory();
   wireSummaries();
   Array.prototype.forEach.call(document.querySelectorAll(".open-setup"), function (b) {
@@ -2179,6 +2640,8 @@
     var saved = sessionStorage.getItem(TAB_NAME);
     tab = TABS.indexOf(saved) >= 0 ? saved : "approvals";
   } catch (e) { tab = "approvals"; }
+  // Кнопка «Открыть «Штурман»» под /today в боте открывает сразу «Договорённости» (?open=commitments).
+  if (TABS.indexOf(openParam) >= 0) tab = openParam;
   openTab(tab);
   $("retry").addEventListener("click", function () {
     screen("screen-wait");
@@ -2193,6 +2656,8 @@
     if (tab === "chats" && chats.opened && !chats.loading) loadAccounts(true);
     if (tab === "spheres") loadSpheres(true);
     if (tab === "rehearsal") loadRehearsal(true);
+    if (tab === "notify") loadNotify(true);
+    if (tab === "commitments") loadCommitments(true);
     if (tab === "notify") { loadNotify(true); loadSummaries(); }
     if (tab === "history") loadHistory(true);
   });

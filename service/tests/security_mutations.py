@@ -41,6 +41,7 @@ AUTHORITY = "tests/test_authority.py::"
 CODE_LOGIN = "tests/setup_page/test_code_login.py::"
 TRIAGE = "tests/triage/test_triage_core.py::"
 TRIAGE_PAGE = "tests/triage/test_triage_page.py::"
+APP_4A = "tests/setup_page/test_pack4a_app.py::"
 PACK4B = "tests/setup_page/test_pack4b.py::"
 MUTATIONS = (
     Mutation("background_owner_context", "src/shturman/authority.py",
@@ -319,6 +320,18 @@ MUTATIONS = (
              "    if row[\"kind\"] in BOT_ONLY and principal.action == \"telegram.miniapp\":",
              "    if False:",
              CODE_LOGIN + "test_managed_bot_has_code_login_off_until_the_owner_presses_in_the_bot",
+             database=True),
+    # Договорённости в приложении (Р-94): отсюда трогаются только принятые владельцем и только его стороны —
+    # не неподтверждённые, не скрытые защитой и не «между другими»; «Не так» и перенос датой — только владелец.
+    Mutation("app_commitments_only_accepted_own", "src/shturman/setup_page/agenda.py",
+             "    if item is None or item[\"status\"] != \"open\" or item[\"direction\"] not in agenda.DIRECTIONS:",
+             "    if item is None:",
+             APP_4A + "test_done_move_wrong_apply_at_once_with_journal",
+             database=True),
+    Mutation("commitment_mark_wrong_owner_only", "src/shturman/processing/commitments.py",
+             "    if not authority.is_owner():\n        return _result(False, error=\"Это решает владелец.\"",
+             "    if False:\n        return _result(False, error=\"Это решает владелец.\"",
+             APP_4A + "test_agent_cannot_mark_wrong_or_move_by_date",
              database=True),
     # Пакет 4б (Р-95): из приложения ослабление — только карточкой в бот; «Вернуть как было», если возврат
     # расширяет, — тоже только карточкой (и со страницы); `owner.widen` применяется только нажатием в боте;

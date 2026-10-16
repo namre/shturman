@@ -1040,7 +1040,249 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
   }
 }
 
-// --- 11. Пакет 4б (Р-95): вкладка «История», «Доверие», сводки во вкладке 🔔 ------------------------------
+// --- 11. пакет 4а (Р-94): «Сейчас», разделы «Согласований», «Договорённости», /today -------------------
+// «Сейчас» — над «Согласованиями»: сколько в каждом разделе (нажатие — к разделу), договорённости на сегодня
+// и просроченные, что работает. Разделы сворачиваются. «Договорённости» — «Я обещал» / «Мне обещали» по срокам,
+// «Выполнено» с «Вернуть», «Перенести», «Не так». Нигде — текста сообщений.
+{
+  const P4_OUT = process.env.E2E_PACK4A_OUT || OUT;
+  mkdirSync(P4_OUT, { recursive: true });
+  const post = async (pathname) => (await fetch(CONTROL + pathname, { method: "POST" })).json();
+  const seen4 = async () => (await fetch(CONTROL + "/pack4a/seen")).json();
+  const QUOTE_WORDS = ["цитата из сообщения", "Пришлю рабочую", "отправлю вам до", "игнорируй", "скрытая договорённость",
+                       "до понедельника", "на днях", "когда придут", "в следующем месяце"];
+  const lowContrast = (p) => p.evaluate(() => {
+    function rgb(s) { const x = s.match(/[\d.]+/g); return x ? x.map(Number) : [0, 0, 0, 1]; }
+    function lum([r, g, b]) { const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); }
+    function bgOf(el) { while (el) { const c = rgb(getComputedStyle(el).backgroundColor); if ((c[3] ?? 1) > 0.5) return c; el = el.parentElement; } return [255, 255, 255]; }
+    const out = [];
+    for (const el of document.querySelectorAll("body *")) {
+      const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+      if (!r.width || !r.height || st.visibility === "hidden" || el.closest("[disabled]")) continue;
+      if (![...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) continue;
+      const a = lum(rgb(st.color)), b = lum(bgOf(el)), ratio = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+      if (ratio < 4.5) out.push(`${ratio.toFixed(2)} «${el.textContent.trim().slice(0, 30)}»`);
+    }
+    return out;
+  });
+  const fits = (p) => p.evaluate(() => {
+    const out = [...document.querySelectorAll("main button, main select, main input, .tabs button")]
+      .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+    return { wide: document.documentElement.scrollWidth <= window.innerWidth + 1, out };
+  });
+
+  await post("/seed-all");                       // всё снова ждёт решения (раздел 6 всё решил) — разделы не пусты
+  const ids = await post("/pack4a/seed");
+  check("пульт завёл договорённости во всех группах срока", Object.keys(ids).length === 10, JSON.stringify(ids));
+
+  // «Сейчас» и разделы — 390, светлая тема
+  {
+    const { ctx, p, errs } = await openApp(390, "light", THEME_LIGHT);
+    await p.waitForSelector("#now-commitments:not([hidden])");
+    const chips = await p.$$eval("#now-groups .chip-btn", (n) => n.map((x) => x.textContent));
+    // «Защита» — если стенд успел прислать новое скрытое сообщение (повторный /seed-all его может не дать)
+    check("«Сейчас»: разделы со счётчиками", ["Ответы", "Разрешения", "Договорённости", "Память"]
+      .every((t) => chips.some((c) => new RegExp("^" + t + "\\d+$").test(c))), chips.join(" | "));
+    const row = await p.textContent("#now-commitments");
+    check("«Сейчас»: договорённости — просрочено N · сегодня M", /просрочено [2-9]\d* · сегодня [2-9]\d*/.test(row), row);
+    const nowText = await p.evaluate(() => { document.getElementById("now-more").open = true; return document.getElementById("now").innerText; });
+    check("«Сейчас»: аккаунты, последнее сообщение, модель, отправка, разбор входящих, ассистент",
+          ["Ваш аккаунт", "Аккаунт помощника", "Последнее сообщение в архиве", "Модель:", "Отправка: выключена",
+           "Разбор входящих:", "Ассистент: работает"].every((t) => nowText.includes(t)), nowText);
+    check("«Сейчас»: без текста переписки", !QUOTE_WORDS.some((w) => nowText.includes(w))
+      && !/смет|бетон|керамогранит/.test(nowText), nowText);
+    check("«Сейчас»: «Остановить всё» — та же кнопка, что в шапке", await p.locator("#now-halt .stop").count() === 1);
+    await p.locator("#now").screenshot({ path: path.join(P4_OUT, "now-390-light.png") });
+    await p.evaluate(() => { document.getElementById("now-more").open = false; });
+    // нажатие на раздел — к нему, раскрытым
+    await p.locator("#now-groups .chip-btn", { hasText: "Память" }).click();
+    await p.waitForTimeout(600);
+    const memory = await p.evaluate(() => {
+      const box = document.getElementById("grp-memory"), r = box.getBoundingClientRect();
+      return { open: box.open, top: r.top, inView: r.top >= -2 && r.top < window.innerHeight };
+    });
+    check("нажатие на раздел в «Сейчас» — к разделу, раскрытому", memory.open && memory.inView, JSON.stringify(memory));
+    // свернуть раздел — помнится после перезагрузки
+    await p.click("#grp-memory > summary");
+    const sections = await p.$$eval("#list > details", (n) => n.map((x) => [x.id, x.open, x.querySelectorAll(".card").length]));
+    const order = ["grp-answers", "grp-permissions", "grp-commitments", "grp-memory", "grp-guard"];
+    check("«Согласования» по разделам: порядок и счётчики", sections.length >= 4
+          && sections.every((s, i) => i === 0 || order.indexOf(s[0]) > order.indexOf(sections[i - 1][0]))
+          && sections.every((s) => s[2] > 0), JSON.stringify(sections));
+    await p.reload();
+    await p.waitForSelector("#screen-approvals:not([hidden]) #grp-memory");
+    check("свёрнутый раздел остаётся свёрнутым после перезагрузки",
+          await p.evaluate(() => !document.getElementById("grp-memory").open && document.getElementById("grp-answers").open));
+    const soon = await p.evaluate(() => ({ shown: !document.getElementById("soon").hidden,
+      items: [...document.querySelectorAll("#soon .soon-item")].map((b) => b.textContent),
+      tags: [...document.querySelectorAll(".soon-tag")].map((b) => b.textContent) }));
+    check("«Скоро истечёт»: только то, что истекает в течение часа, — «осталось N мин»",
+          soon.items.every((t) => /осталось (\d+ мин|меньше минуты)/.test(t)) && soon.tags.every((t) => /осталось/.test(t)),
+          JSON.stringify(soon));
+    await p.screenshot({ path: path.join(P4_OUT, "approvals-sections-390-light.png"), fullPage: true });
+    await p.evaluate(() => window.scrollTo(0, 0));
+    await p.screenshot({ path: path.join(P4_OUT, "approvals-top-390-light.png"), fullPage: false });
+    check("«Сейчас»: в консоли нет ошибок", realErrors(errs).length === 0, realErrors(errs).join(" | "));
+    await ctx.close();
+  }
+
+  // «Договорённости»
+  {
+    const { ctx, p, errs } = await openApp(390, "light", THEME_LIGHT);
+    await p.waitForSelector("#now-commitments:not([hidden])");
+    const badge = await p.textContent("#tab-commitments-count");
+    check("вкладка «Договорённости»: на ней — сколько на сегодня и просрочено", Number(badge) >= 4, badge);
+    await p.click("#now-commitments");
+    await p.waitForSelector("#cm-body:not([hidden]) .cm");
+    const groupsOf = () => p.$$eval("#cm-groups > details", (n) => n.map((x) => x.querySelector(".sect-title").textContent));
+    const inGroup = (group, id) => p.locator(`#cm-${group} #cm-item-${id}`).count();
+    const mine = await groupsOf();
+    const placed = async (pairs) => (await Promise.all(pairs.map(([g, name]) => inGroup(g, ids[name])))).every((n) => n === 1);
+    check("«Я обещал»: «Просрочено», «Сегодня», «На неделе», «Позже», «Без срока» — каждая на своём месте",
+          JSON.stringify(mine) === JSON.stringify(["Просрочено", "Сегодня", "На неделе", "Позже", "Без срока"])
+          && await placed([["overdue", "mine_overdue"], ["today", "mine_today"], ["week", "mine_week"],
+                           ["later", "mine_later"], ["no_date", "mine_nodate"]]), JSON.stringify(mine));
+    const first = await p.$eval(`#cm-item-${ids.mine_overdue}`, (n) => n.innerText);
+    check("договорённость: что, кому, срок, откуда, сфера",
+          first.includes("отправить смету по фасаду корпуса 2") && first.includes("Кому: Ольга Смирнова-Кузнецова")
+          && /просрочено на 2 дня/.test(first) && first.includes("Откуда: личный чат")
+          && first.includes("Стройка"), first);
+    const today = await p.$eval(`#cm-item-${ids.mine_today}`, (n) => n.innerText);
+    check("срок со временем — «сегодня до 15:00»", today.includes("сегодня до 15:00"), today);
+    const waiting = await p.textContent("#cm-waiting");
+    check("«ещё N ждут подтверждения» — со ссылкой в «Согласования»", /Ещё \d+ ждут? подтверждения/.test(waiting), waiting);
+    let text = await p.evaluate(() => document.getElementById("screen-commitments").innerText);
+    check("«Договорённости»: без текста сообщений и без скрытой защитой", !QUOTE_WORDS.some((w) => text.includes(w)), text);
+    await p.screenshot({ path: path.join(P4_OUT, "commitments-mine-390-light.png"), fullPage: true });
+    await p.click("#cm-dir-owed_to_owner");
+    await p.waitForSelector("#cm-dir-owed_to_owner[aria-selected='true']");
+    const theirs = await groupsOf();
+    check("«Мне обещали»: по группам срока, скрытая защитой не показана",
+          await placed([["overdue", "theirs_overdue"], ["today", "theirs_today"], ["week", "theirs_week"],
+                        ["no_date", "theirs_nodate"]]) && await p.locator(`#cm-item-${ids.hidden}`).count() === 0,
+          JSON.stringify(theirs));
+    text = await p.evaluate(() => document.getElementById("screen-commitments").innerText);
+    check("«Мне обещали»: «Кто: …»", text.includes("Кто: Сергей Ковалёв") && !text.includes("скрытая"), text);
+    await p.screenshot({ path: path.join(P4_OUT, "commitments-theirs-390-light.png"), fullPage: true });
+
+    // «Выполнено» → «Вернуть»
+    await p.locator(`#cm-item-${ids.theirs_overdue} button`, { hasText: "Выполнено" }).click();
+    await p.waitForSelector("#toast:not([hidden]) .toast-btn");
+    await p.locator("#toast").screenshot({ path: path.join(P4_OUT, "commitments-done-undo-390-light.png") });
+    let state = await seen4();
+    check("«Выполнено» — сразу; журнал: владелец, из приложения", state.status.theirs_overdue === "done"
+          && state.events.theirs_overdue[0].actor === "owner" && state.events.theirs_overdue[0].details.via === "app",
+          JSON.stringify(state.events.theirs_overdue));
+    await p.click("#toast .toast-btn");
+    await waitFor(async () => (await seen4()).status.theirs_overdue === "open", 5000);
+    await p.waitForSelector(`#cm-overdue #cm-item-${ids.theirs_overdue}`);
+    check("«Вернуть» — снова в списке", (await seen4()).status.theirs_overdue === "open");
+    // «Перенести» → «На завтра»: из «Сегодня» уходит в «На неделе»
+    const before = (await seen4()).due.theirs_today;
+    const todayItem = `#cm-item-${ids.theirs_today}`;
+    await p.locator(`${todayItem} button`, { hasText: "Перенести" }).click();
+    await p.waitForSelector(`${todayItem} .cm-move`);
+    await p.locator(todayItem).screenshot({ path: path.join(P4_OUT, "commitments-move-390-light.png") });
+    await p.locator(`${todayItem} .cm-move button`, { hasText: "На завтра" }).click();
+    await waitFor(async () => (await seen4()).due.theirs_today !== before, 5000);
+    await p.waitForSelector(`#cm-week ${todayItem}`);
+    state = await seen4();
+    check("«Перенести на завтра» — новый срок, журнал «перенесено» из приложения",
+          state.events.theirs_today[0].action === "rescheduled" && state.events.theirs_today[0].details.via === "app",
+          JSON.stringify(state.events.theirs_today));
+    // «Не так» → подтверждение в строке → «Убрать»
+    const weekItem = `#cm-item-${ids.theirs_week}`;
+    await p.locator(`${weekItem} button`, { hasText: "Не так" }).click();
+    await p.waitForSelector(`${weekItem} .confirm`);
+    await p.locator(weekItem).screenshot({ path: path.join(P4_OUT, "commitments-wrong-390-light.png") });
+    await p.locator(`${weekItem} .confirm button`, { hasText: "Убрать" }).click();
+    await waitFor(async () => (await seen4()).status.theirs_week === "rejected", 5000);
+    state = await seen4();
+    check("«Не так» — убрана как неверная, в журнале страницы — номер без формулировки",
+          state.status.theirs_week === "rejected" && state.audit.some((r) => r.action === "app.commitment_wrong")
+          && !JSON.stringify(state.audit).match(/керамогранит|Ольга|Сергей/), JSON.stringify(state.audit));
+    check("«Договорённости»: в консоли нет ошибок", realErrors(errs).length === 0, realErrors(errs).join(" | "));
+    await ctx.close();
+  }
+
+  // телефон 360 и 390, светлая и тёмная тема: ширина, контраст, снимки
+  for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark", THEME], [390, "dark", THEME]]) {
+    const tag = `${width}-${scheme}`;
+    const { ctx, p } = await openApp(width, scheme, theme);
+    await p.waitForSelector("#now-commitments:not([hidden])");
+    let fit = await fits(p);
+    check(`«Согласования» и «Сейчас» ${tag}: страница не шире экрана, кнопки и вкладки не выходят за край`,
+          fit.wide && fit.out === 0, JSON.stringify(fit));
+    let low = await lowContrast(p);
+    check(`«Согласования» и «Сейчас» ${tag}: контраст текста не ниже 4,5:1`, low.length === 0, low.slice(0, 6).join("; "));
+    await p.screenshot({ path: path.join(P4_OUT, `approvals-top-${tag}.png`), fullPage: false });
+    await p.click("#tab-commitments");
+    await p.waitForSelector("#cm-body:not([hidden]) .cm");
+    await p.locator(`#cm-item-${ids.mine_overdue} button`, { hasText: "Перенести" }).click();
+    fit = await fits(p);
+    check(`«Договорённости» ${tag}: страница не шире экрана, кнопки не выходят за край`, fit.wide && fit.out === 0,
+          JSON.stringify(fit));
+    low = await lowContrast(p);
+    check(`«Договорённости» ${tag}: контраст текста не ниже 4,5:1`, low.length === 0, low.slice(0, 6).join("; "));
+    await p.screenshot({ path: path.join(P4_OUT, `commitments-mine-${tag}.png`), fullPage: true });
+    await p.click("#cm-dir-owed_to_owner");
+    await p.screenshot({ path: path.join(P4_OUT, `commitments-theirs-${tag}.png`), fullPage: true });
+    await ctx.close();
+  }
+
+  // ?open=commitments — кнопка «Открыть «Штурман»» под /today
+  {
+    const ctx = await browser.newContext({ ...phone, colorScheme: "light" });
+    const p = await ctx.newPage();
+    const params = new URLSearchParams({ tgWebAppData: await control("/init-data?who=owner"), tgWebAppVersion: "8.0",
+                                         tgWebAppPlatform: "ios", tgWebAppThemeParams: JSON.stringify(THEME_LIGHT) });
+    await p.goto(APP + "?open=commitments#" + params.toString());
+    await p.waitForSelector("#screen-commitments:not([hidden]) #cm-body:not([hidden])");
+    check("?open=commitments открывает «Договорённости», адрес очищен",
+          await p.getAttribute("#tab-commitments", "aria-selected") === "true" && !p.url().includes("open="), p.url());
+    await ctx.close();
+  }
+
+  // /today в боте
+  {
+    await post("/bot/text?text=" + encodeURIComponent("/today"));
+    let msg = null;
+    for (let i = 0; i < 20 && !msg; i++) {
+      msg = (await control("/bot/sent")).filter((m) => (m.text || "").startsWith("Сегодня, ")).pop();
+      if (!msg) await new Promise((r) => setTimeout(r, 200));
+    }
+    const kb = msg && msg.reply_markup ? msg.reply_markup.inline_keyboard.flat() : [];
+    check("/today: «Я обещал» и «Мне обещали», на сегодня и просроченные, без текста сообщений",
+          msg && msg.text.includes("Я обещал") && msg.text.includes("Мне обещали") && msg.text.includes("просрочено на 2 дня")
+          && !msg.text.includes("обход") && !QUOTE_WORDS.some((w) => msg.text.includes(w)), msg ? msg.text : "нет сообщения");
+    check("/today: кнопки меню, «Сегодня» — среди них", kb.some((b) => b.text === "Сегодня" && b.callback_data === "sh:oc:today"),
+          JSON.stringify(kb.map((b) => b.text)));
+    if (process.env.E2E_SETUP_ORIGIN) {
+      check("/today: «Открыть «Штурман»» — сразу на «Договорённости»", kb.some((b) => b.text === "Открыть «Штурман»"
+        && b.web_app && b.web_app.url.endsWith("/shturman-setup/app/?open=commitments")), JSON.stringify(kb));
+    }
+    if (msg) {
+      const ctx = await browser.newContext({ viewport: { width: 460, height: 300 }, deviceScaleFactor: 2, locale: "ru-RU" });
+      const page = await ctx.newPage();
+      const esc = (s) => String(s || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      const rows = ((msg.reply_markup && msg.reply_markup.inline_keyboard) || [])
+        .map((row) => `<div class="row">${row.map((b) => `<span class="b">${esc(b.text)}</span>`).join("")}</div>`).join("");
+      await page.setContent(`<!doctype html><meta charset="utf-8"><style>
+        body { margin: 0; padding: 14px; font: 15px/1.38 -apple-system, "Segoe UI", Roboto, sans-serif; background: #c8d8e6; color: #000; }
+        .head { font-weight: 600; margin: 0 0 10px; color: #2b5278; }
+        .bubble { white-space: pre-wrap; overflow-wrap: anywhere; background: #fff; border-radius: 12px 12px 12px 4px;
+                  padding: 8px 11px; box-shadow: 0 1px 1px rgba(0,0,0,.12); max-width: 420px; }
+        .kbd .row { display: flex; gap: 4px; margin-top: 4px; max-width: 420px; }
+        .kbd .b { flex: 1; text-align: center; padding: 8px 6px; border-radius: 8px; font-size: 14px;
+                  background: rgba(64,120,160,.55); color: #fff; }
+      </style><div class="head">Бот согласований</div><div class="bubble">${esc(msg.text)}</div><div class="kbd">${rows}</div>`);
+      await page.locator("body").screenshot({ path: path.join(P4_OUT, "bot-today.png") });
+      await ctx.close();
+    }
+  }
+}
+
+// --- 12. Пакет 4б (Р-95): вкладка «История», «Доверие», сводки во вкладке 🔔 ------------------------------
 // «Отозвать» — сразу; «Вернуть как было» ужесточение — сразу; расширение доверия — только карточкой в бот,
 // «Да» под которой в приложении не нажать. Сводки: строка во вкладке 🔔, сразу, плагин применяет.
 {
