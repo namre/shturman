@@ -265,16 +265,28 @@ bk_verify() {
   return "$bad"
 }
 
-# Ротация: в каталоге $1 остаются $2 последних копий; остальные метки удаляются целиком (все файлы
-# с этой меткой). Метку $3 (копия, из которой сейчас восстанавливают) не трогаем.
-bk_rotate() {
-  local dir="$1" keep="$2" protect="${3:-}" s i=0
+# Копии сверх ротации — одна точка правды для ./ops/backup.sh (ротация после каждой копии) и
+# ./ops/cleanup.sh --backups (удаление по решению человека): в каталоге $1 остаются $2 последних копий,
+# остальные метки — целиком (архив, выгрузка, опись). Печатает пути файлов. Метку $3 (копия, из которой
+# сейчас восстанавливают) не трогаем.
+bk_extra() {
+  local dir="$1" keep="$2" protect="${3:-}" s f i=0
   for s in $(bk_stamps "$dir"); do
     i=$((i + 1))
     [ "$i" -le "$keep" ] && continue
     [ "$s" = "$protect" ] && continue
-    rm -f -- "$dir/data-$s.tar.gz" "$dir/db-$s.dump" "$dir/meta-$s.txt"
+    for f in "$dir/data-$s.tar.gz" "$dir/db-$s.dump" "$dir/meta-$s.txt"; do
+      if [ -f "$f" ]; then printf '%s\n' "$f"; fi
+    done
   done
+}
+bk_rotate() {
+  local f
+  while IFS= read -r f; do
+    if [ -n "$f" ]; then rm -f -- "$f"; fi
+  done <<EOF_ROT
+$(bk_extra "$1" "$2" "${3:-}")
+EOF_ROT
 }
 
 # --- остановка и восстановление ---

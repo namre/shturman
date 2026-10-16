@@ -1,0 +1,8 @@
+{"accounts": 1, "chats": 12, "chats_excluded": 0, "messages": 3456, "jobs_waiting": 0, "jobs_failed": 0,
+ "owner_known": true, "own_bot": true, "own_llm": true,
+ "tg_health": {"configured": true, "checked": true, "worst": "relogin",
+               "accounts": [{"role": "owner", "state": "relogin", "for_s": 600, "update_age_s": null},
+                            {"role": "assistant", "state": "ok", "for_s": 7200, "update_age_s": 120}]},
+ "pulse": {"enabled": true, "configured": true, "problem": null, "host": "hc-ping.com", "every_s": 300,
+           "last_age_s": 120, "last_sent": "fail", "last_delivered": true, "last_error": null,
+           "failing": ["telegram:relogin"], "sent": 10, "errors": 0}}

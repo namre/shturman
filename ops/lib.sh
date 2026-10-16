@@ -427,3 +427,48 @@ hermes_verified() {
   [ -n "$tag" ] && [ -f "$file" ] || return 1
   awk -F'\t' -v t="$tag" '!/^#/ && $1 == t { found = 1 } END { exit found ? 0 : 1 }' "$file"
 }
+
+# --- что занимает диск (Р-98): ./ops/doctor.sh (строка disk-usage), ./ops/diag.sh, ./ops/cleanup.sh ---
+# Только размеры каталогов целиком и образов Docker: имён файлов внутри data/ функции не печатают и
+# содержимого не читают. Каталог базы принадлежит пользователю контейнера базы — его размер спрашивается
+# у самого контейнера (du), а без него — как получится.
+
+# Размер каталога в МБ; нет каталога — пусто.
+dir_mb() {
+  [ -e "$1" ] || return 0
+  du -sm "$1" 2>/dev/null | awk 'NR == 1 {print $1}'
+}
+
+# «850 МБ» / «2.4 ГБ».
+human_mb() {
+  awk -v m="${1:-0}" 'BEGIN { if (m >= 1024) printf "%.1f ГБ", m / 1024; else printf "%d МБ", m }'
+}
+
+# Одна строка: что сколько занимает — база, переписка, Hermes, модели, копии, образы Docker.
+disk_usage() {
+  local out="" db sh he models m b n img rec
+  db="$(docker exec shturman-postgres du -sm /var/lib/postgresql/data 2>/dev/null | awk 'NR == 1 {print $1}')" || db=""
+  [ -n "$db" ] || db="$(dir_mb data/postgres)"
+  [ -n "$db" ] && out="база архива $(human_mb "$db")"
+  sh="$(dir_mb data/shturman)"
+  [ -n "$sh" ] && out="${out:+$out, }сессии, страницы памяти и вложения на разборе $(human_mb "$sh")"
+  he="$(dir_mb data/hermes)"
+  [ -n "$he" ] && out="${out:+$out, }Hermes $(human_mb "$he")"
+  models=0
+  for m in data/embeddings data/guard data/asr; do
+    b="$(dir_mb "$m")"; models=$((models + ${b:-0}))
+  done
+  [ "$models" -gt 0 ] && out="${out:+$out, }модели $(human_mb "$models")"
+  if [ -d local/backups ]; then
+    b="$(dir_mb local/backups)"
+    n="$(find local/backups -maxdepth 1 -type f \( -name 'data-*.tar.gz' -o -name 'db-*.dump' \) 2>/dev/null | wc -l)"
+    out="${out:+$out, }копии $(human_mb "${b:-0}") (файлов: $n)"
+  fi
+  # Образы Docker: всего и сколько не используется ни одним контейнером — без prune.
+  img="$(docker system df --format '{{.Type}}|{{.Size}}|{{.Reclaimable}}' 2>/dev/null | awk -F'|' '$1 == "Images" {print $2 "|" $3; exit}')" || img=""
+  if [ -n "$img" ]; then
+    rec="${img#*|}"; rec="${rec%% *}"
+    out="${out:+$out, }образы Docker ${img%%|*} (не используются: $rec)"
+  fi
+  printf '%s\n' "$out"
+}

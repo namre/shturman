@@ -197,7 +197,14 @@ async def request_refresh(conn: asyncpg.Connection, *, key: str) -> int | None:
     return await _enqueue(conn, await desired(conn), apply=False, key=key)
 
 
-_JOB_FIELDS = ("exists", "enabled", "time", "day", "expr", "next_run_at", "next_local")
+_JOB_FIELDS = ("exists", "enabled", "time", "day", "expr", "next_run_at", "next_local", "last", "last_run_at")
+# Итог последнего запуска задачи в Hermes (Р-98) — код от плагина (`shturman_core.cron_jobs.last_run`):
+# delivered — сводка ушла; silent — отработала, сказать было нечего ([SILENT]); failed — упала;
+# delivery_failed — составлена, но не доставлена; queued — ждёт доставки; running — идёт сейчас;
+# done — отработала, а ушла или промолчала, Hermes не записал; never — ещё не запускалась.
+LAST_CODES = ("delivered", "silent", "failed", "delivery_failed", "queued", "running", "done", "never")
+SILENT_AFTER = timedelta(hours=3)    # плагин не отвечал дольше (смотрит раз в час) — ассистент молчит
+MISSED_AFTER = timedelta(minutes=90)  # столько после времени сводки — и её запуска так и нет
 
 
 def _clean_report(result: dict[str, Any]) -> dict[str, Any]:
@@ -214,9 +221,11 @@ def _clean_report(result: dict[str, Any]) -> dict[str, Any]:
             item["time"] = job["time"]
         if isinstance(job.get("day"), int) and not isinstance(job.get("day"), bool) and 0 <= job["day"] <= 6:
             item["day"] = job["day"]
-        for field in ("expr", "next_run_at", "next_local"):
+        for field in ("expr", "next_run_at", "next_local", "last_run_at"):
             if isinstance(job.get(field), str):
                 item[field] = job[field][:64]
+        if job.get("last") in LAST_CODES:
+            item["last"] = job["last"]
         out_jobs[key] = item
     zone = result.get("timezone") if isinstance(result.get("timezone"), str) else None
     error = result.get("error") if result.get("error") in _ERRORS else None
@@ -301,10 +310,56 @@ async def overview(conn: asyncpg.Connection) -> dict[str, Any]:
     """Для `GET /api/status` и строки `summaries` в `./ops/doctor.sh`: только признаки и время."""
     v = await view(conn)
     nxt = {key: (v["hermes"][key] or {}).get("next_local") for key in KEYS}
+    morning = v["hermes"]["morning-brief"] or {}
     return {"summaries_available": v["available"], "summaries_chosen": v["chosen"],
             "summaries_state": v["sync"]["state"], "summaries_differs": v["sync"]["differs"],
             "summaries_reported_at": v["reported_at"], "summaries_next_morning": nxt["morning-brief"],
-            "summaries_next_weekly": nxt["weekly-review"]}
+            "summaries_next_weekly": nxt["weekly-review"],
+            "summaries_last_morning": morning.get("last"), "summaries_last_morning_at": morning.get("last_run_at")}
+
+
+def _scheduled_today(time_text: Any, zone_name: Any, now: datetime) -> datetime | None:
+    """Время сводки сегодня по поясу шлюза Hermes. None — не разобрать."""
+    from zoneinfo import ZoneInfo
+
+    if not isinstance(time_text, str) or not _TIME.match(time_text):
+        return None
+    try:
+        zone = ZoneInfo(zone_name) if isinstance(zone_name, str) and zone_name else ZoneInfo("UTC")
+    except Exception:  # noqa: BLE001
+        return None
+    local = now.astimezone(zone)
+    hour, minute = (int(x) for x in time_text.split(":"))
+    return local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def morning_problem(have: dict[str, Any] | None, *, now: datetime | None = None,
+                    zone: str | None = None) -> str | None:
+    """Для внешнего сторожа (pulse.py): неполадка утренней сводки или None.
+
+    assistant_silent — плагин Hermes давно не отвечал на «посмотреть» (раз в час): шлюз Hermes стоит;
+    summary_failed — последний запуск за сутки упал или не доставлен;
+    summary_missed — время сводки сегодня прошло на `MISSED_AFTER`, плагин с тех пор отвечал, а запуска не было.
+    «Промолчала» ([SILENT]) — не неполадка. Сводка выключена, Hermes нет или он не отвечал давно
+    (`AVAILABLE_DAYS`) — проверять нечего, None."""
+    now = now or datetime.now(timezone.utc)
+    reported = _parse((have or {}).get("reported_at"))
+    if reported is None or now - reported >= timedelta(days=AVAILABLE_DAYS):
+        return None
+    if now - reported > SILENT_AFTER:
+        return "assistant_silent"
+    job = ((have or {}).get("jobs") or {}).get("morning-brief") or {}
+    if not job.get("exists") or not job.get("enabled") or "last" not in job:
+        return None     # плагин прежней версии итога запуска не сообщает — судить не по чему
+    ran = _parse(job.get("last_run_at"))
+    if job.get("last") in ("failed", "delivery_failed") and ran is not None and now - ran < timedelta(hours=26):
+        return "summary_failed"
+    planned = _scheduled_today(job.get("time"), (have or {}).get("timezone") or zone, now)
+    if planned is None or now < planned + MISSED_AFTER or reported < planned + timedelta(minutes=15):
+        return None
+    if ran is None or ran < planned - timedelta(minutes=5):
+        return "summary_missed"
+    return None
 
 
 BOOT_DELAY = 30              # секунд после запуска до первого «посмотреть»: плагин успевает подключиться

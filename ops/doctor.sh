@@ -30,6 +30,13 @@
 # расписания и время следующего запуска, без текста задачи. Строка summaries (Р-95) — совпадает ли
 # расписание сводок в Hermes с выбором владельца в «Настройках Штурмана» (по ответу плагина сервису;
 # только признаки). Без выбора владельца и в режиме без Hermes строки нет.
+# Молчаливые сбои (Р-98): summary-last — итог последнего запуска сводок по записи задачи Hermes и его
+# журналу запусков (ушла, промолчала [SILENT], упала, не доставлена, выключена, планировщик не запускал;
+# только коды и время, без текста сводки); bot-live — в контейнере Hermes один запрос getMe к Telegram Bot
+# API с токеном бота ассистента (печатается только код ответа) и состояние платформы telegram в файле
+# состояния шлюза; tg-session — сессии Telegram по ролям из tg_health (/api/status); pulse — внешний
+# сторож; disk-usage — что занимает диск (размеры каталогов целиком, образы Docker). В строках
+# approvals-bot и model — давность последнего ответа Telegram на опрос и последнего успешного ответа модели.
 # Строка hermes-version сверяет тег образа Hermes со списком проверенных версий config/hermes-versions.txt.
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
@@ -43,6 +50,7 @@ pass() { printf 'PASS  %s: %s\n' "$1" "$2"; }
 warn() { printf 'WARN  %s: %s\n' "$1" "$2"; }
 fail() { printf 'FAIL  %s: %s\n' "$1" "$2"; fails=$((fails + 1)); }
 skip() { printf 'SKIP  %s: %s\n' "$1" "$2"; }
+tab="$(printf '\t')"
 
 # Экземпляр без домена (docs/deployment.md, «Без домена»): адрес дашборда или страницы настройки
 # записан внешним IPv4-адресом. Сертификат на IP-адрес Let's Encrypt выдаёт только короткий —
@@ -308,7 +316,7 @@ if [ -n "$public_url" ]; then
   if curl -s -m 5 http://127.0.0.1:9119/api/auth/providers 2>/dev/null | grep -q '"name":"shturman"'; then
     pass login "способ входа «Штурман» подключён"
   else
-    fail login "плагин shturman не зарегистрировал вход — смотрите docker logs --tail 50 shturman-hermes"
+    fail login "плагин shturman не зарегистрировал вход — ./ops/up.sh; не помогло — ./ops/diag.sh --print (журнал Hermes — только счётчики ошибок; сам журнал — только с разрешения владельца: в нём начало текста его сообщений)"
   fi
   page="$(curl -s -o /dev/null -m 8 -w '%{http_code}' "$public_url/shturman-auth/login.html" 2>/dev/null)"
   case "${page:-000}" in
@@ -422,6 +430,149 @@ elif [ "$tz_listed" != yes ]; then
 else
   pass cron-schedule "задач сводок shturman:* в Hermes нет — их заводит плагин (POST /api/plugins/shturman/cron/install)"
 fi
+
+# --- итог последнего запуска сводок (Р-98) ---
+# По записи задачи Hermes (last_run_at, last_status) и последней записи его журнала запусков (status,
+# delivery_outcome: cron/executions.py в 0.21.5) — только коды и время, без текста сводки и без текста
+# ошибки. Различается: ушла; отработала, но сказать было нечего ([SILENT]); упала; не доставлена;
+# выключена или задачи нет (не PASS); следующий запуск давно в прошлом — планировщик не запускал.
+sl_rows=""; sl_listed=no; sl_ledger=unknown
+while IFS="$tab" read -r k f1 f2 f3 f4 f5; do
+  case "$k" in
+    last) sl_rows="$sl_rows$f1$tab$f2$tab$f3$tab$f4$tab$f5"$'\n' ;;
+    ledger) sl_ledger="$f1" ;;
+    listed) sl_listed=yes ;;
+  esac
+done <<EOF_LAST
+$(hpy -c '
+import os, sys
+from datetime import datetime, timezone
+sys.path.insert(0, "/opt/data/plugins/shturman")
+from shturman_core import cron_jobs
+from hermes_cli.config import read_raw_config
+from cron.jobs import list_jobs
+zone = cron_jobs.expected_zone(os.environ.get("HERMES_TIMEZONE"), cron_jobs.config_zone(read_raw_config()))
+jobs = cron_jobs.ours(list_jobs(include_disabled=True))
+try:
+    from cron.executions import latest_executions
+    ledger = latest_executions([str(j.get("id")) for j in jobs if j.get("id")])
+    print("ledger", "yes", sep="\t")
+except Exception:
+    ledger = None
+    print("ledger", "no", sep="\t")
+now = datetime.now(timezone.utc)
+for job in jobs:
+    ex = (ledger or {}).get(str(job.get("id")))
+    on = job.get("enabled", True) and job.get("state") != "paused"
+    state = "overdue" if cron_jobs.overdue(job, now) else "on" if on else "paused"
+    when = cron_jobs.local_run(cron_jobs.last_run_at(job, ex), zone) or "-"
+    nxt = cron_jobs.local_run(job.get("next_run_at"), zone) or "-"
+    print("last", job.get("name"), state, cron_jobs.last_run(job, ex), when, nxt, sep="\t")
+print("listed")')
+EOF_LAST
+if [ "$sl_listed" != yes ]; then
+  warn summary-last "итог последнего запуска сводок не проверен: в этой версии Hermes нет нужных функций либо контейнер не ответил"
+else
+  sl_seen=""
+  while IFS="$tab" read -r name sstate code when nxt; do
+    [ -n "$name" ] || continue
+    case "$name" in shturman:morning-brief) title="утренняя сводка"; sl_seen="${sl_seen}m" ;;
+      shturman:weekly-review) title="обзор недели"; sl_seen="${sl_seen}w" ;; *) continue ;; esac
+    [ "$when" = - ] && when="?"
+    if [ "$sstate" = paused ]; then
+      warn summary-last "задача «$title» выключена в Hermes — сводка не придёт. Если её выключил владелец в «Настройках Штурмана» (блок «Утренняя сводка») — это его решение; включает он там же. Задачу в Hermes руками не править"
+      continue
+    fi
+    if [ "$sstate" = overdue ]; then
+      fail summary-last "$title: следующий запуск ($nxt) прошёл больше 10 минут назад, а запуска не было — планировщик шлюза Hermes стоит или Hermes перезапускался: ./ops/up.sh, затем ./ops/doctor.sh"
+      continue
+    fi
+    case "$code" in
+      delivered) pass summary-last "$title: последняя ушла владельцу ($when)" ;;
+      silent)    pass summary-last "$title: последний запуск ($when) отработал, но сказать было нечего ([SILENT]) — в пустой день сводка не приходит намеренно" ;;
+      done)      pass summary-last "$title: последний запуск ($when) отработал; ушла она или промолчала ([SILENT]), эта версия Hermes не записывает" ;;
+      never)     pass summary-last "$title: ещё не запускалась; первый запуск — $nxt" ;;
+      running)   pass summary-last "$title: идёт сейчас" ;;
+      queued)    warn summary-last "$title ($when) составлена, но ждёт доставки: шлюз Hermes не на связи с Telegram — смотрите строку bot-live" ;;
+      delivery_failed) fail summary-last "$title ($when) составлена, но не доставлена: Telegram не принял сообщение бота ассистента или некуда доставлять — строки bot-live и bot-owner. Повторный запуск — только по решению владельца: сводка придёт ему и потратит запросы к модели" ;;
+      failed)    fail summary-last "$title: последний запуск ($when) упал — чаще всего модель ассистента не ответила (ключ, лимит, сеть) или архив недоступен (строки archive-mcp, jobs-failing). Текст ошибки — в журнале Hermes, его без разрешения владельца не читают: в нём может быть его переписка. Повторный запуск — только по решению владельца" ;;
+      *)         warn summary-last "$title: итог последнего запуска не распознан (код $code)" ;;
+    esac
+  done <<EOF_LAST2
+$sl_rows
+EOF_LAST2
+  case "$sl_seen" in
+    *m*) ;;
+    *) warn summary-last "задачи утренней сводки в Hermes нет — сводка не придёт. Завести: «Настройки Штурмана», блок «Утренняя сводка», «Применить снова» (это делает владелец); если блока нет — мастер настройки ассистента" ;;
+  esac
+  [ "$sl_ledger" = yes ] || warn summary-last-ledger "журнала запусков задач в этой версии Hermes нет: «ушла» и «промолчала» ([SILENT]) не различаются"
+fi
+
+# --- бот ассистента на связи (Р-98) ---
+# Живая проверка, а не «задан ли токен»: в контейнере Hermes один запрос getMe к Telegram Bot API с
+# токеном бота ассистента, как его видит Hermes (.env профиля), — печатается только код ответа; токен
+# не печатается, в командную строку и в журнал не попадает. Плюс состояние платформы telegram в файле
+# состояния шлюза Hermes (gateway_state.json, gateway/status.py в 0.21.5): на связи ли шлюз с Telegram,
+# короткий код ошибки и не устарел ли файл (шлюз обновляет его раз в минуту). Текста ошибок здесь нет.
+bl_getme=unknown; bl_tg=unknown; bl_code=""; bl_stale=unknown
+while IFS='=' read -r k v; do
+  case "$k" in getme) bl_getme="$v" ;; tg) bl_tg="$v" ;; code) bl_code="$v" ;; stale) bl_stale="$v" ;; esac
+done <<EOF_BOT
+$(hpy -c '
+import json, os, re, urllib.error, urllib.request
+token = ""
+try:
+    from hermes_cli.config import get_env_value_prefer_dotenv
+    token = (get_env_value_prefer_dotenv("TELEGRAM_BOT_TOKEN") or "").strip()
+except Exception:
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+if not token:
+    print("getme=none")
+elif not re.fullmatch(r"[0-9]{3,20}:[A-Za-z0-9_-]{20,100}", token):
+    print("getme=format")
+else:
+    try:
+        req = urllib.request.Request("https://api.telegram.org/bot" + token + "/getMe")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print("getme=" + ("ok" if json.load(r).get("ok") is True else "bad"))
+    except urllib.error.HTTPError as exc:
+        print("getme=%d" % exc.code)
+    except Exception:
+        print("getme=net")
+token = ""
+try:
+    from gateway.status import read_runtime_status, runtime_status_is_stale
+    rec = read_runtime_status() or {}
+    plats = rec.get("platforms") if isinstance(rec.get("platforms"), dict) else {}
+    entry = plats.get("telegram")
+    if not isinstance(entry, dict):
+        entry = next((v for k, v in plats.items() if isinstance(k, str) and k.endswith(":telegram") and isinstance(v, dict)), None)
+    print("stale=" + ("yes" if runtime_status_is_stale(rec) else "no"))
+    if isinstance(entry, dict):
+        print("tg=" + (re.sub(r"[^a-z_]", "", str(entry.get("state") or ""))[:20] or "unknown"))
+        print("code=" + re.sub(r"[^A-Za-z0-9_]", "", str(entry.get("error_code") or ""))[:40])
+    else:
+        print("tg=absent")
+except Exception:
+    print("tg=unknown")')
+EOF_BOT
+case "$bl_getme" in
+  none) ;;   # токена нет — об этом строка bot-token
+  format) fail bot-live "токен бота ассистента записан в Hermes не в том виде (не «число:строка») — новый токен вводит владелец в мастере настройки, шаг «Бот в Telegram»" ;;
+  401|404) fail bot-live "Telegram не принимает токен бота ассистента (HTTP $bl_getme): его отозвали в @BotFather или бота удалили — новый токен вводит владелец в мастере настройки, шаг «Бот в Telegram» (или в ключах дашборда Hermes); агент токена не видит и не спрашивает" ;;
+  ok)
+    case "$bl_stale:$bl_tg" in
+      yes:*) warn bot-live "Telegram принимает токен бота ассистента, но шлюз Hermes больше двух минут не обновлял своё состояние — он не запущен или завис: ./ops/up.sh, затем ./ops/doctor.sh" ;;
+      *:connected) pass bot-live "бот ассистента на связи: Telegram принимает его токен, шлюз Hermes подключён к Telegram" ;;
+      *:connecting|*:retrying) warn bot-live "Telegram принимает токен бота ассистента, а шлюз Hermes ещё подключается к Telegram (${bl_tg}${bl_code:+, код $bl_code}) — повторите проверку через пару минут; не прошло — ./ops/up.sh" ;;
+      *:fatal) fail bot-live "шлюз Hermes не может работать с Telegram (fatal${bl_code:+, код $bl_code}) — ./ops/up.sh; если повторится — токеном бота ассистента пользуется другая программа (тот же токен, что у бота согласований?)" ;;
+      *:paused|*:disabled) warn bot-live "Telegram в шлюзе Hermes выключен или на паузе ($bl_tg) — бот ассистента не отвечает; включается в дашборде Hermes, затем ./ops/up.sh" ;;
+      *:absent) warn bot-live "Telegram принимает токен бота ассистента, а в состоянии шлюза Hermes подключения к Telegram нет — шлюз запущен без него: ./ops/up.sh" ;;
+      *) pass bot-live "Telegram принимает токен бота ассистента; состояние шлюза Hermes не прочитано (в этой версии Hermes нет нужных функций)" ;;
+    esac ;;
+  net) warn bot-live "из контейнера Hermes нет связи с api.telegram.org — сеть сервера или прокси (EGRESS_PROXY_URL); бот ассистента не получает сообщений" ;;
+  *) warn bot-live "живая проверка бота ассистента не выполнена (${bl_getme}) — контейнер Hermes не ответил" ;;
+esac
 
 # --- бизнес-режим Telegram ---
 # Бизнес-режим подключается только к боту согласований сервиса (способ «ассистент — отдельный
@@ -984,7 +1135,7 @@ EOF4
   # Строка model с Hermes появляется, только если своя модель настроена: разбор делает ассистент.
   bot_configured=unknown; bot_polling=unknown; bot_problem=""; bot_owner=unknown; bot_business=unknown; bot_menu=""; bot_via=""
   llm_configured=unknown; llm_model=""; llm_last=unknown; llm_problem=""; llm_calls=0; llm_failures=0
-  llm_way=""; llm_sub=""
+  llm_way=""; llm_sub=""; bot_poll_age=""; llm_ok_age=""
   while IFS='=' read -r k v; do
     case "$k" in
       bot_configured) bot_configured="$v" ;; bot_polling) bot_polling="$v" ;; bot_problem) bot_problem="$v" ;;
@@ -992,6 +1143,7 @@ EOF4
       llm_configured) llm_configured="$v" ;; llm_model) llm_model="$v" ;; llm_last) llm_last="$v" ;;
       llm_problem) llm_problem="$v" ;; llm_calls) llm_calls="$v" ;; llm_failures) llm_failures="$v" ;;
       llm_way) llm_way="$v" ;; llm_sub) llm_sub="$v" ;;
+      bot_poll_age) bot_poll_age="$v" ;; llm_ok_age) llm_ok_age="$v" ;;
     esac
   done <<EOF3
 $(docker exec "$svc" shturman call GET /api/executor/status 2>/dev/null | docker exec -i "$svc" python -c '
@@ -1018,7 +1170,10 @@ print("llm_problem=" + safe(m.get("problem")))
 print("llm_calls=" + num(m.get("calls")))
 print("llm_failures=" + num(m.get("failures")))
 print("llm_way=" + safe(m.get("way")))
-print("llm_sub=" + safe(m.get("subscription")))' 2>/dev/null)
+print("llm_sub=" + safe(m.get("subscription")))
+age = lambda v: str(v) if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else ""
+print("bot_poll_age=" + age(b.get("last_poll_age")))
+print("llm_ok_age=" + age(m.get("last_ok_age")))' 2>/dev/null)
 EOF3
 
   if [ "$bot_configured" = unknown ]; then
@@ -1028,7 +1183,10 @@ EOF3
   else
     if [ -n "$bot_problem" ]; then
       fail approvals-bot "бот согласований не работает, код неполадки: $bot_problem — расшифровка: docker exec $svc shturman bot-status"
-    elif [ "$bot_polling" = yes ]; then pass approvals-bot "бот согласований на связи с Telegram"
+    elif [ "$bot_polling" = yes ] && [ -n "$bot_poll_age" ] && [ "$bot_poll_age" -gt 180 ]; then
+      # Опрос — долгий запрос getUpdates (до минуты): ответа нет дольше трёх минут — опрос завис (Р-98).
+      warn approvals-bot "бот согласований: последний ответ Telegram на опрос был $((bot_poll_age / 60)) мин назад — опрос завис или нет связи; расшифровка: docker exec $svc shturman bot-status"
+    elif [ "$bot_polling" = yes ]; then pass approvals-bot "бот согласований на связи с Telegram${bot_poll_age:+: последний ответ на опрос $bot_poll_age с назад}"
     else warn approvals-bot "бот согласований ещё не начал опрос Telegram — повторите проверку через минуту"; fi
     # Как создан бот (Р-77). В одно нажатие — выбор владельца, но он должен его видеть: держатель
     # посредника (бот-менеджера) технически может получить токен этого бота.
@@ -1086,8 +1244,8 @@ EOF3
     esac
   elif [ "$llm_configured" = yes ]; then
     if [ "$llm_last" = no ] || { [ "$llm_last" = unknown ] && [ -n "$llm_problem" ]; }; then
-      warn model "модель $llm_model: последнее обращение не удалось (код: ${llm_problem:-нет}); обращений $llm_calls, неудач $llm_failures"
-    elif [ "$llm_last" = yes ]; then pass model "модель $llm_model: последнее обращение успешно; обращений $llm_calls, неудач $llm_failures"
+      warn model "модель $llm_model: последнее обращение не удалось (код: ${llm_problem:-нет}); обращений $llm_calls, неудач $llm_failures${llm_ok_age:+; последний успешный ответ $((llm_ok_age / 3600)) ч назад}"
+    elif [ "$llm_last" = yes ]; then pass model "модель $llm_model: последнее обращение успешно${llm_ok_age:+ ($((llm_ok_age / 60)) мин назад)}; обращений $llm_calls, неудач $llm_failures"
     else pass model "модель $llm_model настроена, обращений ещё не было (первое — при ночной обработке)"; fi
   fi
 
@@ -1258,16 +1416,113 @@ EOF3
       *) pass commitments "$c_line; перепроверка по новым правилам выполнена" ;;
     esac
   fi
+
+  # Сессии Telegram (Р-98): сбор переписки идёт или стоит. Из tg_health ответа /api/status — только
+  # роль, код состояния и время, без подписей аккаунтов. Сервис сам шлёт владельцу одно сообщение в бот
+  # при переходе в плохое состояние (повтор — не чаще раза в сутки).
+  if [ -n "$st" ]; then
+    tgh="$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, sys
+try:
+    h = json.load(sys.stdin).get("tg_health")
+except Exception:
+    sys.exit(0)
+if not isinstance(h, dict):
+    sys.exit(0)
+num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else -1
+print("conf", "yes" if h.get("configured") else "no", "yes" if h.get("checked") else "no", sep="\t")
+for a in h.get("accounts") or []:
+    role, state = a.get("role"), a.get("state")
+    if role in ("owner", "assistant") and state in ("ok", "connecting", "error", "relogin", "locked", "quiet", "paused"):
+        print("acc", role, state, num(a.get("for_s")), num(a.get("update_age_s")), sep="\t")' 2>/dev/null)"
+    if [ -n "$tgh" ]; then
+      tg_conf=no; tg_checked=no; tg_any=no
+      while IFS="$tab" read -r k f1 f2 f3 f4; do
+        case "$k" in
+          conf) tg_conf="$f1"; tg_checked="$f2" ;;
+          acc)
+            tg_any=yes
+            case "$f1" in owner) who="ваш аккаунт"; where="«Настройки Штурмана» → «Вход в ваш аккаунт Telegram»" ;;
+              *) who="аккаунт помощника"; where="«Настройки Штурмана» → «Группы: аккаунт помощника»" ;; esac
+            upd=""
+            [ "$f4" -ge 0 ] 2>/dev/null && upd="; последнее обновление от Telegram $((f4 / 60)) мин назад"
+            case "$f2" in
+              ok) pass tg-session "$who: на связи, сбор переписки идёт$upd" ;;
+              connecting) pass tg-session "$who: подключается (меньше 15 минут) — повторите проверку позже" ;;
+              paused) warn tg-session "$who на паузе — сбор переписки по нему стоит по решению владельца; снять — $where, «Снять с паузы»" ;;
+              relogin) fail tg-session "$who: нужно войти заново — Telegram больше не принимает сессию (её завершили в «Устройствах» или Telegram её сбросил); сбор переписки стоит. Входит только владелец: $where → «Войти заново» (QR-код). Ссылка на страницу — ./ops/setup-link.sh только по его просьбе. Сервис сообщает об этом владельцу в бот согласований, если бот настроен" ;;
+              error) fail tg-session "$who: нет связи с Telegram $((f3 / 60)) мин — сбор переписки стоит; сервис пробует подключиться сам. Проверьте сеть сервера и прокси (EGRESS_PROXY_URL), строки service и disk" ;;
+              locked) fail tg-session "$who: сессию занял другой процесс — запущен второй экземпляр сервиса на те же данные? docker ps; затем ./ops/up.sh" ;;
+              quiet) warn tg-session "$who: соединение есть, но обновлений от Telegram нет $((f4 < 0 ? f3 / 3600 : f4 / 3600)) ч — сбор, похоже, завис. Владелец: $where → «Пауза», затем «Снять с паузы»" ;;
+            esac ;;
+        esac
+      done <<EOF_TGH
+$tgh
+EOF_TGH
+      if [ "$tg_any" = no ] && [ "$tg_conf" = yes ] && [ "$tg_checked" = yes ]; then
+        pass tg-session "аккаунтов Telegram не подключено — переписка приходит только через бизнес-режим или выгрузку (строка setup-state)"
+      elif [ "$tg_any" = no ] && [ "$tg_conf" = yes ]; then
+        pass tg-session "состояние сессий ещё не проверялось (сервис только что запущен) — повторите через 5 минут"
+      fi
+    fi
+
+    # Внешний сторож (Р-98): включён ли пульс наружу и принимает ли его служба. Адрес целиком не
+    # печатается — только имя узла.
+    pls="$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, re, sys
+try:
+    p = json.load(sys.stdin).get("pulse")
+except Exception:
+    sys.exit(0)
+if not isinstance(p, dict):
+    sys.exit(0)
+num = lambda v: str(v) if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else "-"
+safe = lambda v: re.sub(r"[^A-Za-z0-9._:-]", "", str(v or ""))[:80] or "-"
+fails = " ".join(safe(x) for x in (p.get("failing") or [])[:6]) or "-"
+print("\t".join(["yes" if p.get("enabled") else "no", "yes" if p.get("configured") else "no", safe(p.get("problem")),
+                 safe(p.get("host")), num(p.get("every_s")), num(p.get("last_age_s")), safe(p.get("last_sent")),
+                 "yes" if p.get("last_delivered") is True else "no" if p.get("last_delivered") is False else "-",
+                 safe(p.get("last_error")), fails]))' 2>/dev/null)"
+    if [ -n "$pls" ]; then
+      IFS="$tab" read -r p_on p_conf p_problem p_host p_every p_age p_sent p_deliv p_err p_fails <<EOF_PLS
+$pls
+EOF_PLS
+      if [ "$p_conf" != yes ]; then
+        warn pulse "внешнего сторожа нет: если сервер выключится целиком, никто не скажет владельцу. Завести бесплатно — docs/deployment.md, «Внешний сторож»; адрес записывает ./ops/pulse.sh set"
+      elif [ "$p_on" != yes ]; then
+        warn pulse "адрес внешнего сторожа в .env не годится (${p_problem}): нужен https-адрес вида https://hc-ping.com/… — ./ops/pulse.sh set, затем ./ops/up.sh"
+      elif [ "$p_age" = - ]; then
+        pass pulse "внешний сторож включён ($p_host): первый пульс — через минуту после запуска сервиса"
+      elif [ "$p_deliv" = no ]; then
+        warn pulse "внешний сторож ($p_host) не принял пульс ($p_err) $((p_age / 60)) мин назад — служба скоро сообщит владельцу «нет связи». Проверьте адрес: ./ops/pulse.sh test"
+      elif [ "$p_sent" = fail ]; then
+        pass pulse "внешний сторож ($p_host) получает пульс раз в $((p_every / 60)) мин; последний — «неполадка»: ${p_fails} (служба уже сообщила владельцу)"
+      else
+        pass pulse "внешний сторож ($p_host) получает пульс раз в $((p_every / 60)) мин; последний — «всё в порядке», $((p_age / 60)) мин назад"
+      fi
+    fi
+  fi
 elif [ "$MODE" = standalone ]; then
   fail service "сервис переписки не развёрнут — запустите ./ops/up.sh"
 else
   warn service "сервис переписки не развёрнут — запустите ./ops/up.sh"
 fi
 
-# --- место на диске ---
-free_mb="$(df -Pm . | awk 'NR==2 {print $4}')"
-if [ "${free_mb:-0}" -lt 2048 ]; then warn disk "свободно ${free_mb} МБ — меньше 2 ГБ"
-else pass disk "свободно $((free_mb / 1024)) ГБ"; fi
+# --- место на диске (Р-98) ---
+# Свободно: меньше 512 МБ — FAIL (база может остановиться), меньше 2 ГБ или меньше 10 % — WARN.
+# Что занимает: размеры каталогов (без имён файлов внутри) и образов Docker — disk_usage в ops/lib.sh.
+free_mb="$(df -Pm . | awk 'NR==2 {print $4}')"; size_mb="$(df -Pm . | awk 'NR==2 {print $2}')"
+free_pct=$(( ${free_mb:-0} * 100 / (${size_mb:-1} > 0 ? ${size_mb:-1} : 1) ))
+disk_hint="что можно освободить без потери данных — ./ops/cleanup.sh (по умолчанию только показывает); runbook — docs/runbooks/symptoms.md, «Диск заполнен»"
+if [ "${free_mb:-0}" -lt 512 ]; then fail disk "свободно ${free_mb} МБ — база архива может остановиться, новые сообщения не сохранятся; $disk_hint"
+elif [ "${free_mb:-0}" -lt 2048 ]; then warn disk "свободно ${free_mb} МБ — меньше 2 ГБ; $disk_hint"
+elif [ "$free_pct" -lt 10 ]; then warn disk "свободно $((free_mb / 1024)) ГБ — меньше 10 % диска; $disk_hint"
+else pass disk "свободно $((free_mb / 1024)) ГБ ($free_pct %)"; fi
+du_line="$(disk_usage)"
+if [ -n "$du_line" ]; then
+  if [ "${free_mb:-0}" -lt 2048 ] || [ "$free_pct" -lt 10 ]; then warn disk-usage "$du_line"
+  else pass disk-usage "$du_line"; fi
+fi
 
 echo
 if [ "$fails" -gt 0 ]; then echo "ИТОГ: FAIL ($fails)"; exit 1; fi

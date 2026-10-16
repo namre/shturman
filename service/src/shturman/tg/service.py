@@ -505,8 +505,11 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
     _active = manager
     _login_permits.clear()
     await manager.start()
+    from . import health
     try:
-        yield
+        # Здоровье сессий: строка tg-session в ./ops/doctor.sh и сообщение владельцу при сбое (Р-98).
+        async with health.running(state, manager):
+            yield
     finally:
         if _active is manager:
             _active = None

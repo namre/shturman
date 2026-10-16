@@ -297,6 +297,12 @@ async def overview(state: AppState) -> dict[str, Any]:
     out["llm_jobs"] = jobstats.stats().snapshot()
     # Страница настройки сервиса (/shturman-setup/): что на ней уже сделано. Только признаки.
     out["setup"] = setup
+    # Сессии Telegram (Р-98): по ролям — код состояния и время, без подписей аккаунтов; строка tg-session.
+    from .tg import health as tg_health
+    out["tg_health"] = tg_health.snapshot(state)
+    # Внешний сторож (Р-98): включён ли, имя узла службы, что и когда отправлено; строка pulse.
+    from . import pulse
+    out["pulse"] = pulse.snapshot(state)
     return out
 
 

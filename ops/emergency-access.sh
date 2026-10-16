@@ -36,7 +36,7 @@ case "${1:-}" in
       fi
       sleep 2
     done
-    echo "Дашборд не ответил. Смотрите: docker logs --tail 50 shturman-hermes" >&2
+    echo "Дашборд не ответил. Смотрите: ./ops/diag.sh --print (журнал Hermes — только счётчики ошибок; сам журнал — только с разрешения владельца: в нём начало текста его сообщений)" >&2
     exit 1 ;;
   off)
     exec ./ops/up.sh ;;

@@ -412,6 +412,20 @@ jobs:
           test "$(rc join ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 2
           grep -q 'Свободные варианты: ivan2' out.txt && grep -q 'relay.sh check КОД ИМЯ' out.txt
           if grep -q '^SHTURMAN_RELAY_NAME=' .env; then echo "отказ не должен записывать подключение"; exit 1; fi
+      # Молчаливые сбои и утечки (Р-98): токен архива не выдаётся команде агента (без терминала) и выдаётся
+      # человеку (псевдотерминал программы script); адрес внешнего сторожа — только https и нигде целиком;
+      # очистка по умолчанию ничего не удаляет, копии — только после «да» человека; диагностический пакет —
+      # белым списком: ни одна строка из ops/tests/fixtures/secrets.txt в него не попадает; новые строки doctor
+      # (tg-session, pulse, disk-usage) с подставным Docker и без ошибок оболочки.
+      - name: ops — токен архива, сторож, очистка, диагностический пакет, строки doctor
+        run: |
+          bash ops/tests/mcp_token.sh
+          bash ops/tests/pulse.sh
+          bash ops/tests/cleanup.sh
+          python3 -m unittest discover -s ops/tests -p 'test_*.py'
+          bash ops/tests/diag.sh
+          bash ops/tests/doctor_rows.sh
+          bash ops/tests/doctor_hermes.sh
       # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
       # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
       # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.
@@ -612,7 +626,9 @@ jobs:
           # Справка побеждает и после других параметров; лишний параметр — тоже ошибка, а не действие.
           for args in "up.sh --pull --help" "guard.sh on --help" "embeddings.sh on --model e5-small --help" \
                       "mode.sh set standalone --help" "setup-link.sh --local --help" "backup.sh --list --help" \
-                      "restore.sh --from latest --help" "update.sh --check --help" "backup.sh --verify --help"; do
+                      "restore.sh --from latest --help" "update.sh --check --help" "backup.sh --verify --help" \
+                      "diag.sh --print --help" "cleanup.sh --backups --help" "pulse.sh set https://x.example.com --help" \
+                      "mcp-token.sh --pipe --help"; do
             # shellcheck disable=SC2086
             run ../ops/$args
             [ "$code" -eq 0 ] || { echo "$args: код $code вместо 0"; exit 1; }
@@ -620,7 +636,8 @@ jobs:
           for args in "activation-link.sh сейчас" "bot-bind.sh x" "setup-link.sh x" "guard.sh on x" \
                       "backup.sh x" "doctor.sh x" "preflight.sh x" "logout-all.sh x" "up.sh x" \
                       "set-setup-url.sh --clear https://assistant.example.com:8443" "set-setup-url.sh a b" \
-                      "restore.sh x" "update.sh x" "update.sh --channel nightly" "restore.sh --only all x"; do
+                      "restore.sh x" "update.sh x" "update.sh --channel nightly" "restore.sh --only all x" \
+                      "diag.sh x" "cleanup.sh --images --backups" "pulse.sh x" "mcp-token.sh x"; do
             # shellcheck disable=SC2086
             run ../ops/$args
             [ "$code" -eq 2 ] || { echo "$args: код $code вместо 2"; exit 1; }

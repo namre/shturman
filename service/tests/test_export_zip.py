@@ -515,6 +515,7 @@ async def test_cli_scans_and_imports_a_zip_with_voice_files(conn, tmp_path, monk
     for key, value in {"SHTURMAN_DSN": DSN, "SHTURMAN_API_TOKEN": API_TOKEN, "SHTURMAN_MCP_TOKEN": MCP_TOKEN,
                        "SHTURMAN_DATA_DIR": str(data_dir), "SHTURMAN_ASR": "on"}.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setattr(cli, "_human", lambda: True)    # scan печатает названия чатов только человеку в терминале
     cli._scan(str(path))
     assert "сообщений: 11" in capsys.readouterr().out
     await cli._import(str(path), None, set())
@@ -524,7 +525,8 @@ async def test_cli_scans_and_imports_a_zip_with_voice_files(conn, tmp_path, monk
     assert len(list((data_dir / "media-files").iterdir())) == 3
 
 
-def test_cli_refuses_a_zip_without_result_json(tmp_path):
+def test_cli_refuses_a_zip_without_result_json(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_human", lambda: True)
     path = tmp_path / "export"
     path.write_bytes(make_zip({"a.txt": b"x"}))
     with pytest.raises(SystemExit, match="result.json"):

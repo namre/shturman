@@ -33,7 +33,8 @@ def test_same_choice_changes_nothing_and_report_reads_time_and_next_run():
     out = summaries.report([MORNING, WEEKLY, OTHER], "Europe/Moscow")
     assert out["timezone"] == "Europe/Moscow"
     assert out["jobs"]["morning-brief"] == {"exists": True, "enabled": True, "expr": "27 8 * * *", "time": "08:27",
-                                            "next_run_at": "2026-10-16T08:27:00+03:00", "next_local": "пт 16.10 08:27"}
+                                            "next_run_at": "2026-10-16T08:27:00+03:00", "next_local": "пт 16.10 08:27",
+                                            "last": "never"}
     assert out["jobs"]["weekly-review"]["day"] == 5 and out["jobs"]["weekly-review"]["time"] == "17:47"
     assert "prompt" not in json.dumps(out)
 
@@ -162,3 +163,63 @@ def test_bridge_does_not_create_without_a_home_channel(fake_hermes):
     out = shturman_bridge.cron_sync({"apply": True, "revision": 2, "desired": want()})
     assert [c[0] for c in fake_hermes["calls"]] == ["create", "create"] and out["applied"] is True
     assert out["jobs"]["morning-brief"]["exists"] is True
+
+
+# --- итог последнего запуска (Р-98) ---
+
+def test_last_run_codes_from_job_and_execution_ledger():
+    from shturman_core import cron_jobs
+
+    ran = {**MORNING, "last_run_at": "2026-10-16T08:27:40+03:00", "last_status": "ok"}
+    assert cron_jobs.last_run(MORNING) == "never"
+    assert cron_jobs.last_run(ran) == "done"                       # без журнала: ушла или промолчала — не различить
+    for outcome, code in (("delivered", "delivered"), ("suppressed", "silent"), ("failed", "delivery_failed"),
+                          ("not_configured", "delivery_failed"), ("queued", "queued")):
+        assert cron_jobs.last_run(ran, {"status": "completed", "delivery_outcome": outcome}) == code
+    assert cron_jobs.last_run(ran, {"status": "failed", "delivery_outcome": "delivered"}) == "failed"
+    assert cron_jobs.last_run(ran, {"status": "unknown"}) == "failed"
+    assert cron_jobs.last_run(ran, {"status": "running"}) == "running"
+    assert cron_jobs.last_run({**ran, "last_status": "error"}) == "failed"
+    assert cron_jobs.last_run({**ran, "last_status": "blocked_config"}) == "failed"
+    assert cron_jobs.last_run({**ran, "last_status": "delivery_failed"}) == "delivery_failed"
+    assert cron_jobs.last_run_at(ran, {"finished_at": "2026-10-16T05:28:00+00:00"}) == "2026-10-16T05:28:00+00:00"
+    assert cron_jobs.last_run_at(ran) == "2026-10-16T08:27:40+03:00" and cron_jobs.last_run_at(MORNING) is None
+
+
+def test_overdue_only_for_enabled_jobs_past_their_next_run():
+    from datetime import datetime, timezone
+
+    from shturman_core import cron_jobs
+    now = datetime(2026, 10, 16, 6, 0, tzinfo=timezone.utc)          # 09:00 по Москве, запуск был в 08:27
+    assert cron_jobs.overdue(MORNING, now) is True
+    assert cron_jobs.overdue(MORNING, datetime(2026, 10, 16, 5, 30, tzinfo=timezone.utc)) is False
+    assert cron_jobs.overdue({**MORNING, "enabled": False}, now) is False
+    assert cron_jobs.overdue({**MORNING, "next_run_at": None}, now) is False
+
+
+def test_report_carries_last_run_without_error_text():
+    ran = {**MORNING, "last_run_at": "2026-10-16T08:27:40+03:00", "last_status": "error",
+           "last_error": "текст ошибки с содержимым", "last_delivery_error": "ещё текст"}
+    out = summaries.report([ran, WEEKLY], "Europe/Moscow",
+                           {"m1": {"status": "completed", "delivery_outcome": "suppressed",
+                                   "finished_at": "2026-10-16T05:27:50+00:00"}})
+    assert out["jobs"]["morning-brief"]["last"] == "silent"
+    assert out["jobs"]["morning-brief"]["last_run_at"] == "2026-10-16T05:27:50+00:00"
+    assert out["jobs"]["weekly-review"]["last"] == "never"
+    assert "текст" not in json.dumps(out, ensure_ascii=False)
+
+
+def test_bridge_reads_the_execution_ledger_when_hermes_has_it(fake_hermes, monkeypatch):
+    import shturman_bridge
+    fake_hermes["jobs"][0].update(last_run_at="2026-10-16T08:27:40+03:00", last_status="ok")
+    ledger = {"m1": {"status": "completed", "delivery_outcome": "delivered", "error": "не передаётся",
+                     "finished_at": "2026-10-16T05:27:50+00:00"}}
+    monkeypatch.setitem(sys.modules, "cron.executions",
+                        types.SimpleNamespace(latest_executions=lambda ids: {k: v for k, v in ledger.items() if k in ids}))
+    out = shturman_bridge.cron_sync({"apply": False, "revision": 1})
+    assert out["jobs"]["morning-brief"]["last"] == "delivered"
+    assert "не передаётся" not in json.dumps(out, ensure_ascii=False)
+    # журнала нет (другая версия Hermes) — итог по записи задачи
+    monkeypatch.delitem(sys.modules, "cron.executions")
+    monkeypatch.setitem(sys.modules, "cron.executions", None)
+    assert shturman_bridge.cron_sync({"apply": False, "revision": 1})["jobs"]["morning-brief"]["last"] == "done"

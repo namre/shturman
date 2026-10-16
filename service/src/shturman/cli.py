@@ -82,7 +82,28 @@ async def _attachments(conn, archive):
     return Attachments(archive, config.data_dir, found)
 
 
+# Ответы, в которых нет ни текста переписки, ни названий чатов, ни имён — только числа и состояния
+# (ими пользуются ./ops/doctor.sh, up.sh, guard.sh, embeddings.sh, asr.sh). Остальные ответы на GET
+# `shturman call` печатает только человеку в терминале (Р-98): вывод команды, которую выполняет ИИ-агент,
+# уходит провайдеру его модели.
+SAFE_GET = ("/api/status", "/api/executor/status", "/api/guard/status", "/api/embeddings/status",
+            "/api/voice/status")
+
+
+def _human() -> bool:
+    """Команду запустил человек в терминале: и ввод, и вывод — терминал (docker exec -it …)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _human_only(what: str, how: str) -> None:
+    if not _human():
+        sys.exit(f"{what} — показывается только человеку в его терминале: {how}. Агент эту команду не "
+                 "выполняет: её вывод ушёл бы провайдеру модели агента (AGENTS.md, docs/pilot/locks-audit.md).")
+
+
 def _scan(path: str) -> None:
+    _human_only("Список чатов выгрузки — названия чатов и имена людей",
+                "./ops/import-export.sh scan в своём терминале")
     with _open_export(path) as (_, fp):
         owner, chats = scan(fp)
     if owner:
@@ -111,6 +132,7 @@ async def _import(path: str, owner_id: int | None, exclude: set[tuple[str, int]]
 
 
 async def _search(query: str, limit: int) -> None:
+    _human_only("Найденные сообщения — текст переписки", "docker exec -it shturman-service shturman search …")
     conn = await db.connect(_dsn())
     try:
         hits = await search(conn, query, limit=limit)
@@ -153,6 +175,9 @@ def _local_api(method: str, path: str, payload: dict | None = None) -> tuple[int
 def _call(method: str, path: str, raw: str | None) -> None:
     if not path.startswith("/api/"):
         sys.exit("путь должен начинаться с /api/")
+    if method.upper() == "GET" and path.split("?", 1)[0].rstrip("/") not in SAFE_GET:
+        _human_only("Ответ может содержать текст переписки, названия чатов или имена",
+                    f"docker exec -it shturman-service shturman call GET '{path}'")
     try:
         payload = json.loads(raw) if raw else None
     except ValueError:

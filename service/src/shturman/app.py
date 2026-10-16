@@ -66,6 +66,7 @@ MODULES = (
     "shturman.replies.service",    # продолжение задач после Telegram-решений владельца
     "shturman.remote_mcp",
     "shturman.summaries",          # утренняя сводка и обзор недели: выбор владельца → плагин Hermes (Р-95)
+    "shturman.pulse",              # внешний сторож: пульс наружу с итогом проверок (Р-98)
     "shturman.setup_page.service",  # последним: страница настройки пользуется остальными модулями
 )
 

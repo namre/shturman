@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -60,6 +61,9 @@ class LiveIngest:
         self.auto_personal = False
         self.auto_groups = False
         self._seen_names: dict[PeerKey, tuple] = {}
+        # Когда (time.monotonic) от Telegram последний раз пришло любое обновление о сообщениях — в том
+        # числе из невыбранных чатов. По нему видно «соединение есть, а обновления не идут» (tg/health.py).
+        self.last_update_at: float | None = None
 
     async def reload(self) -> None:
         """Перечитывает из базы выбранные чаты и настройки аккаунта."""
@@ -82,6 +86,7 @@ class LiveIngest:
 
     async def on_update(self, update: Any) -> None:
         """Обработчик Telethon. Ошибку не выпускает: одно сообщение не должно ронять приём."""
+        self.last_update_at = time.monotonic()
         try:
             if isinstance(update, NEW_UPDATES):
                 await self._on_message(update, edited=False)
