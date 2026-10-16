@@ -6,8 +6,17 @@
 #   ./ops/guard.sh off     — выключить проверку и убрать контейнер. Уже скрытые сообщения остаются
 #                            скрытыми, пока владелец не решит по ним в боте.
 #   ./ops/guard.sh status  — что включено и счётчики: проверено, скрыто, показано, не проверено
+#   ./ops/guard.sh stats [--json]
+#                          — защита на вашей переписке, только числа (Р-99): скрыто на 1000 проверенных;
+#                            по причине (модель и её оценка, коды правил), типу чата, пересланному,
+#                            живому потоку или истории; решения владельца и доля «показано» среди
+#                            решённых поштучно — ложные срабатывания; «если бы порог был X»; варианты
+#                            Р-99. Без текстов, имён и названий чатов. Ничего не меняет.
+#   ./ops/guard.sh threshold ЧИСЛО
+#                          — порог оценки модели (0,5–1). Решает только владелец: запускает сам,
+#                            в своём терминале, и набирает фразу подтверждения. Затем ./ops/up.sh.
 # Значения, которые скрипт пишет в .env, не секретные. Из .env он читает только строки
-# SHTURMAN_MODE, SHTURMAN_GUARD и COMPOSE_PROFILES: свой профиль добавляется и убирается,
+# SHTURMAN_MODE, SHTURMAN_GUARD, SHTURMAN_GUARD_THRESHOLD и COMPOSE_PROFILES: свой профиль добавляется и убирается,
 # а поиск по смыслу (./ops/embeddings.sh) и профиль Hermes не трогаются.
 #
 # Защита снижает риск, а не устраняет его: классификатор пропускает часть атак и иногда прячет
@@ -19,12 +28,22 @@ cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
 ops_help "$@"
 mode="${1:-status}"
+value=""
 case "$mode" in
-  on|off|status) ;;
+  on|off|status) [ $# -le 1 ] || ops_unknown "$2" ;;
+  stats)
+    [ $# -le 2 ] || ops_unknown "$3"
+    if [ $# -eq 2 ]; then [ "$2" = --json ] || ops_unknown "$2"; value=--json; fi ;;
+  threshold)
+    [ $# -eq 2 ] || { echo "использование: $0 threshold ЧИСЛО (например 0.97)" >&2; exit 2; }
+    value="$(printf '%s' "$2" | tr , .)"
+    case "$value" in
+      0.[5-9]|0.[5-9][0-9]|0.[5-9][0-9][0-9]|0.[5-9][0-9][0-9][0-9]|1|1.0) ;;
+      *) echo "порог — число от 0.5 до 1, например 0.97" >&2; exit 2 ;;
+    esac ;;
   -*) ops_unknown "$mode" ;;
-  *) echo "использование: $0 on|off|status" >&2; exit 2 ;;
+  *) echo "использование: $0 on|off|status|stats [--json]|threshold ЧИСЛО" >&2; exit 2 ;;
 esac
-[ $# -le 1 ] || ops_unknown "$2"
 [ -f .env ] || { echo "нет .env — сначала ./ops/init-env.sh --auto" >&2; exit 1; }
 # Неизвестный режим установки — остановиться до скачивания модели, а не после.
 shturman_mode > /dev/null || exit 2
@@ -64,7 +83,7 @@ fetch_model() {
   chmod -R a+rX data/guard
 }
 
-[ "$mode" = status ] || ops_lock "защита от внедрённых инструкций: $mode (./ops/guard.sh)"
+case "$mode" in status|stats) ;; *) ops_lock "защита от внедрённых инструкций: $mode (./ops/guard.sh)" ;; esac
 case "$mode" in
   on)
     fetch_model || exit 1
@@ -92,9 +111,25 @@ case "$mode" in
     fi
     echo "Защита от внедрённых инструкций выключена в настройках. Применяю: ./ops/up.sh"
     exec ./ops/up.sh ;;
+  threshold)
+    # Порог — решение владельца (AGENTS.md): скрипт меняет его только по фразе человека в терминале.
+    if ! has_tty; then need_human "./ops/guard.sh threshold $value"; exit "$OPS_NEED_HUMAN"; fi
+    echo "Порог модели сейчас: $(env_get SHTURMAN_GUARD_THRESHOLD || true) (пусто — 0.9). Новый: $value."
+    echo "Выше порог — меньше скрытых обычных сообщений и больше пропущенных атак. Расчёт — ./ops/guard.sh stats."
+    if ! human_confirm "ПОРОГ"; then echo "Не подтверждено — ничего не изменено." >&2; exit "$OPS_NEED_HUMAN"; fi
+    umask 077
+    env_set SHTURMAN_GUARD_THRESHOLD "$value"
+    echo "Порог записан в .env. Применяю: ./ops/up.sh"
+    exec ./ops/up.sh ;;
+  stats)
+    if [ "$(container_state shturman-service)" != running ]; then
+      echo "контейнер shturman-service не запущен — ./ops/up.sh и повторите" >&2; exit 1
+    fi
+    echo "Считаю по всем проверенным сообщениям — до минуты. Выводятся только числа." >&2
+    exec docker exec shturman-service shturman guard stats $value ;;
   status)
     if [ "$(env_get SHTURMAN_GUARD)" = on ]; then echo "в настройках: включено"; else echo "в настройках: выключено"; fi
     docker exec shturman-service shturman call GET /api/guard/status 2>/dev/null \
       || echo "сервис переписки не отвечает — ./ops/doctor.sh" ;;
-  *) echo "использование: $0 on|off|status" >&2; exit 2 ;;
+  *) echo "использование: $0 on|off|status|stats|threshold" >&2; exit 2 ;;
 esac

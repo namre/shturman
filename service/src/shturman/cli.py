@@ -471,6 +471,32 @@ async def _commitments(action: str, *, as_json: bool, dry_run: bool, limit: int,
               "сводкой в боте — в ближайший час сводки. «Похоже, уже сделано» по принятым — тоже там.")
 
 
+async def _guard(action: str, *, as_json: bool) -> None:
+    """Защита (Р-99): `stats` — только числа на переписке владельца, без текстов и названий чатов.
+    Порог, включение и решения по скрытому — не здесь: порог меняет владелец (`./ops/guard.sh
+    threshold`), решения — его нажатия в боте и приложении."""
+    import json as _json
+
+    from .guard import alerts, core, stats as guard_stats
+
+    settings = core.Settings.from_env()
+    conn = await db.connect(_dsn())
+    try:
+        await db.migrate(conn)
+        found = await guard_stats.collect(conn, threshold=settings.threshold, card_hours=settings.card_hours)
+        waiting = await alerts.overview(conn, card_hours=settings.card_hours)
+    finally:
+        await conn.close()
+    found["waiting_now"] = waiting
+    if as_json:
+        print(_json.dumps(found, ensure_ascii=False, indent=2))
+        return
+    print(guard_stats.render(found))
+    print("")
+    print("Сейчас ждут решения — сводка, как в боте (/guard):")
+    print(alerts.summary_text(waiting))
+
+
 def _serve() -> None:
     import logging
 
@@ -538,6 +564,9 @@ def main() -> None:
     cm.add_argument("--force", action="store_true", help="recheck: ещё раз для той же версии правил")
     cm.add_argument("--price-in", type=float, help="цена миллиона входных токенов, для оценки в долларах")
     cm.add_argument("--price-out", type=float, help="цена миллиона выходных токенов")
+    gd = sub.add_parser("guard", help="защита от внедрённых инструкций: stats — только числа на вашей переписке")
+    gd.add_argument("action", choices=["stats"])
+    gd.add_argument("--json", action="store_true", help="вывести JSON")
     a = p.parse_args()
 
     if a.cmd == "migrate":
@@ -564,6 +593,8 @@ def main() -> None:
         asyncio.run(_setup_logout_all())
     elif a.cmd == "retry-failed":
         asyncio.run(_retry_failed(a.since, a.dry_run))
+    elif a.cmd == "guard":
+        asyncio.run(_guard(a.action, as_json=a.json))
     elif a.cmd == "commitments":
         asyncio.run(_commitments(a.action, as_json=a.json, dry_run=a.dry_run, limit=a.limit, force=a.force,
                                  price_in=a.price_in, price_out=a.price_out))

@@ -297,6 +297,8 @@ async def _clear_all(conn) -> dict:
                 "UPDATE outbox_drafts SET status = 'rejected' WHERE status = 'pending'",
                 "UPDATE reply_tasks SET status = 'cancelled' WHERE status IN ('waiting_source', 'waiting_owner')",
                 "UPDATE guard_alerts SET status = 'confirmed' WHERE status = 'sent'",
+                # Р-99: скрытое без карточки тоже решено — иначе осталась бы сводка «Скрытые сообщения»
+                "UPDATE messages SET guard_label = 'confirmed' WHERE guard_label = 'suspect'",
                 "UPDATE commitments SET status = 'rejected' WHERE status = 'proposed'",
                 "UPDATE commitment_changes SET status = 'rejected' WHERE status = 'proposed'",
                 "UPDATE facts SET status = 'rejected' WHERE status = 'proposed'",

@@ -147,14 +147,22 @@ CARD_WARNING = ("Запрос пришёл не из этого бота — о�
 # доверенного, разрешить группу, включить автоответ, расширить обращения) или «Вернуть как было», если
 # возврат расширяет то, что может ассистент (со страницы и из приложения). В карточке — вид и
 # содержимое настоящего действия; применяет его та же функция, что и всегда (`owner_changes.py`).
-BOT_ONLY = frozenset({"halt.resume", "setup.code_login", "triage.enable", "owner.widen"})
+#
+# `guard.release_all` (Р-99) — «Показать ассистенту все скрытые» из сводки защиты: открывает ассистенту
+# сразу сотни сообщений, скрытых как подозрительные, — только нажатием в боте. «Оставить все скрытыми»
+# (`guard.keep_all`) ничего не расширяет: подтвердить можно и в приложении. Оба вида ставит только
+# нажатие владельца под сводкой (`guard/alerts.py`); маршрута внутреннего API у них нет.
+BOT_ONLY = frozenset({"halt.resume", "setup.code_login", "triage.enable", "owner.widen", "guard.release_all"})
+# Карточки, которые ставит только нажатие самого владельца (в боте, приложении или на странице), —
+# в них не нужно предупреждение «запрос пришёл не из этого бота».
+OWNER_ASKED = BOT_ONLY | frozenset({"guard.keep_all"})
 BOT_ONLY_NOTE = "Подтвердить можно только кнопкой под этой карточкой в боте согласований — не в приложении."
-BOT_ONLY_CARD = ("Вы попросили об этом сами — в «Настройках Штурмана» или в приложении «Штурман». "
+BOT_ONLY_CARD = ("Вы попросили об этом сами — в этом боте, в «Настройках Штурмана» или в приложении «Штурман». "
                  "Если не просили — нажмите «Нет».")
 
 
 def _card(summary: str, kind: str | None = None) -> str:
-    return "Подтвердите действие\n\n" + summary.strip() + "\n\n" + (BOT_ONLY_CARD if kind in BOT_ONLY else CARD_WARNING)
+    return "Подтвердите действие\n\n" + summary.strip() + "\n\n" + (BOT_ONLY_CARD if kind in OWNER_ASKED else CARD_WARNING)
 
 
 def _done(value: "str | Done | None") -> Done:
@@ -374,7 +382,8 @@ async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
     # предупреждение — отдельной строкой ниже (в боте это одна карточка `_card`). Действия `BOT_ONLY`
     # видны без кнопок: подтверждают их только в самом боте.
     return [{"id": r["id"], "title": f"Действие № {r['id']}", "text": r["summary"].strip(),
-             "note": BOT_ONLY_NOTE if r["kind"] in BOT_ONLY else CARD_WARNING,
+             "note": BOT_ONLY_NOTE if r["kind"] in BOT_ONLY else (
+                 BOT_ONLY_CARD if r["kind"] in OWNER_ASKED else CARD_WARNING),
              "buttons": [] if r["kind"] in BOT_ONLY else _card_buttons(r["id"], r["nonce"]),
              "card_message_id": r["card_message_id"], "expires_at": r["expires_at"]} for r in rows]
 
