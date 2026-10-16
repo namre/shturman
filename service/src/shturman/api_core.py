@@ -257,7 +257,7 @@ async def overview(state: AppState) -> dict[str, Any]:
         processing.update(await commitment_stats.status_fields(conn))
     out = dict(row)
     # Очередь заданий: всего ждут, неудачных за всё время (jobs_failed — не за час) и по группам —
-    # модель и бот: сколько ждут, давность самого старого готового, выполнено за час (Д-24; строка jobs
+    # модель и бот: сколько ждут, давность самого старого готового, выполнено за час (Д-25; строка jobs
     # в ./ops/doctor.sh — «разбираются» или «за час не выполнено ни одного»). Только числа.
     out.update(jobs_waiting=queue["waiting"], jobs_failed=queue["failed"], jobs_queue=queue["groups"])
     # Разбор переписки (Р-96): прогонов и запросов к модели за сутки, оценка объёма, упёрлись ли в предел;

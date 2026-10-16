@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ./ops/resources.sh (Д-25) с подставным Docker: память и процессор контейнеров печатаются, а docker
+# ./ops/resources.sh (Д-26) с подставным Docker: память и процессор контейнеров печатаются, а docker
 # inspect зовётся только с шаблоном из перечня полей — без окружения (Config.Env) и без шаблона вовсе.
 # Запуск из корня репозитория: bash ops/tests/resources.sh.
 set -eu

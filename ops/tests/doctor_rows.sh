@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Проверка новых строк ./ops/doctor.sh (Р-98) с подставными Docker и curl: tg-session, pulse, disk-usage,
-# jobs (Д-24) в режиме без Hermes; сервис «отвечает» ответом из fixtures/status.json. Заодно ловит ошибки оболочки
+# jobs (Д-25) в режиме без Hermes; сервис «отвечает» ответом из fixtures/status.json. Заодно ловит ошибки оболочки
 # в doctor (как Д-2: строки ниже сломанной молча становились «не проверено»).
 # Запуск из корня репозитория: bash ops/tests/doctor_rows.sh.
 set -eu
@@ -67,7 +67,7 @@ grep -q '^WARN  pulse: внешнего сторожа нет' "$tmp/out.txt" ||
 grep -q '^PASS  tg-session: ваш аккаунт: на связи, сбор переписки идёт; последнее обновление от Telegram 1 мин назад' "$tmp/out.txt" || bad "нет PASS tg-session"
 grep -q '^PASS  jobs: очередь заданий: 0, неудачных за всё время: 0$' "$tmp/out.txt" || bad "нет PASS jobs у сервиса прежней версии"
 
-# Строка jobs (Д-24): длинная очередь, которая разбирается, — PASS; стоящая — WARN при любой длине;
+# Строка jobs (Д-25): длинная очередь, которая разбирается, — PASS; стоящая — WARN при любой длине;
 # неудачные — «за всё время». $1 — jobs_waiting, $2 — объект jobs_queue (JSON) или пусто.
 jobs_status() {
   python3 - "$fx/status.json" "$1" "$2" > "$tmp/status-jobs.json" <<'PY'

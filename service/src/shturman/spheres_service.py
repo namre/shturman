@@ -287,7 +287,7 @@ class SpheresResult(Reply):
 @mcp.tool(name="list_spheres", annotations=READ_ONLY, title="List spheres")
 async def list_spheres_tool(ctx: Context) -> Annotated[CallToolResult, SpheresResult]:
     """List the owner's spheres — the parts of work and life the owner keeps apart (for example
-    "Работа", "Личное", "Преподавание", a construction project): name, the owner's description and
+    "Работа", "Личное", "Хобби"): name, the owner's description and
     how many chats and projects are in each. A chat can be in several spheres or in none.
 
     Every other archive tool labels each result with the spheres of its chat (`spheres` field) and

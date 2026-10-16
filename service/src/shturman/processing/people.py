@@ -50,7 +50,7 @@ _NAME_TAIL_RE = re.compile(r"[|/(\[@,•·—–]| - ")
 
 
 def to_cyrillic(text: str) -> str:
-    """Латиница -> кириллица по своей таблице («Aleksandr Erman» -> «александр ерман»)."""
+    """Латиница -> кириллица по своей таблице («Aleksandr Elkin» -> «александр елкин»)."""
     text = _LAT_FINAL_IA.sub("ия", text.lower())
     return _LAT_RE.sub(lambda m: _LAT[m.group()], text)
 
@@ -602,7 +602,7 @@ async def match_display_name(
     conn: asyncpg.Connection, display: str, *, exclude_person_id: int | None = None,
     cutoff: int = CUTOFF, margin: int = MARGIN,
 ) -> dict[str, Any]:
-    """Сопоставляет отображаемое имя («Пётр Петренко | ГК Фасад», «Aleksandr Erman») с реестром.
+    """Сопоставляет отображаемое имя («Пётр Петренко | ГК Фасад», «Aleksandr Elkin») с реестром.
 
     Возвращает {"status": match | ambiguous | none, "candidates": [{person_id, display_name, score}]}.
     Одно слово («Иван») сравнивается только на точное совпадение с именем, фамилией или алиасом.

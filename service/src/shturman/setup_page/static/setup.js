@@ -4534,7 +4534,7 @@
       el("input", { id: "wr-name", type: "text", maxlength: "100", value: r.name || "" })]));
     form.appendChild(el("div", { class: "field" }, [el("label", { for: "wr-keywords", text: "Слова и выражения" }),
       el("textarea", { id: "wr-keywords", rows: "2", class: "wr-text", text: (r.keywords || []).join(", "),
-                       placeholder: r.ask_name ? "Ваше имя и варианты: Евгений, Женя, Эрман" : "Через запятую" }),
+                       placeholder: r.ask_name ? "Ваше имя и варианты: Иван, Ваня" : "Через запятую" }),
       el("span", { class: "hint", text: r.ask_name ? "Впишите своё имя и как вас ещё называют — через запятую." : "Через запятую. Регистр и «ё» не важны." })]));
     form.appendChild(el("label", { class: "check" }, [el("input", { type: "checkbox", id: "wr-lemmas", checked: r.use_lemmas !== false }),
       el("span", { text: "Учитывать формы слов («счёт» найдёт «счета», «счетов»)" })]));

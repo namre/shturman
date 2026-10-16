@@ -297,7 +297,7 @@ async def test_llm_job_outcomes_for_the_last_hour_are_counted_without_text(make_
 
 
 async def test_status_tells_a_moving_queue_from_a_stuck_one(make_client, conn):
-    """Д-24: строка jobs в doctor отличает очередь, которая разбирается, от той, что стоит. По группам —
+    """Д-25: строка jobs в doctor отличает очередь, которая разбирается, от той, что стоит. По группам —
     сколько ждут, давность самого старого готового задания и выполнено за час; неудачные — за всё время."""
     assert jobs.QUEUE_GROUPS["llm"] == bridge.LLM_KINDS
     client, _ = await make_client("shturman.api_core")

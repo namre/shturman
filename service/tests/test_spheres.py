@@ -59,10 +59,10 @@ def folder(fid, title, *, include=(), exclude=(), pinned=(), flags=(), kind="fil
 # --- сферы -------------------------------------------------------------------------------------------
 
 async def test_spheres_are_created_renamed_ordered_and_names_are_unique(conn):
-    work = await spheres.create_sphere(conn, "  Работа  РАЗУМ ", "стройка, продажи")
-    assert (work["title"], work["description"], work["chats"], work["projects"]) == ("Работа РАЗУМ", "стройка, продажи", 0, 0)
+    work = await spheres.create_sphere(conn, "  Работа  в офисе ", "стройка, продажи")
+    assert (work["title"], work["description"], work["chats"], work["projects"]) == ("Работа в офисе", "стройка, продажи", 0, 0)
     home = await spheres.create_sphere(conn, "Личное")
-    for taken in ("работа разум", "РАБОТА  разум", "«Работа РАЗУМ»"):
+    for taken in ("работа в офисе", "РАБОТА  в  ОФИСЕ", "«Работа в офисе»"):
         with pytest.raises(spheres.SpheresError) as exc:
             await spheres.create_sphere(conn, taken)
         assert exc.value.code == "exists"
@@ -79,7 +79,7 @@ async def test_spheres_are_created_renamed_ordered_and_names_are_unique(conn):
     renamed = await spheres.update_sphere(conn, home["id"], title="Семья и дом", description=None)
     assert (renamed["title"], renamed["description"]) == ("Семья и дом", None)
     with pytest.raises(spheres.SpheresError):
-        await spheres.update_sphere(conn, home["id"], title="работа разум")
+        await spheres.update_sphere(conn, home["id"], title="работа в офисе")
     order = [s["id"] for s in await spheres.list_spheres(conn)]
     assert order[:2] == [work["id"], home["id"]]
     reordered = await spheres.reorder(conn, list(reversed(order)))
@@ -282,20 +282,20 @@ async def test_layouts_by_activity_kind_spheres_and_folders(conn):
 
 async def test_scope_names_all_and_no_sphere(conn):
     acc = await account(conn)
-    work = await spheres.create_sphere(conn, "Работа РАЗУМ")
+    work = await spheres.create_sphere(conn, "Работа в офисе")
     await spheres.create_sphere(conn, "Личное")
     ivan_chat, _ = await store.ensure_chat(conn, acc, ChatRecord("user", IVAN[1], "personal_chat", "Иван"))
     maria_chat, _ = await store.ensure_chat(conn, acc, ChatRecord("user", MARIA[1], "personal_chat", "Мария"))
     await spheres.add_chats(conn, work["id"], acc, [IVAN])
-    for everything in (None, [], "все", ["all"], ["Работа РАЗУМ", "везде"]):
+    for everything in (None, [], "все", ["all"], ["Работа в офисе", "везде"]):
         assert await spheres.resolve_scope(conn, everything) is None
-    scope = await spheres.resolve_scope(conn, ["работа  разум"])
-    assert scope.titles == ("Работа РАЗУМ",) and not scope.without
+    scope = await spheres.resolve_scope(conn, ["работа  в офисе"])
+    assert scope.titles == ("Работа в офисе",) and not scope.without
     assert await spheres.chat_ids_in(conn, scope) == [ivan_chat]
     scope = await spheres.resolve_scope(conn, "без сферы")
     assert await spheres.chat_ids_in(conn, scope) == [maria_chat]
     assert scope.allows([]) and not scope.allows(["Личное"])
     with pytest.raises(spheres.SpheresError) as exc:
         await spheres.resolve_scope(conn, ["Учёба"])
-    assert '"Работа РАЗУМ", "Личное"' in exc.value.message
+    assert '"Работа в офисе", "Личное"' in exc.value.message
     assert spheres.query_names({"spheres": "Работа\nЛичное"}) == ["Работа", "Личное"]

@@ -108,7 +108,7 @@
 | Команда | Что выводит |
 |---|---|
 | `cat .env`, `grep … .env` | Все токены и ключи |
-| `docker inspect shturman-service`, `shturman-hermes`, `shturman-relay`; `docker exec … env`; `/proc/<pid>/environ` | Переменные окружения с токенами. Пределы и потребление памяти контейнеров — `./ops/resources.sh` (только шаблон из перечня полей, Д-25) |
+| `docker inspect shturman-service`, `shturman-hermes`, `shturman-relay`; `docker exec … env`; `/proc/<pid>/environ` | Переменные окружения с токенами. Пределы и потребление памяти контейнеров — `./ops/resources.sh` (только шаблон из перечня полей, Д-26) |
 | `docker compose config` без `--quiet` | Конфигурация с подставленными секретами |
 | `./ops/mcp-token.sh --pipe` из агента | (Р-98) Отказывает без терминала человека; прежде печатал токен прямо в контекст агента (дефект Д-15) |
 | `cat data/hermes/.env`, `data/shturman/setup/*` | Ключ модели, токен бота ассистента, токен бота согласований, ключи приложения Telegram, токены подписки ChatGPT |
