@@ -40,6 +40,8 @@
 # сторож; disk-usage — что занимает диск (размеры каталогов целиком, образы Docker). В строках
 # approvals-bot и model — давность последнего ответа Telegram на опрос и последнего успешного ответа модели.
 # Строка hermes-version сверяет тег образа Hermes со списком проверенных версий config/hermes-versions.txt.
+# Строка updates (Р-101) — какой код запущен в сервисе (тег, коммит; против git в каталоге), итог последней
+# проверки списка выпусков releases.json и что доступно (updates в /api/status: только теги, коды и время).
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -1547,6 +1549,61 @@ EOF_PLS
         pass pulse "внешний сторож ($p_host) получает пульс раз в $((p_every / 60)) мин; последний — «неполадка»: ${p_fails} (служба уже сообщила владельцу)"
       else
         pass pulse "внешний сторож ($p_host) получает пульс раз в $((p_every / 60)) мин; последний — «всё в порядке», $((p_age / 60)) мин назад"
+      fi
+    fi
+
+    # Обновления (Р-101): какой код запущен в сервисе (против кода в каталоге), итог последней проверки списка
+    # выпусков с GitHub и что доступно. Только теги, коды и время — текстов списка в ответе сервиса нет.
+    upd="$(printf '%s' "$st" | docker exec -i "$svc" python -c '
+import json, re, sys
+try:
+    u = json.load(sys.stdin).get("updates")
+except Exception:
+    sys.exit(0)
+if not isinstance(u, dict):
+    sys.exit(0)
+safe = lambda v: re.sub(r"[^A-Za-z0-9._:-]", "", str(v or ""))[:60] or "-"
+num = lambda v: str(v) if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else "-"
+r = u.get("running") if isinstance(u.get("running"), dict) else {}
+print("\t".join(["yes" if u.get("enabled") else "no", safe(u.get("channel")), safe(r.get("version")), safe(r.get("tag")),
+                 safe(r.get("commit")), num(u.get("checked_age_s")), safe(u.get("problem")), num(u.get("fails")),
+                 safe(u.get("expires")), safe(u.get("available")), safe(u.get("available_kind")), num(u.get("behind")),
+                 safe(u.get("hermes_new"))]))' 2>/dev/null)"
+    if [ -n "$upd" ]; then
+      IFS="$tab" read -r u_on u_chan u_ver u_tag u_commit u_age u_problem u_fails u_exp u_avail u_kind u_behind u_hermes <<EOF_UPD
+$upd
+EOF_UPD
+      u_run="${u_tag#-}"; [ -n "$u_run" ] || u_run="$u_ver"
+      [ "$u_commit" = - ] || u_run="$u_run (коммит ${u_commit:0:7})"
+      here_commit="$(git rev-parse HEAD 2> /dev/null || true)"
+      u_note=""
+      if [ "$u_commit" != - ] && [ -n "$here_commit" ] && [ "${here_commit:0:12}" != "$u_commit" ]; then
+        u_note="; сервис запущен с другим кодом, чем в каталоге (${here_commit:0:7}) — ./ops/up.sh"
+      fi
+      if [ -n "$u_note" ]; then
+        warn updates "работает $u_run$u_note"
+      elif [ "$u_on" != yes ]; then
+        pass updates "работает $u_run; проверка новых версий выключена (SHTURMAN_UPDATES=off) — о них владелец не узнает; план обновления — ./ops/update.sh --check"
+      elif [ "$u_problem" = expired ]; then
+        warn updates "работает $u_run; список выпусков на GitHub просрочен — сообщений о новых версиях нет, пока разработчик его не обновит (владельцу сказано один раз); план обновления — ./ops/update.sh --check"
+      elif [ "$u_problem" = invalid ] || [ "$u_problem" = too_big ]; then
+        warn updates "работает $u_run; список выпусков на GitHub не прочитался (повреждён) — сообщений о новых версиях нет; план обновления — ./ops/update.sh --check"
+      elif [ "$u_problem" = bad_url ]; then
+        warn updates "работает $u_run; адрес списка выпусков (SHTURMAN_UPDATES_URL) не https — проверка не идёт"
+      elif [ "$u_problem" = unreachable ] || [ "$u_problem" = http ]; then
+        if [ "${u_fails:-0}" != - ] && [ "${u_fails:-0}" -ge 3 ]; then
+          warn updates "работает $u_run; GitHub не отвечает сервису $u_fails проверок подряд (раз в сутки) — сеть сервера или прокси (EGRESS_PROXY_URL); план обновления — ./ops/update.sh --check"
+        else
+          pass updates "работает $u_run; последняя проверка списка выпусков не удалась ($u_problem), повторит через сутки"
+        fi
+      elif [ "$u_age" = - ]; then
+        pass updates "работает $u_run; список выпусков ещё не проверялся (первый раз — через 5 минут после запуска сервиса), канал $u_chan"
+      elif [ "$u_avail" != - ] && [ "$u_kind" = security ]; then
+        warn updates "работает $u_run; доступно исправление безопасности $u_avail (выпусков впереди: $u_behind) — владельцу сказано в боте; обновить: задание «Обновить экземпляр», ./ops/update.sh --check"
+      elif [ "$u_avail" != - ]; then
+        pass updates "работает $u_run; доступна новая версия $u_avail (выпусков впереди: $u_behind, канал $u_chan) — ./ops/update.sh --check$( [ "$u_hermes" != - ] && printf '; проверена новая версия Hermes %s' "$u_hermes")"
+      else
+        pass updates "работает $u_run; новых версий нет (проверено $((u_age / 3600)) ч назад, канал $u_chan, список годен до $u_exp)$( [ "$u_hermes" != - ] && printf '; проверена новая версия Hermes %s' "$u_hermes")"
       fi
     fi
   fi

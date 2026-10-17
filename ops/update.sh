@@ -7,6 +7,12 @@
 #                                      человека. Меняет только ссылки git (git fetch)
 #   ./ops/update.sh                  — обновить до следующего выпуска (тег vX.Y.Z) на пути к последнему:
 #                                      по одному выпуску за запуск, без перескоков (UPGRADING.md)
+#   ./ops/update.sh --all            — по очереди до последнего выпуска канала: шаг за шагом, каждый — как
+#                                      обычный запуск (проверка до, копия, обновление, проверка после, откат при
+#                                      провале, разрешение владельца в боте, если шаг его просит); первая неудача
+#                                      или стоп-точка UPGRADING.md останавливает цепочку. Только если владелец
+#                                      разрешил переход до последнего выпуска (не вместе с --to, --upgrading-read,
+#                                      --despite-fail)
 #   ./ops/update.sh --to vX.Y.Z      — до названного выпуска (vX.Y.Z или кандидат vX.Y.Z-rc.N); только
 #                                      вперёд от нынешнего кода и без пропуска выпусков между ними
 #   ./ops/update.sh --channel pilot  — до следующего выпуска или кандидата (rc) — для экземпляра пилота;
@@ -39,6 +45,8 @@
 #   код работает с теми же данными); это перезапись данных — только с разрешением владельца.
 # Экземпляр после обновления стоит на теге (detached HEAD): git pull больше не путь обновления.
 # Вывод и итог дублируются в local/update/<время>.log (без секретов: вывод up.sh и doctor).
+# Итог передаётся сервису переписки (`shturman update-result` в его контейнере, Р-101): он пишет владельцу в
+# бот согласований «обновлено, проверки прошли» или что не прошло. Сервис не отвечает — обновлению не мешает.
 # Коды: 0 — обновлено (или уже последняя версия); 1 — не обновлено, откат выполнен, doctor без FAIL;
 # 2 — неверные параметры или цель; 3 — нужен человек: откат не выполнен или не удался, либо копия
 # не сделана; 4 — нет разрешения владельца: ждём нажатия в боте, он отклонил, срок вышел или бот
@@ -52,12 +60,6 @@ REL_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
 RC_RE='^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$'
 CONSENT_FILE="local/consent/update.env"
 
-# Ключ сортировки выпусков: кандидат vX.Y.Z-rc.N идёт перед выпуском vX.Y.Z.
-tag_key() {
-  local t="${1#v}" base rc
-  base="${t%%-rc.*}"
-  if [ "$base" != "$t" ]; then rc="${t##*-rc.}"; echo "$base.0.$rc"; else echo "$base.1.0"; fi
-}
 # Выпуски (и кандидаты для pilot), которые впереди нынешнего коммита: «ключ<TAB>тег», по возрастанию.
 tags_ahead() {
   local channel="$1" t c v head
@@ -92,15 +94,58 @@ upgrading_section() {
     on { print }'
 }
 
+# Итог — сервису переписки (Р-101): он сообщит владельцу. Сервис старой версии или не отвечает — не страшно.
+# Переменные run, head_name, target — из main (видны вызванной функции).
+tell_service() {
+  local result="$1" fails="${2:-}"
+  [ "$(container_state shturman-service)" = running ] || return 0
+  timeout 30 docker exec shturman-service shturman update-result --run "$run" --result "$result" \
+    --from "$head_name" --to "$target" --new-fails "$(printf '%s' "$fails" | tr ',' ' ')" > /dev/null 2>&1 || true
+}
+
+# --all: шаг за шагом до последнего выпуска канала. Каждый шаг — отдельный запуск этого же скрипта под тем же
+# замком: со всеми проверками, копией, разрешением и откатом. Первая неудача останавливает цепочку.
+chain() {
+  local step=0 rc out
+  . ops/lib-backup.sh
+  ops_lock "обновление по очереди до последнего выпуска (./ops/update.sh --all)"
+  mkdir -p "$UPDATE_DIR"; chmod 700 "$UPDATE_DIR"
+  out="$UPDATE_DIR/chain-step.txt"
+  while [ "$step" -lt 20 ]; do
+    step=$((step + 1))
+    echo "=== Шаг $step: ./ops/update.sh${*:+ $*} ==="
+    rc=0
+    ./ops/update.sh "$@" 2>&1 | tee "$out"; rc="${PIPESTATUS[0]}"
+    if [ "$rc" -ne 0 ]; then
+      echo
+      if [ "$step" -gt 1 ]; then echo "Выпуски до этого шага установлены и проверены; экземпляр на $(code_tag || true)."; fi
+      echo "ИТОГ ЦЕПОЧКИ: остановка на шаге $step (код $rc) — что дальше, сказано выше (docs/runbooks/update.md, таблица итогов)."
+      exit "$rc"
+    fi
+    if grep -q '^ИТОГ ОБНОВЛЕНИЯ: OK' "$out"; then
+      if grep -q '^Есть ещё выпуск' "$out"; then continue; fi
+      echo; echo "ИТОГ ЦЕПОЧКИ: OK — последний выпуск канала установлен ($(code_tag || true)), шагов: $step."
+      exit 0
+    fi
+    # Обновлений нет (или уже на цели) — цепочка кончилась.
+    echo; echo "ИТОГ ЦЕПОЧКИ: OK — обновлений больше нет, шагов с обновлением: $((step - 1))."
+    exit 0
+  done
+  echo "ИТОГ ЦЕПОЧКИ: остановка — больше 20 шагов подряд; так быть не должно, скажите разработчику." >&2
+  exit 3
+}
+
 main() {
-  local action=update to="" channel="" no_rb=no despite=no read_up=no
+  local action=update to="" channel="" no_rb=no despite=no read_up=no all=no
+  local -a pass=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      --all) all=yes ;;
       --check) action=check ;;
       --consent) action=consent ;;
       --to) [ -n "${2:-}" ] || { echo "--to: нужен тег выпуска (vX.Y.Z)" >&2; exit 2; }; to="$2"; shift ;;
-      --channel) case "${2:-}" in release|pilot|main) channel="$2"; shift ;; *) echo "--channel: release, pilot или main" >&2; exit 2 ;; esac ;;
-      --no-auto-rollback) no_rb=yes ;;
+      --channel) case "${2:-}" in release|pilot|main) channel="$2"; pass+=(--channel "$2"); shift ;; *) echo "--channel: release, pilot или main" >&2; exit 2 ;; esac ;;
+      --no-auto-rollback) no_rb=yes; pass+=(--no-auto-rollback) ;;
       --despite-fail) despite=yes ;;
       --upgrading-read) read_up=yes ;;
       --set-channel)
@@ -115,6 +160,15 @@ main() {
     shift
   done
   if [ -n "$to" ] && [ -n "$channel" ]; then echo "--to и --channel вместе не задаются" >&2; exit 2; fi
+  if [ "$all" = yes ]; then
+    if [ -n "$to" ] || [ "$action" != update ] || [ "$read_up" = yes ] || [ "$despite" = yes ] || [ "$channel" = main ]; then
+      echo "--all — только обновление по очереди до последнего выпуска: без --to, --check, --consent, --channel main," >&2
+      echo "--upgrading-read и --despite-fail (стоп-точки и обновление поверх FAIL решаются на каждом выпуске отдельно)." >&2
+      exit 2
+    fi
+    [ -f .env ] || { echo "нет .env — экземпляр не развёрнут; обновлять нечего (docs/runbooks/deploy.md)" >&2; exit 2; }
+    chain "${pass[@]}"
+  fi
   if [ -n "$to" ] && ! printf '%s' "$to" | grep -Eq "$REL_RE|$RC_RE"; then echo "--to: тег вида v0.0.8 или v0.0.8-rc.1" >&2; exit 2; fi
   [ -f .env ] || { echo "нет .env — экземпляр не развёрнут; обновлять нечего (docs/runbooks/deploy.md)" >&2; exit 2; }
   git rev-parse --git-dir > /dev/null 2>&1 || { echo "каталог не репозиторий git — обновление этим скриптом невозможно" >&2; exit 2; }
@@ -143,7 +197,8 @@ main() {
   # --- цель ---
   local head head_name target target_c target_ver next latest between ahead
   head="$(git rev-parse HEAD)"
-  head_name="$(git describe --tags --exact-match 2> /dev/null || echo "$(cat VERSION 2> /dev/null), коммит ${head:0:7} вне выпуска")"
+  head_name="$(code_tag)"
+  [ -n "$head_name" ] || head_name="$(cat VERSION 2> /dev/null), коммит ${head:0:7} вне выпуска"
   if [ "$channel" = main ]; then
     target="origin/main"
     target_c="$(git rev-parse -q --verify "origin/main^{commit}")" || { echo "нет origin/main" >&2; exit 2; }
@@ -381,6 +436,7 @@ main() {
     [ "$rc_up" -eq 0 ] || say "Внимание: ./ops/up.sh завершился с кодом $rc_up, но новых FAIL в doctor нет — посмотрите строки выше."
     say ""
     say "ИТОГ ОБНОВЛЕНИЯ: OK — $head_name → $target. Копия до обновления: $stamp. Журнал: $log"
+    tell_service ok
     if [ -n "${latest:-}" ] && [ "$latest" != "$target" ]; then say "Есть ещё выпуск(и) до $latest — после проверки владельцем запустите ./ops/update.sh снова."; fi
     exit 0
   fi
@@ -400,6 +456,7 @@ main() {
     say "Экземпляр сейчас на $target с ошибками. Откат — ./ops/restore.sh --rollback: он пришлёт владельцу запрос в бот"
     say "согласований (если сервис лежит — напрямую от имени бота) и продолжит после нажатия «Разрешить»."
     say "ИТОГ ОБНОВЛЕНИЯ: FAIL — нужен человек. Журнал: $log"
+    tell_service failed-needs-human "$new_fails"
     exit 3
   fi
   if [ "$scope" = data ]; then
@@ -415,11 +472,13 @@ main() {
     last_set result rolled-back
     ./ops/state.sh log "обновление до $target: провал, откат на ${head:0:7} выполнен" > /dev/null 2>&1 || true
     say "ИТОГ ОБНОВЛЕНИЯ: ОТКАТ — экземпляр снова на $head_name, ./ops/doctor.sh без FAIL. Причина провала — строки FAIL выше и $UPDATE_DIR/$run.doctor-after.txt; строка дефекта — docs/pilot/defects.md."
+    tell_service rolled-back "$new_fails"
     exit 1
   fi
   last_set result rollback-failed
   ./ops/state.sh log "обновление до $target: провал, откат не удался" > /dev/null 2>&1 || true
   say "ИТОГ ОБНОВЛЕНИЯ: FAIL — откат не удался (код $rc_rb). Стоп: строка дефекта и владельцу; копия до обновления — $stamp. Журнал: $log"
+  tell_service rollback-failed "$new_fails"
   exit 3
 }
 

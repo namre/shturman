@@ -5,6 +5,9 @@
 # Проверяет: VERSION = X.Y.Z; в CHANGELOG.md есть раздел «## X.Y.Z»; в UPGRADING.md раздел «… → X.Y.Z»
 # есть и не помечен «(не выпущено)» (или раздела нет — выпуск без действий для владельца, тогда в
 # CHANGELOG об этом сказано); образ Hermes по умолчанию из compose.yaml — в config/hermes-versions.txt;
+# в списке выпусков releases.json есть запись этого тега с версией VERSION, форма списка верна, его срок
+# годности не вышел, а образы Hermes в нём — те же, что в config/hermes-versions.txt (Р-101; иначе
+# экземпляры о выпуске не узнают); версия пакета сервиса (service/pyproject.toml) — VERSION;
 # если тег уже стоит — он указывает на проверяемый коммит. Код 0 — можно ставить тег.
 set -eu
 cd "$(dirname "$0")/../.." || exit 1
@@ -29,6 +32,16 @@ if awk -F'\t' -v t="$def" '!/^#/ && $1 == t { f = 1 } END { exit f ? 0 : 1 }' co
 else
   say_bad "Hermes по умолчанию ($def) нет в config/hermes-versions.txt"
 fi
+if out="$(python3 -I ops/release_manifest.py check releases.json --hermes-file config/hermes-versions.txt \
+           --tag "$tag" --version "$ver" --fresh 2>&1)"; then
+  echo "$out"
+else
+  say_bad "список выпусков releases.json: $(printf '%s' "$out" | sed 's/^НЕТ: //' | paste -sd';' -)"
+fi
+pv="$(sed -n 's/^version = "\([^"]*\)"/\1/p' service/pyproject.toml | head -n 1)"
+iv="$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' service/src/shturman/__init__.py | head -n 1)"
+if [ "$pv" = "$ver" ] && [ "$iv" = "$ver" ]; then echo "да: версия пакета сервиса — $ver"
+else say_bad "версия пакета сервиса: pyproject.toml — $pv, __init__.py — $iv, а VERSION — $ver"; fi
 if git rev-parse -q --verify "refs/tags/$tag" > /dev/null 2>&1; then
   [ "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)" ] && echo "да: тег $tag стоит на этом коммите" || say_bad "тег $tag уже стоит на другом коммите"
 fi

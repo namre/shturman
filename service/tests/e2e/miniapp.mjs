@@ -1370,6 +1370,87 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
   }
 }
 
+// --- 13. Плашка новой версии (Р-101) ---------------------------------------------------------------
+// Над «Ждёт вашего решения»: версия и «что изменилось» из проверенного списка выпусков, «Как обновить» — текст для
+// Codex; исправление безопасности — красная полоса и «Внимание»; итог последнего обновления — строкой «Версия» в
+// «Что работает». Текст из списка — только текстом: разметка из него не исполняется.
+{
+  const UPD_OUT = process.env.E2E_UPDATES_OUT || OUT;
+  mkdirSync(UPD_OUT, { recursive: true });
+  const seed = async (q) => (await fetch(CONTROL + "/updates/seed?" + q, { method: "POST" })).json();
+  await seed("case=regular");
+  for (const [width, scheme, theme] of [[390, "light", THEME_LIGHT], [360, "light", THEME_LIGHT], [390, "dark", THEME],
+                                        [360, "dark", THEME]]) {
+    const tag = `${width}-${scheme}`;
+    const { ctx, p, errs } = await openApp(width, scheme, theme);
+    await p.waitForSelector("#now-update:not([hidden])");
+    const title = await p.textContent("#now-update-title");
+    const changes = await p.$$eval("#now-update-changes li", (n) => n.map((x) => x.textContent));
+    const meta = await p.textContent("#now-update-meta");
+    if (width === 390 && scheme === "light") {
+      check("плашка: новая версия — самая новая впереди", title === "Новая версия «Штурмана»: v0.0.11", title);
+      check("плашка: что изменилось — из списка выпусков", changes.length === 2 && changes[0].startsWith("Приложение"),
+            changes.join(" | "));
+      check("плашка: выпусков впереди и перерыв", meta.includes("выпусков впереди: 2") && meta.includes("перерыв около 10 мин"), meta);
+      await p.click("#now-update-how summary");
+      const codex = await p.textContent("#now-update-codex");
+      check("«Как обновить»: текст для Codex — задание из репозитория, по очереди, без терминала",
+            codex.startsWith("Обнови мой «Штурман» до версии v0.0.11") && codex.includes("./ops/update.sh --all")
+            && codex.includes("в терминал меня не отправляй"), codex);
+      await p.click("#now-update-copy");
+      await p.waitForTimeout(300);
+      const lines = await p.evaluate(() => { document.getElementById("now-more").open = true; return document.getElementById("now-lines").innerText; });
+      check("«Что работает»: строка версии", lines.includes("Версия: 0.0.9"), lines);
+    }
+    const box = await p.evaluate(() => {
+      const out = [...document.querySelectorAll("#now-update button, #now-update summary")]
+        .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+      return { wide: document.documentElement.scrollWidth <= window.innerWidth + 1, out };
+    });
+    check(`плашка ${tag}: не шире экрана`, box.wide && box.out === 0, JSON.stringify(box));
+    await p.locator("#now").screenshot({ path: path.join(UPD_OUT, `update-banner-${tag}.png`) });
+    check(`плашка ${tag}: в консоли нет ошибок`, realErrors(errs).length === 0, realErrors(errs).join(" | "));
+    await ctx.close();
+  }
+  // исправление безопасности и неудачное обновление
+  await seed("case=security&last=rolled-back");
+  {
+    const { ctx, p } = await openApp(390, "light", THEME_LIGHT);
+    await p.waitForSelector("#now-update.security:not([hidden])");
+    const title = await p.textContent("#now-update-title");
+    const summary = await p.textContent("#now-summary");
+    const lines = await p.evaluate(() => { document.getElementById("now-more").open = true; return document.getElementById("now-lines").innerText; });
+    check("исправление безопасности: красная плашка и «Внимание»", title.startsWith("Исправление безопасности: v0.0.10")
+          && summary.includes("исправление безопасности"), `${title} / ${summary}`);
+    check("итог обновления: «не встало — всё вернули как было»", lines.includes("обновление не встало — всё вернули как было"), lines);
+    await p.locator("#now").screenshot({ path: path.join(UPD_OUT, "update-security-390-light.png") });
+    await ctx.close();
+  }
+  // новых версий нет; удачное обновление
+  await seed("case=none&last=ok");
+  {
+    const { ctx, p } = await openApp(390, "light", THEME_LIGHT);
+    await p.waitForSelector("#now-more:not([hidden])");
+    const hidden = await p.evaluate(() => document.getElementById("now-update").hidden);
+    const lines = await p.evaluate(() => { document.getElementById("now-more").open = true; return document.getElementById("now-lines").innerText; });
+    check("новых версий нет — плашки нет", hidden === true);
+    check("итог обновления: «обновлено — проверки прошли»", lines.includes("обновлено — проверки прошли"), lines);
+    await ctx.close();
+  }
+  // разметка в списке выпусков — только текст
+  await seed("case=inject");
+  {
+    const { ctx, p } = await openApp(390, "light", THEME_LIGHT);
+    await p.waitForSelector("#now-update:not([hidden])");
+    const injected = await p.evaluate(() => ({ img: document.querySelectorAll("#now-update img").length,
+                                               pwned: Boolean(window.__pwned),
+                                               text: document.getElementById("now-update-changes").innerText }));
+    check("разметка из списка выпусков не исполняется", injected.img === 0 && !injected.pwned
+          && injected.text.includes("<img src=x"), JSON.stringify(injected));
+    await ctx.close();
+  }
+}
+
 await browser.close();
 console.log(failed ? `ИТОГ: ${failed} FAIL` : "ИТОГ: OK");
 process.exit(failed ? 1 : 0);

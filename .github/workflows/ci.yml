@@ -93,6 +93,7 @@ jobs:
       - run: node --check plugins/shturman/dashboard/dist/index.js && node --check plugins/shturman/public/app.js
       # Скрипты страницы настройки и Mini App бота согласований (service/src/shturman/setup_page/static).
       - run: for f in setup.js qr.js app.js; do node --check "service/src/shturman/setup_page/static/$f" || exit 1; done
+      - run: python -m json.tool releases.json > /dev/null
       - run: python -m json.tool plugins/shturman/dashboard/manifest.json > /dev/null && python -m json.tool plugins/shturman/personas.json > /dev/null
 
   # Посредник (relay/, docs/relay.md): служба только на стандартной библиотеке Python 3.12, её тесты;
@@ -153,6 +154,10 @@ jobs:
       - name: выпуск — тег собран верно
         if: startsWith(github.ref, 'refs/tags/v')
         run: bash ops/tests/release_check.sh "${GITHUB_REF#refs/tags/}"
+      # Список выпусков (Р-101): форма — та же, что принимает сервис; образы Hermes — те же, что в списке проверенных.
+      # Срок годности здесь не проверяется (на теге — release_check.sh; напоминание — еженедельная задача security).
+      - name: выпуски — список releases.json
+        run: python3 ops/release_manifest.py check releases.json --hermes-file config/hermes-versions.txt
       # Образ Hermes по умолчанию — из списка проверенных версий (config/hermes-versions.txt, Р-97).
       - name: ops — Hermes по умолчанию проверен
         run: |
@@ -413,6 +418,8 @@ jobs:
           test "$(rc join ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 2
           grep -q 'Свободные варианты: ivan2' out.txt && grep -q 'relay.sh check КОД ИМЯ' out.txt
           if grep -q '^SHTURMAN_RELAY_NAME=' .env; then echo "отказ не должен записывать подключение"; exit 1; fi
+      # Отчёт сессии сопровождения (Р-102) — тем же белым списком, ни одна строка secrets.txt не проходит ни через
+      # строки doctor, ни через свободный текст агента; список выпусков и тревога по уязвимостям — unittest ниже.
       # Молчаливые сбои и утечки (Р-98): токен архива не выдаётся команде агента (без терминала) и выдаётся
       # человеку (псевдотерминал программы script); адрес внешнего сторожа — только https и нигде целиком;
       # очистка по умолчанию ничего не удаляет, копии — только после «Разрешить» владельца в боте (Р-100); диагностический пакет —
@@ -426,6 +433,7 @@ jobs:
           bash ops/tests/cleanup.sh
           python3 -m unittest discover -s ops/tests -p 'test_*.py'
           bash ops/tests/diag.sh
+          bash ops/tests/report.sh
           bash ops/tests/doctor_rows.sh
           bash ops/tests/doctor_hermes.sh
           bash ops/tests/resources.sh

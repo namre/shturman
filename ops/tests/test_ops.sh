@@ -5,7 +5,8 @@
 #   ротация, внешний каталог и проверка; восстановление каталогов и .env; отказ восстанавливать копию
 #   более новой версии; проверка свежей копии в up.sh; выбор версии в update.sh (выпуски, кандидаты,
 #   перескок, неверный тег, откат назад), разрешение человека, решение «откатывать ли базу», успех,
-#   откат только кода, остановка с откатом для человека и сам откат.
+#   откат только кода, остановка с откатом для человека и сам откат; --all — по выпуску за шаг до последнего,
+#   итог каждого шага — сервису (Р-101).
 # Настоящая база (pg_dump → порча → восстановление → сверка строк) — ops/tests/e2e_restore.sh.
 # Запуск из корня репозитория: bash ops/tests/test_ops.sh
 set -eu
@@ -327,6 +328,56 @@ run ./ops/update.sh --upgrading-read; want 0; [ "$(git rev-parse HEAD)" = "$c3" 
 run ./ops/update.sh; want 0; has "Обновлений нет"
 run ./ops/update.sh --check --channel main; want 0; has "Цель:     origin/main"
 ok "последний выпуск — «обновлений нет»; main — только явно"
+
+# --- 6б. update.sh --all: по выпуску за шаг до последнего; итог каждого шага — сервису (Р-101) ---
+o2="$tmp/origin2"; mkdir -p "$o2"; cd "$o2"
+git init -q -b main
+cp -r "$root/ops" "$root/config" "$root/.env.example" .
+rm -rf ops/tests
+cp "$o/ops/doctor.sh" "$o/ops/up.sh" ops/
+printf 'local/\ndata/\n.env\n' > .gitignore
+printf 'services:\n  hermes:\n    image: nousresearch/hermes-agent:${HERMES_VERSION:-v2026.9.24}\n' > compose.yaml
+mkdir -p service/src/shturman/migrations
+printf '# Обновление\n' > UPGRADING.md
+rel 0.0.1 0001_a.sql v0.0.1
+rel 0.0.2 "" v0.0.2
+rel 0.0.3 "" v0.0.3-rc.1
+echo "исправление кандидата" > notes.txt; rel 0.0.3 "" v0.0.3
+rel 0.0.4 "" v0.0.4-rc.1
+chain_inst() {
+  rm -rf "${tmp:?}/$1"; git clone -q "$o2" "$tmp/$1"; cd "$tmp/$1"; git checkout -q --detach v0.0.1
+  printf 'SHTURMAN_MODE=standalone\n' > .env; chmod 600 .env; mkdir -p data/shturman local
+  echo "0001_a.sql" > "$STUB_APPLIED_FILE"
+}
+chain_inst chain1
+: > "$STUB_LOG"
+STUB_SERVICE=running run ./ops/update.sh --all; want 0 "цепочка: код $code"
+has "=== Шаг 1"; has "=== Шаг 2"; has "ИТОГ ЦЕПОЧКИ: OK — последний выпуск канала установлен (v0.0.3), шагов: 2"
+[ "$(git rev-parse HEAD)" = "$(git rev-parse v0.0.3)" ] || die "цепочка не дошла до v0.0.3"
+[ "$(grep -c 'shturman update-result --run [0-9TZ]* --result ok' "$STUB_LOG")" = 2 ] || die "итог шагов не передан сервису"
+grep -q -- "--result ok --from v0.0.1 --to v0.0.2 --new-fails" "$STUB_LOG" || die "итог: не те версии"
+[ "$(./ops/backup.sh --list | grep -c 'before-update')" -ge 2 ] || die "не на каждом шаге копия"
+ok "--all: выпуск за выпуском (кандидаты в канале release — мимо), каждый с копией и проверкой; итог — сервису"
+run ./ops/update.sh --all; want 0; has "обновлений больше нет, шагов с обновлением: 0"
+run ./ops/update.sh --all --channel pilot; want 0; [ "$(git rev-parse HEAD)" = "$(git rev-parse v0.0.4-rc.1)" ] || die "pilot: не до кандидата"
+ok "--all в канале pilot доходит и до кандидата"
+chain_inst chain2
+echo 0.0.3 > local/doctor-fail
+: > "$STUB_LOG"
+STUB_SERVICE=running run ./ops/update.sh --all; want 1 "провал на шаге 2: код $code"
+has "ИТОГ ЦЕПОЧКИ: остановка на шаге 2 (код 1)"; has "экземпляр на v0.0.2"
+[ "$(git rev-parse HEAD)" = "$(git rev-parse v0.0.2)" ] || die "после отката не на v0.0.2"
+grep -q -- "--result rolled-back --from v0.0.2 --to v0.0.3 --new-fails service" "$STUB_LOG" || die "откат не передан сервису"
+ok "--all: провал шага — откат этого шага, цепочка остановлена; сервису — «откат» с именами строк doctor"
+for bad in "--all --to v0.0.3" "--all --upgrading-read" "--all --despite-fail" "--all --check" "--all --consent" "--all --channel main"; do
+  # shellcheck disable=SC2086
+  run ./ops/update.sh $bad; want 2 "$bad: код $code"
+done
+ok "--all не сочетается с --to, --upgrading-read, --despite-fail, --check, --consent, --channel main"
+rm -f local/doctor-fail; : > "$STUB_LOG"
+STUB_SERVICE="" run ./ops/update.sh --all; want 0; has "ИТОГ ЦЕПОЧКИ: OK"
+if grep -q 'update-result' "$STUB_LOG"; then die "сервиса нет, а итог передавался"; fi
+ok "сервис не запущен — обновление идёт, итог просто не передаётся"
 
 # --- Порог защиты: только человек в терминале (Р-99) ---
 d="$(mkinst guard)"; cd "$d"

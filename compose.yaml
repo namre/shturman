@@ -159,6 +159,19 @@ services:
       # пусто — сторожа нет. Раз в столько минут сервис зовёт его с итогом проверок.
       SHTURMAN_PULSE_URL: ${SHTURMAN_PULSE_URL:-}
       SHTURMAN_PULSE_EVERY: ${SHTURMAN_PULSE_EVERY:-5}
+      # Обновления (Р-101): список выпусков с GitHub раз в сутки — сообщения владельцу о новых версиях; канал —
+      # тот же, что у ./ops/update.sh. Что за код запущен (VERSION, тег на коммите, коммит, образ Hermes), пишет
+      # ./ops/up.sh перед запуском — по ним сервис замечает смену версии и сообщает итог обновления.
+      SHTURMAN_UPDATES: ${SHTURMAN_UPDATES:-on}
+      SHTURMAN_UPDATES_URL: ${SHTURMAN_UPDATES_URL:-}
+      SHTURMAN_UPDATE_CHANNEL: ${SHTURMAN_UPDATE_CHANNEL:-release}
+      SHTURMAN_CODE_VERSION: ${SHTURMAN_CODE_VERSION:-}
+      SHTURMAN_CODE_TAG: ${SHTURMAN_CODE_TAG:-}
+      SHTURMAN_CODE_COMMIT: ${SHTURMAN_CODE_COMMIT:-}
+      SHTURMAN_HERMES_IMAGE: ${SHTURMAN_HERMES_IMAGE:-}
+      # Отчёты сессий сопровождения (Р-102): номер чата разработки, куда бот согласований присылает отчёт по
+      # нажатию владельца «Отправить». Пусто — отчёт приходит владельцу для пересылки. Записывает владелец.
+      SHTURMAN_FEEDBACK_CHAT: ${SHTURMAN_FEEDBACK_CHAT:-}
       # Посредник с ботом-менеджером: «создать бота согласований в одно нажатие» на странице
       # настройки переписки (docs/approvals-bot.md). Пусто — https://relay.sh.namre.app; off —
       # выключить. Только здесь: ни страница, ни API адрес не меняют.

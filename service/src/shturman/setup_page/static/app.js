@@ -736,6 +736,7 @@
       stop.addEventListener("click", function () { $("halt-stop").click(); });
       haltBox.appendChild(stop);
     }
+    drawUpdate(nowData.update, line, problems);
     var seen = nowData.last_message_at ? "последнее сообщение " + deadline(nowData.last_message_at) : "сообщений ещё не было";
     var summary = $("now-summary");
     summary.textContent = problems.length ? "⚠ Внимание: " + problems.join(", ") : "Всё работает · " + seen;
@@ -744,10 +745,68 @@
     show("now-more", true);
   }
 
+  // Плашка новой версии и строка «Версия» в «Что работает» (Р-101). Тексты — из проверенного списка выпусков
+  // и только как текст (textContent): ничего из него не исполняется и не становится разметкой.
+  var UPDATE_RESULT = { "ok": "✓", "rolled-back": "⚠", "failed-needs-human": "⚠", "rollback-failed": "⚠" };
+  var UPDATE_WORDS = {
+    "ok": "обновлено — проверки прошли",
+    "rolled-back": "обновление не встало — всё вернули как было",
+    "failed-needs-human": "обновление прошло с ошибками — попросите Codex «откатить последнее обновление»",
+    "rollback-failed": "обновление не встало, и откат не удался — нужен тот, кто сопровождает сервер"
+  };
+  function drawUpdate(u, line, problems) {
+    var box = $("now-update");
+    if (!u) { show("now-update", false); return; }
+    var a = u.available;
+    if (a) {
+      $("now-update-title").textContent = (a.security ? "Исправление безопасности: " : "Новая версия «Штурмана»: ") + a.tag
+        + (a.rc ? " (кандидат для пилота)" : "");
+      var list = $("now-update-changes");
+      clear(list);
+      (a.changes || []).forEach(function (c) { list.appendChild(el("li", null, c)); });
+      var meta = [];
+      if (a.count > 1) meta.push("выпусков впереди: " + a.count);
+      if (a.downtime_minutes === 0) meta.push("без перерыва в работе");
+      else if (a.downtime_minutes) meta.push("перерыв около " + a.downtime_minutes + " мин");
+      if (a.owner_steps && a.owner_steps.length) meta.push("понадобятся ваши действия: " + a.owner_steps.join("; "));
+      $("now-update-meta").textContent = meta.join(" · ");
+      show("now-update-meta", meta.length > 0);
+      $("now-update-codex").textContent = (a.codex_text || "").replace(/^[^\n]*\n\n/, "");
+      box.className = "upd" + (a.security ? " security" : "");
+      if (a.security) problems.push("исправление безопасности");
+    }
+    show("now-update", Boolean(a));
+    var last = u.last;
+    var text = "Версия: " + (u.running || "?");
+    if (last && UPDATE_WORDS[last.result]) text += " · " + deadline(last.at) + " " + UPDATE_WORDS[last.result];
+    else if (u.problem === "expired" || u.problem === "invalid") text += " · проверить новые версии сейчас нельзя (список выпусков на GitHub устарел)";
+    else if (u.enabled === false) text += " · проверка новых версий выключена";
+    else if (!a) text += " · новых версий нет";
+    line(last && UPDATE_RESULT[last.result] ? UPDATE_RESULT[last.result] : "•", text);
+    if (last && last.result !== "ok") problems.push("обновление");
+  }
+
+  function copyCodex() {
+    var text = $("now-update-codex").textContent || "";
+    function done() { toast("Текст для Codex скопирован."); }
+    function fallback() {
+      try {
+        var range = document.createRange();
+        range.selectNodeContents($("now-update-codex"));
+        var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+        if (document.execCommand && document.execCommand("copy")) { done(); return; }
+      } catch (e) { /* ниже — подсказка */ }
+      toast("Выделите текст и скопируйте его вручную.");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback);
+    else fallback();
+  }
+
   function wireNow() {
     // помнится только нажатие владельца (по умолчанию «что работает» раскрыто, когда что-то не так)
     $("now-summary").addEventListener("click", function () { rememberOpen("now", !$("now-more").open); });
     $("now-commitments").addEventListener("click", function () { openTab("commitments"); });
+    $("now-update-copy").addEventListener("click", copyCodex);
   }
 
   /* ------------------------------------------------------------ «Чаты» */

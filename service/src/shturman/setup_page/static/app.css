@@ -671,6 +671,16 @@ details.sect[open] > summary::before { transform: rotate(45deg); }
 .now-line { display: flex; gap: 8px; margin: 4px 0; }
 .now-mark { flex: 0 0 16px; text-align: center; }
 .now-halt .stop { margin-top: 4px; }
+/* Плашка новой версии (Р-101): над «Ждёт вашего решения»; исправление безопасности — красная полоса. */
+.upd { margin: 0 0 10px; padding: 10px 12px; border-radius: 10px; background: var(--quote); border-left: 3px solid var(--accent); }
+.upd.security { border-left-color: var(--danger); }
+.upd p { margin: 0 0 4px; }
+.upd-title { font-weight: 600; }
+.upd-changes { margin: 4px 0 6px; padding-left: 18px; }
+.upd-changes li { margin: 2px 0; }
+.upd-meta { font-size: 13px; }
+.upd-how > summary { cursor: pointer; color: var(--accent); font-weight: 600; min-height: 44px; display: flex; align-items: center; }
+.upd-codex { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; padding: 8px 10px; border-radius: 8px; background: var(--section); border: 1px solid var(--sep); user-select: all; }
 
 .soon {
   background: var(--section);
