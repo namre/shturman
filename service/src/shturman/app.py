@@ -45,6 +45,7 @@ logger = logging.getLogger("shturman")
 
 MODULES = (
     "shturman.api_core",
+    "shturman.ops_consent",        # разрешения владельца на действия сопровождения (Р-100)
     "shturman.executor.service",   # раньше остальных: кто выполняет задания, решается до их постановки
     "shturman.guard.service",      # раньше источников сообщений: живой поток пишется уже под защитой
     "shturman.sources.service",    # ограниченные источники для автоматических задач

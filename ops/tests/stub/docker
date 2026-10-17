@@ -7,12 +7,19 @@
 #   STUB_HERMES_IMAGE=…    — образ работающего контейнера Hermes (пусто — контейнера нет)
 #   STUB_IMAGES=…          — вывод docker compose config --images
 #   STUB_COMPOSE_OK=1      — прочие команды docker compose завершаются успешно (иначе — отказ)
+#   STUB_SERVICE=running   — контейнер сервиса переписки запущен (иначе его нет; restarting — перезапускается)
+#   STUB_CONSENT=N         — решение владельца в боте через сервис: код выхода `shturman ops-consent ask`
+#                            (0 — разрешил, 4 — ещё не ответил, 5 — отклонил, 6 — бота нет, 7 — сервис не отвечает)
+#   STUB_IMAGE=1           — образ сервиса есть (для пути без сервиса: docker compose run … --direct)
+#   STUB_DIRECT=N          — решение владельца на пути без сервиса (тот же смысл кодов; по умолчанию 6)
+#   STUB_CONSENT_STATUS=…  — ответ `shturman ops-consent status` (например «granted 14:00 (UTC)»)
 echo "docker $*" >> "${STUB_LOG:-/dev/null}"
 case "$1" in
   inspect)
     name="${*: -1}"
     case "$name" in
       shturman-postgres) if [ "${STUB_PG:-}" = running ]; then echo running; exit 0; fi; exit 1 ;;
+      shturman-service) if [ -n "${STUB_SERVICE:-}" ]; then echo "$STUB_SERVICE"; exit 0; fi; exit 1 ;;
       shturman-hermes)
         if [ -n "${STUB_HERMES_IMAGE:-}" ]; then
           case "$*" in *Config.Image*) echo "$STUB_HERMES_IMAGE" ;; *) echo running ;; esac
@@ -22,8 +29,11 @@ case "$1" in
       *) exit 1 ;;
     esac ;;
   ps|stop) exit 0 ;;
+  image) if [ "${STUB_IMAGE:-}" = 1 ]; then echo '[]'; exit 0; fi; exit 1 ;;
   exec)
     case "$*" in
+      *"ops-consent ask"*) echo "подставной бот: решение ${STUB_CONSENT:-6}"; exit "${STUB_CONSENT:-6}" ;;
+      *"ops-consent status"*) echo "${STUB_CONSENT_STATUS:-none}" ;;
       *pg_isready*) exit 0 ;;
       *"string_agg(t ||"*) echo "chats=1 messages=2" ;;
       *"to_regclass('public.schema_migrations')"*) echo t ;;
@@ -37,6 +47,7 @@ case "$1" in
     case "$*" in
       *"config --images"*) printf '%s\n' "${STUB_IMAGES:-}" ;;
       *"up -d postgres"*) exit 0 ;;
+      *"ops-consent ask"*"--direct"*) echo "подставной бот без сервиса: решение ${STUB_DIRECT:-6}"; exit "${STUB_DIRECT:-6}" ;;
       *) if [ "${STUB_COMPOSE_OK:-}" = 1 ]; then exit 0; fi; exit 1 ;;
     esac ;;
   *) exit 1 ;;

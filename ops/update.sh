@@ -13,32 +13,36 @@
 #                                      то же — строкой SHTURMAN_UPDATE_CHANNEL=pilot в .env
 #   ./ops/update.sh --channel main   — до нынешнего main, мимо выпусков. Только явно, для разработки
 #   ./ops/update.sh --set-channel release|pilot — записать канал экземпляра в .env (ничего не обновляет)
-#   ./ops/update.sh --consent [--to …|--channel …] — человек в своём терминале разрешает заранее
-#                                      автоматический откат базы и data/ из копии (и непроверенную версию
-#                                      Hermes, если она придёт). Разрешение — на одну целевую версию,
-#                                      на 2 часа, одноразовое: потом агент запускает ./ops/update.sh сам
-#   ./ops/update.sh --no-auto-rollback — обновить без такого разрешения: если после миграций проверка
-#                                      не пройдёт, скрипт остановится (код 3) и назовёт команду отката
-#                                      для человека (./ops/restore.sh --rollback)
+#   ./ops/update.sh --consent [--to …|--channel …] — заранее попросить у владельца разрешение на
+#                                      автоматический откат базы и data/ из копии (и на непроверенную
+#                                      версию Hermes, если она придёт): владельцу в бот согласований
+#                                      приходит карточка, он нажимает «Разрешить» (Р-100). Разрешение — на
+#                                      одну целевую версию, один раз, 2 часа после нажатия; его израсходует
+#                                      следующий ./ops/update.sh. Без --consent обычный запуск спрашивает
+#                                      сам и ждёт нажатия (OPS_CONSENT_WAIT секунд, по умолчанию 300)
+#   ./ops/update.sh --no-auto-rollback — обновить без такого разрешения (с согласия владельца в разговоре):
+#                                      если после миграций проверка не пройдёт, скрипт остановится (код 3)
+#                                      и назовёт команду отката (./ops/restore.sh --rollback — тоже через бот)
 #   ./ops/update.sh --despite-fail   — обновлять, хотя ./ops/doctor.sh уже до обновления с FAIL;
 #                                      успех — если новых FAIL не появилось (только с согласия владельца)
 #   ./ops/update.sh --upgrading-read — раздел UPGRADING.md целевой версии прочитан и пересказан владельцу;
 #                                      нужен, если в разделе есть «Стоп-точка» (шаги вне этого скрипта)
 #   -h, --help                       — эта справка; ничего не делается
 # Шаги: замок ops/ → отслеживаемые файлы не изменены → git fetch --tags → выбор цели и план →
-# разрешение человека, если оно нужно → ./ops/doctor.sh до (сохраняется) → копия (своя, если нет
+# разрешение владельца в боте согласований, если оно нужно (бот недоступен — запасной путь: фраза
+# человека в терминале) → ./ops/doctor.sh до (сохраняется) → копия (своя, если нет
 # свежей с тем же кодом и той же базой: ./ops/backup.sh --reason before-update) → запись
 # local/update/last.env → git checkout --detach цели → ./ops/up.sh (миграции, образы, перезапуск) →
 # ./ops/doctor.sh после (до трёх раз с паузой 30 с) → успех: новых FAIL нет. Провал → откат:
 #   код — всегда, на прежний коммит;
 #   база и data/ из копии — только если применились миграции или сменился образ Hermes (иначе прежний
-#   код работает с теми же данными); это перезапись данных — только с разрешением человека.
+#   код работает с теми же данными); это перезапись данных — только с разрешением владельца.
 # Экземпляр после обновления стоит на теге (detached HEAD): git pull больше не путь обновления.
 # Вывод и итог дублируются в local/update/<время>.log (без секретов: вывод up.sh и doctor).
 # Коды: 0 — обновлено (или уже последняя версия); 1 — не обновлено, откат выполнен, doctor без FAIL;
 # 2 — неверные параметры или цель; 3 — нужен человек: откат не выполнен или не удался, либо копия
-# не сделана; 4 — нужно разрешение человека в терминале (команда — в выводе); 75 — идёт другая
-# команда ops/.
+# не сделана; 4 — нет разрешения владельца: ждём нажатия в боте, он отклонил, срок вышел или бот
+# недоступен (что именно и что дальше — в выводе); 75 — идёт другая команда ops/.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
@@ -121,11 +125,6 @@ main() {
   . ops/lib-backup.sh
   load_mode
 
-  if [ "$action" = consent ] && ! has_tty; then
-    echo "Разрешение даёт человек в своём терминале — у этого запуска терминала нет." >&2
-    need_human "./ops/update.sh --consent${to:+ --to $to}$( [ -n "$channel" ] && [ "$channel" != release ] && printf ' --channel %s' "$channel")"
-    exit "$OPS_NEED_HUMAN"
-  fi
   ops_lock "обновление (./ops/update.sh$( [ "$action" != update ] && printf ' --%s' "$action"))"
   mkdir -p "$UPDATE_DIR"; chmod 700 "$UPDATE_DIR"
 
@@ -220,66 +219,97 @@ main() {
   fi
   if fresh="$(bk_fresh "$(bk_fresh_minutes)")"; then echo "Копия:    свежая есть — $fresh; перед обновлением всё равно будет снята своя, если код или база с тех пор менялись"; else echo "Копия:    будет снята перед обновлением (./ops/backup.sh --reason before-update)"; fi
   if [ "$scope_possible" = data ]; then
-    echo "Откат при провале: код, база и data/ из этой копии (применятся миграции или сменится Hermes) — перезапись данных, нужно разрешение человека"
+    echo "Откат при провале: код, база и data/ из этой копии (применятся миграции или сменится Hermes) — перезапись данных, нужно разрешение владельца в боте согласований"
   else
     echo "Откат при провале: только код (миграций нет, Hermes тот же) — данные не перезаписываются, разрешение не нужно"
   fi
 
-  # --- разрешение человека ---
-  local consent=no need_consent=no need_hermes=no c_target c_exp c_hermes
+  # --- разрешение владельца (Р-100): кнопка в боте согласований ---
+  local consent=no need_consent=no need_hermes=no c_target c_exp c_hermes again rc_c=0
+  local -a details
   [ "$scope_possible" = data ] && need_consent=yes
-  # Непроверенная версия Hermes — подтверждение человека, даже если она уже работает: новый код
+  # Непроверенная версия Hermes — разрешение владельца, даже если она уже работает: новый код
   # плагина с ней тоже не проверен.
   if [ "$MODE" = hermes ] && [ "$hermes_ok" = no ]; then need_hermes=yes; fi
+  # Разрешение, записанное запасным путём (фраза в терминале) или полученное без сервиса заранее.
   if [ -f "$CONSENT_FILE" ]; then
     c_target="$(meta_get "$CONSENT_FILE" target_commit)"; c_exp="$(meta_get "$CONSENT_FILE" expires)"; c_hermes="$(meta_get "$CONSENT_FILE" hermes)"
     if [ "$c_target" = "$target_c" ] && [ "${c_exp:-0}" -ge "$(date +%s)" ] && { [ "$need_hermes" = no ] || [ "$c_hermes" = "$ha" ]; }; then
       consent="file"
     fi
   fi
+  again="./ops/update.sh${to:+ --to $to}"
+  case "$channel" in pilot|main) again="$again --channel $channel" ;; esac
+  details=("from=$head_name" "to=$target" "scope=$scope_possible")
+  [ -n "$mig_new" ] && details+=("migrations=$(list_count "$mig_new") ($mig_new)")
+  [ "$need_hermes" = yes ] && details+=("hermes=$ha")
 
   if [ "$action" = check ]; then
     echo
     if [ "$need_consent" = yes ] || [ "$need_hermes" = yes ]; then
-      if [ "$consent" = file ]; then echo "Разрешение человека на этот выпуск уже записано (до $(date -d "@$c_exp" '+%H:%M')) — ./ops/update.sh можно запускать."
+      if [ "$consent" = file ]; then echo "Разрешение на этот выпуск уже записано (до $(date -d "@$c_exp" '+%H:%M')) — ./ops/update.sh можно запускать."
       else
-        echo "Нужно разрешение человека$( [ "$need_hermes" = yes ] && printf ' (в том числе на непроверенную версию Hermes)'): владелец запускает в своём Терминале"
-        echo "  ssh -t shturman-app 'cd $(pwd) && ./ops/update.sh --consent$( [ -n "$to" ] && printf ' --to %s' "$to")$( [ "$channel" = pilot ] || [ "$channel" = main ] && printf ' --channel %s' "$channel")'"
-        [ "$need_hermes" = no ] && echo "  или обновление без автоматического отката базы: ./ops/update.sh --no-auto-rollback (при провале — остановка и откат человеком)"
+        local bot_state="unknown"
+        if [ "$(container_state shturman-service)" = running ]; then
+          bot_state="$(docker exec shturman-service shturman ops-consent status --action update --target "$target_c" 2> /dev/null || echo unknown)"
+        fi
+        case "$bot_state" in
+          granted*) echo "Разрешение владельца в боте согласований есть (годно до ${bot_state#granted }) — ./ops/update.sh можно запускать." ;;
+          pending*) echo "Запрос разрешения уже в боте согласований и ждёт нажатия владельца (до ${bot_state#pending }). Нажал — запускайте $again." ;;
+          *)
+            echo "Нужно разрешение владельца$( [ "$need_hermes" = yes ] && printf ' (в том числе на непроверенную версию Hermes)'): $again сам пришлёт ему"
+            echo "  запрос в бот согласований и подождёт нажатия «Разрешить»; заранее — ${again/update.sh/update.sh --consent}."
+            [ "$need_hermes" = no ] && echo "  или обновление без автоматического отката базы: ./ops/update.sh --no-auto-rollback (при провале — остановка и откат: ./ops/restore.sh --rollback)" ;;
+        esac
       fi
     fi
     echo "Это план (--check): ничего не изменено."
     exit 0
   fi
 
-  if [ "$action" = consent ] || { has_tty && { [ "$need_consent" = yes ] || [ "$need_hermes" = yes ]; } && [ "$consent" = no ]; }; then
-    {
-      echo
-      echo "Что вы разрешаете:"
-      [ "$need_consent" = yes ] && echo "  * если после обновления проверка не пройдёт — вернуть прежнюю версию ВМЕСТЕ С БАЗОЙ и data/ из копии, которую скрипт снимет прямо перед обновлением; всё, что придёт в архив за время обновления (обычно минуты), может пропасть;"
-      [ "$need_hermes" = yes ] && echo "  * запуск Hermes $ha, которого нет в списке проверенных версий: плагин с ним не проверен; откат — только восстановлением копии data/hermes;"
-      [ "$need_consent" = no ] && [ "$need_hermes" = no ] && echo "  * ничего особого: откат при провале — только код, данные не перезаписываются."
-    } > /dev/tty
-    if ! human_confirm "РАЗРЕШАЮ"; then echo "Не подтверждено — ничего не изменено." >&2; exit "$OPS_NEED_HUMAN"; fi
-    if [ "$action" = consent ]; then
-      mkdir -p local/consent; chmod 700 local/consent
-      { echo "target_commit=$target_c"; echo "target_name=$target"; echo "hermes=$ha"; echo "created=$(date +%s)"; echo "expires=$(( $(date +%s) + 7200 ))"; } > "$CONSENT_FILE"
-      ./ops/state.sh log "обновление до $target: человек разрешил автоматический откат (на 2 часа)" > /dev/null 2>&1 || true
-      echo "Разрешение записано: обновление до $target, действует до $(date -d '+2 hours' '+%H:%M'), один раз. Теперь агент запускает ./ops/update.sh${to:+ --to $to}$( [ "$channel" = pilot ] || [ "$channel" = main ] && printf ' --channel %s' "$channel")."
+  if [ "$action" = consent ] || { { [ "$need_consent" = yes ] || [ "$need_hermes" = yes ]; } && [ "$consent" = no ] && [ "$no_rb" = no ]; } \
+     || { [ "$need_hermes" = yes ] && [ "$consent" = no ]; }; then
+    if [ "$action" = consent ] && [ "$need_consent" = no ] && [ "$need_hermes" = no ]; then
+      echo "Разрешение не нужно: откат при провале — только код, данные не перезаписываются. Запускайте $again."
       exit 0
     fi
-    consent="tty"
-  fi
-  if [ "$need_hermes" = yes ] && [ "$consent" = no ]; then
-    echo "Целевой образ Hermes $ha не из списка проверенных — нужно подтверждение человека." >&2
-    need_human "./ops/update.sh --consent${to:+ --to $to}$( [ "$channel" = pilot ] || [ "$channel" = main ] && printf ' --channel %s' "$channel")"
-    exit "$OPS_NEED_HUMAN"
-  fi
-  if [ "$need_consent" = yes ] && [ "$consent" = no ] && [ "$no_rb" = no ]; then
-    echo "В этом обновлении миграции базы (или смена Hermes): при провале откат перезапишет базу и data/ из копии — на это нужно разрешение человека." >&2
-    need_human "./ops/update.sh --consent${to:+ --to $to}$( [ "$channel" = pilot ] || [ "$channel" = main ] && printf ' --channel %s' "$channel")"
-    echo "Другой путь — с согласия владельца в этой сессии: ./ops/update.sh --no-auto-rollback (при провале — остановка, откат делает человек: ./ops/restore.sh --rollback)." >&2
-    exit "$OPS_NEED_HUMAN"
+    echo
+    rc_c=0
+    if [ "$action" = consent ]; then OWNER_CONSENT_KEEP=1 owner_consent update "$target_c" "${details[@]}" || rc_c=$?
+    else owner_consent update "$target_c" "${details[@]}" || rc_c=$?; fi
+    if [ "$rc_c" -eq 1 ]; then
+      echo "Разрешения владельца нет — ничего не изменено. Нажмёт «Разрешить» — повторите: $again" >&2
+      [ "$need_hermes" = no ] && echo "Другой путь — с согласия владельца в разговоре: ./ops/update.sh --no-auto-rollback (при провале — остановка и откат: ./ops/restore.sh --rollback)." >&2
+      exit "$OPS_NEED_HUMAN"
+    fi
+    if [ "$rc_c" -eq 2 ]; then
+      echo "Подтвердить в боте согласований сейчас нельзя (причина — выше). Запасной путь — человек в своём терминале; он слабее кнопки в боте." >&2
+      if has_tty; then
+        {
+          echo "Что вы разрешаете:"
+          [ "$need_consent" = yes ] && echo "  * если после обновления проверка не пройдёт — вернуть прежнюю версию ВМЕСТЕ С БАЗОЙ и data/ из копии, которую скрипт снимет прямо перед обновлением; всё, что придёт в архив за время обновления (обычно минуты), может пропасть;"
+          [ "$need_hermes" = yes ] && echo "  * запуск Hermes $ha, которого нет в списке проверенных версий: плагин с ним не проверен; откат — только восстановлением копии data/hermes;"
+        } > /dev/tty
+        if ! human_confirm "РАЗРЕШАЮ"; then echo "Не подтверждено — ничего не изменено." >&2; exit "$OPS_NEED_HUMAN"; fi
+        OWNER_CONSENT_VIA="tty"
+      else
+        need_human "${again/update.sh/update.sh --consent}"
+        [ "$need_hermes" = no ] && echo "Другой путь — с согласия владельца в разговоре: ./ops/update.sh --no-auto-rollback." >&2
+        exit "$OPS_NEED_HUMAN"
+      fi
+    fi
+    if [ "$action" = consent ]; then
+      if [ "$OWNER_CONSENT_VIA" != bot ]; then
+        # Без сервиса (или фразой в терминале) разрешение хранится здесь: сервису его не передать.
+        mkdir -p local/consent; chmod 700 local/consent
+        { echo "target_commit=$target_c"; echo "target_name=$target"; echo "hermes=$ha"; echo "via=$OWNER_CONSENT_VIA"; echo "created=$(date +%s)"; echo "expires=$(( $(date +%s) + 7200 ))"; } > "$CONSENT_FILE"
+      fi
+      ./ops/state.sh log "обновление до $target: владелец разрешил автоматический откат ($OWNER_CONSENT_VIA, на 2 часа)" > /dev/null 2>&1 || true
+      echo "Разрешение получено: обновление до $target, один раз, 2 часа. Теперь агент запускает $again."
+      exit 0
+    fi
+    consent="$OWNER_CONSENT_VIA"
+    ./ops/state.sh log "обновление до $target: владелец разрешил автоматический откат ($consent)" > /dev/null 2>&1 || true
   fi
   if [ "$stops" = yes ] && [ "$read_up" = no ]; then
     echo "В разделе UPGRADING.md этой версии есть «Стоп-точка». Прочитайте раздел (git show $target:UPGRADING.md), перескажите владельцу, получите его «да» и запустите с --upgrading-read." >&2
@@ -367,8 +397,8 @@ main() {
     last_set result failed-needs-human
     ./ops/state.sh log "обновление до $target: провал, откат ждёт человека" > /dev/null 2>&1 || true
     say "Миграции применились (или сменился Hermes), а разрешения на автоматический откат базы нет — ничего не откатываю."
-    say "Экземпляр сейчас на $target с ошибками. Откат делает человек в своём Терминале:"
-    say "  ssh -t shturman-app 'cd $(pwd) && ./ops/restore.sh --rollback'"
+    say "Экземпляр сейчас на $target с ошибками. Откат — ./ops/restore.sh --rollback: он пришлёт владельцу запрос в бот"
+    say "согласований (если сервис лежит — напрямую от имени бота) и продолжит после нажатия «Разрешить»."
     say "ИТОГ ОБНОВЛЕНИЯ: FAIL — нужен человек. Журнал: $log"
     exit 3
   fi

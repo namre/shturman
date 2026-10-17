@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Сценарные тесты ops/ без настоящего Docker (подставной docker — ops/tests/stub/docker):
-#   замок от параллельного запуска (Д-9); подтверждение человеком только в терминале; копия, её опись,
+#   замок от параллельного запуска (Д-9); разрешение владельца кнопкой в боте согласований — через сервис
+#   и без него (Р-100), запасной путь — фраза человека только в терминале; копия, её опись,
 #   ротация, внешний каталог и проверка; восстановление каталогов и .env; отказ восстанавливать копию
 #   более новой версии; проверка свежей копии в up.sh; выбор версии в update.sh (выпуски, кандидаты,
 #   перескок, неверный тег, откат назад), разрешение человека, решение «откатывать ли базу», успех,
@@ -14,7 +15,8 @@ holder=""
 cleanup() { [ -n "$holder" ] && kill "$holder" 2> /dev/null; rm -rf "$tmp"; }
 trap cleanup EXIT
 export PATH="$root/ops/tests/stub:$PATH" STUB_LOG="$tmp/docker.log" OPS_UPDATE_RETRY_PAUSE=0
-unset STUB_PG STUB_APPLIED STUB_APPLIED_FILE STUB_HERMES_IMAGE STUB_IMAGES STUB_COMPOSE_OK SHTURMAN_BACKUP_DIR 2> /dev/null || true
+unset STUB_PG STUB_APPLIED STUB_APPLIED_FILE STUB_HERMES_IMAGE STUB_IMAGES STUB_COMPOSE_OK SHTURMAN_BACKUP_DIR \
+  STUB_SERVICE STUB_CONSENT STUB_IMAGE STUB_DIRECT STUB_CONSENT_STATUS 2> /dev/null || true
 pty="$root/ops/tests/pty_confirm.py"
 n=0
 ok() { n=$((n + 1)); echo "ok $n — $1"; }
@@ -97,11 +99,24 @@ run ./ops/backup.sh; want 0
 s="$(./ops/backup.sh --list | awk 'NR == 1 {print $1}')"
 echo v2 > data/shturman/file; echo new > data/shturman/new
 sed -i 's/secret-token-one/secret-token-two/' .env
-run ./ops/restore.sh --from "$s" --dry-run; want 0; has "ЗАМЕНЯЮТСЯ копией: data/shturman"; has "ssh -t"
+run ./ops/restore.sh --from "$s" --dry-run; want 0; has "ЗАМЕНЯЮТСЯ копией: data/shturman"; has "запрос в бот согласований"; hasnt "ssh -t"
 [ "$(cat data/shturman/file)" = v2 ] || die "--dry-run что-то изменил"
 ok "--dry-run: план, ничего не меняет"
 run ./ops/restore.sh --from "$s"; want 4; has "ssh -t shturman-app"; [ "$(cat data/shturman/file)" = v2 ] || die "без терминала восстановил"
-ok "без терминала — отказ (код 4) и команда для человека"
+ok "бота нет и терминала нет — отказ (код 4) и команда для человека"
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=4 run ./ops/restore.sh --from "$s"; want 4; has "повторите: ./ops/restore.sh --from $s"; [ "$(cat data/shturman/file)" = v2 ] || die "без нажатия восстановил"
+grep -q "ops-consent ask --action restore --target $s:all:keep" "$STUB_LOG" || die "запрос в бот без вида и цели"
+grep -q -- "--detail parts=каталоги data/" "$STUB_LOG" || die "в карточке нет того, что заменится"
+STUB_SERVICE=running STUB_CONSENT=5 run ./ops/restore.sh --from "$s"; want 4; [ "$(cat data/shturman/file)" = v2 ] || die "отклонённое восстановил"
+hasnt "Наберите:"
+ok "сервис работает: запрос в бот; владелец не ответил или отклонил — код 4, данные не тронуты, фразы не спрашивает"
+STUB_SERVICE=running STUB_CONSENT=7 run ./ops/restore.sh --from "$s"; want 4; has "запасной путь\|Запасной путь"
+grep -q "docker stop shturman-service" "$STUB_LOG" || die "зависший сервис не остановлен перед путём без сервиса"
+: > "$STUB_LOG"
+STUB_IMAGE=1 STUB_DIRECT=5 run ./ops/restore.sh --from "$s"; want 4; [ "$(cat data/shturman/file)" = v2 ] || die "без сервиса восстановил отклонённое"
+grep -q "compose run --rm --no-deps -T shturman ops-consent ask --action restore .*--direct" "$STUB_LOG" || die "путь без сервиса не через одноразовый контейнер"
+ok "сервис не отвечает — запрос напрямую через бот (одноразовый контейнер); отклонено — ничего не тронуто"
 run_tty none ./ops/restore.sh --from "$s"; want 4; [ "$(cat data/shturman/file)" = v2 ] || die "без фразы восстановил"
 run_tty wrong ./ops/restore.sh --from "$s"; want 4; has "Не подтверждено"; [ "$(cat data/shturman/file)" = v2 ] || die "с неверной фразой восстановил"
 ok "неверная фраза или пустой ввод — отказ, данные не тронуты"
@@ -111,7 +126,14 @@ run_tty right ./ops/restore.sh --from "$s"; want 0 "восстановление
 grep -q 'secret-token-two' .env || die ".env заменён без --with-env"
 [ ! -d "$(find local/restore -mindepth 1 -maxdepth 1 -type d | head -n 1)/replaced" ] || die "прежние каталоги не убраны"
 ./ops/backup.sh --list | grep -q 'причина: before-restore' || die "нет копии перед восстановлением"
-ok "фраза верна — каталоги восстановлены, .env прежний, копия «до» сделана"
+ok "бота нет, фраза человека верна — каталоги восстановлены, .env прежний, копия «до» сделана"
+echo v2 > data/shturman/file
+STUB_SERVICE=running STUB_CONSENT=0 run ./ops/restore.sh --from "$s"; want 0 "восстановление по кнопке: код $code"; has "ИТОГ ВОССТАНОВЛЕНИЯ: OK"
+[ "$(cat data/shturman/file)" = v1 ] || die "по кнопке владельца не восстановил"
+echo v2 > data/shturman/file
+STUB_IMAGE=1 STUB_DIRECT=0 run ./ops/restore.sh --from "$s"; want 0 "восстановление без сервиса: код $code"
+[ "$(cat data/shturman/file)" = v1 ] || die "по кнопке без сервиса не восстановил"
+ok "владелец нажал «Разрешить» (через сервис или напрямую) — восстановлено без терминала"
 run_tty right ./ops/restore.sh --from "$s" --with-env; want 0; grep -q 'secret-token-one' .env || die "--with-env не вернул .env"; [ "$(stat -c %a .env)" = 600 ] || die "права .env"
 ok "--with-env возвращает .env из копии (права 600)"
 echo v3 > data/shturman/file
@@ -146,7 +168,15 @@ STUB_APPLIED="$but_last" run ./ops/up.sh; want 1; has "Ждут: миграци�
 if grep -q 'compose build\|compose up -d --remove-orphans' "$STUB_LOG"; then die "up.sh дошёл до сборки без копии"; fi
 ok "up.sh: ждут миграции, копии нет — остановка до перезапуска"
 STUB_APPLIED="$but_last" run ./ops/up.sh --skip-backup-check; want 4; has "ssh -t"
-ok "up.sh --skip-backup-check без терминала — отказ, код 4"
+ok "up.sh --skip-backup-check без бота и терминала — отказ, код 4"
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=5 STUB_APPLIED="$but_last" run ./ops/up.sh --skip-backup-check; want 4
+if grep -q 'compose build' "$STUB_LOG"; then die "up.sh без разрешения дошёл до сборки"; fi
+grep -q "ops-consent ask --action no_backup --target [0-9a-f]\{16\} .*--detail need=миграции базы: 1" "$STUB_LOG" || die "запрос в бот без того, что ждёт"
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=0 STUB_APPLIED="$but_last" run ./ops/up.sh --skip-backup-check
+grep -q 'compose config --quiet' "$STUB_LOG" || die "up.sh с разрешением владельца не пошёл дальше"
+ok "up.sh --skip-backup-check: отклонено в боте — стоп; разрешено — дальше, без терминала"
 STUB_APPLIED="$but_last" run ./ops/backup.sh; want 0
 : > "$STUB_LOG"
 STUB_APPLIED="$but_last" run ./ops/up.sh; has "Свежая копия есть"; grep -q 'compose config --quiet' "$STUB_LOG" || die "после свежей копии up.sh не пошёл дальше"
@@ -209,7 +239,7 @@ printf 'SHTURMAN_MODE=standalone\n' > .env; chmod 600 .env; mkdir -p data/shturm
 c1="$(git rev-parse v0.0.1)"; c2="$(git rev-parse v0.0.2)"; c3="$(git rev-parse v0.0.3)"
 export STUB_PG=running STUB_APPLIED_FILE="$tmp/applied"; echo "0001_a.sql" > "$STUB_APPLIED_FILE"
 
-run ./ops/update.sh --check; want 0; has "Цель:     v0.0.2"; has "Миграции базы придут: 1 (0002_b.sql)"; has "Нужно разрешение человека"; has "update.sh --consent"
+run ./ops/update.sh --check; want 0; has "Цель:     v0.0.2"; has "Миграции базы придут: 1 (0002_b.sql)"; has "Нужно разрешение владельца"; has "update.sh --consent"; has "бот согласований"
 [ "$(git rev-parse HEAD)" = "$c1" ] || die "--check сменил код"
 ok "--check: следующий выпуск, миграции, нужно разрешение; код не меняется"
 run ./ops/update.sh --check --channel pilot; want 0; has "Цель:     v0.0.2"
@@ -223,7 +253,23 @@ run ./ops/update.sh --to v0.0.3-rc.1; want 2; has "по одному выпус�
 ok "перескок через выпуск — отказ"
 run ./ops/update.sh --channel nightly; want 2
 run ./ops/update.sh; want 4; has "update.sh --consent"; has "no-auto-rollback"; [ "$(git rev-parse HEAD)" = "$c1" ] || die "без разрешения код сменился"
-ok "миграции без разрешения человека и без терминала — код 4, ничего не изменено"
+ok "миграции, бота нет и терминала нет — код 4, ничего не изменено"
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=4 run ./ops/update.sh; want 4; has "Нажмёт «Разрешить» — повторите: ./ops/update.sh"; has "no-auto-rollback"
+[ "$(git rev-parse HEAD)" = "$c1" ] || die "без нажатия код сменился"
+grep -q "ops-consent ask --action update --target $c2 .*--detail from=.*--detail to=v0.0.2 --detail scope=data --detail migrations=1 (0002_b.sql)" "$STUB_LOG" \
+  || die "запрос в бот: не та цель или нет подробностей"
+STUB_SERVICE=running STUB_CONSENT=5 run ./ops/update.sh; want 4; [ "$(git rev-parse HEAD)" = "$c1" ] || die "отклонённое обновление пошло"
+hasnt "Наберите:"
+ok "сервис работает: запрос в бот на этот коммит; не ответил или отклонил — код 4, ничего не изменено"
+STUB_SERVICE=running STUB_CONSENT_STATUS="pending 14:00 (UTC)" run ./ops/update.sh --check; want 0; has "ждёт нажатия владельца (до 14:00 (UTC))"
+STUB_SERVICE=running STUB_CONSENT_STATUS="granted 15:00 (UTC)" run ./ops/update.sh --check; want 0; has "Разрешение владельца в боте согласований есть"
+ok "--check видит запрос в боте: ждёт нажатия или уже разрешено"
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=0 run ./ops/update.sh --consent; want 0; has "Разрешение получено"
+grep -q "ops-consent ask --action update .*--keep" "$STUB_LOG" || die "--consent израсходовал разрешение сразу"
+[ ! -f local/consent/update.env ] || die "разрешение из бота записано в файл: его держит сервис"
+ok "--consent через бот: разрешение остаётся в сервисе до следующего запуска (--keep), файла нет"
 run ./ops/update.sh --consent; want 4
 run_tty wrong ./ops/update.sh --consent; want 4; [ ! -f local/consent/update.env ] || die "неверная фраза записала разрешение"
 ok "--consent: без терминала и с неверной фразой разрешение не записывается"
@@ -236,12 +282,24 @@ grep -q '^result=failed-needs-human$' local/update/last.env && grep -q '^scope=d
 ok "миграции применились, проверка не прошла, разрешения нет — остановка (код 3), откат — команда человеку"
 run ./ops/restore.sh --rollback --dry-run; want 0; has "база и каталоги data/ — из копии"
 run ./ops/restore.sh --rollback; want 4
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=5 run ./ops/restore.sh --rollback; want 4; [ "$(git rev-parse HEAD)" = "$c2" ] || die "отклонённый откат выполнен"
+grep -q "ops-consent ask --action rollback --target $c1 .*--detail scope=data" "$STUB_LOG" || die "запрос отката без цели"
+ok "откат: запрос в бот на прежний коммит; отклонено — ничего не тронуто"
 echo v2 > data/shturman/file
 run_tty right ./ops/restore.sh --rollback; want 0 "откат человеком: код $code"; has "ИТОГ ОТКАТА: OK"; has "База восстановлена"
 [ "$(git rev-parse HEAD)" = "$c1" ] || die "откат не вернул код"
 [ "$(cat data/shturman/file)" = v1 ] || die "откат не вернул каталоги из копии"
 grep -q '^result=rolled-back$' local/update/last.env || die "итог отката не записан"
 ok "откат человеком: код, база (подставная) и каталоги — из копии до обновления"
+
+# Разрешение кнопкой в боте, обновление не прошло проверку — откат базы и данных сам, без терминала.
+echo 0.0.2 > local/doctor-fail; echo "0001_a.sql" > "$STUB_APPLIED_FILE"; echo v1 > data/shturman/file
+STUB_SERVICE=running STUB_CONSENT=0 run ./ops/update.sh; want 1 "откат по разрешению из бота: код $code"; has "ИТОГ ОБНОВЛЕНИЯ: ОТКАТ"; has "Откат: код, база и data/"
+[ "$(git rev-parse HEAD)" = "$c1" ] || die "откат по разрешению из бота не вернул код"
+grep -q '^consent=bot$' local/update/last.env || die "в записи обновления нет, что разрешил владелец в боте"
+ok "владелец нажал «Разрешить» → обновление, провал → автоматический откат базы и data/ без терминала"
+rm -f local/doctor-fail
 
 # Разрешение заранее, затем обновление агентом без терминала — успех.
 rm -f local/doctor-fail; echo "0001_a.sql" > "$STUB_APPLIED_FILE"
@@ -274,13 +332,20 @@ ok "последний выпуск — «обновлений нет»; main �
 d="$(mkinst guard)"; cd "$d"
 printf '#!/bin/sh\necho "подставной up.sh"\nexit 0\n' > ops/up.sh
 run ./ops/guard.sh threshold 0.97; want 4; has "ssh -t shturman-app"; hasnt "подставной up.sh"
-grep -q SHTURMAN_GUARD_THRESHOLD .env && die "без терминала порог записан"
+grep -q SHTURMAN_GUARD_THRESHOLD .env && die "без бота и терминала порог записан"
+STUB_SERVICE=running STUB_CONSENT=5 run ./ops/guard.sh threshold 0.97; want 4; hasnt "подставной up.sh"
+grep -q SHTURMAN_GUARD_THRESHOLD .env && die "отклонённый в боте порог записан"
 run_tty wrong ./ops/guard.sh threshold 0.97; want 4; has "Не подтверждено"
 grep -q SHTURMAN_GUARD_THRESHOLD .env && die "с неверной фразой порог записан"
 run ./ops/guard.sh threshold 0.2; want 2; has "от 0.5 до 1"
 run_tty right ./ops/guard.sh threshold 0,97; want 0 "порог: код $code"; has "подставной up.sh"
 grep -q '^SHTURMAN_GUARD_THRESHOLD=0.97$' .env || die "порог не записан"
 grep -q 'secret-token-one' .env || die "остальные строки .env тронуты"
-ok "порог защиты меняет только человек фразой в терминале; без неё — код 4 и команда для человека"
+sed -i '/^SHTURMAN_GUARD_THRESHOLD=/d' .env
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=0 run ./ops/guard.sh threshold 0.98; want 0 "порог по кнопке: код $code"; has "подставной up.sh"
+grep -q '^SHTURMAN_GUARD_THRESHOLD=0.98$' .env || die "порог по кнопке не записан"
+grep -q "ops-consent ask --action guard_threshold --target 0.98 .*--detail old=0.9" "$STUB_LOG" || die "запрос порога без цели"
+ok "порог защиты меняет только владелец: кнопкой в боте или (бота нет) фразой человека в терминале; иначе — код 4"
 
 echo "Все проверки пройдены: $n."

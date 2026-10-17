@@ -43,6 +43,7 @@ TRIAGE = "tests/triage/test_triage_core.py::"
 TRIAGE_PAGE = "tests/triage/test_triage_page.py::"
 APP_4A = "tests/setup_page/test_pack4a_app.py::"
 PACK4B = "tests/setup_page/test_pack4b.py::"
+OPS_CONSENT = "tests/executor/test_ops_consent.py::"
 MUTATIONS = (
     Mutation("background_owner_context", "src/shturman/authority.py",
              "    context.run(_owner.set, None)", "    # mutation: retain inherited owner context",
@@ -321,6 +322,22 @@ MUTATIONS = (
              "    if False:",
              CODE_LOGIN + "test_managed_bot_has_code_login_off_until_the_owner_presses_in_the_bot",
              database=True),
+    # Разрешения на сопровождение (Р-100): выдаёт только нажатие «Разрешить» под карточкой в самом боте;
+    # израсходовать — один раз; на пути без сервиса — нажатие только привязанного владельца в его чате.
+    Mutation("ops_consent_needs_card_press", "src/shturman/ops_consent.py",
+             "    if not confirm.card_press():", "    if False:",
+             OPS_CONSENT + "test_no_route_or_owner_channel_grants_without_a_bot_press", database=True),
+    Mutation("ops_consent_bot_only", "src/shturman/confirm.py",
+             "\"guard.release_all\", OPS})", "\"guard.release_all\"})",
+             OPS_CONSENT + "test_no_route_or_owner_channel_grants_without_a_bot_press", database=True),
+    Mutation("ops_consent_used_once", "src/shturman/ops_consent.py",
+             "AND target = $3 AND status = 'granted' AND valid_until > now()",
+             "AND target = $3 AND valid_until > now()",
+             OPS_CONSENT + "test_request_card_press_and_one_time_use", database=True),
+    Mutation("ops_consent_direct_owner_only", "src/shturman/ops_consent.py",
+             "            mine = (sender.get(\"id\") == owner[\"user_id\"] and chat.get(\"id\")",
+             "            mine = (chat.get(\"id\")",
+             OPS_CONSENT + "test_direct_stranger_press_is_refused_and_rejection_denies"),
     # Решение разом по скрытому защитой (Р-99): «Показать все» — только нажатием владельца в самом боте.
     Mutation("guard_release_all_needs_press", "src/shturman/guard/alerts.py",
              "    confirm.must_not_widen(True)\n    return await _bulk(conn, payload, \"released\")",
@@ -329,8 +346,8 @@ MUTATIONS = (
              "test_bulk_kinds_have_no_route_and_cannot_be_applied_without_the_owner",
              database=True),
     Mutation("guard_release_all_bot_only", "src/shturman/confirm.py",
-             "\"owner.widen\", \"guard.release_all\"})",
-             "\"owner.widen\"})",
+             "\"owner.widen\", \"guard.release_all\", OPS})",
+             "\"owner.widen\", OPS})",
              "tests/guard/test_guard_review.py::"
              "test_release_all_needs_a_second_press_in_the_bot_and_is_remembered",
              database=True),

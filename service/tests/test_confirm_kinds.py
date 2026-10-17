@@ -39,7 +39,21 @@ EXPECTED = {
     # внутреннем API нет). «Показать все» расширяет видимое ассистенту — только в самом боте (BOT_ONLY);
     # «Оставить все скрытыми» — подтверждение и в приложении
     "guard.release_all", "guard.keep_all",
+    # Р-100: разрешение владельца на действие сопровождения сервера (обновление с откатом базы, восстановление,
+    # откат, перезапуск без копии, порог защиты, удаление копий) вместо фразы в терминале. Просит скрипт ops/
+    # (`POST /api/ops/consents`), выдаёт — только «Разрешить» в самом боте (BOT_ONLY): функция применения
+    # отказывает без нажатия под карточкой (`confirm.card_press`). Маршрута, который выдаёт разрешение, нет
+    "ops.consent",
 }
+
+
+def test_ops_consent_is_granted_only_by_a_press_in_the_bot():
+    assert "ops.consent" in confirm.BOT_ONLY
+    assert "ops.consent" not in confirm.OWNER_ASKED       # просит сервер, а не сам владелец: своё предупреждение
+    text = confirm._card("Обновление", "ops.consent")
+    assert confirm.OPS_CARD in text and confirm.CARD_WARNING not in text
+    labels = [b["text"] for row in confirm._card_buttons(1, "n", "ops.consent") for b in row]
+    assert labels == ["Разрешить", "Отклонить"]
 
 
 async def test_every_confirmable_action_is_known(make_client):

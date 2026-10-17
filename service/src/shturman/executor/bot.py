@@ -33,7 +33,7 @@ from typing import Any, Callable
 
 import asyncpg
 
-from .. import authority, bridge, control_peers, ingest_api, words
+from .. import authority, bridge, control_peers, ingest_api, ops_consent, words
 from ..api_core import BadRequest
 from ..app import AppState
 from ..sanitize import clean_line
@@ -221,6 +221,17 @@ class Bot:
         except Exception as exc:  # noqa: BLE001 — база или Telegram недоступны
             self.menu = menu_button.FAILED
             logger.warning("бот согласований: кнопка меню не сверена (%s)", type(exc).__name__)
+        await self.remember_owner()
+
+    async def remember_owner(self) -> None:
+        """Копия «этот бот → владелец» в каталоге данных сервиса — для разрешений на сопровождение,
+        когда сервис не работает (`ops_consent.py`, путь без сервиса). Сбой — не повод останавливать опрос."""
+        try:
+            ops_consent.remember_owner(self.state.config.data_dir, self.bot_id, await self._owner())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — база недоступна или каталог только для чтения
+            logger.warning("бот согласований: копия владельца не записана (%s)", type(exc).__name__)
 
     async def _advance(self, next_id: int) -> None:
         self.offset = next_id
