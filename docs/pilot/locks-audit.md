@@ -119,7 +119,7 @@
 | `./ops/tg-login.sh` | QR-код входа в Telegram |
 | `/etc/caddy/Caddyfile` | Может содержать секреты (так считает `doctor`, он файл не печатает) |
 
-**Безопасные для оператора** (только числа, состояния, коды): `./ops/doctor.sh`, `./ops/state.sh show`, `./ops/diag.sh` и `--print` (Р-98: белый список, журналы Hermes — только счётчики), `./ops/cleanup.sh` без ключей, `./ops/pulse.sh status`, `./ops/commitments.sh stats` и `recheck --dry-run`, `shturman retry-failed --dry-run`, `shturman bot-status`, `./ops/backup.sh --list`, `./ops/connect.sh`, `./ops/relay.sh status`, `cat VERSION`, `git log`, `docker ps`. В выводе `doctor` есть адреса экземпляра и имя модели — это не секреты, но и не для публикации.
+**Безопасные для оператора** (только числа, состояния, коды): `./ops/doctor.sh`, `./ops/state.sh show`, `./ops/diag.sh` и `--print` (Р-98: белый список, журналы Hermes — только счётчики), `./ops/report.sh` (Р-102: тот же белый список; свободный текст агента — через фильтр и словарь runbook; уходит разработчику только по кнопке владельца), `./ops/cleanup.sh` без ключей, `./ops/pulse.sh status`, `./ops/commitments.sh stats` и `recheck --dry-run`, `shturman retry-failed --dry-run`, `shturman bot-status`, `./ops/backup.sh --list`, `./ops/connect.sh`, `./ops/relay.sh status`, `cat VERSION`, `git log`, `docker ps`. В выводе `doctor` есть адреса экземпляра и имя модели — это не секреты, но и не для публикации.
 
 ## Предложения замков
 

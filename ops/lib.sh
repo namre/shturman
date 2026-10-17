@@ -505,6 +505,35 @@ hermes_verified() {
   awk -F'\t' -v t="$tag" '!/^#/ && $1 == t { found = 1 } END { exit found ? 0 : 1 }' "$file"
 }
 
+# --- Выпуски (docs/releases.md) ---
+# Ключ сортировки выпусков: кандидат vX.Y.Z-rc.N идёт перед выпуском vX.Y.Z (./ops/update.sh, сервис — то же).
+tag_key() {
+  local t="${1#v}" base rc
+  base="${t%%-rc.*}"
+  if [ "$base" != "$t" ]; then rc="${t##*-rc.}"; echo "$base.0.$rc"; else echo "$base.1.0"; fi
+}
+# Тег выпуска на нынешнем коммите (пусто — коммит вне выпуска). На одном коммите бывают кандидат и выпуск
+# (выпуск ставится на коммит прошедшего пилот кандидата) — тогда выпуск.
+code_tag() {
+  local t
+  git tag --points-at HEAD 2> /dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' | while IFS= read -r t; do
+    printf '%s\t%s\n' "$(tag_key "$t")" "$t"
+  done | sort -V | tail -n 1 | cut -f2
+}
+# Что за код запущен — для сервиса (Р-101: он сверяет версию после перезапуска и узнаёт выпуск для сообщений
+# об обновлениях): VERSION, тег, коммит и, в режиме с Hermes, образ Hermes. Пишет переменные окружения,
+# которые compose.yaml передаёт контейнеру сервиса; ничего не читает из .env.
+export_code_info() {
+  SHTURMAN_CODE_VERSION="$(tr -d '[:space:]' < VERSION 2> /dev/null || true)"
+  SHTURMAN_CODE_COMMIT="$(git rev-parse HEAD 2> /dev/null || true)"
+  SHTURMAN_CODE_TAG="$(code_tag)"
+  SHTURMAN_HERMES_IMAGE=""
+  if [ "${MODE:-}" = hermes ]; then
+    SHTURMAN_HERMES_IMAGE="$(docker compose --profile hermes config --images 2> /dev/null | grep -m1 'hermes-agent' || true)"
+  fi
+  export SHTURMAN_CODE_VERSION SHTURMAN_CODE_COMMIT SHTURMAN_CODE_TAG SHTURMAN_HERMES_IMAGE
+}
+
 # --- что занимает диск (Р-98): ./ops/doctor.sh (строка disk-usage), ./ops/diag.sh, ./ops/cleanup.sh ---
 # Только размеры каталогов целиком и образов Docker: имён файлов внутри data/ функции не печатают и
 # содержимого не читают. Каталог базы принадлежит пользователю контейнера базы — его размер спрашивается

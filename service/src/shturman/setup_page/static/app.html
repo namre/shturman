@@ -93,6 +93,19 @@
          Только числа, состояния и время -->
     <div class="panel now" id="now" aria-labelledby="now-title">
       <h2 id="now-title">Сейчас</h2>
+      <!-- Новая версия «Штурмана» (Р-101): из проверенного списка выпусков; «Как обновить» — текст для Codex -->
+      <div class="upd" id="now-update" role="status" hidden>
+        <p class="upd-title" id="now-update-title"></p>
+        <ul class="upd-changes" id="now-update-changes"></ul>
+        <p class="upd-meta muted" id="now-update-meta"></p>
+        <details class="upd-how" id="now-update-how">
+          <summary>Как обновить</summary>
+          <p class="muted">Обновляет Codex по инструкции из репозитория. Откройте новую сессию с промптом
+            prompts/operate-codex.md и вставьте в конце этот текст. Разрешения придут кнопкой в бот согласований.</p>
+          <p class="upd-codex" id="now-update-codex"></p>
+          <button type="button" class="secondary" id="now-update-copy">Скопировать текст</button>
+        </details>
+      </div>
       <p class="now-label" id="now-groups-label" hidden>Ждёт вашего решения:</p>
       <div class="chips" id="now-groups" aria-label="Что ждёт решения по разделам"></div>
       <p class="now-none" id="now-none" hidden>Ничего не ждёт вашего решения.</p>

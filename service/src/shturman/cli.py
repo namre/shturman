@@ -567,8 +567,10 @@ def main() -> None:
     gd = sub.add_parser("guard", help="защита от внедрённых инструкций: stats — только числа на вашей переписке")
     gd.add_argument("action", choices=["stats"])
     gd.add_argument("--json", action="store_true", help="вывести JSON")
-    from . import ops_consent_cli
+    from . import ops_consent_cli, ops_report, updates
     ops_consent_cli.add_parser(sub)
+    updates.add_parser(sub)
+    ops_report.add_parser(sub)
     a = p.parse_args()
 
     if a.cmd == "migrate":
@@ -599,6 +601,10 @@ def main() -> None:
         asyncio.run(_guard(a.action, as_json=a.json))
     elif a.cmd == "ops-consent":
         ops_consent_cli.main(a)
+    elif a.cmd == "update-result":
+        updates.cli_result(a)
+    elif a.cmd == "ops-report":
+        ops_report.cli(a)
     elif a.cmd == "commitments":
         asyncio.run(_commitments(a.action, as_json=a.json, dry_run=a.dry_run, limit=a.limit, force=a.force,
                                  price_in=a.price_in, price_out=a.price_out))

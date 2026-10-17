@@ -44,6 +44,10 @@ EXPECTED = {
     # (`POST /api/ops/consents`), выдаёт — только «Разрешить» в самом боте (BOT_ONLY): функция применения
     # отказывает без нажатия под карточкой (`confirm.card_press`). Маршрута, который выдаёт разрешение, нет
     "ops.consent",
+    # Р-102: отправка отчёта сессии сопровождения разработчику. Отчёт кладёт ./ops/report.sh на сервере прямо в
+    # базу (у внутреннего API маршрута нет), «Отправить» — только в самом боте (BOT_ONLY): функция применения
+    # отказывает без нажатия под карточкой. Без нажатия отчёт не уходит никуда
+    "ops.report",
 }
 
 
@@ -54,6 +58,14 @@ def test_ops_consent_is_granted_only_by_a_press_in_the_bot():
     assert confirm.OPS_CARD in text and confirm.CARD_WARNING not in text
     labels = [b["text"] for row in confirm._card_buttons(1, "n", "ops.consent") for b in row]
     assert labels == ["Разрешить", "Отклонить"]
+
+
+def test_ops_report_is_sent_only_by_a_press_in_the_bot():
+    assert "ops.report" in confirm.BOT_ONLY and "ops.report" not in confirm.OWNER_ASKED
+    text = confirm._card("Отчёт сессии сопровождения — отправить разработчику?", "ops.report")
+    assert confirm.REPORT_CARD in text and confirm.CARD_WARNING not in text and "Подтвердите действие" not in text
+    labels = [b["text"] for row in confirm._card_buttons(1, "n", "ops.report") for b in row]
+    assert labels == ["Отправить", "Не отправлять"]
 
 
 async def test_every_confirmable_action_is_known(make_client):

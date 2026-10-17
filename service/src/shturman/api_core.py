@@ -306,6 +306,11 @@ async def overview(state: AppState) -> dict[str, Any]:
     # Внешний сторож (Р-98): включён ли, имя узла службы, что и когда отправлено; строка pulse.
     from . import pulse
     out["pulse"] = pulse.snapshot(state)
+    # Обновления (Р-101): запущенная версия, итог проверки списка выпусков, что доступно — только теги и коды,
+    # без текстов списка (их видит владелец, а не ассистент); строка updates в ./ops/doctor.sh.
+    from . import updates
+    async with state.ro_pool.acquire() as conn:
+        out["updates"] = await updates.overview(conn, state)
     return out
 
 

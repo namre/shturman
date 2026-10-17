@@ -99,4 +99,46 @@ grep -q '^PASS  jobs: очередь заданий: 3, за час выполн
 jobs_status 86 ''
 grep -q '^WARN  jobs: в очереди 86 заданий — их некому выполнять: смотрите строки approvals-bot и model; неудачных за всё время: 3021$' "$tmp/out.txt" \
   || bad "прежний сервис, длинная очередь — не WARN"
+
+# Строка updates (Р-101): сервис прежней версии — строки нет; дальше — по объекту updates в /api/status.
+grep -q '  updates:' "$tmp/out.txt" && bad "у сервиса без объекта updates строки быть не должно"
+updates_status() {
+  python3 - "$fx/status.json" "$1" > "$tmp/status-upd.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+base = {"enabled": True, "channel": "pilot", "running": {"version": "0.0.10", "tag": "v0.0.10-rc.1",
+        "commit": "0123456789ab", "hermes": None}, "checked_age_s": 7200, "problem": None, "fails": 0,
+        "expires": "2026-12-01", "available": None, "available_kind": None, "behind": 0, "hermes_new": None}
+base.update(json.loads(sys.argv[2]))
+d["updates"] = base
+print(json.dumps(d))
+PY
+  sed -i "s|$tmp/status-[a-z]*.json|$tmp/status-upd.json|" "$tmp/stub/docker"
+  ./ops/doctor.sh > "$tmp/out.txt" 2>&1 || true
+  grep -q "line [0-9]*:" "$tmp/out.txt" && bad "ошибки оболочки в doctor (updates)"
+  true
+}
+updates_status '{}'
+grep -q '^PASS  updates: работает v0.0.10-rc.1 (коммит 0123456); новых версий нет (проверено 2 ч назад, канал pilot, список годен до 2026-12-01)$' "$tmp/out.txt" \
+  || bad "нет PASS updates «новых версий нет»"
+updates_status '{"available": "v0.0.11", "available_kind": "regular", "behind": 2, "hermes_new": "v2026.11.2"}'
+grep -q '^PASS  updates: .*доступна новая версия v0.0.11 (выпусков впереди: 2, канал pilot) — ./ops/update.sh --check; проверена новая версия Hermes v2026.11.2$' "$tmp/out.txt" \
+  || bad "нет PASS updates «доступна»"
+updates_status '{"available": "v0.0.11", "available_kind": "security", "behind": 1}'
+grep -q '^WARN  updates: .*исправление безопасности v0.0.11' "$tmp/out.txt" || bad "исправление безопасности — не WARN"
+updates_status '{"problem": "expired", "expires": null}'
+grep -q '^WARN  updates: .*просрочен' "$tmp/out.txt" || bad "просроченный список — не WARN"
+updates_status '{"problem": "unreachable", "fails": 1}'
+grep -q '^PASS  updates: .*не удалась (unreachable), повторит через сутки$' "$tmp/out.txt" || bad "одна неудача — не PASS"
+updates_status '{"problem": "unreachable", "fails": 3}'
+grep -q '^WARN  updates: .*GitHub не отвечает сервису 3 проверок подряд' "$tmp/out.txt" || bad "три неудачи — не WARN"
+updates_status '{"enabled": false, "checked_age_s": null}'
+grep -q '^PASS  updates: .*выключена (SHTURMAN_UPDATES=off)' "$tmp/out.txt" || bad "выключено — не PASS"
+updates_status '{"checked_age_s": null}'
+grep -q '^PASS  updates: .*ещё не проверялся' "$tmp/out.txt" || bad "ещё не проверялся"
+# Сервис запущен с другим коммитом, чем в каталоге, — WARN и ./ops/up.sh.
+git init -q . && git -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m x
+updates_status '{}'
+grep -q '^WARN  updates: работает v0.0.10-rc.1 (коммит 0123456); сервис запущен с другим кодом, чем в каталоге' "$tmp/out.txt" \
+  || bad "другой код — не WARN"
 echo "doctor rows: ok"

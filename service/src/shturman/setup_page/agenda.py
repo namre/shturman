@@ -3,8 +3,10 @@
   GET  app/now                              «Сейчас»: аккаунты (на связи / пауза / нет связи), время
                                             последнего сообщения в архиве, сбои модели за сутки, отправка,
                                             разбор входящих, остановлено ли, договорённости на сегодня и
-                                            просроченные (числа). Только состояния, числа и время — ни
-                                            текста переписки, ни имён собеседников
+                                            просроченные (числа); плашка новой версии и итог последнего
+                                            обновления (`update`, Р-101: теги и тексты проверенного списка
+                                            выпусков). Только состояния, числа и время — ни текста переписки,
+                                            ни имён собеседников
   GET  app/commitments                      «Я обещал» и «Мне обещали» по группам срока (`processing.agenda`)
                                             и сколько ждут подтверждения «Верно / Не так» в «Согласованиях»
   POST app/commitments/{id}/done            «Выполнено»: {v}
@@ -109,7 +111,17 @@ async def now_view(state: AppState) -> dict[str, Any]:
         "halt": stopped,
         "commitments": counts,
         "today": today.isoformat(),
+        # Плашка обновления (Р-101): что доступно, как обновить, итог последнего обновления.
+        "update": await _update_view(state),
     }
+
+
+async def _update_view(state: AppState) -> dict[str, Any] | None:
+    from .. import updates
+    try:
+        return await updates.app_view(state)
+    except Exception:  # noqa: BLE001 — «Сейчас» показывается и без плашки (например, база до миграции)
+        return None
 
 
 async def app_now(request: Request) -> JSONResponse:

@@ -37,6 +37,21 @@ def _int(name: str, default: int) -> int:
         raise ConfigError(f"{name}: нужно целое число") from None
 
 
+def _feedback_chat(raw: str) -> int:
+    """Номер чата Telegram: целое число (у групп — отрицательное). Неразборчивое — ошибка запуска,
+    а не молчаливое «отчёты никуда»."""
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError("SHTURMAN_FEEDBACK_CHAT: нужен номер чата Telegram (целое число, у группы — "
+                          "с минусом)") from None
+    if value == 0 or abs(value) > 10 ** 15:
+        raise ConfigError("SHTURMAN_FEEDBACK_CHAT: номер чата записан неверно")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     dsn: str = field(repr=False)
@@ -145,6 +160,23 @@ class Config:
     # не пишется.
     pulse_url: str = ""
     pulse_every: float = 300.0
+    # Уведомления об обновлениях (updates.py, Р-101): раз в сутки сервис читает список выпусков
+    # (releases.json) с GitHub — без идентификатора экземпляра. Выключатель — SHTURMAN_UPDATES=off;
+    # адрес — только https, по умолчанию raw-ссылка на main репозитория. Канал — тот же, что у
+    # ./ops/update.sh (SHTURMAN_UPDATE_CHANNEL: release — только выпуски, pilot — и кандидаты).
+    updates: bool = True
+    updates_url: str = ""
+    update_channel: str = "release"
+    # Что за код запущен: пишет ./ops/up.sh из VERSION и git (тег на коммите, сам коммит) и образ Hermes
+    # (только в режиме с Hermes). Пусто — сервис запущен не через ./ops/up.sh: версия — из пакета.
+    code_version: str = ""
+    code_tag: str = ""
+    code_commit: str = ""
+    hermes_image: str = ""
+    # Отчёты сопровождения (ops_report.py, Р-102): номер чата разработки, куда бот согласований присылает
+    # отчёт по нажатию владельца «Отправить». Пусто (по умолчанию) — отчёт приходит владельцу готовым
+    # сообщением, и он пересылает его сам. Только из окружения (.env), записывает владелец.
+    feedback_chat: int = 0
 
     @property
     def own_bot(self) -> bool:
@@ -263,6 +295,14 @@ class Config:
             bot_manager_api=bot_manager_api(_env("SHTURMAN_BOT_MANAGER_API")),
             pulse_url=_env("SHTURMAN_PULSE_URL"),
             pulse_every=float(min(3600, max(60, _int("SHTURMAN_PULSE_EVERY", 5) * 60))),
+            updates=_env("SHTURMAN_UPDATES", "on").lower() not in ("off", "0", "false", "no"),
+            updates_url=_env("SHTURMAN_UPDATES_URL"),
+            update_channel="pilot" if _env("SHTURMAN_UPDATE_CHANNEL").lower() == "pilot" else "release",
+            code_version=_env("SHTURMAN_CODE_VERSION"),
+            code_tag=_env("SHTURMAN_CODE_TAG"),
+            code_commit=_env("SHTURMAN_CODE_COMMIT").lower(),
+            hermes_image=_env("SHTURMAN_HERMES_IMAGE"),
+            feedback_chat=_feedback_chat(_env("SHTURMAN_FEEDBACK_CHAT")),
         )
         return with_page_values(config, os.environ)
 

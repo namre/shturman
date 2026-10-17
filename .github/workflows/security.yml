@@ -1,0 +1,60 @@
+name: security
+# Еженедельно и вручную (docs/releases.md, «Уязвимости зависимостей» и «Список выпусков»):
+#   * OSV-Scanner по закреплённым зависимостям (service/requirements.lock, asr/requirements.lock; у плагина и
+#     посредника своих зависимостей нет). Тревога — только на высокую и критическую тяжесть: задача падает
+#     (GitHub пишет владельцу о неудаче) и открывает issue «Уязвимость в зависимостях» с перечнем. Автоматических
+#     PR с обновлениями нет (ни Renovate, ни Dependabot updates): исправление — обычный PR и выпуск с kind security.
+#   * Срок годности releases.json: меньше 14 дней — задача падает, пока экземпляры ещё принимают список.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.2"
+          cache: false
+      # Закреплённая версия; суммы модулей Go сверяет по sum.golang.org, а итоговую — проверяем ниже.
+      - name: OSV-Scanner v2.6.0
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.6.0
+          go version -m "$RUNNER_TEMP/bin/osv-scanner" | grep -q 'github.com/google/osv-scanner/v2[[:space:]]*v2.6.0[[:space:]]*h1:hqtNLANWaKcqOC6znJX8J/23PtzV82RX23oMS9/ab4I='
+      - name: проверка зависимостей
+        run: |
+          code=0
+          "$RUNNER_TEMP/bin/osv-scanner" scan source --format json \
+            -L requirements.txt:service/requirements.lock -L requirements.txt:asr/requirements.lock > "$RUNNER_TEMP/osv.json" || code=$?
+          # 0 — уязвимостей нет, 1 — есть (решает следующий шаг по тяжести); остальное — сбой самой проверки.
+          [ "$code" -le 1 ] || { echo "OSV-Scanner не отработал (код $code)"; exit "$code"; }
+      - name: тревога — только высокая и критическая тяжесть
+        id: gate
+        run: python3 .github/scripts/osv_gate.py "$RUNNER_TEMP/osv.json" --report "$RUNNER_TEMP/osv.md"
+      - name: issue «Уязвимость в зависимостях»
+        if: failure() && steps.gate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          open="$(gh issue list --state open --search 'Уязвимость в зависимостях in:title' --json number --jq '.[0].number // empty')"
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file "$RUNNER_TEMP/osv.md"
+          else
+            gh issue create --title "Уязвимость в зависимостях ($(date -u +%F))" --body-file "$RUNNER_TEMP/osv.md"
+          fi
+
+  manifest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: срок годности releases.json — не меньше 14 дней
+        run: python3 ops/release_manifest.py check releases.json --hermes-file config/hermes-versions.txt --expiring-days 14

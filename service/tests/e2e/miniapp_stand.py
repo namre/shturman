@@ -93,7 +93,7 @@ from starlette.routing import Route  # noqa: E402
 import exec_fakes  # noqa: E402
 import pack4b_stand  # noqa: E402 — «История», доверие, сводки (Р-95)
 import tg_fakes  # noqa: E402
-from shturman import confirm, db, store  # noqa: E402
+from shturman import confirm, db, store, updates  # noqa: E402
 from shturman.app import build_app  # noqa: E402
 from shturman.config import Config  # noqa: E402
 from shturman.executor import binding  # noqa: E402
@@ -366,6 +366,7 @@ async def main() -> None:
         setup_origin=os.environ.get("E2E_SETUP_ORIGIN") or None)
     telegram = exec_fakes.FakeTelegram()
     executor_service.TEST_OVERRIDES.update(bot_transport=telegram.transport(), poll=0, idle=0.2)
+    updates.TEST_OVERRIDES["start_delay"] = 10 ** 6    # проверка списка выпусков не идёт: в сеть стенд не ходит
     gate = build_app(config, migrate=False)
     seeded: dict = {}
     worlds = {"owner": make_world(tg_fakes.ME), "assistant": make_world(tg_fakes.HELPER)}
@@ -751,6 +752,37 @@ async def main() -> None:
                 """SELECT action, outcome, detail FROM setup_audit
                    WHERE action LIKE 'app.sphere%' OR action LIKE 'app.bulk%' ORDER BY id""")]})
 
+    async def updates_seed(request):
+        """Плашка новой версии (Р-101): список выпусков в базе стенда (в сеть стенд не ходит) и итог
+        последнего обновления. case: regular | security | none | inject; last: ok | rolled-back | (нет)."""
+        case = request.query_params.get("case", "regular")
+        today = datetime.now(timezone.utc).date()
+
+        def rel(tag, kind, changes, minutes=5):
+            return {"tag": tag, "version": tag[1:].split("-rc.")[0], "date": today.isoformat(), "kind": kind,
+                    "changes": changes, "downtime_minutes": minutes, "owner_action": False, "owner_steps": [],
+                    "hermes": ["v2026.9.24"]}
+
+        releases = [rel("v0.0.9", "regular", ["Прежний выпуск."])]
+        if case == "regular":
+            releases += [rel("v0.0.10", "regular", ["Сообщения о новых версиях.", "Отчёты сессий сопровождения."]),
+                         rel("v0.0.11", "regular", ["Приложение «Штурман» показывает новую версию.",
+                                                    "Обновление по очереди до последнего выпуска."])]
+        elif case == "security":
+            releases += [rel("v0.0.10", "security", ["Закрыта уязвимость во входе на страницу настройки."], 3)]
+        elif case == "inject":
+            releases += [rel("v0.0.10", "regular", ["<img src=x onerror=\"window.__pwned=1\">", "Обычная строка."])]
+        data = {"schema": 1, "published": today.isoformat(), "expires": (today + timedelta(days=45)).isoformat(),
+                "releases": releases, "hermes": [], "warnings": []}
+        manifest = updates.parse(data, today=today)
+        await conn.execute("DELETE FROM update_state WHERE key IN ('manifest', 'check'); DELETE FROM update_runs")
+        await updates._put(conn, "manifest", {"data": manifest.to_json(), "fetched_at": datetime.now(timezone.utc).isoformat()})
+        last = request.query_params.get("last")
+        if last:
+            await updates.record_result(conn, updates.check_result(
+                datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"), last, "v0.0.9-rc.2", "v0.0.9", []))
+        return JSONResponse({"ok": True})
+
     async def notify_seen(request):
         """Уведомления (Р-84): настройки, сообщения владельцу «Из приложения…» и журнал app.notify."""
         raw = await conn.fetchval("SELECT value::text FROM settings WHERE key = 'notify.settings'")
@@ -761,6 +793,7 @@ async def main() -> None:
                 "SELECT action, outcome, detail FROM setup_audit WHERE action = 'app.notify' ORDER BY id")]})
 
     control = Starlette(routes=[Route("/notify/seen", notify_seen),
+                                Route("/updates/seed", updates_seed, methods=["POST"]),
                                 Route("/pack2/seed", pack2_seed, methods=["POST"]),
                                 Route("/pack2/ask", pack2_ask, methods=["POST"]),
                                 Route("/bot/sent", bot_sent), Route("/bot/press", bot_press, methods=["POST"]),

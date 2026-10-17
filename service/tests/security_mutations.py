@@ -44,6 +44,8 @@ TRIAGE_PAGE = "tests/triage/test_triage_page.py::"
 APP_4A = "tests/setup_page/test_pack4a_app.py::"
 PACK4B = "tests/setup_page/test_pack4b.py::"
 OPS_CONSENT = "tests/executor/test_ops_consent.py::"
+OPS_REPORT = "tests/executor/test_ops_report.py::"
+UPDATES = "tests/test_updates.py::"
 MUTATIONS = (
     Mutation("background_owner_context", "src/shturman/authority.py",
              "    context.run(_owner.set, None)", "    # mutation: retain inherited owner context",
@@ -338,6 +340,17 @@ MUTATIONS = (
              "            mine = (sender.get(\"id\") == owner[\"user_id\"] and chat.get(\"id\")",
              "            mine = (chat.get(\"id\")",
              OPS_CONSENT + "test_direct_stranger_press_is_refused_and_rejection_denies"),
+    # Отчёт сопровождения (Р-102) уходит разработчику только по нажатию владельца «Отправить» в самом боте.
+    Mutation("ops_report_needs_card_press", "src/shturman/ops_report.py",
+             "    if not confirm.card_press():", "    if False:",
+             OPS_REPORT + "test_nothing_is_sent_without_the_owner_pressing_in_the_bot", database=True),
+    Mutation("ops_report_bot_only", "src/shturman/confirm.py",
+             "    | frozenset({OPS_REPORT})", "    | frozenset()",
+             OPS_REPORT + "test_nothing_is_sent_without_the_owner_pressing_in_the_bot", database=True),
+    # Список выпусков (Р-101): просроченный не даёт уведомлений о версиях.
+    Mutation("updates_expired_manifest_refused", "src/shturman/updates.py",
+             "    if expires < today:", "    if False:",
+             UPDATES + "test_expired_list_gives_no_release_news_and_one_problem_message", database=True),
     # Решение разом по скрытому защитой (Р-99): «Показать все» — только нажатием владельца в самом боте.
     Mutation("guard_release_all_needs_press", "src/shturman/guard/alerts.py",
              "    confirm.must_not_widen(True)\n    return await _bulk(conn, payload, \"released\")",
