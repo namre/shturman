@@ -152,17 +152,31 @@ CARD_WARNING = ("Запрос пришёл не из этого бота — о�
 # сразу сотни сообщений, скрытых как подозрительные, — только нажатием в боте. «Оставить все скрытыми»
 # (`guard.keep_all`) ничего не расширяет: подтвердить можно и в приложении. Оба вида ставит только
 # нажатие владельца под сводкой (`guard/alerts.py`); маршрута внутреннего API у них нет.
-BOT_ONLY = frozenset({"halt.resume", "setup.code_login", "triage.enable", "owner.widen", "guard.release_all"})
+#
+# `ops.consent` (Р-100) — разрешение владельца на действие сопровождения сервера: обновление с откатом базы,
+# восстановление из копии, откат обновления, перезапуск без свежей копии, порог защиты, удаление старых копий
+# (`ops_consent.py`). Просит скрипт `ops/` на сервере; «Разрешить» — только в самом боте: нажатие приходит
+# из аккаунта Telegram владельца, а не с сервера, где работает агент сопровождения.
+OPS = "ops.consent"
+BOT_ONLY = frozenset({"halt.resume", "setup.code_login", "triage.enable", "owner.widen", "guard.release_all", OPS})
 # Карточки, которые ставит только нажатие самого владельца (в боте, приложении или на странице), —
 # в них не нужно предупреждение «запрос пришёл не из этого бота».
-OWNER_ASKED = BOT_ONLY | frozenset({"guard.keep_all"})
+OWNER_ASKED = (BOT_ONLY - {OPS}) | frozenset({"guard.keep_all"})   # ops.consent просит сервер, а не владелец
 BOT_ONLY_NOTE = "Подтвердить можно только кнопкой под этой карточкой в боте согласований — не в приложении."
 BOT_ONLY_CARD = ("Вы попросили об этом сами — в этом боте, в «Настройках Штурмана» или в приложении «Штурман». "
                  "Если не просили — нажмите «Нет».")
 
 
+# У разрешений на сопровождение своё предупреждение и свои подписи кнопок (Р-100).
+OPS_CARD = ("Запрос прислала команда сопровождения на сервере (например, Codex по вашей просьбе). "
+            "Если вы ни о чём таком не просили — нажмите «Отклонить».")
+LABELS = {OPS: ("Разрешить", "Отклонить", "Разрешено")}
+DEFAULT_LABELS = ("Да, сделать", "Нет", "Сделано")
+
+
 def _card(summary: str, kind: str | None = None) -> str:
-    return "Подтвердите действие\n\n" + summary.strip() + "\n\n" + (BOT_ONLY_CARD if kind in OWNER_ASKED else CARD_WARNING)
+    note = OPS_CARD if kind == OPS else (BOT_ONLY_CARD if kind in OWNER_ASKED else CARD_WARNING)
+    return "Подтвердите действие\n\n" + summary.strip() + "\n\n" + note
 
 
 def _done(value: "str | Done | None") -> Done:
@@ -360,15 +374,16 @@ async def _enqueue(conn: asyncpg.Connection, kind: str, summary: str, payload: d
             kind, summary, body, nonce, float(TTL),
         )
         await bridge.notify_owner(
-            conn, _card(summary, kind), buttons=_card_buttons(row["id"], nonce),
+            conn, _card(summary, kind), buttons=_card_buttons(row["id"], nonce, kind),
             handler=CARD_HANDLER, context={"action_id": row["id"]},
         )
     return _waiting(row, duplicate=False)
 
 
-def _card_buttons(action_id: int, nonce: str) -> list[list[dict[str, str]]]:
-    return [[bridge.button("Да, сделать", CALLBACK_MODULE, f"y:{action_id}:{nonce}"),
-             bridge.button("Нет", CALLBACK_MODULE, f"n:{action_id}:{nonce}")]]
+def _card_buttons(action_id: int, nonce: str, kind: str | None = None) -> list[list[dict[str, str]]]:
+    yes, no, _ = LABELS.get(kind or "", DEFAULT_LABELS)
+    return [[bridge.button(yes, CALLBACK_MODULE, f"y:{action_id}:{nonce}"),
+             bridge.button(no, CALLBACK_MODULE, f"n:{action_id}:{nonce}")]]
 
 
 async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
@@ -384,7 +399,7 @@ async def awaiting_owner(conn: asyncpg.Connection) -> list[dict[str, Any]]:
     return [{"id": r["id"], "title": f"Действие № {r['id']}", "text": r["summary"].strip(),
              "note": BOT_ONLY_NOTE if r["kind"] in BOT_ONLY else (
                  BOT_ONLY_CARD if r["kind"] in OWNER_ASKED else CARD_WARNING),
-             "buttons": [] if r["kind"] in BOT_ONLY else _card_buttons(r["id"], r["nonce"]),
+             "buttons": [] if r["kind"] in BOT_ONLY else _card_buttons(r["id"], r["nonce"], r["kind"]),
              "card_message_id": r["card_message_id"], "expires_at": r["expires_at"]} for r in rows]
 
 
@@ -451,8 +466,9 @@ async def _pressed(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[st
         _card_press.reset(pressed)
         _from_card.reset(token)
     await conn.execute("UPDATE pending_actions SET status = 'applied', decided_at = now() WHERE id = $1", row["id"])
-    text = "Сделано:\n" + row["summary"] + (f"\n\n{done.note}" if done.note else "")
-    return {"answer": "Сделано.", "edit_text": text, "remove_buttons": True, "after_commit": done.after}
+    word = LABELS.get(row["kind"], DEFAULT_LABELS)[2]
+    text = f"{word}:\n" + row["summary"] + (f"\n\n{done.note}" if done.note else "")
+    return {"answer": f"{word}.", "edit_text": text, "remove_buttons": True, "after_commit": done.after}
 
 
 async def cancel(conn: asyncpg.Connection, action_id: int) -> bool:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Восстановление экземпляра из копии ./ops/backup.sh. Это стоп-точка AGENTS.md («восстановление
-# поверх данных»): скрипт сам просит человека подтвердить фразой в терминале.
+# поверх данных»): скрипт сам просит разрешение владельца — карточкой в боте согласований (Р-100).
 #   ./ops/restore.sh --list                 — какие копии есть: время, размер, версия кода, где лежат
 #   ./ops/restore.sh --from МЕТКА --dry-run — что будет сделано и что будет перезаписано; ничего не меняет
 #   ./ops/restore.sh --from МЕТКА           — восстановить. МЕТКА — из --list (20261016T081500Z) или latest.
@@ -14,10 +14,13 @@
 #       на прежний коммит; если применились миграции или сменился образ Hermes — ещё база и data/
 #       из копии, снятой перед обновлением. Всё, что пришло после этой копии, из архива пропадёт.
 #   -h, --help — эта справка; ничего не делается.
-# Восстановление и откат запускает человек в своём терминале: ssh -t shturman-app 'cd /opt/shturman &&
-# ./ops/restore.sh --from …'. Скрипт показывает, что будет перезаписано, и просит набрать фразу
-# с одноразовым числом (читается из терминала, не из параметров и не из конвейера). Без терминала —
-# отказ с кодом 4 и готовой командой для человека.
+# Восстановление и откат может запустить и агент сопровождения: скрипт показывает, что будет перезаписано,
+# и шлёт владельцу в бот согласований карточку с тем же описанием; продолжает только после нажатия
+# «Разрешить» (ждёт OPS_CONSENT_WAIT секунд, по умолчанию 300; не дождался — код 4, запрос в силе: повтор
+# той же команды продолжит). Сервис переписки не отвечает — карточку шлёт напрямую одноразовый контейнер
+# от имени бота (владелец — из базы или из копии сервиса). Бот не настроен или недоступен вовсе
+# (новый сервер без .env) — запасной путь: человек в своём терминале (ssh -t …) набирает фразу
+# с одноразовым числом; без терминала — отказ с кодом 4 и готовой командой.
 # Порядок: проверка копии (суммы по описи, архив, оглавление выгрузки) и совместимости с кодом →
 # подтверждение → копия нынешнего состояния (./ops/backup.sh --reason before-restore; не вышла —
 # отдельное подтверждение «БЕЗ-КОПИИ») → остановка всего, кроме базы → выгрузка в отдельную базу
@@ -29,7 +32,8 @@
 # имена каталогов верхнего уровня. Ошибки pg_restore — в local/restore/…/pg_restore.log (в нём может
 # оказаться строка данных: агенту не открывать).
 # Коды: 0 — восстановлено, ./ops/doctor.sh без FAIL; 1 — не удалось или doctor с FAIL (что именно —
-# в выводе); 2 — неверные параметры; 4 — нужен человек в терминале; 75 — идёт другая команда ops/.
+# в выводе); 2 — неверные параметры; 4 — нет разрешения владельца (ждём нажатия, отклонено, срок вышел,
+# бот недоступен — что именно, в выводе); 75 — идёт другая команда ops/.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 . ops/lib.sh
@@ -63,15 +67,16 @@ main() {
   esac
 }
 
-# Копия нынешнего состояния перед перезаписью. Не вышла — только с отдельным согласием человека.
+# Копия нынешнего состояния перед перезаписью. Не вышла — только с отдельным разрешением владельца.
+#   $1 — метка копии, из которой восстанавливаем; $2 — команда для повтора.
 safety_copy() {
   if [ ! -d data ] && ! pg_running; then return 0; fi
   echo "Делаю копию нынешнего состояния (на случай, если восстановленное окажется хуже)…"
   if ./ops/backup.sh --reason before-restore; then return 0; fi
-  echo "Копию нынешнего состояния сделать не удалось (причина — выше). Без неё нынешние данные после восстановления вернуть будет нечем." >/dev/tty
-  if human_confirm "БЕЗ-КОПИИ"; then return 0; fi
-  echo "Не подтверждено — ничего не изменено." >&2
-  exit 1
+  echo "Копию нынешнего состояния сделать не удалось (причина — выше). Без неё нынешние данные после восстановления вернуть будет нечем."
+  if OWNER_CONSENT_MAY_STOP=1 confirm_owner restore_nocopy "$1" "БЕЗ-КОПИИ" "$2" "reason=копия не сделана"; then return 0; fi
+  echo "Ничего не изменено." >&2
+  exit "$OPS_NEED_HUMAN"
 }
 
 do_restore() {
@@ -141,15 +146,25 @@ do_restore() {
   echo "  5. файл .env: $env_act"
   if [ "$NO_START" = yes ]; then echo "  6. стек не запускается (--no-start): дальше — код нужной версии и ./ops/up.sh"
   elif [ -n "$older" ]; then echo "  6. ./ops/up.sh поднимет стек и применит миграции, которых в копии ещё не было: $(list_count "$older")"; else echo "  6. ./ops/up.sh поднимет стек и вызовет ./ops/doctor.sh"; fi
+  local again envflag=keep
+  again="./ops/restore.sh --from $from"
+  [ "$only" = all ] || again="$again --only $only"
+  [ "$with_env" = no ] || again="$again --with-env"
+  [ -z "$extra" ] || again="$again --dir $extra"
+  [ "$NO_START" = no ] || again="$again --no-start"
   if [ "$dry" = yes ]; then
-    echo; echo "Это проверка (--dry-run): ничего не изменено. Восстановление запускает человек: ssh -t shturman-app 'cd $(pwd) && ./ops/restore.sh --from $from$( [ "$only" != all ] && printf ' --only %s' "$only")$( [ "$with_env" = yes ] && printf ' --with-env')$( [ -n "$extra" ] && printf ' --dir %s' "$extra")$( [ "$NO_START" = yes ] && printf ' --no-start')'"
+    echo; echo "Это проверка (--dry-run): ничего не изменено. Запуск без --dry-run ($again) пришлёт владельцу запрос в бот согласований и продолжит после нажатия «Разрешить»."
     exit 0
   fi
 
-  if ! has_tty; then need_human "./ops/restore.sh --from $from$( [ "$only" != all ] && printf ' --only %s' "$only")$( [ "$with_env" = yes ] && printf ' --with-env')$( [ -n "$extra" ] && printf ' --dir %s' "$extra")$( [ "$NO_START" = yes ] && printf ' --no-start')"; exit "$OPS_NEED_HUMAN"; fi
-  echo > /dev/tty
-  echo "Восстановление перезапишет то, что перечислено выше." > /dev/tty
-  if ! human_confirm "ВОССТАНОВИТЬ"; then echo "Не подтверждено — ничего не изменено." >&2; exit "$OPS_NEED_HUMAN"; fi
+  echo
+  echo "Восстановление перезапишет то, что перечислено выше. Спрашиваю разрешение владельца."
+  { [ "$with_env" = yes ] || [ ! -f .env ]; } && envflag="env"
+  if ! OWNER_CONSENT_MAY_STOP=1 confirm_owner restore "$from:$only:$envflag" "ВОССТАНОВИТЬ" "$again" \
+       "created=$(meta_get "$meta" created)" "parts=$parts" "env=$env_act" "version=$(meta_get "$meta" version)"; then
+    exit "$OPS_NEED_HUMAN"
+  fi
+  ./ops/state.sh log "восстановление из копии $from: владелец разрешил (${OWNER_CONSENT_VIA:-?})" > /dev/null 2>&1 || true
 
   ops_lock "восстановление из копии $from (./ops/restore.sh)"
   ./ops/state.sh log "восстановление из копии $from: начато (только: $only)" > /dev/null 2>&1 || true
@@ -161,7 +176,7 @@ do_restore() {
     ln "$dir/$s" "$run/src/$s" 2> /dev/null || cp "$dir/$s" "$run/src/$s"
   done
   src="$run/src"
-  safety_copy
+  safety_copy "$from" "$again"
 
   if [ "$with_env" = yes ] || [ ! -f .env ]; then
     local had_cluster=no
@@ -227,12 +242,16 @@ do_rollback() {
     echo "  база и данные не меняются: миграции не применялись, Hermes тот же."
   fi
   echo "  затем ./ops/up.sh прежней версии и ./ops/doctor.sh."
-  if [ "$dry" = yes ]; then echo; echo "Это проверка (--dry-run): ничего не изменено. Откат запускает человек: ssh -t shturman-app 'cd $(pwd) && ./ops/restore.sh --rollback'"; exit 0; fi
-  if ! has_tty; then need_human "./ops/restore.sh --rollback"; exit "$OPS_NEED_HUMAN"; fi
-  if ! human_confirm "ОТКАТИТЬ"; then echo "Не подтверждено — ничего не изменено." >&2; exit "$OPS_NEED_HUMAN"; fi
+  if [ "$dry" = yes ]; then echo; echo "Это проверка (--dry-run): ничего не изменено. Запуск без --dry-run (./ops/restore.sh --rollback) пришлёт владельцу запрос в бот согласований и продолжит после нажатия «Разрешить»."; exit 0; fi
+  if ! OWNER_CONSENT_MAY_STOP=1 confirm_owner rollback "$from" "ОТКАТИТЬ" "./ops/restore.sh --rollback" \
+       "from=$(meta_get "$UPDATE_LAST" from_name)" "to=$(meta_get "$UPDATE_LAST" to_name)" "stamp=$stamp" \
+       "minutes=${age:-}" "scope=$scope"; then
+    exit "$OPS_NEED_HUMAN"
+  fi
+  ./ops/state.sh log "откат обновления: владелец разрешил (${OWNER_CONSENT_VIA:-?})" > /dev/null 2>&1 || true
   ops_lock "откат обновления (./ops/restore.sh --rollback)"
   load_mode
-  if [ "$scope" = data ]; then safety_copy; fi
+  if [ "$scope" = data ]; then safety_copy "${stamp:-}" "./ops/restore.sh --rollback"; fi
   ./ops/state.sh log "откат обновления на ${from:0:12} (scope $scope): начат" > /dev/null 2>&1 || true
   rollback_run "$scope" || rc=$?
   last_set result "$( [ "$rc" -eq 0 ] && echo rolled-back || echo rollback-failed)"

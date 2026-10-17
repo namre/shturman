@@ -271,7 +271,11 @@ _ROUTE = re.compile(r"""Route\(\s*f?["']([^"']+)["']\s*,[^\n]*?methods=\[([^\]]+
 _SAMPLES = {"{import_id}": "a" * 32, "{login_id}": "abc", "{action}": "close", "{account}": "/api/tg/accounts/7"}
 # Маршруты сервиса, которые из плагина не вызывает никто: создание черновика доступно только
 # агенту, запуск обработки и MCP — не через плагин.
-_NOBODY = {("POST", "/api/processing/run"), ("POST", "/mcp")}
+_NOBODY = {("POST", "/api/processing/run"), ("POST", "/mcp"),
+           # разрешения владельца на сопровождение (Р-100): их зовёт только `shturman ops-consent` скриптов ops/
+           # на сервере; плагину — ни одной ролью (выдать разрешение не может никто, кроме нажатия в боте)
+           ("POST", "/api/ops/consents"), ("GET", "/api/ops/consents"),
+           ("GET", "/api/ops/consents/7"), ("POST", "/api/ops/consents/7/use")}
 # Страница настройки переписки и всё под её префиксом — тоже никому: у неё свой вход, мимо Hermes.
 _NOBODY_PREFIX = "/shturman-setup"
 

@@ -15,11 +15,13 @@
 #                                      хранит ./ops/backup.sh; правило одно — bk_extra в ops/lib-backup.sh;
 #                                      N не меньше 2) — и недописанные копии (*.part). Внешний каталог
 #                                      копий (SHTURMAN_BACKUP_DIR) не трогает.
-#                                      Удалённую копию не вернуть: скрипт показывает список и ждёт «да»,
-#                                      набранное ЧЕЛОВЕКОМ в его терминале. Без терминала (так выполняет
-#                                      команды ИИ-агент) — отказ.
+#                                      Удалённую копию не вернуть: скрипт показывает список и шлёт владельцу
+#                                      запрос в бот согласований (сколько копий, какие, сколько места);
+#                                      удаляет только после нажатия «Разрешить» (Р-100) и только тот же список.
+#                                      Бот недоступен — запасной путь: фраза человека в терминале.
 #
-# Агент: --dry-run можно всегда; --images — сказав владельцу; --backups запускает владелец сам.
+# Агент: --dry-run можно всегда; --images — сказав владельцу; --backups — по просьбе владельца: решает
+# он сам, кнопкой в боте.
 # Печатаются только размеры, число файлов и имена копий (в них только дата и время).
 #   -h, --help — эта справка; ничего не удаляется.
 set -eu
@@ -75,7 +77,7 @@ case "$action" in
       n="$(printf '%s\n' "$extra" | grep -c .)"
       echo "Копии сверх $keep последних и недописанные — $n шт., $(human_mb "$(printf '%s\n' "$extra" | files_mb)"):"
       printf '%s\n' "$extra" | sed 's/^/  /'
-      echo "  удалить — ./ops/cleanup.sh --backups${keep:+ --keep $keep} (запускает владелец, спросит «да»)"
+      echo "  удалить — ./ops/cleanup.sh --backups${keep:+ --keep $keep} (спросит разрешение владельца в боте согласований)"
     else
       echo "Копий сверх $keep последних нет."
       echo "  Если места мало, а копий много: ./ops/cleanup.sh --dry-run --keep 2 покажет, что останется при двух."
@@ -107,19 +109,24 @@ EOF
   backups)
     extra="$(extra_backups)"
     if [ -z "$extra" ]; then echo "Копий сверх $keep последних нет — удалять нечего."; exit 0; fi
-    if [ ! -t 0 ] || ! (: < /dev/tty) 2> /dev/null; then
-      echo "Удаление копий подтверждает человек в своём терминале; у этого запуска терминала нет." >&2
-      echo "Что было бы удалено — ./ops/cleanup.sh --dry-run --keep $keep." >&2
-      exit 2
-    fi
     echo "Будут удалены (останутся $keep последних копий):"
     printf '%s\n' "$extra" | sed 's/^/  /'
-    echo "Освободится: $(human_mb "$(printf '%s\n' "$extra" | files_mb)"). Удалённую копию не вернуть."
-    printf 'Чтобы удалить, напишите «да»: '
-    IFS= read -r answer < /dev/tty
-    [ "$answer" = "да" ] || { echo "отменено — ничего не удалено"; exit 1; }
+    size="$(human_mb "$(printf '%s\n' "$extra" | files_mb)")"
+    echo "Освободится: $size. Удалённую копию не вернуть. Спрашиваю разрешение владельца."
+    stamps_of="$(printf '%s\n' "$extra" | sed -n 's/.*-\([0-9]\{8\}T[0-9]\{6\}Z\)\..*/\1/p' | sort -u)"
+    target="$keep:$(short_hash "$extra")"
+    if ! confirm_owner backups_delete "$target" "УДАЛИТЬ" "./ops/cleanup.sh --backups --keep $keep" \
+         "count=$(printf '%s\n' "$extra" | grep -c .)" "size=$size" \
+         "oldest=$(printf '%s\n' "$stamps_of" | head -n 1)" "newest=$(printf '%s\n' "$stamps_of" | tail -n 1)"; then
+      echo "Ничего не удалено." >&2; exit "$OPS_NEED_HUMAN"
+    fi
     # Под общим замком ops/: не удалять копии, пока идёт копия, восстановление или обновление.
     ops_lock "удаление копий (./ops/cleanup.sh --backups)"
+    # Разрешение — на этот самый список: если он изменился, пока владелец решал, ничего не удаляем.
+    if [ "$(short_hash "$(extra_backups)")" != "${target#*:}" ]; then
+      echo "Список копий изменился, пока ждали решения владельца — ничего не удалено. Посмотрите ./ops/cleanup.sh --dry-run и повторите." >&2
+      exit 1
+    fi
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       case "$f" in "$dir"/data-*.tar.gz|"$dir"/db-*.dump|"$dir"/meta-*.txt|"$dir"/*.part) rm -f -- "$f" ;; esac
