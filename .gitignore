@@ -1,0 +1,23 @@
+.env
+compose.override.yaml
+local/
+data/
+# размеченный набор примеров для защиты от внедрённых инструкций — не данные экземпляра
+!service/tests/guard/data/
+# синтетический набор вопросов для измерения поиска по смыслу — тоже не данные экземпляра
+!service/tests/search/data/
+*.session
+*.session-journal
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+node_modules/
+# Для браузерных сценариев (tests/e2e) каталог Playwright бывает подключён символической ссылкой;
+# шаблон с косой чертой на конце ссылку не закрывает, поэтому имя названо и без неё.
+node_modules
+
+# Рабочие каталоги ИИ-агента
+.claude/worktrees/
+build/
+*.egg-info/

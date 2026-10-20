@@ -1,0 +1,34 @@
+# Служебный frpc посредника: отдаёт через frps имя relay.<зона> локальному Caddy посредника
+# (relay/Caddyfile) — так /api/join доступен по https на порту 443, который занят frps.
+# Проверено с frp 0.71.0. relay/install.sh кладёт файл в /etc/shturman-relay/frpc.toml.
+# Секретов в файле нет: общий токен — из /etc/frp/token.env, ключ служебного экземпляра — из
+# /etc/shturman-relay/operator.env (оба — EnvironmentFile службы, читает только root).
+
+serverAddr = "127.0.0.1"
+serverPort = 7000
+loginFailExit = false
+user = "relay"
+metadatas.key = "{{ .Envs.FRPC_OPERATOR_KEY }}"
+auth.method = "token"
+auth.token = "{{ .Envs.FRP_AUTH_TOKEN }}"
+transport.tls.enable = true
+transport.tls.trustedCaFile = "/etc/frp/frps.crt"
+transport.tls.serverName = "relay.@DOMAIN@"
+log.to = "console"
+
+[[proxies]]
+name = "api-https"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 9443
+subdomain = "relay"
+transport.proxyProtocolVersion = "v2"
+
+[[proxies]]
+name = "api-http"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 9080
+subdomain = "relay"
+# Без протокола PROXY: порт 80 нужен только для перенаправления и проверки http-01, адрес клиента
+# на нём не нужен (так же у экземпляров — frpc/frpc.toml).

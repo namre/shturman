@@ -1,0 +1,385 @@
+"""Общие маршруты внутреннего API: очередь заданий, нажатия кнопок, владелец, сводное состояние."""
+
+from __future__ import annotations
+
+import contextlib
+from typing import Any, AsyncIterator
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import BaseRoute, Route
+
+from . import authority, bridge, confirm, embeddings, jobs
+from .guard import service as guard_service
+from .app import AppState, state_of
+
+REAP_EVERY = 60  # секунд
+
+
+class BadRequest(Exception):
+    def __init__(self, message: str, status: int = 400, code: str | None = None,
+                 extra: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.message, self.status, self.code, self.extra = message, status, code, extra or {}
+
+
+MAX_BODY = 1024 * 1024  # байт: JSON-запросы внутреннего API заведомо меньше
+
+
+async def body(request: Request) -> dict[str, Any]:
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY:
+        raise BadRequest("тело запроса слишком большое", 413)
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY:
+            raise BadRequest("тело запроса слишком большое", 413)
+        chunks.append(chunk)
+    try:
+        import json as _json
+
+        data = _json.loads(b"".join(chunks) or b"null")
+    except Exception:
+        raise BadRequest("тело запроса должно быть JSON-объектом") from None
+    if not isinstance(data, dict):
+        raise BadRequest("тело запроса должно быть JSON-объектом")
+    return data
+
+
+def need_int(data: dict[str, Any], key: str) -> int:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BadRequest(f"поле {key}: нужно целое число")
+    return value
+
+
+def need_str(data: dict[str, Any], key: str, *, limit: int = 10_000) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise BadRequest(f"поле {key}: нужна непустая строка")
+    return value[:limit]
+
+
+def handler(fn):
+    """Оборачивает обработчик: ошибки запроса превращаются в ответ с кодом и текстом."""
+    async def wrapped(request: Request) -> JSONResponse:
+        try:
+            return await fn(request)
+        except BadRequest as exc:
+            return error_response(exc)
+        except (ValueError, TypeError):
+            # число не того вида в запросе — это ошибка запроса, а не сервиса
+            return JSONResponse({"error": "неверное значение в запросе"}, status_code=400)
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
+def error_response(exc: BadRequest) -> JSONResponse:
+    payload = {**exc.extra, "error": exc.message}
+    if exc.code:
+        payload["code"] = exc.code
+    return JSONResponse(payload, status_code=exc.status)
+
+
+# --- подтверждение владельцем (см. confirm.py) ---
+
+async def settle(
+    conn, kind: str, payload: dict[str, Any], *, summary: str | None,
+    applied_now: dict[str, Any] | None = None,
+) -> tuple[JSONResponse | None, Any]:
+    """Применяет действие или ставит его ждать нажатия владельца в боте согласований.
+
+    summary — что именно изменится, простыми словами: этот текст увидит владелец на карточке.
+    summary=None значит «это ужесточение»: действие применяется сразу в любом режиме.
+
+    Возвращает (ответ, результат). Ответ не None — действие ждёт подтверждения: его и нужно
+    вернуть вызывающему (HTTP 202, тело {"status": "pending_confirmation", "action_id", "summary",
+    "expires_at", "note"}; в applied_now — то, что из запроса применено сразу). Иначе действие
+    применено, и результат — то, что вернула функция применения (`confirm.Done.result`).
+
+    Вызывать вне транзакции (см. `confirm.apply`).
+    """
+    from . import access
+    if summary is None and access.is_hermes():
+        # Токен ассистента (Р-104): даже ужесточение — решение владельца, а не применяется сразу.
+        summary = access.ask_summary(kind)
+    try:
+        if summary is None:
+            out = await confirm.apply(conn, kind, payload)
+        else:
+            out = await confirm.request(conn, kind, summary, payload)
+    except confirm.Refused as exc:
+        raise BadRequest(exc.message, exc.status, exc.code, exc.extra) from None
+    except confirm.TooManyPending:
+        raise BadRequest(
+            "Слишком много действий уже ждут вашего подтверждения в боте согласований. "
+            "Ответьте на карточки в боте или отмените лишние, затем повторите.", 429, "too_many_pending") from None
+    except confirm.NoOwner:
+        raise BadRequest(
+            "Это действие нужно подтвердить в боте согласований, а владелец к боту ещё не привязан: "
+            "подтвердить некому. Сначала привяжите владельца.", 409, "owner_unknown") from None
+    if out["status"] != confirm.PENDING:
+        return None, out.get("result")
+    answer = {"status": confirm.PENDING, "action_id": out["action_id"], "summary": out["summary"],
+              "expires_at": out["expires_at"], "note": out["note"]}
+    if applied_now:
+        answer["applied_now"] = applied_now
+    return JSONResponse(answer, status_code=202), None
+
+
+@handler
+async def claim_jobs(request: Request) -> JSONResponse:
+    data = await body(request)
+    kinds = [k for k in data.get("kinds") or bridge.EXECUTOR_KINDS if k in bridge.EXECUTOR_KINDS]
+    if not kinds:
+        raise BadRequest("поле kinds: нет известных видов заданий")
+    async with state_of(request).pool.acquire() as conn:
+        claimed = await jobs.claim(
+            conn, kinds, worker=str(data.get("worker") or "plugin")[:64],
+            limit=int(data.get("limit") or 1),
+        )
+    return JSONResponse({"jobs": claimed})
+
+
+@handler
+async def complete_job(request: Request) -> JSONResponse:
+    data = await body(request)
+    result = data.get("result")
+    if not isinstance(result, dict):
+        raise BadRequest("поле result: нужен объект")
+    async with state_of(request).pool.acquire() as conn:
+        ok = await bridge.deliver_result(
+            conn, int(request.path_params["job_id"]), result, executor="plugin",
+        )
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 409)
+
+
+@handler
+async def fail_job(request: Request) -> JSONResponse:
+    data = await body(request)
+    retry = data.get("retry_in", 60)
+    async with state_of(request).pool.acquire() as conn:
+        status = await bridge.deliver_failure(
+            conn, int(request.path_params["job_id"]), str(data.get("error") or "ошибка без описания"),
+            retry_in=None if retry is None else int(retry), executor="plugin",
+        )
+    return JSONResponse({"status": status})
+
+
+OWN_BOT = "own_bot"  # код отказа: по нему плагин понимает, что повторять запрос бесполезно
+
+
+def only_without_own_bot() -> None:
+    """Со своим ботом сервиса нажатия, привязка владельца и бизнес-поток через плагин
+    не принимаются: иначе их мог бы подделать ассистент, у которого в Hermes есть терминал."""
+    if bridge.owns_bot():
+        raise BadRequest("это действие выполняется только через бота согласований", 403, OWN_BOT)
+
+
+@handler
+async def telegram_callback(request: Request) -> JSONResponse:
+    only_without_own_bot()
+    data = await body(request)
+    async with state_of(request).pool.acquire() as conn:
+        out = await bridge.dispatch_callback(conn, need_str(data, "data", limit=64), need_int(data, "from_user_id"))
+    return JSONResponse(out)
+
+
+@handler
+async def put_owner(request: Request) -> JSONResponse:
+    only_without_own_bot()
+    data = await body(request)
+    user_id, chat_id = need_int(data, "user_id"), need_int(data, "chat_id")
+    if user_id <= 0 or chat_id != user_id:
+        raise BadRequest("первичная запись владельца требует его личного Telegram-чата", 400)
+    async with state_of(request).pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.owner.binding'))")
+        current = await bridge.get_owner(conn)
+        if current is not None and not authority.is_owner():
+            if current == {"user_id": user_id, "chat_id": chat_id}:
+                return JSONResponse({"ok": True})  # legacy startup may repeat its unchanged hint
+            raise BadRequest("владельца меняют только через независимого управляющего бота", 403, "owner_required")
+        # A legacy first hint preserves Hermes bootstrap/notifications; it establishes
+        # no principal, source grant, permission approval or business re-enable.
+        await bridge.set_owner(conn, user_id, chat_id)
+    return JSONResponse({"ok": True})
+
+
+@handler
+async def delete_owner(request: Request) -> JSONResponse:
+    only_without_own_bot()
+    if not authority.is_owner():
+        raise BadRequest("владельца отвязывают только через независимый канал владельца", 403, "owner_required")
+    async with state_of(request).pool.acquire() as conn:
+        await bridge.clear_owner(conn)
+    return JSONResponse({"ok": True})
+
+
+@handler
+async def status(request: Request) -> JSONResponse:
+    """Сводное состояние без содержимого переписки: только счётчики."""
+    return JSONResponse(await overview(state_of(request)))
+
+
+async def overview(state: AppState) -> dict[str, Any]:
+    """То, что отдаёт `GET /api/status`: счётчики и признаки. Этим же пользуется страница
+    настройки сервиса в разделе «Что собрано»."""
+    from .setup_page import summary as setup_summary
+
+    async with state.ro_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT (SELECT count(*) FROM accounts) AS accounts,
+                      (SELECT count(*) FROM chats WHERE NOT excluded) AS chats,
+                      (SELECT count(*) FROM chats WHERE excluded) AS chats_excluded,
+                      (SELECT count(*) FROM messages) AS messages,
+                      (SELECT max(first_seen_at) FROM messages) AS last_message_seen_at,
+                      (SELECT value IS NOT NULL FROM settings WHERE key = 'owner') AS owner_known"""
+        )
+        queue = await jobs.queue_overview(conn)
+        guard = await guard_service.overview(conn, state.config)
+        search = await embeddings.overview(conn, state)
+        setup = await setup_summary.overview(conn, state)
+        from .voice import service as voice_service
+        voice = await voice_service.overview(conn, state)
+        from .media import service as media_service
+        media = await media_service.overview(conn, state)
+        from . import retry
+        from .notify import service as notify_service
+        notify = await notify_service.overview(conn)
+        from .rehearsal import service as rehearsal_service
+        rehearsal = await rehearsal_service.overview(conn)
+        from .replies import delivery
+        replies = await delivery.summary(conn, state)
+        replies["drafts"] = rehearsal.pop("drafts")
+        from .triage import service as triage_service
+        triage = await triage_service.overview(conn)
+        retried = await retry.overview(conn, media_days=state.config.media_days)
+        from . import halt
+        stopped = halt.public(await halt.current(conn))
+        from . import summaries
+        scheduled = await summaries.overview(conn)
+        from .processing import commitment_stats, pipeline as processing_pipeline
+        processing = await processing_pipeline.overview(conn)
+        processing.update(await commitment_stats.status_fields(conn))
+    out = dict(row)
+    # Очередь заданий: всего ждут, неудачных за всё время (jobs_failed — не за час) и по группам —
+    # модель и бот: сколько ждут, давность самого старого готового, выполнено за час (Д-25; строка jobs
+    # в ./ops/doctor.sh — «разбираются» или «за час не выполнено ни одного»). Только числа.
+    out.update(jobs_waiting=queue["waiting"], jobs_failed=queue["failed"], jobs_queue=queue["groups"])
+    # Разбор переписки (Р-96): прогонов и запросов к модели за сутки, оценка объёма, упёрлись ли в предел;
+    # договорённости по статусам и выполнена ли перепроверка. Только числа; строки processing и
+    # commitments в ./ops/doctor.sh.
+    out.update(processing)
+    # Утренняя сводка и обзор недели (Р-95): выбрал ли владелец, совпадает ли с Hermes, следующий запуск.
+    # Только признаки и время; строка summaries в ./ops/doctor.sh.
+    out.update(scheduled)
+    # «Остановить всё» (Р-87): остановлено ли, с какого времени, откуда, сколько аккаунтов на паузе.
+    out["stopped"] = stopped
+    # Уведомления владельцу (Р-84): какие включены, сколько ждут и сколько ушло за сутки.
+    out.update(notify)
+    # Ответы (Р-105): доступна ли доставка «Отправить» и чего не хватает (коды), черновики ответов — включены ли
+    # сами, сколько людей, карточки и оценки за 7 дней. Только признаки и числа; строка replies в
+    # ./ops/doctor.sh. Прежние поля `rehearsal_*` (Р-85) — ещё на один выпуск, для совместимости.
+    out["replies"] = replies
+    out.update(rehearsal)
+    # Разбор входящих (Р-92): включён ли и за сутки — разобрано, показано, напоминаний, сбоев модели;
+    # сейчас ждут ответа и в работе. Только числа.
+    out.update(triage)
+    # Повтор того, что не получилось из-за сбоя модели (Р-84): сколько можно вернуть и сколько
+    # возвращено последним повтором.
+    out.update(retried)
+    # Разбор фото и документов: включён ли владельцем и счётчики очереди.
+    out.update(media)
+    # Расшифровка голосовых: включена ли, отвечает ли контейнер, счётчики очереди.
+    out.update(voice)
+    # Защита от внедрённых инструкций: включена ли, чем проверяет, и счётчики (проверено, скрыто,
+    # показано владельцем, не проверено). Только числа и состояние.
+    out.update(guard)
+    # Поиск по смыслу: включён ли, какой моделью, сколько сообщений с вектором этой модели
+    # и сколько ещё осталось посчитать (после смены модели — пересчитать).
+    out.update(search)
+    config = state.config
+    out.update(sending=config.sending, own_bot=bridge.owns_bot(),
+               own_llm=bridge.LLM_TEXT in bridge.builtin_kinds())
+    out["last_message_seen_at"] = out["last_message_seen_at"].isoformat() if out["last_message_seen_at"] else None
+    out["owner_known"] = bool(out["owner_known"])
+    # Задания модели за последний час: сколько попыток удалось, сколько нет и виды ошибок
+    # (имя класса или короткий код). Считает сам сервис, в памяти (jobstats.py).
+    from . import jobstats
+    out["llm_jobs"] = jobstats.stats().snapshot()
+    # Страница настройки сервиса (/shturman-setup/): что на ней уже сделано. Только признаки.
+    out["setup"] = setup
+    # Сессии Telegram (Р-98): по ролям — код состояния и время, без подписей аккаунтов; строка tg-session.
+    from .tg import health as tg_health
+    out["tg_health"] = tg_health.snapshot(state)
+    # Внешний сторож (Р-98): включён ли, имя узла службы, что и когда отправлено; строка pulse.
+    from . import pulse
+    out["pulse"] = pulse.snapshot(state)
+    # Обновления (Р-101): запущенная версия, итог проверки списка выпусков, что доступно — только теги и коды,
+    # без текстов списка (их видит владелец, а не ассистент); строка updates в ./ops/doctor.sh.
+    from . import updates
+    async with state.ro_pool.acquire() as conn:
+        out["updates"] = await updates.overview(conn, state)
+        # Граница выдачи архива (Р-104): открыта, приторможена или закрыта, пределы и выдано за час и сутки по
+        # видам токена, ловушки и тревоги — только числа; строка archive-guard в ./ops/doctor.sh.
+        from . import archive_guard
+        out["archive_guard"] = await archive_guard.overview(conn, config)
+    return out
+
+
+@handler
+async def confirmations(request: Request) -> JSONResponse:
+    async with state_of(request).ro_pool.acquire() as conn:
+        return JSONResponse({"required": confirm.required(), "pending": await confirm.list_pending(conn)})
+
+
+@handler
+async def confirmation(request: Request) -> JSONResponse:
+    """Что стало с действием, которое ждало владельца: по номеру из ответа 202."""
+    async with state_of(request).ro_pool.acquire() as conn:
+        out = await confirm.get(conn, int(request.path_params["action_id"]))
+    if out is None:
+        raise BadRequest("такого действия нет", 404)
+    return JSONResponse(out)
+
+
+@handler
+async def cancel_confirmation(request: Request) -> JSONResponse:
+    async with state_of(request).pool.acquire() as conn:
+        ok = await confirm.cancel(conn, int(request.path_params["action_id"]))
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+def routes() -> list[BaseRoute]:
+    return [
+        Route("/api/confirmations", confirmations, methods=["GET"]),
+        Route("/api/confirmations/{action_id:int}", confirmation, methods=["GET"]),
+        Route("/api/confirmations/{action_id:int}/cancel", cancel_confirmation, methods=["POST"]),
+        Route("/api/status", status, methods=["GET"]),
+        Route("/api/owner", put_owner, methods=["PUT"]),
+        Route("/api/owner", delete_owner, methods=["DELETE"]),
+        Route("/api/jobs/claim", claim_jobs, methods=["POST"]),
+        Route("/api/jobs/{job_id:int}/complete", complete_job, methods=["POST"]),
+        Route("/api/jobs/{job_id:int}/fail", fail_job, methods=["POST"]),
+        Route("/api/callbacks/telegram", telegram_callback, methods=["POST"]),
+    ]
+
+
+@contextlib.asynccontextmanager
+async def lifespan(state: AppState) -> AsyncIterator[None]:
+    import asyncio
+
+    from . import halt
+    halt.bind(state)
+
+    async def reaper() -> None:
+        while True:
+            await asyncio.sleep(REAP_EVERY)
+            async with state.pool.acquire() as conn:
+                await bridge.reap_lost(conn)
+                await jobs.scrub_finished(conn)
+                await confirm.expire(conn)
+
+    state.spawn(reaper(), name="jobs-reaper")
+    yield

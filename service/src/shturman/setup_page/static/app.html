@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>Штурман — согласования и чаты</title>
+<link rel="stylesheet" href="../static/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 36 36" fill="none" aria-hidden="true"><circle cx="18" cy="18" r="16" stroke="currentColor" stroke-width="2"/><path d="M18 5l4 13-4 13-4-13z" fill="#F2B441"/><circle cx="18" cy="18" r="2.4" fill="currentColor"/></svg>
+    <span>Штурман</span>
+  </div>
+  <div class="top-actions">
+    <button type="button" class="ghost" id="refresh" hidden>Обновить</button>
+    <button type="button" class="stop" id="halt-stop" hidden>Остановить всё</button>
+  </div>
+</header>
+
+<!-- «Остановить всё» (Р-87): пока остановлено — над любым разделом -->
+<div class="halt" id="halt-banner" role="status" hidden>
+  <p class="halt-title"><b>⏸ Остановлено <span id="halt-since"></span></b></p>
+  <p class="small">Ассистент ничего не делает сам: не готовит ответы, не задаёт вопросов, ничего не отправляет.
+    Уведомления приходят. <span id="halt-reading"></span></p>
+  <label class="check" id="halt-reading-box" hidden><input type="checkbox" id="halt-reading-resume"><span>и снова читать переписку</span></label>
+  <div class="actions">
+    <button type="button" class="primary" id="halt-resume">Продолжить…</button>
+    <button type="button" class="secondary" id="halt-reading-stop" hidden>Ещё и перестать читать переписку</button>
+  </div>
+  <p class="small" id="halt-note" hidden></p>
+</div>
+
+<nav class="tabs" id="tabs" role="tablist" aria-label="Разделы" hidden>
+  <button type="button" role="tab" id="tab-approvals" aria-controls="screen-approvals" aria-selected="true">
+    <span>Согласования</span><span class="badge" id="tab-count" hidden></span>
+  </button>
+  <button type="button" role="tab" id="tab-commitments" aria-controls="screen-commitments" aria-selected="false">
+    <span>Договорённости</span><span class="badge" id="tab-commitments-count" hidden></span>
+  </button>
+  <button type="button" role="tab" id="tab-chats" aria-controls="screen-chats" aria-selected="false">
+    <span>Чаты</span>
+  </button>
+  <button type="button" role="tab" id="tab-spheres" aria-controls="screen-spheres" aria-selected="false">
+    <span>Сферы</span><span class="badge" id="tab-spheres-count" hidden></span>
+  </button>
+  <button type="button" role="tab" id="tab-rehearsal" aria-controls="screen-rehearsal" aria-selected="false"
+          aria-label="Черновики" title="Черновики">
+    <span aria-hidden="true">✍️</span>
+  </button>
+  <button type="button" role="tab" id="tab-notify" aria-controls="screen-notify" aria-selected="false"
+          aria-label="Уведомления" title="Уведомления">
+    <span aria-hidden="true">🔔</span>
+  </button>
+  <button type="button" role="tab" id="tab-history" aria-controls="screen-history" aria-selected="false"
+          aria-label="История" title="История">
+    <span aria-hidden="true">🕘</span>
+  </button>
+</nav>
+
+<main id="main">
+  <!-- вход и его неудачи -->
+  <section class="state" id="screen-wait">
+    <p class="muted">Открываю…</p>
+  </section>
+
+  <section class="state" id="screen-outside" hidden>
+    <h1>Откройте в Telegram</h1>
+    <p>Это приложение открывается кнопкой <strong>«Штурман»</strong> внизу чата с вашим ботом согласований.
+       Отдельного входа у него нет: Telegram сам сообщает, что открыли именно вы.</p>
+    <p class="muted">Настройка — первый вход, ключи, вход в аккаунт Telegram и выгрузка — в «Настройках Штурмана».</p>
+  </section>
+
+  <section class="state" id="screen-failed" hidden>
+    <h1>Не получилось войти</h1>
+    <p id="failed-text">Закройте приложение и откройте его снова кнопкой «Штурман» в боте согласований.</p>
+    <p class="muted">Данные входа от Telegram действуют несколько минут и годятся один раз.</p>
+  </section>
+
+  <section class="state" id="screen-error" hidden>
+    <h1>Список не загрузился</h1>
+    <p id="error-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+    <p class="muted">Решения по-прежнему можно принять кнопками под карточками в боте согласований.</p>
+    <button type="button" class="primary" id="retry">Повторить</button>
+  </section>
+
+  <!-- экран «Согласования» -->
+  <section id="screen-approvals" role="tabpanel" aria-labelledby="tab-approvals" hidden>
+    <!-- «Сейчас» (пакет 4а, Р-94): что ждёт решения по разделам, договорённости на сегодня, что работает.
+         Только числа, состояния и время -->
+    <div class="panel now" id="now" aria-labelledby="now-title">
+      <h2 id="now-title">Сейчас</h2>
+      <!-- Новая версия «Штурмана» (Р-101): из проверенного списка выпусков; «Как обновить» — текст для Codex -->
+      <div class="upd" id="now-update" role="status" hidden>
+        <p class="upd-title" id="now-update-title"></p>
+        <ul class="upd-changes" id="now-update-changes"></ul>
+        <p class="upd-meta muted" id="now-update-meta"></p>
+        <details class="upd-how" id="now-update-how">
+          <summary>Как обновить</summary>
+          <p class="muted">Обновляет Codex по инструкции из репозитория. Откройте новую сессию с промптом
+            prompts/operate-codex.md и вставьте в конце этот текст. Разрешения придут кнопкой в бот согласований.</p>
+          <p class="upd-codex" id="now-update-codex"></p>
+          <button type="button" class="secondary" id="now-update-copy">Скопировать текст</button>
+        </details>
+      </div>
+      <p class="now-label" id="now-groups-label" hidden>Ждёт вашего решения:</p>
+      <div class="chips" id="now-groups" aria-label="Что ждёт решения по разделам"></div>
+      <p class="now-none" id="now-none" hidden>Ничего не ждёт вашего решения.</p>
+      <button type="button" class="now-row" id="now-commitments" hidden></button>
+      <details class="now-more" id="now-more">
+        <summary id="now-summary">Что работает</summary>
+        <ul class="lines now-lines" id="now-lines"></ul>
+        <div class="now-halt" id="now-halt"></div>
+      </details>
+    </div>
+    <div class="soon" id="soon" role="status" hidden>
+      <p class="soon-title">Скоро истечёт</p>
+      <div class="soon-list" id="soon-list"></div>
+    </div>
+    <div class="title-row">
+      <h1>Согласования</h1>
+      <span class="count" id="count"></span>
+    </div>
+    <p class="banner" id="sending-off" hidden>Отправка на сервере выключена: кнопки «Отправить» у черновиков нет.
+      «Отклонить» убирает черновик ассистента из списка, ничего не отправляя.</p>
+    <div id="list" class="groups" aria-live="polite"></div>
+    <p class="empty" id="empty" hidden>Сейчас ничего не ждёт вашего решения.</p>
+    <p class="later muted" id="later" hidden></p>
+    <p class="muted foot">Те же решения приходят карточками в бот согласований — решать можно и там, и здесь.
+      Раздел сворачивается нажатием на его заголовок.</p>
+    <button type="button" class="secondary wide open-setup" hidden>Открыть настройки в браузере</button>
+    <button type="button" class="home" id="home-screen" hidden>Добавить «Штурман» на главный экран</button>
+  </section>
+
+  <!-- экран «Договорённости» (пакет 4а, Р-94): только принятые вами; без текста сообщений -->
+  <section id="screen-commitments" role="tabpanel" aria-labelledby="tab-commitments" hidden>
+    <div class="title-row">
+      <h1>Договорённости</h1>
+      <span class="count" id="cm-count"></span>
+    </div>
+    <p class="lead muted">Что вы обещали и что обещали вам — из переписки, после вашего «Верно».</p>
+    <div class="segmented" id="cm-dirs" role="tablist" aria-label="Чьи обещания">
+      <button type="button" role="tab" id="cm-dir-owner_owes" aria-selected="true"><span class="seg-label" id="cm-dir-owner_owes-label">Я обещал</span></button>
+      <button type="button" role="tab" id="cm-dir-owed_to_owner" aria-selected="false"><span class="seg-label" id="cm-dir-owed_to_owner-label">Мне обещали</span></button>
+      <button type="button" role="tab" id="cm-dir-team" aria-selected="false"><span class="seg-label" id="cm-dir-team-label">В команде</span></button>
+    </div>
+    <p class="muted" id="cm-loading">Загружаю договорённости…</p>
+    <div class="panel" id="cm-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="cm-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="cm-retry">Повторить</button>
+    </div>
+    <div id="cm-body" hidden>
+      <div class="banner cm-waiting" id="cm-waiting" hidden>
+        <span id="cm-waiting-text"></span>
+        <button type="button" class="link-btn" id="cm-waiting-open">Открыть «Согласования»</button>
+      </div>
+      <div class="groups" id="cm-groups" aria-live="polite"></div>
+      <p class="empty" id="cm-empty" hidden></p>
+      <p class="muted small" id="cm-truncated" hidden>Показаны первые 500 договорённостей — с самым ранним сроком.</p>
+      <p class="muted foot" id="cm-promised-note">«Выполнено», «Перенести» и «Не так» действуют сразу: это ваши записи. Каждое действие
+        пишется в журнал «Настроек Штурмана». Новые договорённости появляются после разбора переписки (днём — раз в час)
+        — сначала вопросом «Верно ли записано?» в «Согласованиях». Уже сделанное до этого не предлагается.</p>
+    </div>
+  </section>
+
+  <!-- экран «Чаты» -->
+  <section id="screen-chats" role="tabpanel" aria-labelledby="tab-chats" hidden>
+    <div class="title-row">
+      <h1>Чаты</h1>
+      <span class="count" id="chats-count"></span>
+    </div>
+    <p class="lead muted">Какие чаты читает ассистент. То же, что шаг «Какие чаты читать» в «Настройках Штурмана».</p>
+
+    <div class="segmented" id="chats-accounts" role="tablist" aria-label="Аккаунт Telegram" hidden></div>
+
+    <p class="muted" id="chats-loading">Загружаю чаты…</p>
+
+    <div class="panel" id="chats-none" hidden>
+      <h2>Аккаунт Telegram не подключён</h2>
+      <p>Войдите в него в «Настройках Штурмана» — шаг со входом в аккаунт Telegram. В приложении
+         входа нет: QR-код для входа с этого же телефона не отсканировать.</p>
+      <div class="actions">
+        <button type="button" class="primary open-setup" hidden>Открыть настройки в браузере</button>
+        <button type="button" class="secondary" id="chats-none-retry">Проверить ещё раз</button>
+      </div>
+    </div>
+
+    <div class="panel" id="chats-offline" hidden>
+      <h2>Аккаунт сейчас не подключён</h2>
+      <p id="chats-offline-text">Поэтому список его чатов недоступен. Состояние аккаунта и вход в него — в «Настройках Штурмана».</p>
+      <div class="actions">
+        <button type="button" class="primary open-setup" hidden>Открыть настройки в браузере</button>
+        <button type="button" class="secondary" id="chats-offline-retry">Проверить ещё раз</button>
+      </div>
+    </div>
+
+    <div class="panel" id="chats-failed" hidden>
+      <h2>Чаты не загрузились</h2>
+      <p id="chats-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="chats-failed-retry">Повторить</button>
+    </div>
+
+    <div id="chats-body" hidden>
+      <div class="tools">
+        <label class="field" for="chats-layout">
+          <span>Как показать список</span>
+          <select id="chats-layout">
+            <option value="">Все чаты</option>
+            <option value="folders">Папки Telegram</option>
+            <option value="spheres">Сферы</option>
+            <option value="activity">По активности</option>
+            <option value="kind">По виду</option>
+          </select>
+        </label>
+        <input type="search" id="chats-q" placeholder="Поиск по названию или @имени" aria-label="Поиск чата"
+               autocomplete="off" spellcheck="false" enterkeyhint="search">
+        <div class="tools-row">
+          <select id="chats-kind" aria-label="Вид чатов">
+            <option value="">Все чаты</option>
+            <option value="personal">Личные</option>
+            <option value="group">Группы</option>
+            <option value="channel">Каналы</option>
+          </select>
+          <label class="check"><input type="checkbox" id="chats-only"><span>Только выбранные</span></label>
+        </div>
+        <label class="field" for="chats-depth">
+          <span>Глубина истории для чатов, которые вы включите</span>
+          <select id="chats-depth">
+            <option value="1">1 месяц</option>
+            <option value="3">3 месяца</option>
+            <option value="6">6 месяцев</option>
+            <option value="12">12 месяцев</option>
+            <option value="24">2 года</option>
+            <option value="60">5 лет</option>
+            <option value="all">вся история</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="load" id="chats-load" role="status" aria-live="polite" hidden>
+        <p class="load-title" id="chats-load-title"></p>
+        <p class="load-text" id="chats-load-text"></p>
+        <div class="meter" id="chats-load-meter-box" aria-hidden="true"><span id="chats-load-meter"></span></div>
+      </div>
+      <p class="status" id="chats-status" role="status" hidden></p>
+      <p class="counter muted" id="chats-counter"></p>
+      <ul class="chats" id="chats-list" aria-live="polite"></ul>
+      <div class="sections" id="chats-sections" hidden></div>
+      <button type="button" class="secondary wide" id="chats-more" hidden></button>
+      <button type="button" class="secondary wide" id="chats-refresh">Обновить список из Telegram</button>
+
+      <p class="muted foot">Каждое включение и выключение чата отсюда бот согласований сообщит вам отдельным
+        сообщением — так вы заметите, если чаты меняет кто-то другой. Стереть уже сохранённые сообщения чата,
+        включить сразу все чаты раздела, группы или каналы и войти в аккаунт — в «Настройках Штурмана».
+        Выключить все чаты раздела можно и здесь.</p>
+      <button type="button" class="secondary wide open-setup" hidden>Открыть настройки в браузере</button>
+    </div>
+  </section>
+
+  <!-- экран «Сферы» (Р-82) -->
+  <section id="screen-spheres" role="tabpanel" aria-labelledby="tab-spheres" hidden>
+    <div class="title-row">
+      <h1>Сферы</h1>
+      <span class="count" id="sph-count"></span>
+    </div>
+    <p class="lead muted">Работа, личное, хобби. Ассистент по умолчанию ищет в сфере, о которой
+      разговор, и помечает найденное сферами. То же, что раздел «Сферы» в «Настройках Штурмана».</p>
+    <p class="muted" id="sph-loading">Загружаю сферы…</p>
+    <div class="panel" id="sph-failed" hidden>
+      <h2>Сферы не загрузились</h2>
+      <p id="sph-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="sph-retry">Повторить</button>
+    </div>
+    <div id="sph-body" hidden>
+      <div id="sph-offers"></div>
+      <ul class="sph-list" id="sph-list"></ul>
+      <p class="muted sph-empty" id="sph-empty" hidden>Сфер пока нет. Заведите первую или свяжите со сферой папку Telegram.</p>
+      <form class="panel sph-new" id="sph-new" autocomplete="off" novalidate>
+        <h2>Новая сфера</h2>
+        <label class="field" for="sph-new-title"><span>Название</span>
+          <input type="text" id="sph-new-title" maxlength="60" placeholder="Например: Работа"></label>
+        <label class="field" for="sph-new-description"><span>Коротко, что в ней — по желанию</span>
+          <input type="text" id="sph-new-description" maxlength="300" placeholder="Например: стройка, продажи"></label>
+        <button type="submit" class="primary wide" id="sph-new-save">Завести сферу</button>
+      </form>
+      <h2 class="sub-h">Из папок Telegram</h2>
+      <p class="muted small">«Связать со сферой…» относит все чаты папки к сфере, которую вы выберете: новой (с названием
+        папки) или одной из ваших. Флажок «Предлагать новые чаты папки» — новые чаты появятся здесь вопросом «добавить в
+        сферу?», сами они не добавляются.</p>
+      <p class="muted small" id="sph-folders-empty" hidden>Папок нет — или список чатов ещё не обновлялся из Telegram.</p>
+      <ul class="sph-list" id="sph-folders"></ul>
+      <p class="muted foot">Добавить чат в сферу — кнопкой «Сферы» в строке чата на экране «Чаты». Изменения сфер отсюда
+        записываются в журнал действий страницы с пометкой «из приложения». Какие чаты читаются, сферы не меняют.</p>
+    </div>
+  </section>
+  <!-- экран «Уведомления» (Р-84): смотреть и сужать; включить больше — в «Настройках Штурмана» -->
+  <section id="screen-notify" role="tabpanel" aria-labelledby="tab-notify" hidden>
+    <div class="title-row">
+      <h1>Уведомления</h1>
+    </div>
+    <p class="lead muted">Бот пишет вам, когда вам написали в личку или обратились к вам в группе. Здесь можно
+      выключить лишнее и выбрать время. Включить больше — в «Настройках Штурмана».</p>
+    <p class="muted" id="nt-loading">Загружаю…</p>
+    <div class="panel" id="nt-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="nt-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="nt-retry">Повторить</button>
+    </div>
+    <div id="nt-body" hidden>
+      <p class="banner" id="nt-nobot" hidden>Бот согласований не настроен — уведомлений не будет.</p>
+      <!-- утренняя сводка и обзор недели (Р-95): только когда ассистент в Hermes отвечает -->
+      <form class="panel sm-panel" id="sm-form" autocomplete="off" novalidate hidden>
+        <h2>Сводки от ассистента</h2>
+        <div class="sm-line">
+          <label class="check"><input type="checkbox" id="sm-morning-on"><span>Утренняя сводка в</span></label>
+          <input type="time" id="sm-morning-time" step="60" aria-label="Время утренней сводки" required>
+        </div>
+        <p class="muted small" id="sm-morning-next"></p>
+        <div class="sm-line">
+          <label class="check"><input type="checkbox" id="sm-weekly-on"><span>Обзор недели</span></label>
+          <select id="sm-weekly-day" aria-label="День обзора недели">
+            <option value="1">пн</option><option value="2">вт</option><option value="3">ср</option><option value="4">чт</option>
+            <option value="5">пт</option><option value="6">сб</option><option value="0">вс</option>
+          </select>
+          <input type="time" id="sm-weekly-time" step="60" aria-label="Время обзора недели" required>
+        </div>
+        <p class="muted small" id="sm-weekly-next"></p>
+        <p class="banner" id="sm-sync" hidden></p>
+        <button type="submit" class="primary wide" id="sm-save">Сохранить</button>
+      </form>
+      <div class="panel">
+        <h2>Сейчас</h2>
+        <ul class="lines nt-now" id="nt-now"></ul>
+      </div>
+      <div class="panel" id="nt-off-box">
+        <h2>Выключить</h2>
+        <div class="actions nt-off" id="nt-off"></div>
+        <p class="muted small" id="nt-off-none" hidden>Всё уже выключено.</p>
+      </div>
+      <form class="panel nt-when" id="nt-when-form" autocomplete="off" novalidate>
+        <h2>Когда присылать</h2>
+        <label class="field" for="nt-when"><span>Как присылать</span>
+          <select id="nt-when">
+            <option value="i5">Сразу, не чаще раза в 5 мин</option>
+            <option value="i10">Сразу, не чаще раза в 10 мин</option>
+            <option value="i15">Сразу, не чаще раза в 15 мин</option>
+            <option value="i30">Сразу, не чаще раза в 30 мин</option>
+            <option value="i60">Сразу, не чаще раза в час</option>
+            <option value="d15">Пачкой раз в 15 мин</option>
+            <option value="d30">Пачкой раз в 30 мин</option>
+            <option value="d60">Пачкой раз в час</option>
+          </select></label>
+        <p class="muted small">«Сразу» — для каждого чата отдельно: следующие сообщения того же чата придут одним уведомлением «…и ещё N».</p>
+        <label class="check"><input type="checkbox" id="nt-quiet"><span>Тихие часы</span></label>
+        <div class="tools-row">
+          <label class="field" for="nt-from"><span>с</span><input type="time" id="nt-from" step="300"></label>
+          <label class="field" for="nt-to"><span>до</span><input type="time" id="nt-to" step="300"></label>
+        </div>
+        <button type="submit" class="primary wide" id="nt-save">Сохранить</button>
+      </form>
+      <p class="muted foot">Каждое изменение отсюда бот согласований сообщит вам отдельным сообщением.</p>
+      <button type="button" class="secondary wide open-setup" hidden>Открыть настройки в браузере</button>
+    </div>
+  </section>
+
+  <!-- экран «Черновики» (Р-89, Р-105; внутреннее имя rehearsal): кому готовить черновики ответов, предел, статистика -->
+  <section id="screen-rehearsal" role="tabpanel" aria-labelledby="tab-rehearsal" hidden>
+    <div class="title-row">
+      <h1>Черновики ответов</h1>
+      <span class="count" id="rh-count"></span>
+    </div>
+    <p class="lead muted">Когда вам пишет человек из списка, ассистент готовит черновик ответа и присылает его вам
+      в бот. Сам ничего не отправляет: отправить, скопировать или наговорить свой — решаете вы. Черновик на
+      любое сообщение — кнопкой «Подготовить ответ» под уведомлением.</p>
+    <p class="muted" id="rh-loading">Загружаю…</p>
+    <div class="panel" id="rh-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="rh-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="rh-retry">Повторить</button>
+    </div>
+    <div class="panel" id="rh-unavailable" hidden>
+      <h2>Недоступна в этом способе</h2>
+      <p id="rh-unavailable-text"></p>
+      <p class="muted small">Способ работы меняется в «Настройках Штурмана».</p>
+    </div>
+    <div id="rh-body" hidden>
+      <p class="banner" id="rh-halted" hidden>Ассистент остановлен — пока он не продолжит, черновики не готовятся.</p>
+      <div class="panel">
+        <label class="check rh-switch"><input type="checkbox" id="rh-enabled"><span>Готовить черновики сами</span></label>
+        <p class="muted small">Только личные чаты вашего основного аккаунта.</p>
+      </div>
+      <div class="panel">
+        <h2>Кому готовить черновики</h2>
+        <ul class="rh-people" id="rh-people"></ul>
+        <p class="muted small" id="rh-people-empty" hidden>Список пуст — добавьте человека из ваших личных чатов.</p>
+        <input type="search" id="rh-q" placeholder="Найти человека по имени" aria-label="Найти человека по имени"
+               autocomplete="off" spellcheck="false" enterkeyhint="search">
+        <ul class="rh-people rh-found" id="rh-found" aria-live="polite"></ul>
+      </div>
+      <form class="panel rh-limits" id="rh-limits" autocomplete="off" novalidate>
+        <h2>Сколько и как часто</h2>
+        <div class="tools-row">
+          <label class="field" for="rh-cap-input"><span>Карточек в сутки</span>
+            <input type="number" id="rh-cap-input" min="1" max="300" step="1" inputmode="numeric" required></label>
+          <label class="field" for="rh-pause-input"><span>Пауза между карточками, секунд</span>
+            <input type="number" id="rh-pause-input" min="0" max="3600" step="1" inputmode="numeric" required></label>
+        </div>
+        <p class="rh-used" id="rh-used" aria-live="polite"></p>
+        <p class="muted small">Когда предел исчерпан, новые сообщения из списка приходят обычными уведомлениями до конца
+          суток. Больше карточек — больше сообщений уходит модели.</p>
+        <button type="submit" class="primary wide" id="rh-limits-save">Сохранить</button>
+      </form>
+      <div class="panel">
+        <h2>За 7 дней</h2>
+        <p id="rh-stats"></p>
+        <ul class="rh-recent" id="rh-recent"></ul>
+        <p class="muted small" id="rh-recent-empty" hidden>Карточек пока не было.</p>
+      </div>
+      <p class="muted foot">Изменения отсюда действуют сразу; о каждом бот согласований напишет вам отдельно — с
+        командой, которой его вернуть. Предел можно поднять и кнопкой в боте, когда он исчерпан, или командой
+        /drafts cap ЧИСЛО.</p>
+    </div>
+  </section>
+
+  <!-- экран «История» (Р-95): решения, действия ассистента, входы; доверие — сузить сразу, расширить — в боте -->
+  <section id="screen-history" role="tabpanel" aria-labelledby="tab-history" hidden>
+    <div class="title-row">
+      <h1>История</h1>
+      <span class="count" id="hs-count"></span>
+    </div>
+    <div class="segmented hs-seg" id="hs-seg" role="tablist" aria-label="Раздел истории">
+      <button type="button" role="tab" data-hs="decisions" aria-selected="true">Решения</button>
+      <button type="button" role="tab" data-hs="assistant" aria-selected="false">Ассистент</button>
+      <button type="button" role="tab" data-hs="logins" aria-selected="false">Входы</button>
+      <button type="button" role="tab" data-hs="trust" aria-selected="false">Доверие</button>
+    </div>
+    <p class="muted" id="hs-loading">Загружаю…</p>
+    <div class="panel" id="hs-failed" hidden>
+      <h2>Не загрузилось</h2>
+      <p id="hs-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+      <button type="button" class="primary" id="hs-retry">Повторить</button>
+    </div>
+    <div id="hs-body" hidden></div>
+    <p class="muted foot" id="hs-foot">Отозвать и убрать — сразу. Вернуть то, что расширяет возможности ассистента, или
+      добавить доверенного — только нажатием «Да» в самом боте согласований: отсюда уходит карточка.</p>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="../static/app.js"></script>
+</body>
+</html>

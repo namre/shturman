@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Подставной docker для сценарных тестов ops/ (ops/tests/test_ops.sh): отвечает ровно на те вызовы,
+# которые делают lib.sh и lib-backup.sh, по переменным окружения. Каждый вызов пишется в $STUB_LOG.
+#   STUB_PG=running        — контейнер базы запущен (иначе его нет)
+#   STUB_APPLIED=a,b       — применённые миграции (schema_migrations); STUB_APPLIED_FILE — то же из файла
+#                            (его пишет подставной up.sh теста: «миграции применились»)
+#   STUB_HERMES_IMAGE=…    — образ работающего контейнера Hermes (пусто — контейнера нет)
+#   STUB_IMAGES=…          — вывод docker compose config --images
+#   STUB_COMPOSE_OK=1      — прочие команды docker compose завершаются успешно (иначе — отказ)
+#   STUB_SERVICE=running   — контейнер сервиса переписки запущен (иначе его нет; restarting — перезапускается)
+#   STUB_CONSENT=N         — решение владельца в боте через сервис: код выхода `shturman ops-consent ask`
+#                            (0 — разрешил, 4 — ещё не ответил, 5 — отклонил, 6 — бота нет, 7 — сервис не отвечает)
+#   STUB_IMAGE=1           — образ сервиса есть (для пути без сервиса: docker compose run … --direct)
+#   STUB_DIRECT=N          — решение владельца на пути без сервиса (тот же смысл кодов; по умолчанию 6)
+#   STUB_CONSENT_STATUS=…  — ответ `shturman ops-consent status` (например «granted 14:00 (UTC)»)
+#   STUB_RUNNING_COMMIT_FILE=… — файл (путь от каталога экземпляра) с коммитом кода, с которым работает сервис:
+#                            `shturman call GET /api/status` отдаёт его первые 12 знаков в updates.running.commit
+#                            (файл пишет подставной up.sh теста). Отвечает, только если STUB_SERVICE=running, файл
+#                            есть и STUB_STATUS_DOWN не задан; local/status-wait (число, пишет подставной up.sh) —
+#                            столько запросов подряд сервис ещё «применяет миграции» и не отвечает. Слово none
+#                            в файле — сервис отвечает, но коммита не называет; local/status-fail-at (пишет подставной
+#                            up.sh при STUB_FLAKY=N) — N-й запрос после него не отвечает, один раз
+#   STUB_HERMES_STARTED=…  — время запуска контейнера Hermes ({{.State.StartedAt}})
+#   local/late-mig         — миграции, которые «лягут» к моменту `docker stop shturman-service` (пишет подставной
+#                            up.sh при STUB_LATE_MIG): дописываются в $STUB_APPLIED_FILE
+echo "docker $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+  inspect)
+    name="${*: -1}"
+    case "$name" in
+      shturman-postgres) if [ "${STUB_PG:-}" = running ]; then echo running; exit 0; fi; exit 1 ;;
+      shturman-service) if [ -n "${STUB_SERVICE:-}" ]; then echo "$STUB_SERVICE"; exit 0; fi; exit 1 ;;
+      shturman-hermes)
+        if [ -n "${STUB_HERMES_IMAGE:-}" ]; then
+          case "$*" in *Config.Image*) echo "$STUB_HERMES_IMAGE" ;; *StartedAt*) echo "${STUB_HERMES_STARTED:-}" ;; *) echo running ;; esac
+          exit 0
+        fi
+        exit 1 ;;
+      *) exit 1 ;;
+    esac ;;
+  ps) exit 0 ;;
+  stop)
+    if [ "${*: -1}" = shturman-service ] && [ -f local/late-mig ] && [ -n "${STUB_APPLIED_FILE:-}" ]; then
+      { tr ',' '\n' < "$STUB_APPLIED_FILE"; cat local/late-mig; } | grep -v '^$' | LC_ALL=C sort -u | paste -sd, - > "$STUB_APPLIED_FILE.new"
+      mv "$STUB_APPLIED_FILE.new" "$STUB_APPLIED_FILE"; rm -f local/late-mig
+    fi
+    exit 0 ;;
+  image) if [ "${STUB_IMAGE:-}" = 1 ]; then echo '[]'; exit 0; fi; exit 1 ;;
+  exec)
+    case "$*" in
+      *"ops-consent ask"*) echo "подставной бот: решение ${STUB_CONSENT:-6}"; exit "${STUB_CONSENT:-6}" ;;
+      *"ops-consent status"*) echo "${STUB_CONSENT_STATUS:-none}" ;;
+      *"shturman-service shturman call GET /api/status"*)
+        [ "${STUB_SERVICE:-}" = running ] && [ -z "${STUB_STATUS_DOWN:-}" ] || exit 1
+        [ -n "${STUB_RUNNING_COMMIT_FILE:-}" ] && [ -f "$STUB_RUNNING_COMMIT_FILE" ] || exit 1
+        if [ -f local/status-fail-at ]; then         # один случайный сбой ответа: N-й запрос после up.sh
+          k=$(( $(cat local/status-calls 2> /dev/null || echo 0) + 1 )); echo "$k" > local/status-calls
+          [ "$k" != "$(cat local/status-fail-at)" ] || exit 1
+        fi
+        w="$(cat local/status-wait 2> /dev/null || echo 0)"
+        if [ "${w:-0}" -gt 0 ]; then echo $((w - 1)) > local/status-wait; exit 1; fi
+        if [ "$(cat "$STUB_RUNNING_COMMIT_FILE")" = none ]; then echo '{"updates": {"running": {"version": "0.0.2"}}}'; exit 0; fi
+        printf '{"updates": {"running": {"commit": "%s", "version": "%s", "tag": "v%s"}}}\n' \
+          "$(head -c 12 "$STUB_RUNNING_COMMIT_FILE")" "$(tr -d '[:space:]' < VERSION)" "$(tr -d '[:space:]' < VERSION)"
+        exit 0 ;;
+      *pg_isready*) exit 0 ;;
+      *"string_agg(t ||"*) echo "chats=1 messages=2" ;;
+      *"to_regclass('public.schema_migrations')"*) echo t ;;
+      *"string_agg(name"*)
+        if [ -n "${STUB_APPLIED_FILE:-}" ] && [ -f "$STUB_APPLIED_FILE" ]; then cat "$STUB_APPLIED_FILE"; else echo "${STUB_APPLIED:-}"; fi ;;
+      *pg_dump*) printf 'PGDMP-stub-dump' ;;
+      *"pg_restore --list"*) cat > /dev/null; echo "215; 1259 16390 TABLE public messages shturman" ;;
+      *) exit 0 ;;
+    esac ;;
+  compose)
+    case "$*" in
+      *"config --images"*) printf '%s\n' "${STUB_IMAGES:-}" ;;
+      *"up -d postgres"*) exit 0 ;;
+      *"ops-consent ask"*"--direct"*) echo "подставной бот без сервиса: решение ${STUB_DIRECT:-6}"; exit "${STUB_DIRECT:-6}" ;;
+      *) if [ "${STUB_COMPOSE_OK:-}" = 1 ]; then exit 0; fi; exit 1 ;;
+    esac ;;
+  *) exit 1 ;;
+esac

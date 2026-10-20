@@ -1,0 +1,1410 @@
+"""Сессии аккаунтов Telegram: запуск, вход, остановка — и шлюз для остальных модулей.
+
+Объект `TgManager` лежит в `state.extras["tg"]` и для остальных модулей выглядит как
+`tg/gateway.py::TgGateway`. Клиента Telethon наружу он не отдаёт.
+
+Две роли, на каждую — одна сессия (файл `<роль>.session` в каталоге данных сервиса):
+  * owner — основной аккаунт владельца. Только чтение: перечень запросов клиента не содержит
+    отправки, а `send_text` отказывает до любого обращения к клиенту;
+  * assistant — аккаунт-помощник. Может отправлять, но только через `send_text` шлюза.
+
+Аккаунт владельца нельзя подключить как помощника:
+  * вход помощника не начинается, пока сервис не знает владельца (не привязан управляющий чат
+    и в архиве нет основного аккаунта) — иначе аккаунты не отличить;
+  * после входа аккаунт сверяется с владельцем управляющего чата и с основными аккаунтами
+    архива; при совпадении только что созданная сессия завершается;
+  * та же сверка — при каждом запуске сессии с диска;
+  * если владельцем управляющего чата становится аккаунт, уже подключённый как помощник,
+    сессия останавливается и ставится на паузу, а владелец получает уведомление.
+
+Отправка, кроме роли, требует главного выключателя `config.sending` (только из окружения
+сервиса): пока он выключен, `can_send` — ложь, `send_text` отказывает, «печатает…» не шлётся.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
+
+import asyncpg
+from telethon import errors
+from telethon.tl import functions, types
+
+from .. import authority, bridge, control_peers, store
+from .. import events as ev
+from ..config import Config
+from ..events import Events
+from . import dialogs as dl
+from . import client as client_module
+from . import gateway, normalize, sync
+from .client import (ROLES, ClientFactory, NotConfigured, RequestPolicy, make_client_factory,
+                     remove_session_file, session_path)
+from .live import LiveIngest
+from .lock import SessionLock, SessionLocked
+from .normalize import PeerKey
+from .qr import LoginFlow, LoginRejected, LoginStateError
+
+logger = logging.getLogger("shturman.tg")
+
+TEXT_LIMIT = 4096
+PUT_READ_TIMEOUT = 5.0     # «В чат»: чтение поля ввода — не дольше; сама запись по времени не прерывается
+
+
+def _online(client: Any) -> bool:
+    """Клиент на связи и не переподключается: запрос не ляжет в очередь Telethon до следующего соединения."""
+    try:
+        connected = bool(client.is_connected())
+    except Exception:  # noqa: BLE001 — не знаем — значит, не на связи
+        return False
+    sender = getattr(client, "_sender", None)
+    return connected and not getattr(sender, "_reconnecting", False)
+DIALOGS_TTL = 600.0       # список старше — страница настройки сама запускает его обновление (в фоне)
+DIALOGS_MIN_GAP = 30.0    # чаще список не перечитывается даже по просьбе
+FLOW_KEEP = 600.0         # сколько помнить законченный вход, чтобы экран узнал итог
+RETRY_FIRST, RETRY_MAX = 5.0, 600.0
+
+# Состояния аккаунта для экрана.
+STARTING, RUNNING, DISCONNECTED, ERROR = "starting", "running", "disconnected", "error"
+PAUSED, UNAUTHORIZED, LOCKED, FAILED, NO_SESSION = "paused", "unauthorized", "locked", "failed", "no_session"
+ACTIVE = (STARTING, RUNNING, DISCONNECTED, ERROR)
+
+ROLE_NAMES = {"owner": "основной аккаунт владельца", "assistant": "аккаунт-помощник"}
+# Подсказка к отказам по роли: запись о роли остаётся в архиве и после выхода из аккаунта.
+FORGET_HINT = ("Если раньше подключили не тот аккаунт — выйдите из него и удалите его из архива в "
+               "«Настройках Штурмана» (блок «Аккаунты в архиве без подключения»), затем войдите заново.")
+
+
+KEEP: Any = object()   # «настройку не трогать»
+
+
+class TgError(Exception):
+    """Отказ с текстом для владельца и кодом ответа HTTP."""
+
+    def __init__(self, message: str, status: int = 400, *, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.message, self.status = message, status
+        self.retry_after = retry_after   # Telegram велел ждать столько секунд (для 429)
+
+
+class DialogsNotLoaded(TgError):
+    """Списка диалогов аккаунта в базе ещё нет: он ни разу не загружался (или загружается сейчас)."""
+
+    def __init__(self) -> None:
+        super().__init__("Список чатов ещё не загружен из Telegram. Дождитесь, пока он загрузится, или нажмите "
+                         "«Обновить список из Telegram».", 409)
+
+
+class _Unauthorized(Exception):
+    pass
+
+
+# Диалог аккаунта: чат и номер его последнего сообщения (и сведения для будущей группировки).
+DialogInfo = dl.DialogRow
+
+
+@dataclass
+class AccountRuntime:
+    """Одна подключённая (или подключающаяся) сессия."""
+
+    slot: str
+    client: Any = None
+    lock: SessionLock | None = None
+    policy: RequestPolicy | None = None
+    account_id: int | None = None
+    self_id: int | None = None
+    status: str = STARTING
+    error: str | None = None
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    reconnected: asyncio.Event = field(default_factory=asyncio.Event)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    pacer: sync.Pacer = field(default_factory=sync.Pacer)
+    live: LiveIngest | None = None
+    history: sync.HistorySync | None = None
+    task: asyncio.Task | None = None
+    dialogs_load: dl.DialogsLoad = field(default_factory=dl.DialogsLoad)   # загрузка списка диалогов
+    dialogs_tried: float = 0.0     # когда (time.monotonic) последний раз начата загрузка списка
+    dialogs_done_at: float = 0.0   # когда она последний раз дошла до конца
+    logout: bool = False
+    lock_lost: bool = False
+    terminated: bool = False  # сессия завершена на стороне Telegram
+
+    @property
+    def role(self) -> str:
+        return self.slot
+
+    def on_reconnect(self) -> None:
+        self.reconnected.set()
+        self.wake.set()
+
+
+def _label(user: Any) -> str:
+    return normalize.display_name(user) or f"Аккаунт {user.id}"
+
+
+def _sent_message(result: Any, key: PeerKey, text: str, self_id: int,
+                  reply_to: int | None) -> tuple[int, Any, dict]:
+    """Номер отправленного сообщения и само сообщение из ответа Telegram."""
+    if isinstance(result, types.UpdateShortSentMessage):
+        message = types.Message(
+            id=result.id, peer_id=normalize.to_peer(key), from_id=types.PeerUser(self_id),
+            date=result.date, message=text, out=True, entities=result.entities, media=result.media,
+            reply_to=types.MessageReplyHeader(reply_to_msg_id=reply_to) if reply_to else None,
+        )
+        return int(result.id), message, {}
+    updates = getattr(result, "updates", None) or ()
+    for update in updates:
+        if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)) \
+                and isinstance(update.message, types.Message):
+            entities = normalize.index_entities(getattr(result, "users", None), getattr(result, "chats", None))
+            return int(update.message.id), update.message, entities
+    for update in updates:
+        if isinstance(update, types.UpdateMessageID):
+            return int(update.id), None, {}
+    raise RuntimeError("Telegram не вернул номер отправленного сообщения")
+
+
+class TgManager:
+    def __init__(
+        self, config: Config, pool: asyncpg.Pool, events: Events, *,
+        client_factory: ClientFactory | None = None, pacing: float = 3.0,
+    ) -> None:
+        self.config, self.pool, self.events = config, pool, events
+        # Настоящая фабрика читает ключи приложения из нынешних настроек: их можно ввести на
+        # странице настройки уже после запуска сервиса (см. `reconfigure`).
+        self.client_factory: ClientFactory = client_factory or self._default_factory
+        self.pacing = pacing
+        self.runtimes: dict[str, AccountRuntime] = {}
+        self.flows: dict[str, LoginFlow] = {}
+        self._flow_done_at: dict[str, float] = {}
+        self._retry_first = RETRY_FIRST
+        self._background: set[asyncio.Task] = set()
+        events.subscribe(ev.CHAT_EXCLUDED, self.on_chat_excluded)
+
+    # ------------------------------------------------------------------ общее
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.config.tg_api_id and self.config.tg_api_hash)
+
+    def require_configured(self) -> None:
+        if not self.configured:
+            raise TgError(
+                "Работа с аккаунтами Telegram не настроена: не заданы ключи приложения. Владелец вводит их "
+                "в «Настройках Штурмана», шаг «Ключи приложения Telegram»; запасной путь — TELEGRAM_API_ID и "
+                "TELEGRAM_API_HASH в настройках сервера.", 503)
+
+    def _default_factory(self, role: str, path: Any, policy: RequestPolicy, on_reconnect: Any) -> Any:
+        return make_client_factory(self.config)(role, path, policy, on_reconnect)
+
+    async def reconfigure(self, config: Config) -> None:
+        """Принимает новые настройки сервиса — владелец ввёл или сменил ключи приложения на
+        странице настройки. Сессия привязана к ключам, с которыми создана, поэтому менять их
+        при подключённых аккаунтах нельзя: сначала выход из аккаунтов."""
+        changed = (config.tg_api_id, config.tg_api_hash) != (self.config.tg_api_id, self.config.tg_api_hash)
+        if changed and await self.has_sessions():
+            raise TgError("Сначала выйдите из подключённых аккаунтов Telegram: их сессии созданы "
+                          "с прежними ключами приложения.", 409)
+        self.config = config
+        if changed:
+            await self.start()
+
+    async def has_sessions(self) -> bool:
+        """Есть ли подключённые аккаунты, идущие входы или файлы сессий на диске."""
+        if self.runtimes or any(not flow.done for flow in self.flows.values()):
+            return True
+        if any(session_path(self.config, slot).exists() for slot in ROLES):
+            return True
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT EXISTS (SELECT 1 FROM tg_sessions)"))
+
+    def _by_account(self, account_id: int) -> AccountRuntime | None:
+        return next((rt for rt in self.runtimes.values() if rt.account_id == account_id), None)
+
+    def _running(self, account_id: int) -> AccountRuntime:
+        rt = self._by_account(account_id)
+        if rt is None or rt.status != RUNNING or rt.client is None:
+            raise gateway.AccountUnavailable("сессия аккаунта не запущена")
+        return rt
+
+    async def _slot_of(self, account_id: int) -> asyncpg.Record:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT s.slot, s.paused, a.role FROM tg_sessions s JOIN accounts a ON a.id = s.account_id
+                   WHERE s.account_id = $1""", account_id)
+        if row is None:
+            raise TgError("У этого аккаунта нет сессии Telegram.", 404)
+        return row
+
+    # ------------------------------------------------------------------ запуск и остановка
+
+    async def start(self) -> None:
+        """Запускает сессии, файлы которых лежат на диске. Не ждёт подключения."""
+        if not self.configured:
+            return
+        async with self.pool.acquire() as conn:
+            paused = {r["slot"] for r in await conn.fetch("SELECT slot FROM tg_sessions WHERE paused")}
+        for slot in ROLES:
+            if slot in paused or not session_path(self.config, slot).exists():
+                continue
+            await self._launch(slot)
+
+    async def stop(self) -> None:
+        for flow in list(self.flows.values()):
+            await flow.cancel()
+        for rt in list(self.runtimes.values()):
+            await self._shutdown(rt)
+        self.runtimes.clear()
+        if self._background:
+            await asyncio.gather(*list(self._background), return_exceptions=True)
+
+    def _spawn(self, coro: Any, name: str) -> None:
+        task = asyncio.get_running_loop().create_task(coro, name=name, context=authority.background_context())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    # ------------------------------------------------------------------ события сервиса
+
+    async def on_chat_excluded(self, payload: dict[str, Any]) -> None:
+        """Владелец исключил чат из архива: синхронизация чата прекращается немедленно, не
+        дожидаясь, пока очередная запись в него будет отвергнута. Страница истории, которая в
+        этот момент уже запрошена, при записи отбрасывается."""
+        async with self.pool.acquire() as conn:
+            hit = await sync.chat_excluded(conn, int(payload["chat_id"]), purged=bool(payload.get("purged")))
+        if hit is None:
+            return
+        account_id, key = hit
+        rt = self._by_account(account_id)
+        if rt is not None and rt.live is not None:
+            rt.live.drop_chat(key)
+        logger.info("аккаунт %s: чат %s%s исключён из архива, синхронизация выключена", account_id, *key)
+
+    async def owner_changed(self, conn: asyncpg.Connection, new_user_id: int) -> None:
+        """Сменился владелец управляющего чата (вызывается внутри транзакции смены).
+
+        Если новым владельцем оказался аккаунт, подключённый как помощник, это основной аккаунт
+        владельца с правом отправки — так быть не должно. Сессия останавливается и ставится на
+        паузу; снять паузу не выйдет (запуск такую сессию отвергнет), остаётся выйти из неё.
+        """
+        if not new_user_id:
+            return
+        account_id = await conn.fetchval(
+            """SELECT s.account_id FROM tg_sessions s JOIN accounts a ON a.id = s.account_id
+               WHERE s.slot = 'assistant' AND a.tg_user_id = $1""", int(new_user_id))
+        if account_id is None:
+            return
+        reason = "Аккаунт владельца подключён как помощник: сессия остановлена."
+        await conn.execute("UPDATE tg_sessions SET paused = true, last_error = $2 WHERE account_id = $1",
+                           account_id, reason)
+        rt = self.runtimes.pop("assistant", None)   # с этого мгновения can_send — ложь
+        if rt is not None:
+            rt.stop.set()
+            self._spawn(self._shutdown(rt), "tg-assistant-owner-stop")
+        await bridge.notify_owner(
+            conn,
+            "Аккаунт, подключённый к сервису как помощник, оказался вашим основным аккаунтом. "
+            "Помощнику разрешена отправка сообщений, поэтому его сессия остановлена и поставлена "
+            "на паузу. Выйдите из неё в разделе аккаунтов и подключите помощником другой аккаунт.")
+        logger.warning("аккаунт %s: владелец управляющего чата совпал с помощником, сессия остановлена", account_id)
+
+    async def _open(self, slot: str, rt: AccountRuntime, *, login: bool) -> None:
+        """Берёт блокировки и создаёт клиента. Блокировка — до любого подключения."""
+        path = session_path(self.config, slot)
+        lock = SessionLock(path, self.config.dsn, on_lost=lambda: self._lock_lost(rt))
+        await lock.acquire(f"slot:{slot}")
+        try:
+            policy = RequestPolicy(slot, login=login, sending=self.config.sending)
+            client = self.client_factory(slot, path, policy, rt.on_reconnect)
+        except BaseException:
+            await lock.release()
+            raise
+        rt.lock, rt.policy, rt.client = lock, policy, client
+        rt.pacer = sync.Pacer(self.pacing, jitter=True)
+
+    async def _launch(self, slot: str) -> AccountRuntime:
+        rt = AccountRuntime(slot=slot)
+        self.runtimes[slot] = rt
+        try:
+            await self._open(slot, rt, login=False)
+        except SessionLocked as exc:
+            rt.status, rt.error = LOCKED, str(exc)
+            rt.ready.set()
+            logger.error("аккаунт (%s): сессия занята другим процессом, не подключаюсь", slot)
+            return rt
+        except NotConfigured as exc:
+            rt.status, rt.error = FAILED, str(exc)
+            rt.ready.set()
+            return rt
+        rt.task = asyncio.get_running_loop().create_task(self._supervise(rt), name=f"tg-{slot}", context=authority.background_context())
+        return rt
+
+    def _lock_lost(self, rt: AccountRuntime) -> None:
+        if rt.stop.is_set() or rt.task is None or rt.task.done():
+            return
+        rt.lock_lost = True
+        rt.task.cancel()
+
+    async def _shutdown(self, rt: AccountRuntime, *, logout: bool = False) -> None:
+        rt.logout = logout
+        rt.stop.set()
+        rt.wake.set()
+        if rt.task is not None and not rt.task.done():
+            rt.task.cancel()
+            await asyncio.gather(rt.task, return_exceptions=True)
+        else:
+            await self._close(rt)
+
+    async def _close(self, rt: AccountRuntime) -> None:
+        loading = rt.dialogs_load.task
+        if loading is not None and not loading.done():
+            loading.cancel()   # загрузка списка ждёт и паузы Telegram — без клиента ей делать нечего
+            await asyncio.gather(loading, return_exceptions=True)
+        client, rt.client = rt.client, None
+        if client is not None:
+            try:
+                if rt.logout:
+                    # log_out() сам отключается и удаляет файл сессии
+                    rt.terminated = bool(await client.log_out())
+                if not rt.terminated:
+                    await client.disconnect()
+            except Exception as exc:
+                logger.warning("аккаунт (%s): отключение завершилось с ошибкой (%s)", rt.slot, type(exc).__name__)
+        if rt.logout:
+            remove_session_file(session_path(self.config, rt.slot))
+        lock, rt.lock = rt.lock, None
+        if lock is not None:
+            await lock.release()
+
+    async def _supervise(self, rt: AccountRuntime) -> None:
+        """Держит сессию подключённой. Неустранимая ошибка останавливает её без повторов."""
+        delay = self._retry_first
+        try:
+            while not rt.stop.is_set():
+                try:
+                    await self._session(rt)
+                    delay = self._retry_first
+                    rt.status = DISCONNECTED
+                except asyncio.CancelledError:
+                    raise
+                except (_Unauthorized, errors.UnauthorizedError):
+                    rt.status, rt.error = UNAUTHORIZED, "Сессия больше не действует: войдите в аккаунт заново."
+                    break
+                except errors.AuthKeyError as exc:
+                    # В том числе AUTH_KEY_DUPLICATED: ключ использован вторым подключением
+                    # и отозван. Повтор только ухудшит положение.
+                    rt.status = FAILED
+                    rt.error = f"Ключ сессии недействителен ({type(exc).__name__}): войдите в аккаунт заново."
+                    break
+                except (LoginRejected, SessionLocked) as exc:
+                    rt.status, rt.error = FAILED, str(exc)
+                    break
+                except Exception as exc:
+                    rt.status, rt.error = ERROR, type(exc).__name__
+                    logger.warning("аккаунт (%s): подключение не удалось (%s), повтор через %s с",
+                                   rt.slot, type(exc).__name__, int(delay))
+                finally:
+                    rt.ready.set()
+                if await sync.interruptible_sleep(delay, rt.stop):
+                    break
+                delay = min(delay * 2, RETRY_MAX)
+        except asyncio.CancelledError:
+            if rt.lock_lost and not rt.stop.is_set():
+                rt.status, rt.error = FAILED, "Потеряна блокировка сессии: соединение с базой оборвалось."
+                logger.error("аккаунт (%s): блокировка сессии потеряна, отключаюсь", rt.slot)
+            else:
+                raise
+        finally:
+            if rt.status in ACTIVE:
+                rt.status = DISCONNECTED
+            await self._close(rt)
+            await self._save_error(rt)
+
+    async def _save_error(self, rt: AccountRuntime) -> None:
+        if rt.account_id is None or rt.logout or rt.stop.is_set():
+            return  # остановка по команде причину прежней остановки не стирает
+        with contextlib.suppress(Exception):
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE tg_sessions SET last_error = $2 WHERE account_id = $1",
+                                   rt.account_id, rt.error if rt.status in (FAILED, UNAUTHORIZED) else None)
+
+    async def _session(self, rt: AccountRuntime) -> None:
+        """Одно подключение: от connect() до разрыва."""
+        client = rt.client
+        if not client.is_connected():
+            await client.connect()
+        # Не is_user_authorized(): тот считает «не авторизован» любую ошибку запроса, в том числе
+        # временную. get_me() возвращает None только когда Telegram прямо ответил, что сессия не действует.
+        me = await client.get_me()
+        if me is None:
+            raise _Unauthorized()
+        if rt.account_id is None:
+            await self._register(rt, me, fresh=False)
+        elif int(me.id) != rt.self_id:
+            raise LoginRejected("Сессия принадлежит другому аккаунту, чем была при запуске.")
+        rt.policy.login = False
+        if rt.live is None:
+            rt.live = LiveIngest(pool=self.pool, events=self.events, account_id=rt.account_id,
+                                 self_id=rt.self_id, wake=rt.wake)
+            await rt.live.reload()
+            rt.live.register(client)  # до первого чтения истории, чтобы ничего не проскочило
+        set_filter = getattr(client, "set_channel_filter", None)
+        if set_filter is not None:
+            set_filter(rt.live.wants_channel)
+        rt.history = sync.HistorySync(
+            client=client, pool=self.pool, events=self.events, account_id=rt.account_id,
+            self_id=rt.self_id, pacer=rt.pacer, stop=rt.stop)
+        rt.status, rt.error = RUNNING, None
+        rt.ready.set()
+        loop = asyncio.get_running_loop()
+        worker = loop.create_task(
+            rt.history.run(rt.wake, rt.reconnected, tops=lambda: self._tops(rt)), name=f"tg-{rt.slot}-history",
+            context=authority.background_context())
+        gone = authority.background_context().run(asyncio.ensure_future, client.disconnected)
+        try:
+            await asyncio.wait({worker, gone}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        if gone.done() and not gone.cancelled():
+            gone.exception()  # причина разрыва не важна: дальше — переподключение
+        if not worker.cancelled() and worker.exception() is not None:
+            raise worker.exception()  # например, сессию отозвали посреди работы
+
+    async def _register(self, rt: AccountRuntime, user: Any, *, fresh: bool) -> None:
+        """Сверяет аккаунт с ролью и записывает его. Бросает LoginRejected с текстом для владельца."""
+        role, tg_user_id = rt.role, int(user.id)
+        async with self.pool.acquire() as conn, conn.transaction():
+            known = await conn.fetchrow("SELECT id, role FROM accounts WHERE tg_user_id = $1", tg_user_id)
+            if known is not None and known["role"] != role:
+                raise LoginRejected(
+                    f"Этот аккаунт уже записан в архиве как {ROLE_NAMES[known['role']]} — "
+                    f"подключить его как {ROLE_NAMES[role]} нельзя. {FORGET_HINT}")
+            if role == "assistant":
+                owner = await bridge.get_owner(conn)
+                if owner is not None and int(owner["user_id"]) == tg_user_id:
+                    raise LoginRejected(
+                        "Это основной аккаунт владельца. Как помощника его подключать нельзя: "
+                        "помощнику разрешена отправка сообщений. Отсканируйте код другим аккаунтом.")
+            else:
+                other = await conn.fetchval(
+                    "SELECT 1 FROM accounts WHERE role = 'owner' AND tg_user_id <> $1 LIMIT 1", tg_user_id)
+                if other:
+                    raise LoginRejected(
+                        "В архиве уже есть основной аккаунт — другой. Отсканируйте код тем аккаунтом, "
+                        f"чья переписка уже загружена. {FORGET_HINT}")
+            bound = await conn.fetchval(
+                """SELECT a.tg_user_id FROM tg_sessions s JOIN accounts a ON a.id = s.account_id
+                   WHERE s.slot = $1""", rt.slot)
+            if bound is not None and bound != tg_user_id:
+                if not fresh:
+                    raise LoginRejected("Файл сессии принадлежит другому аккаунту, чем записан в базе.")
+                await conn.execute("DELETE FROM tg_sessions WHERE slot = $1", rt.slot)
+            account_id = await store.ensure_account(conn, tg_user_id, _label(user), role)
+            await conn.execute(
+                """INSERT INTO tg_sessions (account_id, slot, last_started_at) VALUES ($1, $2, now())
+                   ON CONFLICT (account_id) DO UPDATE SET last_started_at = now(), last_error = NULL""",
+                account_id, rt.slot)
+        # Вторая блокировка — по самому аккаунту: тот же аккаунт не подключится из другой роли.
+        await rt.lock.add(f"account:{tg_user_id}")
+        rt.account_id, rt.self_id = account_id, tg_user_id
+
+    # ------------------------------------------------------------------ вход
+
+    def _sweep_flows(self) -> None:
+        now = time.monotonic()
+        for flow_id, flow in list(self.flows.items()):
+            if not flow.done:
+                continue
+            done_at = self._flow_done_at.setdefault(flow_id, now)
+            if now - done_at > FLOW_KEEP:
+                self.flows.pop(flow_id, None)
+                self._flow_done_at.pop(flow_id, None)
+
+    def login(self, login_id: str) -> LoginFlow:
+        self._sweep_flows()
+        flow = self.flows.get(login_id)
+        if flow is None:
+            raise TgError("Вход не найден или уже завершён. Начните заново.", 404)
+        return flow
+
+    async def check_login(self, role: str, *, confirm_owner: bool = False) -> None:
+        """Можно ли начать вход в этой роли. Ничего не меняет: маршрут зовёт эту проверку до того,
+        как просить владельца подтвердить вход, чтобы не показывать карточку впустую."""
+        self.require_configured()
+        if role not in ROLES:
+            raise TgError("Поле role: нужно assistant или owner.")
+        if role == "owner" and not confirm_owner:
+            raise TgError(
+                "Подключение основного аккаунта нужно подтвердить (confirm_owner: true): на сервере "
+                "появится сессия вашего основного аккаунта. Сервис будет только читать, но риск "
+                "ограничений со стороны Telegram ложится на основной номер.")
+        if role == "assistant":
+            async with self.pool.acquire() as conn:
+                owner_known = await bridge.get_owner(conn) is not None or await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM accounts WHERE role = 'owner')")
+            if not owner_known:
+                raise TgError(
+                    "Сервис ещё не знает, какой аккаунт ваш основной. Сначала привяжите себя как владельца "
+                    "к боту согласований — это первый шаг «Настроек Штурмана». Другой способ — сначала подключите "
+                    "основной аккаунт там же. "
+                    "Иначе сервис не сможет отличить основной аккаунт от помощника, а помощнику "
+                    "разрешена отправка сообщений. После этого подключите помощника снова.", 409)
+        current = self.runtimes.get(role)
+        if current is not None and current.status in ACTIVE:
+            raise TgError(f"{ROLE_NAMES[role].capitalize()} уже подключён. Чтобы сменить его, сначала выйдите.", 409)
+        async with self.pool.acquire() as conn:
+            if await conn.fetchval("SELECT paused FROM tg_sessions WHERE slot = $1", role):
+                raise TgError("Аккаунт на паузе. Снимите паузу или выйдите из него.", 409)
+
+    async def start_login(self, role: str, *, confirm_owner: bool = False) -> LoginFlow:
+        await self.check_login(role, confirm_owner=confirm_owner)
+        self._sweep_flows()
+        for flow in list(self.flows.values()):
+            if flow.role == role and not flow.done:
+                await flow.cancel()  # экран входа открыли заново — прежний код больше не нужен
+        current = self.runtimes.get(role)
+        if current is not None:
+            await self._shutdown(current)
+            self.runtimes.pop(role, None)
+        path = session_path(self.config, role)
+        if path.exists():
+            # Остаток прежней сессии (недействительной или чужой): завершаем её в Telegram,
+            # а не просто стираем файл, чтобы она не осталась в списке устройств.
+            await self._logout_offline(role)
+
+        rt = AccountRuntime(slot=role)
+        try:
+            # Блокировка берётся до того, как тронут файл: его может держать другой процесс.
+            lock = SessionLock(path, self.config.dsn, on_lost=lambda: self._lock_lost(rt))
+            await lock.acquire(f"slot:{role}")
+        except SessionLocked as exc:
+            raise TgError(f"Сессия занята другим процессом: {exc}.", 409) from None
+        try:
+            rt.lock, rt.policy = lock, RequestPolicy(role, login=True, sending=self.config.sending)
+            rt.pacer = sync.Pacer(self.pacing, jitter=True)
+            rt.client = self.client_factory(role, path, rt.policy, rt.on_reconnect)
+        except NotConfigured as exc:
+            await lock.release()
+            raise TgError(str(exc), 503) from None
+        except BaseException:
+            await lock.release()
+            raise
+
+        async def done(user: Any) -> int | None:
+            return await self._login_done(rt, user)
+
+        async def close() -> None:
+            await self._login_abort(rt)
+
+        flow = LoginFlow(rt.client, role, on_success=done, on_close=close)
+        try:
+            await flow.start()
+        except errors.FloodWaitError as exc:
+            await close()
+            raise TgError(f"Telegram просит подождать {int(exc.seconds)} с. Попробуйте позже.", 429) from None
+        except (errors.ApiIdInvalidError, errors.ApiIdPublishedFloodError):
+            await close()
+            raise TgError("Telegram не принял ключи приложения (api_id и api_hash). Проверьте, что они "
+                          "скопированы с my.telegram.org без ошибок, и введите их заново.", 400) from None
+        except Exception as exc:
+            await close()
+            logger.warning("вход (%s): не удалось начать (%s)", role, type(exc).__name__)
+            raise TgError("Не удалось связаться с Telegram. Попробуйте позже.", 502) from None
+        self.flows[flow.id] = flow
+        return flow
+
+    async def _login_done(self, rt: AccountRuntime, user: Any) -> int | None:
+        try:
+            await self._register(rt, user, fresh=True)
+        except (LoginRejected, SessionLocked) as exc:
+            # Сессия на стороне Telegram уже создана — завершаем её, чтобы не осталась
+            # в списке устройств аккаунта, который сюда подключать не собирались.
+            with contextlib.suppress(Exception):
+                await rt.client.log_out()
+            raise LoginRejected(str(exc)) from None
+        rt.policy.login = False
+        self.runtimes[rt.slot] = rt
+        rt.task = asyncio.get_running_loop().create_task(self._supervise(rt), name=f"tg-{rt.slot}", context=authority.background_context())
+        logger.info("аккаунт %s (%s): вход выполнен", rt.account_id, rt.slot)
+        return rt.account_id
+
+    async def _login_abort(self, rt: AccountRuntime) -> None:
+        client, rt.client = rt.client, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+        remove_session_file(session_path(self.config, rt.slot))
+        lock, rt.lock = rt.lock, None
+        if lock is not None:
+            await lock.release()
+
+    async def submit_password(self, login_id: str, password: str) -> LoginFlow:
+        flow = self.login(login_id)
+        try:
+            await flow.submit_password(password)
+        except LoginStateError as exc:
+            raise TgError(f"{str(exc).capitalize()}.", 409) from None
+        return flow
+
+    async def cancel_login(self, login_id: str) -> LoginFlow:
+        flow = self.login(login_id)
+        await flow.cancel()
+        return flow
+
+    # ------------------------------------------------------------------ аккаунты
+
+    async def list_accounts(self) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT a.id, a.tg_user_id, a.label, s.slot, s.paused, s.auto_personal, s.auto_groups,
+                          s.backfill_months, s.logged_in_at, s.last_error
+                   FROM tg_sessions s JOIN accounts a ON a.id = s.account_id ORDER BY s.slot""")
+        out, seen = [], set()
+        for row in rows:
+            slot = row["slot"]
+            seen.add(slot)
+            rt = self.runtimes.get(slot)
+            if rt is not None:
+                status, error = rt.status, rt.error
+            elif row["paused"]:
+                status, error = PAUSED, row["last_error"]
+            elif not session_path(self.config, slot).exists():
+                status, error = NO_SESSION, "Файла сессии нет: войдите в аккаунт заново."
+            else:
+                status, error = DISCONNECTED, row["last_error"]
+            out.append({
+                "role": slot, "account_id": row["id"], "tg_user_id": row["tg_user_id"],
+                "label": row["label"], "status": status, "error": error, "paused": row["paused"],
+                "can_send": self.can_send(row["id"]),
+                "auto_personal": row["auto_personal"], "auto_groups": row["auto_groups"],
+                "backfill_months": row["backfill_months"],
+                "logged_in_at": row["logged_in_at"].isoformat(),
+            })
+        for slot, rt in self.runtimes.items():
+            if slot not in seen:  # сессия не дошла до записи в базу: занята или недействительна
+                out.append({"role": slot, "account_id": None, "tg_user_id": None, "label": None,
+                            "status": rt.status, "error": rt.error, "paused": False, "can_send": False,
+                            "auto_personal": False, "auto_groups": False, "backfill_months": None,
+                            "logged_in_at": None})
+        return out
+
+    async def health_rows(self) -> list[dict[str, Any]]:
+        """Для `tg/health.py`: по каждой роли — состояние сессии и сколько секунд назад от Telegram пришло
+        последнее обновление о сообщениях (None — с запуска сессии не было ни одного). Без подписей
+        аккаунтов, номеров и текстов ошибок: это уходит в `GET /api/status`, `./ops/doctor.sh` и наружу."""
+        rows = []
+        for account in await self.list_accounts():
+            rt = self.runtimes.get(account["role"])
+            age = None
+            if rt is not None and rt.live is not None and rt.live.last_update_at is not None:
+                age = max(0.0, time.monotonic() - rt.live.last_update_at)
+            rows.append({"role": account["role"], "status": account["status"], "update_age": age})
+        return rows
+
+    async def detached_accounts(self, conn: asyncpg.Connection) -> list[dict[str, Any]]:
+        """Аккаунты, которые есть в архиве, но без сессии: из них вышли, или переписка пришла
+        только из выгрузки или бизнес-режима. Их роль в архиве остаётся и мешает подключить тот же
+        аккаунт в другой роли — поэтому страница показывает их и даёт удалить (`forget`)."""
+        rows = await conn.fetch(
+            """SELECT a.id, a.label, a.role,
+                      (SELECT count(*) FROM chats c WHERE c.account_id = a.id) AS chats,
+                      (SELECT count(*) FROM messages m JOIN chats c ON c.id = m.chat_id
+                        WHERE c.account_id = a.id) AS messages
+               FROM accounts a
+               WHERE NOT EXISTS (SELECT 1 FROM tg_sessions s WHERE s.account_id = a.id)
+               ORDER BY a.id""")
+        return [{"account_id": r["id"], "label": r["label"], "role": r["role"],
+                 "role_name": ROLE_NAMES.get(r["role"], r["role"]),
+                 "chats": int(r["chats"]), "messages": int(r["messages"])} for r in rows]
+
+    async def forget(self, conn: asyncpg.Connection, account_id: int) -> dict[str, Any]:
+        """Удаляет из архива аккаунт без сессии вместе с его чатами, сообщениями и всем, что из
+        них извлечено (каскадом). Нужен, когда в роль вошли не тем аккаунтом: запись о роли
+        иначе не даёт подключить ни этот аккаунт в другой роли, ни правильный — в этой.
+
+        Вызывается из функции применения действия, внутри её транзакции."""
+        row = await conn.fetchrow("SELECT id, tg_user_id, label, role FROM accounts WHERE id = $1 FOR UPDATE",
+                                  account_id)
+        if row is None:
+            raise TgError("Такого аккаунта в архиве нет.", 404)
+        if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM tg_sessions WHERE account_id = $1)", account_id) \
+                or self._by_account(account_id) is not None:
+            raise TgError("Этот аккаунт подключён. Сначала выйдите из него, затем удалите из архива.", 409)
+        if any(not flow.done for flow in self.flows.values()):
+            raise TgError("Идёт вход в аккаунт Telegram. Дождитесь его окончания или отмените вход.", 409)
+        if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM business_connections WHERE account_id = $1 AND enabled)",
+                               account_id):
+            raise TgError("К этому аккаунту подключён бизнес-режим. Сначала отключите бота в Telegram: "
+                          "«Настройки» → «Telegram для бизнеса» → «Чат-боты».", 409)
+        messages = int(await conn.fetchval(
+            "SELECT count(*) FROM messages m JOIN chats c ON c.id = m.chat_id WHERE c.account_id = $1", account_id))
+        await conn.execute("DELETE FROM accounts WHERE id = $1", account_id)
+        # факты из удалённых сообщений ушли каскадом: закрытые ими прежние снова действуют
+        from ..processing import facts
+        await facts.repair_chains(conn)
+        logger.info("аккаунт %s (%s) удалён из архива, сообщений: %s", account_id, row["role"], messages)
+        return {"role": row["role"], "label": row["label"], "messages": messages}
+
+    async def logout(self, account_id: int) -> dict[str, Any]:
+        """Завершает сессию в Telegram и удаляет её файл. Архив остаётся."""
+        self.require_configured()
+        slot = (await self._slot_of(account_id))["slot"]
+        rt = self.runtimes.pop(slot, None)
+        if rt is not None and rt.client is not None:
+            await self._shutdown(rt, logout=True)
+            terminated = rt.terminated
+        else:
+            if rt is not None:
+                await self._shutdown(rt)
+            terminated = await self._logout_offline(slot)
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM tg_sessions WHERE account_id = $1", account_id)
+            # Список всех диалогов аккаунта нужен, только пока к нему есть сессия; архив остаётся.
+            await dl.forget(conn, account_id)
+        logger.info("аккаунт %s (%s): выход, сессия на стороне Telegram %s",
+                    account_id, slot, "завершена" if terminated else "не подтверждена")
+        return {"ok": True, "terminated": terminated}
+
+    async def _logout_offline(self, slot: str) -> bool:
+        """Выход из аккаунта, который сейчас не подключён (пауза, сбой)."""
+        path = session_path(self.config, slot)
+        if not path.exists():
+            return False
+        rt = AccountRuntime(slot=slot)
+        try:
+            await self._open(slot, rt, login=False)
+        except SessionLocked:
+            raise TgError("Сессия занята другим процессом — выйти из неё отсюда нельзя.", 409) from None
+        except NotConfigured as exc:
+            raise TgError(str(exc), 503) from None
+        terminated = False
+        try:
+            await asyncio.get_running_loop().create_task(
+                rt.client.connect(), name=f"tg-{rt.slot}-connect", context=authority.background_context())
+            if await rt.client.get_me() is not None:
+                terminated = bool(await rt.client.log_out())
+        except Exception as exc:
+            logger.warning("аккаунт (%s): завершить сессию в Telegram не удалось (%s)", slot, type(exc).__name__)
+        finally:
+            with contextlib.suppress(Exception):
+                await rt.client.disconnect()
+            remove_session_file(path)
+            await rt.lock.release()
+        return terminated
+
+    async def pause(self, account_id: int) -> None:
+        slot = (await self._slot_of(account_id))["slot"]
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE tg_sessions SET paused = true WHERE account_id = $1", account_id)
+        rt = self.runtimes.pop(slot, None)
+        if rt is not None:
+            await self._shutdown(rt)
+
+    async def _paused(self, account_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT paused FROM tg_sessions WHERE account_id = $1", account_id))
+
+    async def resume(self, account_id: int, *, unpause: bool = True) -> None:
+        """Снимает паузу и подключает аккаунт.
+
+        unpause=False — только переподключить аккаунт, который не на паузе: сама пауза не
+        снимается никогда. Если она стоит или появилась, пока шло подключение, — отказ, и
+        аккаунт остаётся отключённым. Так поступает маршрут, когда паузу вправе снять только
+        владелец в боте согласований."""
+        self.require_configured()
+        slot = (await self._slot_of(account_id))["slot"]
+        if unpause:
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE tg_sessions SET paused = false WHERE account_id = $1", account_id)
+        elif await self._paused(account_id):
+            raise TgError("Аккаунт на паузе: снять её может только владелец.", 409)
+        current = self.runtimes.get(slot)
+        if current is not None and current.status in ACTIVE:
+            return
+        if current is not None:
+            await self._shutdown(current)
+        if not session_path(self.config, slot).exists():
+            self.runtimes.pop(slot, None)
+            raise TgError("Файла сессии нет: войдите в аккаунт заново.", 409)
+        await self._launch(slot)
+        if not unpause and await self._paused(account_id):
+            # Паузу поставили, пока аккаунт подключался: её решение сильнее.
+            rt = self.runtimes.pop(slot, None)
+            if rt is not None:
+                await self._shutdown(rt)
+            raise TgError("Аккаунт на паузе: снять её может только владелец.", 409)
+
+    async def set_options(
+        self, account_id: int, *, auto_personal: bool | None, auto_groups: bool | None,
+        backfill_months: Any = KEEP,
+    ) -> None:
+        """Настройки аккаунта.
+
+        «Брать новые личные чаты / группы»: при включении все нынешние диалоги запоминаются как
+        уже существующие — настройка касается только чатов, появившихся позже.
+        `backfill_months` — глубина истории для чатов, которые включат после этого: число месяцев
+        или None (вся история). Уже включённых чатов не касается."""
+        await self._slot_of(account_id)
+        rt = self._by_account(account_id)
+        if auto_personal or auto_groups:
+            if rt is None or rt.status != RUNNING:
+                raise TgError("Аккаунт не подключён: включить настройку можно только на работающем аккаунте.", 409)
+            async with self.pool.acquire() as conn:
+                known = await dl.info(conn, account_id)
+                if known["completed_at"] is None:
+                    # Без полного списка сервис не отличит существующие чаты от новых: настройка
+                    # взяла бы и старые чаты, как только в них кто-то напишет.
+                    self.start_dialogs(rt)
+                    raise TgError("Список чатов аккаунта ещё не загружен из Telegram целиком. Дождитесь, пока он "
+                                  "загрузится (шаг «Какие чаты читать»), и включите настройку снова.", 409)
+                await sync.mark_seen(conn, account_id, [d.key for d in await dl.rows(conn, account_id)])
+            if known["age"] is None or known["age"] > DIALOGS_MIN_GAP:
+                # Чаты, появившиеся после прошлой загрузки, отметит свежая — когда дойдёт до конца.
+                self.start_dialogs(rt, mark_seen=True)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE tg_sessions SET auto_personal = COALESCE($2, auto_personal),
+                                          auto_groups = COALESCE($3, auto_groups),
+                                          backfill_months = CASE WHEN $4 THEN $5 ELSE backfill_months END
+                   WHERE account_id = $1""",
+                account_id, auto_personal, auto_groups, backfill_months is not KEEP,
+                None if backfill_months is KEEP else backfill_months)
+        if rt is not None and rt.live is not None:
+            await rt.live.reload()
+
+    # ------------------------------------------------------------------ диалоги и выбор чатов
+
+    def start_dialogs(self, rt: AccountRuntime, *, mark_seen: bool = False) -> bool:
+        """Запускает загрузку списка диалогов в фоне и сразу возвращается. Если она уже идёт, вторая
+        не начинается. True — начата сейчас. `mark_seen` — по окончании отметить все диалоги как уже
+        существующие (настройка «брать новые чаты»)."""
+        load = rt.dialogs_load
+        if mark_seen:
+            load.mark_seen = True          # идущая загрузка отметит, когда дойдёт до конца
+        if load.running:
+            return False
+        if rt.client is None or rt.account_id is None or rt.status != RUNNING:
+            return False
+        fresh = dl.DialogsLoad(state=dl.LOADING, started=time.monotonic(), mark_seen=load.mark_seen)
+        rt.dialogs_load, rt.dialogs_tried = fresh, fresh.started
+        fresh.task = asyncio.get_running_loop().create_task(
+            self._load_dialogs(rt, fresh), name=f"tg-{rt.slot}-dialogs", context=authority.background_context())
+        return True
+
+    async def _load_dialogs(self, rt: AccountRuntime, load: dl.DialogsLoad) -> None:
+        """Фоновая загрузка списка: страница за страницей — в базу; FLOOD_WAIT — ожидание и та же
+        страница снова (tg/dialogs.py)."""
+        account_id = rt.account_id
+        try:
+            async with self.pool.acquire() as conn:
+                load_id = await dl.begin(conn, account_id)
+
+            async def on_page(rows: list[dl.DialogRow], expected: int | None, done: bool) -> None:
+                async with self.pool.acquire() as conn:
+                    await dl.save_page(conn, account_id, load_id, rows, position=load.loaded, expected=expected)
+                load.loaded += len(rows)
+                load.pages += 1
+                load.expected = expected
+                load.state = dl.LOADING
+
+            async def on_wait(seconds: int) -> None:
+                load.waits += 1
+                load.state = dl.WAITING
+                logger.warning("аккаунт %s: список чатов — Telegram просит подождать %s с; загружено %s из ~%s, "
+                               "продолжу с той же страницы", account_id, seconds, load.loaded, load.expected or "?")
+
+            await dl.fetch_all(rt.client, self_id=rt.self_id, pacer=rt.pacer, stop=rt.stop,
+                               on_page=on_page, on_wait=on_wait)
+            # Папки Telegram — той же загрузкой, одним запросом после последней страницы (Р-82).
+            # Не получилось — прежние папки остаются, список диалогов всё равно считается загруженным.
+            found = await dl.fetch_folders(rt.client, self_id=rt.self_id, pacer=rt.pacer, stop=rt.stop,
+                                           on_wait=on_wait)
+            async with self.pool.acquire() as conn:
+                if found is not None:
+                    await dl.save_folders(conn, account_id, found)
+                removed = await dl.finish(conn, account_id, load_id, mark_seen=load.mark_seen)
+            load.mark_seen = False
+            load.state, rt.dialogs_done_at = dl.DONE, time.monotonic()
+            logger.info("аккаунт %s: список чатов загружен — диалогов %s, страниц %s, ожиданий %s, убрано %s",
+                        account_id, load.loaded, load.pages, load.waits, removed)
+        except sync.Stopped:
+            load.state, load.error = dl.FAILED, "Аккаунт отключается."
+        except asyncio.CancelledError:
+            load.state, load.error = dl.FAILED, "Аккаунт отключается."
+            raise
+        except Exception as exc:
+            load.state, load.error = dl.FAILED, _load_error(exc)
+            logger.warning("аккаунт %s: список чатов не загружен (%s); загружено %s", account_id,
+                           type(exc).__name__, load.loaded)
+        finally:
+            load.done.set()
+
+    def _load_status(self, rt: AccountRuntime | None, known: dict[str, Any]) -> dict[str, Any]:
+        """Загрузка списка для экрана: идёт ли, сколько получено, ждёт ли Telegram, когда список
+        последний раз загружен целиком."""
+        load = rt.dialogs_load if rt is not None else None
+        updated = known["completed_at"].isoformat() if known["completed_at"] is not None else None
+        out: dict[str, Any] = {"state": dl.DONE if updated else dl.IDLE, "running": False,
+                               "loaded": known["stored"], "expected": known["expected"],
+                               "wait_seconds": None, "updated_at": updated, "error": None}
+        if load is None or load.state == dl.IDLE or (load.state == dl.DONE and not load.running):
+            return out
+        out.update(state=load.state, running=load.running, loaded=load.loaded,
+                   expected=load.expected if load.expected is not None else known["expected"])
+        # Ждать может велеть и ответ на запрос истории: пауза у аккаунта общая (Pacer).
+        waiting = rt.pacer.flood_remaining() if load.running else 0.0
+        if waiting > 0:
+            out.update(state=dl.WAITING, wait_seconds=max(1, int(waiting + 0.999)))
+        elif load.running:
+            out["state"] = dl.LOADING
+        if load.state == dl.FAILED:
+            out["error"] = load.error
+        return out
+
+    async def dialogs(self, account_id: int) -> list[DialogInfo]:
+        """Диалоги аккаунта из базы, в порядке списка Telegram — без запроса к Telegram, как бы давно
+        список ни загружался. Списка нет вовсе — `DialogsNotLoaded`."""
+        async with self.pool.acquire() as conn:
+            known = await dl.info(conn, account_id)
+            if known["completed_at"] is None and not known["stored"]:
+                raise DialogsNotLoaded()
+            return await dl.rows(conn, account_id)
+
+    async def find_dialogs(self, account_id: int, keys: list[PeerKey]) -> dict[PeerKey, DialogInfo]:
+        """Названные диалоги аккаунта из базы. Списка нет вовсе — `DialogsNotLoaded`."""
+        async with self.pool.acquire() as conn:
+            known = await dl.info(conn, account_id)
+            if known["completed_at"] is None and not known["stored"]:
+                raise DialogsNotLoaded()
+            return {d.key: d for d in await dl.rows(conn, account_id, keys=keys)}
+
+    async def _tops(self, rt: AccountRuntime) -> dict[PeerKey, int] | None:
+        """Номер последнего сообщения каждого диалога — для дозагрузки истории (sync.gap_fill_pass).
+        Нужен свежий список: загрузка в фоне запускается (или идущая используется) и дожидается.
+        Не дошла до конца — None: тогда история опрашивает чаты по одному."""
+        load = rt.dialogs_load
+        fresh = load.state == dl.DONE and time.monotonic() - rt.dialogs_done_at < DIALOGS_MIN_GAP
+        if not load.running and not fresh:
+            self.start_dialogs(rt)
+        load = rt.dialogs_load
+        if load.running:
+            await load.done.wait()       # отмена истории загрузку не прерывает
+        if load.state != dl.DONE:
+            return None
+        async with self.pool.acquire() as conn:
+            return {d.key: d.top_message for d in await dl.rows(conn, rt.account_id)}
+
+    async def list_dialogs(
+        self, account_id: int, *, offset: int = 0, limit: int = 100,
+        chat_type: str | None = None, refresh: bool = False,
+        chat_types: Any = None, query: str | None = None, only_enabled: bool = False, cached: bool = False,
+        keys: list[PeerKey] | None = None,
+    ) -> dict[str, Any]:
+        """Страница списка диалогов для экрана выбора — из базы, сразу. Отбор: один вид чата
+        (`chat_type`), несколько видов (`chat_types`), подстрока названия или адреса (`query`),
+        только уже включённые (`only_enabled`), только названные диалоги (`keys` — раздел раскладки:
+        папка, сфера, активность, вид). `total` — сколько диалогов прошло отбор.
+
+        `refresh` — кнопка «Обновить список из Telegram»: запускает загрузку в фоне (если она не
+        идёт и список не обновлялся последние `DIALOGS_MIN_GAP` секунд). Без неё страница настройки
+        сама запускает обновление, когда список старше `DIALOGS_TTL`; `cached` — не запускает
+        (приложение «Штурман», Р-80). `loaded` — есть ли что показать; `age` — сколько секунд назад
+        список загружен целиком; `load` — состояние загрузки (`_load_status`)."""
+        try:
+            rt = self._running(account_id)
+        except gateway.AccountUnavailable:
+            raise TgError("Аккаунт не подключён: список чатов недоступен.", 409) from None
+        async with self.pool.acquire() as conn:
+            known = await dl.info(conn, account_id)
+        if refresh:
+            if known["age"] is None or known["age"] > DIALOGS_MIN_GAP:
+                self.start_dialogs(rt)
+        elif not cached and (known["age"] is None or known["age"] > DIALOGS_TTL) \
+                and (not rt.dialogs_tried or time.monotonic() - rt.dialogs_tried > DIALOGS_TTL):
+            self.start_dialogs(rt)
+        types_: list[str] | None = None
+        if chat_type:
+            types_ = [chat_type]
+        if chat_types:
+            types_ = [t for t in chat_types if types_ is None or t in types_]
+        needle = (query or "").strip().lstrip("@").casefold()
+        async with self.pool.acquire() as conn:
+            for _ in range(2):
+                running = rt.dialogs_load.running
+                known = await dl.info(conn, account_id)
+                total, rows = await dl.page(conn, account_id, offset=offset, limit=limit, chat_types=types_,
+                                            needle=needle, only_enabled=only_enabled, keys=keys)
+                # Ход загрузки — тот, что был, когда читали список: дальше ещё запросы к базе.
+                status = self._load_status(rt, known)
+                if not running or rt.dialogs_load.running:
+                    break     # загрузка не закончилась, пока читали, — прочитанное и есть её нынешний ход
+            states = await conn.fetch(
+                """SELECT p.class, p.tg_id, c.excluded, COALESCE(s.enabled, false) AS enabled
+                   FROM chats c JOIN peers p ON p.id = c.peer_id
+                   LEFT JOIN tg_sync_chats s ON s.chat_id = c.id
+                   WHERE c.account_id = $1 AND (p.class, p.tg_id) IN
+                         (SELECT * FROM unnest($2::text[], $3::bigint[]))""",
+                account_id, [d.chat.peer_class for d in rows], [d.chat.tg_id for d in rows])
+            protected = await control_peers.blocked_ids(conn)
+        known_rows = {(r["class"], r["tg_id"]): r for r in states}
+        items = []
+        for d in rows:
+            row = known_rows.get(d.key)
+            blocked = (store.is_blocked_peer(d.chat.peer_class, d.chat.tg_id, d.chat.username)
+                       or (d.chat.peer_class == "user" and d.chat.tg_id in protected))
+            items.append({
+                "peer_class": d.chat.peer_class, "tg_id": d.chat.tg_id, "type": d.chat.type,
+                "title": d.chat.name, "username": d.chat.username,
+                "enabled": bool(row and row["enabled"]),
+                "excluded": blocked or bool(row and row["excluded"]),
+                # В каналах и супергруппах номера сообщений свои — номер последнего близок к их
+                # числу. В личных чатах и обычных группах нумерация общая на аккаунт.
+                "message_estimate": d.top_message if d.chat.peer_class == "channel" else None,
+            })
+        return {"total": total, "offset": offset, "items": items,
+                "loaded": known["completed_at"] is not None or known["stored"] > 0,
+                "age": known["age"], "load": status}
+
+    async def set_sync(
+        self, account_id: int, *, enabled: bool,
+        chats: list[PeerKey] | None = None, chat_types: list[str] | None = None,
+        since: Any = sync.ACCOUNT_DEFAULT,
+    ) -> list[dict[str, Any]]:
+        """Включает или выключает синхронизацию чатов — поштучно или всех чатов заданных видов.
+
+        `since` — граница загрузки истории вглубь для включаемых чатов: дата, None (вся история)
+        или не названа (глубина по умолчанию из настроек аккаунта). Чат ищется в списке диалогов
+        аккаунта в базе, без запроса к Telegram (`dialogs`)."""
+        await self._slot_of(account_id)
+        rt = self._by_account(account_id)
+        keys: list[PeerKey] = list(chats or [])
+        by_key: dict[PeerKey, DialogInfo] = {}
+        if enabled or chat_types:
+            by_key = await self.find_dialogs(account_id, keys)
+        if chat_types:
+            async with self.pool.acquire() as conn:
+                of_types = await dl.rows(conn, account_id, chat_types=chat_types)
+            by_key.update((d.key, d) for d in of_types)
+            keys += [d.key for d in of_types if d.key not in keys]
+        out = []
+        async with self.pool.acquire() as conn:
+            for key in keys:
+                if not enabled:
+                    await sync.disable_chat(conn, account_id, key)
+                    out.append({"peer_class": key[0], "tg_id": key[1], "enabled": False})
+                    continue
+                dialog = by_key.get(key)
+                if dialog is None:
+                    out.append({"peer_class": key[0], "tg_id": key[1], "enabled": False,
+                                "error": "Чат не найден среди диалогов аккаунта."})
+                    continue
+                _, on = await sync.enable_chat(conn, account_id, dialog.chat, since=since)
+                item = {"peer_class": key[0], "tg_id": key[1], "enabled": on}
+                if not on:
+                    item["excluded"] = True
+                    item["error"] = "Чат исключён из архива и не синхронизируется."
+                out.append(item)
+        if rt is not None and rt.live is not None:
+            await rt.live.reload()
+            rt.wake.set()
+        return out
+
+    async def sync_status(self, account_id: int) -> dict[str, Any]:
+        """Состояние синхронизации: счётчики и курсоры, без названий и содержимого."""
+        await self._slot_of(account_id)
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT s.peer_class, s.tg_id, s.chat_id, s.enabled, s.auto_enabled, s.backfill_before,
+                          s.backfill_done, s.backfill_since, s.forward_id, s.gap_checked_at, s.reconciled_at,
+                          s.access_lost_at, s.access_lost_reason, s.last_error,
+                          (SELECT count(*) FROM messages m WHERE m.chat_id = s.chat_id) AS messages
+                   FROM tg_sync_chats s WHERE s.account_id = $1 AND s.chat_id IS NOT NULL
+                   ORDER BY s.peer_class, s.tg_id""", account_id)
+        rt = self._by_account(account_id)
+
+        def iso(value: Any) -> str | None:
+            return value.isoformat() if value is not None else None
+
+        chats = [{
+            "peer_class": r["peer_class"], "tg_id": r["tg_id"], "chat_id": r["chat_id"],
+            "enabled": r["enabled"], "auto_enabled": r["auto_enabled"], "messages": r["messages"],
+            "backfill_before": r["backfill_before"], "backfill_done": r["backfill_done"],
+            "backfill_since": iso(r["backfill_since"]),
+            "forward_id": r["forward_id"], "gap_checked_at": iso(r["gap_checked_at"]),
+            "reconciled_at": iso(r["reconciled_at"]), "access_lost_at": iso(r["access_lost_at"]),
+            "access_lost_reason": r["access_lost_reason"], "last_error": r["last_error"],
+        } for r in rows]
+        on = [c for c in chats if c["enabled"]]
+        return {
+            "account_id": account_id,
+            "status": rt.status if rt is not None else DISCONNECTED,
+            "busy": rt.history.busy if rt is not None and rt.history is not None else None,
+            "flood_wait_until": iso(rt.pacer.flood_until) if rt is not None else None,
+            "counts": {
+                "enabled": len(on),
+                "backfill_done": sum(1 for c in on if c["backfill_done"]),
+                "backfill_pending": sum(1 for c in on if not c["backfill_done"] and not c["access_lost_at"]),
+                "access_lost": sum(1 for c in on if c["access_lost_at"]),
+                "errors": sum(1 for c in on if c["last_error"]),
+                "messages": sum(c["messages"] for c in chats),
+            },
+            "chats": chats,
+        }
+
+    # ------------------------------------------------------------------ шлюз (tg/gateway.py)
+
+    def can_send(self, account_id: int) -> bool:
+        rt = self._by_account(account_id)
+        return bool(self.config.sending and rt is not None and rt.role == "assistant"
+                    and rt.status == RUNNING and rt.client is not None
+                    and rt.policy is not None and rt.policy.can_send)
+
+    async def _role_of(self, account_id: int) -> str | None:
+        rt = self._by_account(account_id)
+        if rt is not None:
+            return rt.role
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval("SELECT role FROM accounts WHERE id = $1", account_id)
+
+    async def send_text(
+        self, account_id: int, peer_class: str, tg_id: int, text: str, *,
+        reply_to_tg_id: int | None = None, topic_tg_id: int | None = None,
+    ) -> int:
+        # Роль проверяется первой, до любого обращения к клиенту: у основного аккаунта
+        # владельца пути отправки нет.
+        role = await self._role_of(account_id)
+        if role != "assistant":
+            raise gateway.SendForbidden(
+                "отправка от этого аккаунта запрещена: это не аккаунт-помощник")
+        # Главный выключатель — тоже до любого обращения к клиенту.
+        if not self.config.sending:
+            raise gateway.SendForbidden(
+                "отправка выключена в настройках сервиса (SHTURMAN_SENDING): сервис ничего не отправляет")
+        rt = self._running(account_id)
+        if rt.policy is None or not rt.policy.can_send:
+            raise gateway.SendForbidden("отправка от этого аккаунта запрещена")
+        if not isinstance(text, str) or not text.strip() or bridge.utf16_len(text) > TEXT_LIMIT:
+            raise ValueError(f"текст сообщения должен быть непустым и не длиннее {TEXT_LIMIT} знаков")
+        if topic_tg_id is not None and (isinstance(topic_tg_id, bool) or not isinstance(topic_tg_id, int)
+                                        or topic_tg_id <= 0 or peer_class != "channel"):
+            raise ValueError("тема допустима только в группе-форуме с положительным номером")
+        key: PeerKey = (peer_class, int(tg_id))
+        peer = await rt.client.get_input_entity(normalize.to_peer(key))
+        request = functions.messages.SendMessageRequest(
+            peer=peer, message=text, no_webpage=True,
+            reply_to=(types.InputReplyToMessage(reply_to_msg_id=int(reply_to_tg_id or topic_tg_id),
+                                                top_msg_id=topic_tg_id)
+                      if reply_to_tg_id or topic_tg_id else None),
+        )
+        try:
+            result = await rt.client(request)
+        except (errors.FloodWaitError, errors.SlowModeWaitError) as exc:
+            raise gateway.FloodWait(exc.seconds) from None
+        except (errors.UnauthorizedError, errors.AuthKeyError, ConnectionError) as exc:
+            raise gateway.AccountUnavailable(f"сессия аккаунта недоступна ({type(exc).__name__})") from None
+        message_id, message, entities = _sent_message(result, key, text, rt.self_id, reply_to_tg_id)
+        # Свои же отправки Telethon обработчикам не раздаёт — записываем сами, если чат выбран.
+        state = rt.live.index.get(key) if rt.live is not None else None
+        if message is not None and state is not None and state.enabled and state.chat_id is not None:
+            record = normalize.message_record(message, entities, self_id=rt.self_id)
+            if record is not None:
+                try:
+                    await rt.live.save(key, state.chat_id, record, entities,
+                                       outgoing=True, edited=False, via_bot=False)
+                except Exception as exc:  # сообщение уже ушло: сбой записи не должен выглядеть как сбой отправки
+                    logger.error("аккаунт %s: отправленное сообщение не записано в архив (%s)",
+                                 account_id, type(exc).__name__)
+        return message_id
+
+    async def download_voice(self, account_id: int, peer_class: str, tg_id: int, tg_message_id: int,
+                             *, max_bytes: int) -> tuple[bytes, int | None]:
+        """Файл голосового или «кружка» — для расшифровки (voice/). Возвращает байты файла и
+        длительность в секундах. Запросы идут с той же паузой, что и чтение истории.
+
+        Бросает AccountUnavailable (сессии нет), MediaUnavailable (сообщения или вложения нет,
+        это не голосовое, файл больше max_bytes), FloodWait."""
+        data, info = await self.download_media(account_id, peer_class, tg_id, tg_message_id,
+                                               max_bytes=max_bytes, kinds=("voice_message", "video_message"))
+        return data, info.get("media_duration")
+
+    async def download_media(self, account_id: int, peer_class: str, tg_id: int, tg_message_id: int,
+                             *, max_bytes: int, kinds: tuple[str, ...]) -> tuple[bytes, dict[str, Any]]:
+        """Файл вложения сообщения, если его вид — один из kinds (photo, file, voice_message…):
+        байты и сведения (длительность, имя, тип, размер). Запросы идут с той же паузой, что и
+        чтение истории; отдельный запрос Telegram — только скачивание файла (upload.GetFile).
+
+        Бросает AccountUnavailable, MediaUnavailable (нет сообщения или вложения нужного вида,
+        файл больше max_bytes), FloodWait."""
+        rt = self._running(account_id)
+        key: PeerKey = (peer_class, int(tg_id))
+        try:
+            await rt.pacer.wait(rt.stop)
+            peer = await rt.client.get_input_entity(normalize.to_peer(key))
+            found = await rt.client.get_messages(peer, ids=[int(tg_message_id)])
+            message = found[0] if found else None
+            media = getattr(message, "media", None)
+            if message is None or normalize.media_type(media) not in kinds:
+                raise gateway.MediaUnavailable("сообщения нет или в нём нет вложения нужного вида")
+            info = {"media_duration": normalize.media_duration(media), **normalize.media_file_info(media)}
+            size = info.get("media_size") or _photo_size(media) or 0
+            if size > max_bytes:
+                raise gateway.MediaUnavailable(f"файл больше предела ({size} байт)")
+            await rt.pacer.wait(rt.stop)
+            data = await rt.client.download_media(message, file=bytes)
+        except sync.FLOOD as exc:
+            rt.pacer.flood(exc.seconds)
+            raise gateway.FloodWait(exc.seconds) from None
+        except sync.Stopped:
+            raise gateway.AccountUnavailable("аккаунт останавливается") from None
+        except (errors.UnauthorizedError, errors.AuthKeyError, ConnectionError) as exc:
+            raise gateway.AccountUnavailable(f"сессия аккаунта недоступна ({type(exc).__name__})") from None
+        if not isinstance(data, (bytes, bytearray)) or not data or len(data) > max_bytes:
+            raise gateway.MediaUnavailable("файл не скачался")
+        return bytes(data), info
+
+    def can_put(self, account_id: int) -> bool:
+        rt = self._by_account(account_id)
+        return bool(rt is not None and rt.role == "owner" and rt.status == RUNNING and rt.client is not None)
+
+    async def put_draft(self, account_id: int, peer_class: str, tg_id: int, text: str, *,
+                        reply_to_tg_id: int | None = None,
+                        before_write: Callable[[], Awaitable[bool]] | None = None,
+                        read_timeout: float = PUT_READ_TIMEOUT) -> str:
+        """«В чат» (Р-105): текст — облачным черновиком в поле ввода личного чата основного аккаунта.
+
+        Только роль owner и только по нажатию владельца: проверку нажатия делает `replies.put.require_press`,
+        здесь — ещё раз, до любого обращения к клиенту. Порядок:
+          1. Telegram велел ждать (FLOOD) — сразу отказ, без ожидания; паузы «как у человека» (`Pacer.wait`)
+             нет: это одно действие, начатое самим владельцем, а не поток запросов, и владелец ждёт ответа
+             на нажатие. Клиент не на связи или переподключается — отказ: запрос не должен лечь в очередь
+             Telethon и уйти позже.
+          2. Чтение облачного черновика чата (`messages.getPeerDialogs`) — не дольше `read_timeout`; прервать
+             чтение безопасно. Там ровно этот текст — «already»; другой текст — `DraftBusy`: поле владельца
+             не перезаписывается, а его текст только сравнивается — не сохраняется и не пишется в журнал.
+          3. `before_write` — последняя проверка сервиса (остановка ассистента) прямо перед записью.
+          4. Запись (`messages.saveDraft`, взведённая ровно на этот запрос). Её **не прерывают** по времени:
+             поставленный в очередь Telethon запрос отменить нельзя, после переподключения он уходит снова —
+             прерванная по таймеру запись могла бы лечь позже, поверх того, что владелец начал набирать.
+             Telegram ответил True — «placed». Связь оборвалась после отправки, Telegram ответил -500/-503
+             («мог быть выполнен») или клиент отключили во время записи (Telethon гасит свои ожидания) —
+             `PutUnknown`: текст ещё может появиться в поле. Цена: если связь пропала ровно во время записи,
+             вызов ждёт переподключения Telethon (до минуты); перед записью связь проверяется ещё раз.
+        Известный предел: другое устройство владельца может прислать в облако свой черновик между чтением
+        и записью (доли секунды) — тогда запись его заменит. Это видно только вживую
+        (`docs/runbooks/validate.md`, «В чат: живые проверки»)."""
+        from ..replies import put as put_rules
+        put_rules.require_press()
+        role = await self._role_of(account_id)
+        if role != "owner":
+            raise gateway.SendForbidden("«В чат» — только в чатах основного аккаунта")
+        if peer_class != "user":
+            raise gateway.SendForbidden("«В чат» — только в личных чатах")
+        if not isinstance(text, str) or not text.strip() or bridge.utf16_len(text) > TEXT_LIMIT:
+            raise ValueError(f"текст должен быть непустым и не длиннее {TEXT_LIMIT} знаков")
+        rt = self._running(account_id)
+        key: PeerKey = (peer_class, int(tg_id))
+        waiting = rt.pacer.flood_remaining()
+        if waiting > 0:
+            raise gateway.FloodWait(int(waiting) + 1)
+        if not _online(rt.client):
+            raise gateway.AccountUnavailable("клиент Telegram не на связи")
+
+        async def field(peer: Any) -> str:
+            got = await rt.client(functions.messages.GetPeerDialogsRequest(peers=[types.InputDialogPeer(peer=peer)]),
+                                  flood_sleep_threshold=0)
+            dialogs = getattr(got, "dialogs", None) or []
+            draft = getattr(dialogs[0], "draft", None) if dialogs else None
+            return getattr(draft, "message", "") or ""
+
+        try:
+            peer = await asyncio.wait_for(rt.client.get_input_entity(normalize.to_peer(key)), read_timeout)
+            now = await asyncio.wait_for(field(peer), read_timeout)
+        except asyncio.CancelledError:
+            if bridge.own_task_cancelled():
+                raise
+            # клиент отключают (пауза, остановка, повторный вход) — Telethon гасит свои запросы; записи не было
+            raise gateway.AccountUnavailable("клиент Telegram отключается") from None
+        except asyncio.TimeoutError:
+            raise gateway.AccountUnavailable("Telegram не ответил вовремя") from None
+        except sync.FLOOD as exc:
+            rt.pacer.flood(exc.seconds)
+            raise gateway.FloodWait(exc.seconds) from None
+        except (errors.UnauthorizedError, errors.AuthKeyError, ConnectionError, OSError) as exc:
+            raise gateway.AccountUnavailable(f"сессия аккаунта недоступна ({type(exc).__name__})") from None
+        rt.pacer.note_request()
+        if now.strip() == text.strip():
+            return "already"
+        if now.strip():
+            raise gateway.DraftBusy("в поле ввода уже есть текст")
+        if before_write is not None and not await before_write():
+            raise gateway.Halted("ассистент остановлен")
+        if not _online(rt.client):
+            raise gateway.AccountUnavailable("клиент Telegram не на связи")
+        request = functions.messages.SaveDraftRequest(
+            peer=peer, message=text, no_webpage=True,
+            reply_to=types.InputReplyToMessage(reply_to_msg_id=int(reply_to_tg_id)) if reply_to_tg_id else None)
+        try:
+            with client_module.arming(request):
+                ok = await rt.client(request, flood_sleep_threshold=0)
+        except sync.FLOOD as exc:
+            rt.pacer.flood(exc.seconds)
+            raise gateway.FloodWait(exc.seconds) from None
+        except asyncio.CancelledError:
+            if bridge.own_task_cancelled():
+                raise
+            # Клиент отключают, пока запись в пути (`client.disconnect()` гасит ожидания Telethon): ушла ли
+            # она — неизвестно. Не отмена задачи: дальше её пускать нельзя — иначе остановится бот согласований.
+            raise gateway.PutUnknown("клиент Telegram отключён во время записи") from None
+        except (errors.UnauthorizedError, errors.AuthKeyError) as exc:
+            raise gateway.AccountUnavailable(f"сессия аккаунта недоступна ({type(exc).__name__})") from None
+        except (errors.ServerError, errors.TimedOutError) as exc:
+            # -500 и -503: по документации Telegram запрос мог быть выполнен — исход неизвестен.
+            raise gateway.PutUnknown(type(exc).__name__) from None
+        except errors.RPCError as exc:
+            # Telegram ответил отказом — запись не применена.
+            raise gateway.DraftRefused(type(exc).__name__) from None
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+            raise gateway.PutUnknown(type(exc).__name__) from None
+        finally:
+            rt.pacer.note_request()
+        return "placed" if ok is True else "unknown"
+
+    async def set_typing(self, account_id: int, peer_class: str, tg_id: int, on: bool) -> None:
+        if not self.can_send(account_id):
+            return  # основной аккаунт владельца ничем не выдаёт своё присутствие
+        try:
+            rt = self._running(account_id)
+            peer = await rt.client.get_input_entity(normalize.to_peer((peer_class, int(tg_id))))
+            action = types.SendMessageTypingAction() if on else types.SendMessageCancelAction()
+            await rt.client(functions.messages.SetTypingRequest(peer=peer, action=action))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass  # индикатор не важнее ответа
+
+
+def _load_error(exc: BaseException) -> str:
+    """Почему список не загрузился — для владельца, без подробностей ответа Telegram."""
+    if isinstance(exc, sync.FATAL):
+        return "Сессия аккаунта больше не действует: войдите в аккаунт заново."
+    if isinstance(exc, (ConnectionError, OSError, asyncio.TimeoutError)):
+        return "Нет связи с Telegram. Попробуйте обновить список позже."
+    return f"Telegram ответил ошибкой ({type(exc).__name__}). Попробуйте обновить список позже."
+
+
+def _photo_size(media: Any) -> int | None:
+    """Размер самого большого варианта фото (его и скачивает Telethon)."""
+    photo = getattr(media, "photo", None)
+    best = 0
+    for size in getattr(photo, "sizes", None) or ():
+        value = getattr(size, "size", None)
+        if isinstance(value, int):
+            best = max(best, value)
+        for value in getattr(size, "sizes", None) or ():     # PhotoSizeProgressive
+            if isinstance(value, int):
+                best = max(best, value)
+    return best or None

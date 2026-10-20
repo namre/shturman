@@ -1,0 +1,453 @@
+"""Мост к Hermes: что сервис просит сделать плагин и как разбирает ответы.
+
+Плагин умеет ровно шесть вещей (виды заданий) и ничего не знает о том, зачем они нужны:
+
+  llm.structured  {instructions, input, json_schema, schema_name, task, max_tokens}
+                  -> {parsed: {...} | null, text, model}
+  llm.text        {messages: [{role, content}], task, max_tokens}
+                  -> {text, model}
+  notify.owner    {text, buttons: [[{text, data}]] | null, silent: bool, entities?: [...]}
+                  -> {message_id}
+  notify.edit     {message_id, text, remove_buttons: bool, entities?: [...]}
+                  -> {}
+                  entities — оформление текста (цитата, свёрнутая цитата, моноширинный блок; richtext.py,
+                  Р-103). Исполнитель плагина его не читает: сообщение приходит обычным текстом.
+  business.send   {business_connection_id, chat_id, text, reply_to_message_id | null}
+                  -> {message_id}
+                  Выполняет только свой бот сервиса (`executor/worker.py`); исполнитель плагина
+                  такое задание не получает, а получив (очередь прежней версии), отказывает (Д-45).
+  hermes.cron     {apply, revision, desired?: {morning-brief: {enabled, time}, weekly-review: {enabled, time, day}}}
+                  -> {jobs: {morning-brief|weekly-review: {exists, enabled, time, day, expr, next_run_at,
+                      next_local}}, timezone, applied, revision, error?}
+                  Расписание утренней сводки и обзора недели (Р-95, `summaries.py`): плагин приводит задачи
+                  Hermes к выбранному (apply) или только сообщает, что есть. Шестой вид: исполнителя
+                  в сервисе у него нет, в режиме без Hermes задание гаснет по сроку.
+
+Про business.send: если Telegram точно отказал (сообщение не ушло), исполнитель сообщает
+неудачу с текстом, начинающимся на «not_sent:». Любая другая неудача значит «исход неизвестен»:
+сообщение могло уйти, и повторять отправку без владельца нельзя.
+
+И одно умение в обратную сторону: нажатие кнопки под сообщением владельцу плагин пересылает
+в сервис как есть (`data` кнопки и идентификатор нажавшего), сервис решает, что это значит.
+
+Модули сервиса регистрируют разбор результата (`on_result`) и разбор нажатий (`on_callback`).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import json
+import logging
+from typing import Any, Awaitable, Callable
+
+import asyncpg
+
+from . import jobs, jobstats
+
+logger = logging.getLogger("shturman.bridge")
+
+LLM_STRUCTURED = "llm.structured"
+LLM_TEXT = "llm.text"
+MAX_IMAGES = 6                        # картинок в одном запросе к модели
+MAX_IMAGE_BYTES = 2_500_000           # их общий размер до base64: плагин забирает по два задания
+                                      # за раз, а ответ сервиса ему — не больше 8 МиБ
+NOTIFY_OWNER = "notify.owner"
+NOTIFY_EDIT = "notify.edit"
+BUSINESS_SEND = "business.send"
+# hermes.cron (Р-95) — расписание сводок: только плагин в Hermes, у сервиса своего исполнителя для него нет.
+HERMES_CRON = "hermes.cron"
+EXECUTOR_KINDS = (LLM_STRUCTURED, LLM_TEXT, NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND, HERMES_CRON)
+LLM_KINDS = (LLM_STRUCTURED, LLM_TEXT)
+NOT_SENT_PREFIX = "not_sent:"
+
+# Все кнопки сервиса начинаются с этого префикса: он не пересекается с префиксами ядра Hermes
+# (ea: sc: cl: cp: mp: mm: mc: gt: update_prompt:) и плагина бизнес-режима (bd:).
+CALLBACK_PREFIX = "sh:"
+CALLBACK_DATA_LIMIT = 64  # байт — предел Telegram
+MESSAGE_LIMIT = 4096      # предел сообщения Telegram — в единицах UTF-16, а не в знаках
+
+
+def utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def fit_message(text: str, limit: int = MESSAGE_LIMIT) -> str:
+    """Обрезает текст до предела Telegram (эмодзи и редкие знаки считаются за два)."""
+    if utf16_len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    while utf16_len(cut) > limit - 1:
+        cut = cut[:-1]
+    return cut + "…"
+
+ResultHandler = Callable[[asyncpg.Connection, dict[str, Any], dict[str, Any]], Awaitable[None]]
+FailureHandler = Callable[[asyncpg.Connection, dict[str, Any], str], Awaitable[None]]
+CallbackHandler = Callable[[asyncpg.Connection, str, int], Awaitable[dict[str, Any]]]
+
+_result_handlers: dict[str, ResultHandler] = {}
+_failure_handlers: dict[str, FailureHandler] = {}
+_callback_handlers: dict[str, CallbackHandler] = {}
+
+
+def on_result(handler_name: str) -> Callable[[ResultHandler], ResultHandler]:
+    """Регистрирует разбор результата: fn(conn, job, result). Вызывается в транзакции закрытия задания."""
+    def deco(fn: ResultHandler) -> ResultHandler:
+        _result_handlers[handler_name] = fn
+        return fn
+    return deco
+
+
+def on_failure(handler_name: str) -> Callable[[FailureHandler], FailureHandler]:
+    """Регистрирует реакцию на окончательную неудачу задания: fn(conn, job, error)."""
+    def deco(fn: FailureHandler) -> FailureHandler:
+        _failure_handlers[handler_name] = fn
+        return fn
+    return deco
+
+
+def on_callback(module: str) -> Callable[[CallbackHandler], CallbackHandler]:
+    """Регистрирует разбор нажатий кнопок с данными вида `sh:<module>:<остальное>`.
+
+    fn(conn, остальное, tg_id нажавшего) -> {"answer": "короткий текст-подсказка",
+                                              "edit_text": "новый текст сообщения" | None,
+                                              "remove_buttons": bool,
+                                              "buttons": [[{text, data}]] | None — заменить кнопки,
+                                                         не меняя текста (только свой бот сервиса),
+                                              "after_commit": async-функция без аргументов | None}
+    Нажатие приходит только от владельца: это проверено до вызова. `after_commit` выполняется
+    после фиксации транзакции нажатия — для событий и фоновой работы, которым нужны уже
+    записанные изменения. Ответ на нажатие собирается после неё, поэтому она может дописать
+    текст в `reply` (так «Поднять до …» у репетиции добавляет итог повторённой просьбы).
+    """
+    def deco(fn: CallbackHandler) -> CallbackHandler:
+        _callback_handlers[module] = fn
+        return fn
+    return deco
+
+
+def callback_data(module: str, rest: str) -> str:
+    data = f"{CALLBACK_PREFIX}{module}:{rest}"
+    if len(data.encode("utf-8")) > CALLBACK_DATA_LIMIT:
+        raise ValueError(f"данные кнопки длиннее {CALLBACK_DATA_LIMIT} байт: {data!r}")
+    return data
+
+
+def button(text: str, module: str, rest: str) -> dict[str, str]:
+    return {"text": text, "data": callback_data(module, rest)}
+
+
+# --- кто выполняет задания ---
+
+# Виды заданий, которые сервис выполняет сам (свой бот, свой ключ модели). Задаёт модуль
+# исполнителя при запуске; остальное забирает плагин в Hermes.
+_builtin_kinds: frozenset[str] = frozenset()
+
+
+def set_builtin(kinds) -> None:
+    global _builtin_kinds
+    _builtin_kinds = frozenset(kinds)
+
+
+def builtin_kinds() -> frozenset[str]:
+    return _builtin_kinds
+
+
+def executor_for(kind: str) -> str:
+    return "builtin" if kind in _builtin_kinds else "plugin"
+
+
+def owns_bot() -> bool:
+    """Свой бот сервиса активен: нажатия и привязка владельца идут только через него."""
+    return NOTIFY_OWNER in _builtin_kinds
+
+
+def model_hint() -> str:
+    """Куда владельцу смотреть, если модель не отвечает. Сервис не знает, установлен ли Hermes,
+    поэтому судит по своему исполнителю: своя модель — её настройки, иначе модель у Hermes."""
+    if LLM_TEXT in _builtin_kinds:
+        return "Проверьте ключ и имя модели сервиса: `shturman bot-status`."
+    return "Проверьте модель в настройках Hermes."
+
+
+# --- владелец ---
+
+OwnerChangeHandler = Callable[[asyncpg.Connection, int], Awaitable[None]]
+_owner_change_handlers: list[OwnerChangeHandler] = []
+
+
+def on_owner_change(fn: OwnerChangeHandler) -> OwnerChangeHandler:
+    """Регистрирует реакцию на смену или сброс владельца: fn(conn, новый user_id или 0)."""
+    _owner_change_handlers.append(fn)
+    return fn
+
+
+async def _owner_changed(conn: asyncpg.Connection, new_user_id: int) -> None:
+    # Бизнес-подключения прежнего владельца перестают принимать сообщения и отправлять.
+    await conn.execute(
+        """UPDATE business_connections SET enabled = false, updated_at = now()
+           WHERE account_id IN (SELECT id FROM accounts WHERE tg_user_id <> $1)""",
+        new_user_id,
+    )
+    for fn in _owner_change_handlers:
+        await fn(conn, new_user_id)
+
+
+async def _end_app_sessions(conn: asyncpg.Connection) -> None:
+    """Привязка или отвязка владельца завершает все сессии Mini App бота согласований
+    (setup_page/miniapp.py): они выданы прежней привязке и не должны ожить при возврате к ней."""
+    await conn.execute("UPDATE miniapp_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
+
+
+async def clear_owner(conn: asyncpg.Connection) -> None:
+    """Владелец отвязан (ссылка восстановления): кнопки никто не нажмёт, отправки останавливаются."""
+    async with conn.transaction():
+        await _end_app_sessions(conn)
+        removed = await conn.fetchval("DELETE FROM settings WHERE key = 'owner' RETURNING key")
+        if removed:
+            await _owner_changed(conn, 0)
+
+
+async def set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('shturman.owner.binding'))")
+        await _end_app_sessions(conn)
+        previous = await get_owner(conn)
+        await _set_owner(conn, user_id, chat_id)
+        if previous is not None and int(previous["user_id"]) != int(user_id):
+            await _owner_changed(conn, int(user_id))
+        from . import authority
+        if authority.is_owner() and (previous is None or int(previous["user_id"]) != int(user_id)):
+            # Владелец привязан (заново): его собственные бизнес-подключения снова принимают
+            # сообщения. Если Telegram подключение отключил, отправка через него всё равно откажет.
+            await conn.execute(
+                """UPDATE business_connections SET enabled = true, updated_at = now()
+                   WHERE NOT enabled AND account_id IN (SELECT id FROM accounts WHERE tg_user_id = $1)""",
+                int(user_id),
+            )
+
+
+async def _set_owner(conn: asyncpg.Connection, user_id: int, chat_id: int) -> None:
+    await conn.execute(
+        """INSERT INTO settings (key, value) VALUES ('owner', $1::jsonb)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
+        json.dumps({"user_id": int(user_id), "chat_id": int(chat_id)}),
+    )
+
+
+async def get_owner(conn: asyncpg.Connection) -> dict[str, int] | None:
+    raw = await conn.fetchval("SELECT value FROM settings WHERE key = 'owner'")
+    if raw is None:
+        return None
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+# --- постановка заданий ---
+
+async def notify_owner(
+    conn: asyncpg.Connection, text: str, *, buttons: list[list[dict[str, str]]] | None = None,
+    silent: bool = False, dedup_key: str | None = None, handler: str | None = None,
+    context: dict[str, Any] | None = None, entities: list[dict[str, Any]] | None = None,
+) -> int | None:
+    """Сообщение владельцу в управляющий чат. Текст — без разметки, не длиннее 4096 знаков.
+    `entities` — оформление (richtext.py): цитата, свёрнутая цитата, моноширинный блок."""
+    payload: dict[str, Any] = {"text": fit_message(text), "buttons": buttons, "silent": silent}
+    if entities:
+        from .richtext import clip
+        payload["entities"] = clip(payload["text"], entities)
+    return await jobs.enqueue(
+        conn, NOTIFY_OWNER, payload,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(NOTIFY_OWNER),
+    )
+
+
+async def edit_owner_message(
+    conn: asyncpg.Connection, message_id: int, text: str, *, remove_buttons: bool = True,
+    entities: list[dict[str, Any]] | None = None,
+) -> int | None:
+    """Меняет текст ранее отправленного владельцу сообщения (например, карточку устаревшего черновика)."""
+    payload: dict[str, Any] = {"message_id": int(message_id), "text": fit_message(text),
+                               "remove_buttons": remove_buttons}
+    if entities:
+        from .richtext import clip
+        payload["entities"] = clip(payload["text"], entities)
+    return await jobs.enqueue(conn, NOTIFY_EDIT, payload, max_attempts=2, executor=executor_for(NOTIFY_EDIT))
+
+
+async def request_structured(
+    conn: asyncpg.Connection, *, handler: str, instructions: str, input: str,
+    json_schema: dict[str, Any], schema_name: str, task: str = "shturman_extract",
+    max_tokens: int = 2000, context: dict[str, Any] | None = None, dedup_key: str | None = None,
+    images: list[bytes] | None = None,
+) -> int | None:
+    """Просит модель вернуть JSON по схеме. Результат придёт в `on_result(handler)`.
+
+    images — картинки JPEG к запросу (фото, страницы скана; media/). В задании они лежат
+    base64 в поле images; модуль-владелец стирает задание после ответа, как и текст.
+
+    Ключи и токены из переписки модели не уходят (Р-96): в `input` строки, похожие на секрет,
+    заменяются на «[ключ скрыт]» здесь — в одном месте для всех заданий обработки."""
+    from .sanitize import redact_secrets
+
+    input = redact_secrets(input)
+    payload: dict[str, Any] = {"instructions": instructions, "input": input, "json_schema": json_schema,
+                               "schema_name": schema_name, "task": task, "max_tokens": max_tokens}
+    if images:
+        if len(images) > MAX_IMAGES or sum(len(i) for i in images) > MAX_IMAGE_BYTES:
+            raise ValueError("слишком много картинок для одного запроса")
+        payload["images"] = [{"mime": "image/jpeg", "data": base64.b64encode(i).decode("ascii")} for i in images]
+    return await jobs.enqueue(
+        conn, LLM_STRUCTURED, payload,
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_STRUCTURED),
+    )
+
+
+async def request_text(
+    conn: asyncpg.Connection, *, handler: str, messages: list[dict[str, str]],
+    task: str = "shturman_reply", max_tokens: int = 1500,
+    context: dict[str, Any] | None = None, dedup_key: str | None = None,
+) -> int | None:
+    from .sanitize import redact_secrets
+
+    # ключи и токены из переписки модели не уходят (Р-96) — как в request_structured
+    messages = [{**m, "content": redact_secrets(m["content"])} if isinstance(m.get("content"), str) else m
+                for m in messages]
+    return await jobs.enqueue(
+        conn, LLM_TEXT, {"messages": messages, "task": task, "max_tokens": max_tokens},
+        handler=handler, context=context, dedup_key=dedup_key, executor=executor_for(LLM_TEXT),
+    )
+
+
+async def request_business_send(
+    conn: asyncpg.Connection, *, handler: str, business_connection_id: str, chat_id: int,
+    text: str, reply_to_message_id: int | None = None,
+    context: dict[str, Any] | None = None, dedup_key: str | None = None,
+) -> int | None:
+    """Отправка от имени владельца через бизнес-бота. Ставится только после согласования.
+
+    Исполнитель — всегда свой бот сервиса (`builtin`): только он перед обращением к Telegram заново
+    проверяет выключатель, «Остановить всё» и что подключение его (`via = 'service'`). Плагину в Hermes
+    задание `business.send` не выдаётся никогда, даже для подключения его бота (Д-45): такое задание
+    исполнитель сервиса закроет отказом «not_sent», и черновик станет «не отправлен»."""
+    return await jobs.enqueue(
+        conn, BUSINESS_SEND,
+        {"business_connection_id": business_connection_id, "chat_id": int(chat_id),
+         "text": text, "reply_to_message_id": reply_to_message_id},
+        handler=handler, context=context, dedup_key=dedup_key, max_attempts=1,
+        executor="builtin",
+    )
+
+
+# --- разбор ответов ---
+
+async def deliver_result(
+    conn: asyncpg.Connection, job_id: int, result: dict[str, Any], *, executor: str | None = None,
+) -> bool:
+    """Закрывает задание и передаёт результат модулю-владельцу. Одна транзакция.
+
+    executor — чьё задание разрешено закрыть; по HTTP от плагина это всегда "plugin"."""
+    async with conn.transaction():
+        job = await jobs.complete(conn, job_id, result, executor=executor)
+        if job is None:
+            return False
+        fn = _result_handlers.get(job["handler"] or "")
+        if fn is not None:
+            await fn(conn, job, result)
+    if job["kind"] in LLM_KINDS:
+        jobstats.stats().record(True)
+    return True
+
+
+async def deliver_failure(
+    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None, executor: str | None = None,
+) -> str:
+    async with conn.transaction():
+        status = await jobs.fail(conn, job_id, error, retry_in=retry_in, executor=executor)
+        kind = None
+        if status == "failed":
+            job = await jobs.get(conn, job_id)
+            kind = (job or {}).get("kind")
+            fn = _failure_handlers.get((job or {}).get("handler") or "")
+            if fn is not None and job is not None:
+                await fn(conn, job, error)
+        elif status != "unknown":
+            kind = await conn.fetchval("SELECT kind FROM jobs WHERE id = $1", job_id)
+    # Счётчик попыток за час (строка jobs-failing): только вид ошибки, без её текста.
+    if kind in LLM_KINDS:
+        jobstats.stats().record(False, error)
+    return status
+
+
+async def reap_lost(conn: asyncpg.Connection) -> int:
+    """Закрывает задания, на которые исполнитель так и не ответил, и сообщает модулям-владельцам."""
+    async with conn.transaction():
+        lost = await jobs.reap(conn) + await jobs.expire_queued(conn)
+        for job in lost:
+            fn = _failure_handlers.get(job.get("handler") or "")
+            if fn is not None:
+                await fn(conn, job, job.get("error") or "исполнитель не ответил")
+    return len(lost)
+
+
+def own_task_cancelled() -> bool:
+    """Отменена ли сама текущая задача (а не одно из ожиданий внутри неё). CancelledError, который пришёл
+    без отмены задачи, — это отменённое чужим кодом ожидание (например, запросы Telethon при отключении
+    клиента); такую отмену нельзя пропускать дальше как остановку задачи."""
+    task = asyncio.current_task()
+    return task is None or task.cancelling() > 0
+
+
+async def dispatch_callback(conn: asyncpg.Connection, data: str, from_user_id: int) -> dict[str, Any]:
+    """Разбирает нажатие кнопки. Чужие нажатия и неизвестные кнопки отклоняются без подробностей."""
+    refused = {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
+    if not data.startswith(CALLBACK_PREFIX):
+        return refused
+    owner = await get_owner(conn)
+    if owner is None or int(from_user_id) != int(owner["user_id"]):
+        return refused
+    module, _, rest = data[len(CALLBACK_PREFIX):].partition(":")
+    fn = _callback_handlers.get(module)
+    if fn is None:
+        return refused
+    # The bot establishes this receipt after authenticating the actual private
+    # Telegram update. Claimed numeric IDs never establish authority here.
+    from . import authority
+    principal = authority.get_owner_principal()
+    if principal is None or principal.source != "telegram" or principal.user_id != int(from_user_id) \
+            or principal.chat_id != int(owner["chat_id"]):
+        return refused
+    with contextlib.ExitStack() as stack:
+        async with conn.transaction():
+            out = await fn(conn, rest, int(from_user_id))
+    after = out.get("after_commit")
+    if after is not None:
+        try:
+            await after()
+        except asyncio.CancelledError:
+            # Отменили саму задачу (остановка сервиса) — отмена идёт дальше. Отменили чужое ожидание внутри
+            # (например, Telethon при отключении аккаунта гасит свои запросы) — это сбой «после», не повод
+            # остановить бота согласований.
+            if own_task_cancelled():
+                raise
+            logger.error("нажатие разобрано, но работа после него прервана (отмена изнутри)")
+        except Exception as exc:  # нажатие уже разобрано и записано; сбой «после» его не отменяет
+            logger.error("нажатие разобрано, но работа после него не выполнена (%s)", type(exc).__name__)
+    reply = {"answer": str(out.get("answer") or "")[:190], "edit_text": out.get("edit_text"),
+             "remove_buttons": bool(out.get("remove_buttons"))}
+    if out.get("buttons") is not None:
+        # Новые кнопки под тем же сообщением (текст не меняется): например, отметка выбранной оценки
+        # у карточки репетиции (rehearsal/). Только кнопки сервиса — каждая собрана `button()`.
+        reply["buttons"] = out["buttons"]
+    if isinstance(out.get("prompt"), dict):
+        # Просьба написать текст следующим сообщением (ForceReply): «Ответить» на вопрос ассистента,
+        # свой вариант после «Почти» у репетиции. Отправляет и запоминает её только бот сервиса
+        # (`executor/bot.py`); приложение такую кнопку не нажимает (у него своё поле ввода).
+        reply["prompt"] = out["prompt"]
+    if out.get("reply") is not None:
+        reply["reply"] = out["reply"]
+    if out.get("edit_entities"):
+        # Оформление нового текста карточки (richtext.py): без него правка сняла бы цитату.
+        reply["edit_entities"] = out["edit_entities"]
+    return reply
+

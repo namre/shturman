@@ -1,0 +1,359 @@
+# «Штурман» — эталонный стек: стоковый Hermes, сервис переписки и его база (docs/deployment.md).
+#
+# Что именно запускается, решают профили Compose:
+#   hermes      — контейнер Hermes. Включён в режиме SHTURMAN_MODE=hermes (по умолчанию);
+#                 в режиме standalone («только архив и согласования», docs/standalone.md)
+#                 профиль выключен: контейнер не создаётся, образ не скачивается;
+#   embeddings  — локальные эмбеддинги, включаются командой ./ops/embeddings.sh on;
+#   guard       — модель защиты от внедрённых инструкций, включается командой ./ops/guard.sh on;
+#   asr         — распознавание речи для голосовых, включается командой ./ops/asr.sh on;
+#   relay       — подключение к посреднику (frpc), включается командой ./ops/relay.sh join;
+#                 только в режиме с Hermes.
+# Профили записывает в .env (COMPOSE_PROFILES) и выставляет при запуске ./ops/up.sh — по режиму
+# из SHTURMAN_MODE. Режим выбирает ./ops/init-env.sh --mode, меняет ./ops/mode.sh.
+#
+# Запускать через ./ops/up.sh — он подставляет владельца каталога данных и профили.
+# Голая команда `docker compose up` без COMPOSE_PROFILES поднимет только сервис и базу.
+# Локальные изменения — в compose.override.yaml и .env, этот файл на сервере не править.
+
+name: shturman
+
+services:
+  hermes:
+    # Только в режиме с Hermes (SHTURMAN_MODE=hermes).
+    profiles: ["hermes"]
+    # Официальный образ без изменений. Версию владелец может поднять сам: HERMES_VERSION в .env.
+    image: nousresearch/hermes-agent:${HERMES_VERSION:-v2026.9.24}
+    container_name: shturman-hermes
+    restart: unless-stopped
+    command: gateway run
+    # Как в официальном compose Hermes: сеть хоста, дашборд слушает только локальный адрес.
+    # Наружу его отдаёт прокси с аутентификацией (docs/setup.md). Порты здесь не публикуются.
+    network_mode: host
+    # Без CAP_NET_RAW (решение владельца Р-76): в сети хоста процесс root контейнера с этим правом
+    # открывает сырой сокет (AF_PACKET) и читает весь трафик сервера на 127.0.0.1 — в том числе то,
+    # что владелец вводит на странице настройки переписки. Это настройка запуска, а не правка образа:
+    # сырые сокеты и ICMP Hermes не использует; ping в терминале работает через ICMP-сокеты, если их
+    # разрешает ядро сервера (net.ipv4.ping_group_range). Остальные права Docker по умолчанию
+    # остаются: без них образ не запустится (s6, смена пользователя, chown каталога данных).
+    cap_drop: [NET_RAW]
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: 127.0.0.1
+      HERMES_DASHBOARD_PORT: "9119"
+      # Адрес, по которому владелец открывает ассистента. Задан — Hermes включает вход
+      # и принимает запросы с этим именем; пуст — дашборд доступен только с самого сервера.
+      HERMES_DASHBOARD_PUBLIC_URL: ${SHTURMAN_PUBLIC_URL:-}
+      # Часовой пояс владельца — один на Hermes (расписание сводок) и сервис переписки (сроки).
+      HERMES_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
+      # Связь с сервисом переписки. Токены генерирует ./ops/init-env.sh --auto.
+      # Первый — для плагина «Штурмана» (внутренний API), второй — для агента (архив, только чтение).
+      # Оба считаются известными ассистенту (Р-104): сервис открывает по ним только чтение с пределами и
+      # запросы, которые ждут нажатия владельца. Токен оператора (SHTURMAN_OPERATOR_TOKEN) сюда не передаётся.
+      SHTURMAN_SERVICE_URL: http://127.0.0.1:8765
+      SHTURMAN_API_TOKEN: ${SHTURMAN_API_TOKEN:-}
+      MCP_SHTURMAN_API_KEY: ${SHTURMAN_MCP_TOKEN:-}
+    # Подключено только это. Каталог сокета сервиса (/run/shturman-service), каталог данных сервиса,
+    # /run и /proc хоста, сокет Docker сюда не подключаются никогда (AGENTS.md, Р-76).
+    volumes:
+      - ./data/hermes:/opt/data
+      # Плагин «Штурмана» подключается из репозитория только для чтения: обновляется вместе с git pull.
+      - ./plugins/shturman:/opt/data/plugins/shturman:ro
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    # Postgres 16 с расширением pgvector; образ назван по версии расширения и базы.
+    image: pgvector/pgvector:0.8.7-pg16-bookworm
+    container_name: shturman-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shturman
+      POSTGRES_DB: shturman
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?не задан POSTGRES_PASSWORD — запустите ./ops/init-env.sh --auto}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    # Порт наружу не публикуется, выхода в интернет у базы нет: сеть backend закрытая.
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shturman -d shturman"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  shturman:
+    # Сервис переписки: архив, сессии Telegram, MCP-сервер архива, свой бот согласований
+    # и свой доступ к модели. Работает в обоих режимах. Собирается из ./service.
+    build: ./service
+    image: shturman-service:local
+    container_name: shturman-service
+    restart: unless-stopped
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SHTURMAN_DSN: postgresql://shturman@postgres:5432/shturman
+      PGPASSWORD: ${POSTGRES_PASSWORD:?не задан POSTGRES_PASSWORD — запустите ./ops/init-env.sh --auto}
+      SHTURMAN_API_TOKEN: ${SHTURMAN_API_TOKEN:?не задан SHTURMAN_API_TOKEN — запустите ./ops/init-env.sh --auto}
+      SHTURMAN_MCP_TOKEN: ${SHTURMAN_MCP_TOKEN:?не задан SHTURMAN_MCP_TOKEN — запустите ./ops/init-env.sh --auto}
+      # Токен оператора (Р-104): shturman call и скрипты ops/ в этом контейнере. В контейнер Hermes не передаётся:
+      # там SHTURMAN_API_TOKEN, которому сервис открывает только чтение и запросы, ждущие нажатия владельца.
+      SHTURMAN_OPERATOR_TOKEN: ${SHTURMAN_OPERATOR_TOKEN:?не задан SHTURMAN_OPERATOR_TOKEN — запустите ./ops/init-env.sh --auto}
+      # Пределы выдачи архива ассистенту за час и сутки (Р-104, docs/service.md, «Граница выдачи архива»).
+      # Ослабить их может только владелец; без строк в .env — значения ниже.
+      SHTURMAN_ARCHIVE_HOUR_MESSAGES: ${SHTURMAN_ARCHIVE_HOUR_MESSAGES:-3000}
+      SHTURMAN_ARCHIVE_HOUR_CHARS: ${SHTURMAN_ARCHIVE_HOUR_CHARS:-600000}
+      SHTURMAN_ARCHIVE_DAY_MESSAGES: ${SHTURMAN_ARCHIVE_DAY_MESSAGES:-12000}
+      SHTURMAN_ARCHIVE_DAY_CHARS: ${SHTURMAN_ARCHIVE_DAY_CHARS:-2500000}
+      SHTURMAN_CANARY: ${SHTURMAN_CANARY:-on}
+      SHTURMAN_TIMEZONE: ${SHTURMAN_TIMEZONE:-Europe/Moscow}
+      SHTURMAN_NIGHTLY_AT: ${SHTURMAN_NIGHTLY_AT:-03:30}
+      SHTURMAN_PROCESSING_EVERY: ${SHTURMAN_PROCESSING_EVERY:-60}
+      SHTURMAN_PROCESSING_HOURLY_CAP: ${SHTURMAN_PROCESSING_HOURLY_CAP:-40}
+      SHTURMAN_PROCESSING_DAILY_CAP: ${SHTURMAN_PROCESSING_DAILY_CAP:-300}
+      SHTURMAN_DIGEST_AT: ${SHTURMAN_DIGEST_AT:-13:00,19:00}
+      # Страница настройки переписки (/shturman-setup/): сервис отдаёт её сам, за собственным входом,
+      # и только на ОТДЕЛЬНОМ адресе — не на том, где дашборд Hermes. Ассистент может добавлять свои
+      # страницы на адрес дашборда; на общем адресе он действовал бы на странице настройки от имени
+      # вошедшего владельца (docs/architecture.md, «Почему у страницы настройки свой адрес»).
+      #   SHTURMAN_SETUP_ORIGIN     — внешний адрес страницы (схема, имя, порт; без пути). По умолчанию —
+      #                               то же имя, что у дашборда, порт 8443: его записывают
+      #                               ./ops/set-public-url.sh и ./ops/up.sh, меняет ./ops/set-setup-url.sh.
+      #                               Пусто — страница открывается только с сервера или через туннель
+      #                               SSH (./ops/setup-link.sh);
+      #   SHTURMAN_DASHBOARD_ORIGIN — адрес дашборда: сервису он нужен, только чтобы сверить, что
+      #                               адреса разные. Совпали — сервис запускается, но страницу снаружи
+      #                               не отдаёт.
+      SHTURMAN_SETUP_ORIGIN: ${SHTURMAN_SETUP_URL:-}
+      SHTURMAN_DASHBOARD_ORIGIN: ${SHTURMAN_PUBLIC_URL:-}
+      # Unix-сокет для обратного прокси (Р-76): Caddy ходит к странице настройки, Mini App и внешнему
+      # шлюзу архива через него, а не через порт 8765, который в сети хоста может занять процесс из
+      # Hermes. Сервис открывает сокет, только если каталог создан как в
+      # config/shturman-service-socket.conf (владелец — пользователь стека, группа caddy, режим 2710);
+      # иначе слушает только порт, как раньше.
+      SHTURMAN_PROXY_SOCKET: /run/shturman-service/proxy.sock
+      # Отправка сообщений выключена, пока владелец не включит её сам в .env (docs/service.md);
+      # без своего бота согласований (SHTURMAN_BOT_TOKEN) значение on не действует.
+      # Через API это значение не меняется.
+      SHTURMAN_SENDING: ${SHTURMAN_SENDING:-off}
+      SHTURMAN_SOURCES_FILE: ${SHTURMAN_SOURCES_FILE:-}
+      SHTURMAN_REMOTE_MCP_ORIGIN: ${SHTURMAN_REMOTE_MCP_ORIGIN:-}
+      SHTURMAN_SEND_DAILY_CAP: ${SHTURMAN_SEND_DAILY_CAP:-50}
+      SHTURMAN_EMBEDDINGS_URL: ${SHTURMAN_EMBEDDINGS_URL:-}
+      # Модель поиска по смыслу. Та же строка .env задаёт имя, под которым её отдаёт контейнер
+      # embeddings ниже; записывает ./ops/embeddings.sh on --model.
+      SHTURMAN_EMBEDDINGS_MODEL: ${SHTURMAN_EMBEDDINGS_MODEL:-intfloat/multilingual-e5-small}
+      # Защита от внедрённых инструкций во входящих сообщениях: выключена, пока владелец не
+      # включит (./ops/guard.sh on). Через API эти значения не меняются.
+      SHTURMAN_GUARD: ${SHTURMAN_GUARD:-off}
+      SHTURMAN_GUARD_URL: ${SHTURMAN_GUARD_URL:-}
+      # Расшифровка голосовых: включает ./ops/asr.sh on (контейнер asr ниже).
+      SHTURMAN_ASR: ${SHTURMAN_ASR:-off}
+      SHTURMAN_ASR_URL: ${SHTURMAN_ASR_URL:-}
+      SHTURMAN_ASR_DAYS: ${SHTURMAN_ASR_DAYS:-30}
+      SHTURMAN_ASR_MAX_SECONDS: ${SHTURMAN_ASR_MAX_SECONDS:-600}
+      SHTURMAN_MEDIA_DAYS: ${SHTURMAN_MEDIA_DAYS:-30}
+      # Пачка сообщений (Р-93): пауза, до которой сообщения одного человека — одна пачка, и ожидание её вложений.
+      SHTURMAN_PACK_GAP: ${SHTURMAN_PACK_GAP:-90}
+      SHTURMAN_PACK_MEDIA_WAIT: ${SHTURMAN_PACK_MEDIA_WAIT:-90}
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      EGRESS_PROXY_URL: ${EGRESS_PROXY_URL:-}
+      # Внешний сторож (Р-98, docs/deployment.md, «Внешний сторож»): адрес пульса — пишет ./ops/pulse.sh;
+      # пусто — сторожа нет. Раз в столько минут сервис зовёт его с итогом проверок.
+      SHTURMAN_PULSE_URL: ${SHTURMAN_PULSE_URL:-}
+      SHTURMAN_PULSE_EVERY: ${SHTURMAN_PULSE_EVERY:-5}
+      # Обновления (Р-101): список выпусков с GitHub раз в сутки — сообщения владельцу о новых версиях; канал —
+      # тот же, что у ./ops/update.sh. Что за код запущен (VERSION, тег на коммите, коммит, образ Hermes), пишет
+      # ./ops/up.sh перед запуском — по ним сервис замечает смену версии и сообщает итог обновления.
+      SHTURMAN_UPDATES: ${SHTURMAN_UPDATES:-on}
+      SHTURMAN_UPDATES_URL: ${SHTURMAN_UPDATES_URL:-}
+      SHTURMAN_UPDATE_CHANNEL: ${SHTURMAN_UPDATE_CHANNEL:-release}
+      SHTURMAN_CODE_VERSION: ${SHTURMAN_CODE_VERSION:-}
+      SHTURMAN_CODE_TAG: ${SHTURMAN_CODE_TAG:-}
+      SHTURMAN_CODE_COMMIT: ${SHTURMAN_CODE_COMMIT:-}
+      SHTURMAN_HERMES_IMAGE: ${SHTURMAN_HERMES_IMAGE:-}
+      # Отчёты сессий сопровождения (Р-102): номер чата разработки, куда бот согласований присылает отчёт по
+      # нажатию владельца «Отправить». Пусто — отчёт приходит владельцу для пересылки. Записывает владелец.
+      SHTURMAN_FEEDBACK_CHAT: ${SHTURMAN_FEEDBACK_CHAT:-}
+      # Посредник с ботом-менеджером: «создать бота согласований в одно нажатие» на странице
+      # настройки переписки (docs/approvals-bot.md). Пусто — https://relay.sh.namre.app; off —
+      # выключить. Только здесь: ни страница, ни API адрес не меняют.
+      SHTURMAN_BOT_MANAGER_API: ${SHTURMAN_BOT_MANAGER_API:-}
+      # Свой бот согласований и свой доступ к модели (API, совместимый с OpenAI). В режиме
+      # standalone это единственные бот и модель экземпляра; значения владелец вводит сам:
+      # ./ops/init-env.sh. Контейнеру Hermes эти переменные не передаются никогда.
+      SHTURMAN_BOT_TOKEN: ${SHTURMAN_BOT_TOKEN:-}
+      SHTURMAN_LLM_API_KEY: ${SHTURMAN_LLM_API_KEY:-}
+      # Адрес API модели — без значения по умолчанию и без подстановки: контейнер получает эту
+      # переменную, только если строка есть в .env. Адрес, заданный окружением, сервис считает
+      # заданным на сервере: страница настройки показывает его и менять не даёт. Подставляй мы сюда
+      # адрес по умолчанию, поле адреса на странице было бы закрыто всегда. Строки нет — сервис сам
+      # берёт https://api.openai.com/v1, а владелец может ввести другой адрес на странице.
+      SHTURMAN_LLM_BASE_URL:
+      SHTURMAN_LLM_MODEL: ${SHTURMAN_LLM_MODEL:-}
+      SHTURMAN_LLM_MODEL_EXTRACT: ${SHTURMAN_LLM_MODEL_EXTRACT:-}
+      SHTURMAN_LLM_MODEL_REPLY: ${SHTURMAN_LLM_MODEL_REPLY:-}
+      SHTURMAN_LLM_MODEL_WATCH: ${SHTURMAN_LLM_MODEL_WATCH:-}
+      SHTURMAN_LLM_MODEL_MEDIA: ${SHTURMAN_LLM_MODEL_MEDIA:-}
+      SHTURMAN_LLM_TOKENS_PARAM: ${SHTURMAN_LLM_TOKENS_PARAM:-}
+    volumes:
+      # Сессии Telegram, страницы памяти, загруженные выгрузки. Контейнеру Hermes этот каталог не подключён.
+      - ./data/shturman:/data
+      # Каталог сокета для обратного прокси — только этому контейнеру; Hermes его не видит. Создаёт
+      # его systemd-tmpfiles (config/shturman-service-socket.conf; установка — стоп-точка, sudo). Если
+      # каталога ещё нет, Docker создаст пустой каталог от root — сервис им не воспользуется и
+      # останется только на порту.
+      - /run/shturman-service:/run/shturman-service
+    # Только локальный адрес сервера: к сервису обращается Hermes, который работает в сети хоста,
+    # а в режиме standalone — клиент владельца (Codex CLI, Claude Code) с этого же сервера
+    # или через SSH-туннель (./ops/connect.sh). Наружу порт не публикуется ни в одном режиме.
+    # В режиме с Hermes обратный прокси на хосте отдаёт наружу один префикс сервиса —
+    # /shturman-setup/ — и только на отдельном адресе страницы настройки (другой порт или другое
+    # имя), не на адресе дашборда (config/Caddyfile.example); /api/* и /mcp наружу не выходят.
+    # К сервису прокси ходит через Unix-сокет (SHTURMAN_PROXY_SOCKET выше), а не через этот порт.
+    ports:
+      - "127.0.0.1:8765:8765"
+    # backend — к базе, эмбеддингам и классификатору защиты; egress — выход к Telegram
+    # (сессии аккаунтов, свой бот) и к провайдеру модели, если у сервиса свой доступ к ней.
+    networks: [backend, egress]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    logging: *logging
+
+  embeddings:
+    # Локальные эмбеддинги для поиска по смыслу. Выключено, пока владелец не включит:
+    # ./ops/embeddings.sh on. Через контейнер проходит текст всех сообщений, поэтому выхода
+    # в интернет у него нет вовсе (сеть backend закрытая), а модель заранее скачивает и сверяет
+    # по контрольным суммам ./ops/embeddings.sh.
+    #
+    # Модель выбирает владелец: ./ops/embeddings.sh on --model e5-small|user2-small. Скрипт пишет
+    # в .env имя модели и её каталог; без этих строк запускается прежняя модель из прежнего
+    # каталога — экземпляру, развёрнутому до появления выбора, править .env не нужно.
+    #   intfloat/multilingual-e5-small (по умолчанию) — около 1,2 ГБ памяти;
+    #   deepvk/USER2-small — 0,2 ГБ на коротких сообщениях, до 0,7 ГБ на длинных.
+    #
+    # --max-batch-tokens 2048 задан для обеих моделей. У USER2-small окно 8192 токена, и при запуске
+    # TEI прогоняет пачку наибольшего размера: без ограничения прогрев не помещается в память
+    # и контейнер убивается. Заодно модель видит только первые 2048 токенов сообщения — сообщение
+    # Telegram предельной длины (4096 знаков) в них помещается. Для e5-small (окно 512 токенов)
+    # ограничение ничего не обрезает и лишь уменьшает внутреннюю пачку сервера.
+    profiles: ["embeddings"]
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
+    container_name: shturman-embeddings
+    restart: unless-stopped
+    command: ["--model-id", "/data/${SHTURMAN_EMBEDDINGS_MODEL_DIR:-model}",
+              "--served-model-name", "${SHTURMAN_EMBEDDINGS_MODEL:-intfloat/multilingual-e5-small}",
+              "--max-batch-tokens", "2048"]
+    volumes:
+      - ./data/embeddings:/data:ro
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 1536m
+    logging: *logging
+
+  guard:
+    # Модель-классификатор для защиты от внедрённых инструкций (docs/guard.md). Занимает около
+    # 0,6 ГБ памяти, поэтому выключено, пока владелец не включит: ./ops/guard.sh on. Через контейнер
+    # проходит текст всех входящих сообщений, поэтому выхода в интернет у него нет вовсе (сеть
+    # backend закрытая), а модель заранее скачивает и сверяет по контрольной сумме ./ops/guard.sh.
+    # --max-batch-tokens: у модели окно в 8192 токена, и при запуске TEI прогоняет пачку наибольшего
+    # размера — без этого ограничения прогрев не помещается в память. Сервис сам режет длинный
+    # текст на окна по 1000 знаков, так что 1024 токенов хватает с запасом.
+    profiles: ["guard"]
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
+    container_name: shturman-guard
+    restart: unless-stopped
+    command: ["--model-id", "/data/model", "--served-model-name", "Horizon-Labs/prompt-injection-guard-small",
+              "--max-batch-tokens", "1024"]
+    volumes:
+      - ./data/guard:/data:ro
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 1024m
+    logging: *logging
+
+  asr:
+    # Распознавание речи для расшифровки голосовых и «кружков» (docs/voice.md). Модель —
+    # GigaAM-Multilingual от ai-sage, несжатая, как её выложил производитель: около 1,4 ГБ памяти
+    # в работе, поэтому выключено, пока владелец не включит: ./ops/asr.sh on. Через контейнер
+    # проходит звук голосовых, поэтому выхода в интернет у него нет (сеть backend закрытая);
+    # модель заранее скачивает и сверяет по контрольным суммам ./ops/asr.sh. Образ собирается
+    # на сервере из каталога asr/ по списку зависимостей с контрольными суммами.
+    profiles: ["asr"]
+    build: ./asr
+    image: shturman-asr:local
+    container_name: shturman-asr
+    restart: unless-stopped
+    environment:
+      ASR_THREADS: ${SHTURMAN_ASR_THREADS:-2}
+    volumes:
+      - ./data/asr:/data:ro
+    networks: [backend]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    shm_size: 128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          memory: 2048m
+    logging: *logging
+
+  relay:
+    # Подключение к посреднику (docs/relay.md): frpc держит исходящее соединение к посреднику и
+    # получает по нему соединения браузеров к двум именам экземпляра — дашборду и странице настройки
+    # переписки. Выключено, пока владелец не подключит экземпляр: ./ops/relay.sh join. Только в режиме
+    # с Hermes (без него экземпляр наружу ничего не публикует; ./ops/up.sh профиль не включит).
+    # Сеть хоста — чтобы дойти до обратного прокси Caddy этого сервера на 127.0.0.1:443 и :80;
+    # протокол PROXY Caddy принимает только с 127.0.0.1. Образ собирается из каталога frpc/ с
+    # проверкой контрольной суммы выпуска frp. Значения — из .env; ключ экземпляра и токен посредника —
+    # секреты (./ops/relay.sh их не печатает). Сертификат посредника — data/relay/ca.pem.
+    profiles: ["relay"]
+    build: ./frpc
+    image: shturman-frpc:local
+    container_name: shturman-relay
+    restart: unless-stopped
+    network_mode: host
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    environment:
+      SHTURMAN_RELAY_SERVER: ${SHTURMAN_RELAY_SERVER:-}
+      SHTURMAN_RELAY_PORT: ${SHTURMAN_RELAY_PORT:-7000}
+      SHTURMAN_RELAY_NAME: ${SHTURMAN_RELAY_NAME:-}
+      SHTURMAN_RELAY_KEY: ${SHTURMAN_RELAY_KEY:-}
+      SHTURMAN_RELAY_TOKEN: ${SHTURMAN_RELAY_TOKEN:-}
+      SHTURMAN_RELAY_ADMIN_PASSWORD: ${SHTURMAN_RELAY_ADMIN_PASSWORD:-}
+    volumes:
+      - ./data/relay:/etc/frpc/relay:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    logging: *logging
+
+networks:
+  # Закрытая сеть: контейнеры видят друг друга, но не интернет.
+  backend:
+    driver: bridge
+    internal: true
+  egress:
+    driver: bridge

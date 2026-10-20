@@ -1,0 +1,251 @@
+"""Очередь заданий для исполнителя вне сервиса.
+
+Сервис не ходит к модели и не владеет ботом: и то и другое есть только у Hermes. Поэтому всё,
+что требует модели или сообщения владельцу, сервис ставит в очередь, а плагин «Штурмана»
+в Hermes забирает задание, выполняет и возвращает результат.
+
+Задание берётся «в аренду» на время: если исполнитель пропал, оно возвращается в очередь.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any, Sequence
+
+import asyncpg
+
+DEFAULT_LEASE = 300  # секунд на выполнение одного задания
+
+_CLAIM = """
+UPDATE jobs SET status = 'running', attempts = attempts + 1, worker = $3,
+       locked_until = now() + make_interval(secs => $4)
+WHERE id IN (
+    SELECT id FROM jobs
+    WHERE kind = ANY($1::text[]) AND executor = $5
+      AND ((status = 'queued' AND run_after <= now())
+           OR (status = 'running' AND locked_until < now() AND attempts < max_attempts))
+    ORDER BY run_after, id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, payload, attempts
+"""
+
+
+def _loads(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
+async def enqueue(
+    conn: asyncpg.Connection, kind: str, payload: dict[str, Any], *,
+    handler: str | None = None, context: dict[str, Any] | None = None,
+    dedup_key: str | None = None, run_after: datetime | None = None, max_attempts: int = 3,
+    executor: str = "plugin",
+) -> int | None:
+    """Ставит задание. Возвращает его идентификатор или None, если такое уже ставилось."""
+    return await conn.fetchval(
+        """INSERT INTO jobs (kind, handler, payload, context, dedup_key, run_after, max_attempts, executor)
+           VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, COALESCE($6, now()), $7, $8)
+           ON CONFLICT (kind, dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+           RETURNING id""",
+        kind, handler, json.dumps(payload, ensure_ascii=False),
+        json.dumps(context or {}, ensure_ascii=False), dedup_key, run_after, max_attempts, executor,
+    )
+
+
+async def claim(
+    conn: asyncpg.Connection, kinds: Sequence[str], *, worker: str, limit: int = 1,
+    lease: int = DEFAULT_LEASE, executor: str = "plugin",
+) -> list[dict[str, Any]]:
+    """Берёт задания в работу. Исполнитель получает только свои: плагин — plugin, сервис — builtin."""
+    rows = await conn.fetch(_CLAIM, list(kinds), max(1, min(limit, 20)), worker, float(lease), executor)
+    return [
+        {"id": r["id"], "kind": r["kind"], "payload": _loads(r["payload"]), "attempt": r["attempts"]}
+        for r in rows
+    ]
+
+
+async def get(conn: asyncpg.Connection, job_id: int) -> dict[str, Any] | None:
+    row = await conn.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
+    if row is None:
+        return None
+    out = dict(row)
+    for key in ("payload", "context", "result"):
+        out[key] = _loads(out[key])
+    return out
+
+
+async def complete(
+    conn: asyncpg.Connection, job_id: int, result: dict[str, Any], *, executor: str | None = None,
+) -> dict[str, Any] | None:
+    """Закрывает задание. Возвращает его строку (с контекстом) или None, если оно уже закрыто.
+
+    executor — чьё задание разрешено закрыть. Плагин по HTTP закрывает только свои задания:
+    иначе держатель токена API мог бы подложить результат заданию своего исполнителя сервиса.
+    """
+    row = await conn.fetchrow(
+        """UPDATE jobs SET status = 'done', result = $2::jsonb, finished_at = now(), locked_until = NULL
+           WHERE id = $1 AND status = 'running' AND ($3::text IS NULL OR executor = $3)
+           RETURNING *""",
+        job_id, json.dumps(result, ensure_ascii=False), executor,
+    )
+    if row is None:
+        return None
+    out = dict(row)
+    for key in ("payload", "context", "result"):
+        out[key] = _loads(out[key])
+    return out
+
+
+async def fail(
+    conn: asyncpg.Connection, job_id: int, error: str, *, retry_in: int | None = 60,
+    executor: str | None = None,
+) -> str:
+    """Отмечает неудачу. Пока попытки остались, задание возвращается в очередь. Возвращает новый статус.
+
+    executor — чьё задание разрешено трогать (см. complete)."""
+    row = await conn.fetchrow(
+        """SELECT attempts, max_attempts FROM jobs
+           WHERE id = $1 AND status = 'running' AND ($2::text IS NULL OR executor = $2) FOR UPDATE""",
+        job_id, executor,
+    )
+    if row is None:
+        return "unknown"
+    final = retry_in is None or row["attempts"] >= row["max_attempts"]
+    if final:
+        await conn.execute(
+            "UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), locked_until = NULL WHERE id = $1",
+            job_id, error[:2000],
+        )
+        return "failed"
+    await conn.execute(
+        """UPDATE jobs SET status = 'queued', error = $2, locked_until = NULL, run_after = $3 WHERE id = $1""",
+        job_id, error[:2000], datetime.now(timezone.utc) + timedelta(seconds=retry_in),
+    )
+    return "queued"
+
+
+async def postpone(conn: asyncpg.Connection, job_id: int, error: str, *, delay: int) -> str:
+    """Возвращает забранное задание в очередь через `delay` секунд и не засчитывает попытку.
+
+    Для случаев, когда дело не в задании, а в доступе к модели: исчерпан лимит подписки, нужно
+    войти заново. Иначе три таких отказа подряд закрыли бы задание навсегда. Срок ожидания в
+    очереди (`QUEUE_TTL`) считается от постановки и этим не продлевается."""
+    done = await conn.execute(
+        """UPDATE jobs SET status = 'queued', attempts = GREATEST(attempts - 1, 0), error = $2,
+                  locked_until = NULL, run_after = $3
+           WHERE id = $1 AND status = 'running'""",
+        job_id, error[:2000], datetime.now(timezone.utc) + timedelta(seconds=max(1, int(delay))),
+    )
+    return "queued" if done.endswith(" 1") else "unknown"
+
+
+async def reap(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """Закрывает как неудачные задания, у которых вышли и аренда, и попытки. Возвращает их строки."""
+    rows = await conn.fetch(
+        """UPDATE jobs SET status = 'failed', error = COALESCE(error, 'исполнитель не ответил'),
+                  finished_at = now(), locked_until = NULL
+           WHERE status = 'running' AND locked_until < now() AND attempts >= max_attempts
+           RETURNING *"""
+    )
+    out = []
+    for row in rows:
+        job = dict(row)
+        for key in ("payload", "context", "result"):
+            job[key] = _loads(job[key])
+        out.append(job)
+    return out
+
+
+# Сколько задание может ждать исполнителя. Позже оно теряет смысл: уведомление устарело,
+# ответ модели никому не нужен. Отправка через бизнес-бота здесь не значится — её срок ведёт шлюз.
+# Расписание сводок (`hermes.cron`, Р-95): без Hermes его никто не заберёт — гаснет за час.
+QUEUE_TTL = {"notify.owner": 24 * 3600, "notify.edit": 3600, "llm.structured": 24 * 3600, "llm.text": 3600,
+             "hermes.cron": 3600}
+SCRUB_AFTER = 600  # секунд после закрытия задания
+
+
+async def expire_queued(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """Закрывает как неудачные задания, которых исполнитель не забрал за отведённый срок."""
+    out: list[dict[str, Any]] = []
+    for kind, ttl in QUEUE_TTL.items():
+        rows = await conn.fetch(
+            """UPDATE jobs SET status = 'failed', error = 'исполнитель не забрал вовремя', finished_at = now()
+               WHERE status = 'queued' AND kind = $1 AND created_at < now() - make_interval(secs => $2)
+               RETURNING *""",
+            kind, float(ttl),
+        )
+        for row in rows:
+            job = dict(row)
+            for key in ("payload", "context", "result"):
+                job[key] = _loads(job[key])
+            out.append(job)
+    return out
+
+
+async def scrub_finished(conn: asyncpg.Connection, *, after: int = SCRUB_AFTER) -> int:
+    """Стирает содержимое закрытых заданий: в нём копии текста сообщений, которые иначе пережили
+    бы удаление и исключение чата. Сама строка остаётся — она защищает от повторной постановки."""
+    done = await conn.execute(
+        """UPDATE jobs SET payload = '{}', context = '{}', result = NULL, error = left(error, 80)
+           WHERE status IN ('done', 'failed') AND finished_at < now() - make_interval(secs => $1)
+             AND (payload <> '{}' OR context <> '{}' OR result IS NOT NULL)""",
+        float(after),
+    )
+    return int(done.split()[-1])
+
+
+async def cancel(conn: asyncpg.Connection, job_id: int, reason: str) -> bool:
+    """Снимает задание, которое ещё никто не забрал. Забранное снять нельзя: оно уже выполняется."""
+    done = await conn.execute(
+        """UPDATE jobs SET status = 'failed', error = $2, finished_at = now()
+           WHERE id = $1 AND status = 'queued'""",
+        job_id, reason[:2000],
+    )
+    return done.endswith(" 1")
+
+
+# Очередь по группам — для строки `jobs` в `./ops/doctor.sh` (Д-25): движется ли она, а не только
+# сколько в ней. Модель — задания `llm.*`; бот — уведомления владельцу, их правка и отправка через
+# бизнес-бота. `hermes.cron` в группы не входит: без Hermes его никто не забирает, и это норма (гаснет
+# за час); у расписания сводок своя строка `summaries`.
+QUEUE_GROUPS = {
+    "llm": ("llm.structured", "llm.text"),
+    "bot": ("notify.owner", "notify.edit", "business.send"),
+}
+
+
+async def queue_overview(conn: asyncpg.Connection) -> dict[str, Any]:
+    """Одним проходом по `jobs`: всего ждут, неудачных за всё время и по группам — сколько ждут
+    (`waiting`), сколько секунд ждёт исполнителя самое старое готовое задание (`ready_age_s`; 0 — таких
+    нет; отложенные повтором и тихими часами не считаются) и сколько выполнено за последний час
+    (`done_hour`, по `finished_at` — переживает перезапуск сервиса). Только числа."""
+    llm, bot = list(QUEUE_GROUPS["llm"]), list(QUEUE_GROUPS["bot"])
+    row = await conn.fetchrow(
+        """SELECT count(*) FILTER (WHERE status IN ('queued', 'running')) AS waiting,
+                  count(*) FILTER (WHERE status = 'failed') AS failed,
+                  count(*) FILTER (WHERE status IN ('queued', 'running') AND kind = ANY($1)) AS llm_waiting,
+                  min(run_after) FILTER (WHERE status = 'queued' AND run_after <= now() AND kind = ANY($1)) AS llm_ready,
+                  count(*) FILTER (WHERE status = 'done' AND finished_at > now() - interval '1 hour'
+                                   AND kind = ANY($1)) AS llm_done_hour,
+                  count(*) FILTER (WHERE status IN ('queued', 'running') AND kind = ANY($2)) AS bot_waiting,
+                  min(run_after) FILTER (WHERE status = 'queued' AND run_after <= now() AND kind = ANY($2)) AS bot_ready,
+                  count(*) FILTER (WHERE status = 'done' AND finished_at > now() - interval '1 hour'
+                                   AND kind = ANY($2)) AS bot_done_hour,
+                  now() AS now
+             FROM jobs""",
+        llm, bot,
+    )
+
+    def age(ready: datetime | None) -> int:
+        return max(0, int((row["now"] - ready).total_seconds())) if ready is not None else 0
+
+    return {
+        "waiting": int(row["waiting"]), "failed": int(row["failed"]),
+        "groups": {
+            g: {"waiting": int(row[f"{g}_waiting"]), "ready_age_s": age(row[f"{g}_ready"]),
+                "done_hour": int(row[f"{g}_done_hour"])}
+            for g in QUEUE_GROUPS
+        },
+    }

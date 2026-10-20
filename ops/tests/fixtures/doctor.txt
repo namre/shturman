@@ -1,0 +1,13 @@
+PASS  mode: с Hermes
+PASS  public-url: https://assistant.example.com
+PASS  setup-origin: у страницы настройки свой адрес: https://setup.example.com:8443 (дашборд — https://assistant.example.com)
+PASS  proxy-cert: 203.0.113.10:8443 — сертификат на IP-адрес действителен, осталось 5 д 3 ч (живёт 160 ч, продлевает Caddy)
+PASS  relay: контейнер frpc работает: имя ivanpetrov, посредник relay.example.com:7000
+PASS  model: модель gpt-6.1-sol: последнее обращение успешно (3 мин назад); обращений 120, неудач 2
+WARN  hermes-tz: пояс записан в config.yaml после запуска Hermes — ./ops/up.sh
+PASS  pulse: внешний сторож (hc-ping.com) получает пульс раз в 5 мин; последний — «всё в порядке», 2 мин назад
+FAIL  tg-session: ваш аккаунт: нужно войти заново — «Настройки Штурмана» → «Вход в ваш аккаунт Telegram» → «Войти заново» 123456789:AAH-secret-bot-token-ABCDEFGHIJKLMNOP
+WARN  stopped: владелец остановил ассистента (с 2026-10-16 10:00 UTC, в боте согласований)
+PASS  disk-usage: база архива 1.2 ГБ, копии 300 МБ (файлов: 10), образы Docker 4.1GB (не используются: 1.2GB)
+какая-то посторонняя строка Иван Петров +7 916 123-45-67
+ИТОГ: FAIL (1)

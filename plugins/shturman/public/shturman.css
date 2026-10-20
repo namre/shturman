@@ -1,0 +1,165 @@
+/* Страницы входа «Штурмана». Без внешних шрифтов и скриптов: страница входа
+   не должна обращаться к чужим серверам. */
+
+:root {
+  --ink: #12202f;
+  --navy: #0f1d2e;
+  --navy-line: #2a3d54;
+  --ground: #eef2f4;
+  --surface: #ffffff;
+  --line: #d5dde3;
+  --field-line: #8a99a6;
+  --muted: #51606e;
+  --on-navy: #e8eef3;
+  --on-navy-muted: #9fb0c0;
+  --accent: #0b5c7a;
+  --accent-hover: #083f54;
+  --accent-soft: #e1eef3;
+  --amber: #f2b441;
+  --ok-bg: #e3f1e9;
+  --ok-ink: #174f34;
+  --warn-bg: #fbeedb;
+  --warn-ink: #6b3b00;
+  --font: "Golos Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; }
+
+body {
+  min-height: 100vh;
+  display: flex;
+  flex-wrap: wrap;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+a { color: var(--accent); }
+a:hover { color: var(--accent-hover); }
+
+.side {
+  flex: 1 1 340px;
+  background: var(--navy);
+  color: var(--on-navy);
+  padding: 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; font-weight: 600; font-size: 22px; }
+
+.side .motto { margin-top: auto; display: flex; flex-direction: column; gap: 16px; }
+.side .motto strong { font-size: 38px; line-height: 1.15; font-weight: 600; }
+.side .motto span { color: var(--on-navy-muted); font-size: 18px; }
+
+main {
+  flex: 999 1 480px;
+  min-width: 0;
+  padding: 48px 56px;
+  display: flex;
+  align-items: center;
+}
+
+.panel { max-width: 540px; width: 100%; display: flex; flex-direction: column; gap: 22px; }
+
+.eyebrow {
+  font-size: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted);
+}
+
+h1 { margin: 0; font-size: 34px; line-height: 1.2; font-weight: 600; }
+.lead { margin: 0; font-size: 18px; color: var(--muted); }
+.small { margin: 0; font-size: 14px; color: var(--muted); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.need { display: flex; gap: 12px; align-items: flex-start; }
+.need b {
+  flex: none; width: 28px; height: 28px; border-radius: 50%;
+  background: var(--accent-soft); color: var(--accent);
+  display: flex; align-items: center; justify-content: center; font-size: 14px;
+}
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 52px; padding: 12px 28px;
+  background: var(--accent); color: #fff;
+  border: 0; border-radius: 8px;
+  font: inherit; font-weight: 600; font-size: 18px; text-decoration: none; cursor: pointer;
+}
+.btn:hover { background: var(--accent-hover); color: #fff; }
+.btn[disabled] { opacity: 0.6; cursor: default; }
+.btn:focus-visible, .link:focus-visible, input:focus-visible {
+  outline: 3px solid var(--amber); outline-offset: 2px;
+}
+
+.link {
+  min-height: 44px; padding: 10px 4px; background: none; border: 0;
+  color: var(--accent); font: inherit; font-weight: 600; text-decoration: underline; cursor: pointer;
+  display: inline-flex; align-items: center;
+}
+
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.row.actions { margin-top: 16px; }
+
+label { font-weight: 600; display: block; margin-bottom: 6px; }
+
+input.code {
+  width: 100%; min-height: 60px; padding: 10px 16px;
+  border: 1px solid var(--field-line); border-radius: 8px;
+  background: #fff; color: var(--ink);
+  font-family: var(--font-mono); font-weight: 500; font-size: 28px; letter-spacing: 0.12em;
+}
+
+.note { border-radius: 10px; padding: 14px 18px; font-weight: 600; }
+.note.ok { background: var(--ok-bg); color: var(--ok-ink); }
+.note.warn { background: var(--warn-bg); color: var(--warn-ink); }
+
+.foot { border-top: 1px solid var(--line); padding-top: 20px; }
+.foot b { display: block; }
+
+[hidden] { display: none !important; }
+
+/* --- схема «куда смотреть»: условный экран Telegram --- */
+
+.shot {
+  border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #fff;
+  max-width: 360px;
+}
+.shot-bar {
+  background: var(--navy); color: var(--on-navy);
+  padding: 10px 14px; font-size: 14px; font-weight: 600;
+}
+.shot-body { padding: 14px; display: flex; flex-direction: column; gap: 8px; background: var(--ground); }
+.bubble {
+  align-self: flex-start; max-width: 88%;
+  background: #fff; border: 1px solid var(--line); border-radius: 12px 12px 12px 4px;
+  padding: 8px 12px; font-size: 14px;
+}
+.bubble .hl {
+  display: inline-block; padding: 1px 6px; border-radius: 6px;
+  border: 2px solid var(--amber); background: #fff7e2;
+  font-family: var(--font-mono); font-weight: 500; letter-spacing: 0.06em;
+}
+.shot-caption { padding: 10px 14px; font-size: 14px; color: var(--muted); border-top: 1px solid var(--line); }
+
+@media (max-width: 720px) {
+  .side { padding: 28px 24px; gap: 16px; }
+  .side .motto strong { font-size: 26px; }
+  main { padding: 28px 24px; }
+  h1 { font-size: 28px; }
+}

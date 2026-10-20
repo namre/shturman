@@ -1,0 +1,612 @@
+"""Исполнитель заданий сервиса переписки. Только стандартная библиотека.
+
+У сервиса нет ни модели, ни бота: то и другое есть только у Hermes. Сервис ставит задания
+в очередь, а этот исполнитель в процессе шлюза забирает их, выполняет и сообщает итог.
+Видов заданий шесть (договор — `service/src/shturman/bridge.py`), и зачем они нужны сервису,
+исполнитель не знает:
+
+  llm.structured, llm.text          — обращение к модели Hermes;
+  notify.owner, notify.edit         — сообщение владельцу в управляющий чат и его правка;
+  business.send                     — отправка от имени владельца: исполнитель плагина её не выполняет
+                                      и закрывает задание отказом «not_sent» (Д-45) — отправляет только
+                                      свой бот сервиса;
+  hermes.cron                       — расписание утренней сводки и обзора недели (Р-95, `summaries.py`):
+                                      своя дорожка «hermes», реже опрашивается; функцию даёт мост.
+
+Две независимые дорожки, чтобы долгий ответ модели не задерживал нажатие владельца «Отправить»:
+дорожка бота берёт по одному заданию и выполняет их по порядку, дорожка модели — до двух сразу.
+
+Главное правило — от имени владельца этот исполнитель не отправляет ничего (Д-45). Задание
+`business.send`, если оно всё же пришло, закрывается отказом с «not_sent:» и пустым повтором
+(`retry_in`), запроса к Telegram нет.
+
+В журнал пишется только вид задания и вид ошибки (имя класса исключения либо короткий код —
+`error_label`): тексты сообщений, содержимое заданий, ответы модели и токен туда не попадают.
+Одинаковые сбои сворачиваются: не больше одной строки в минуту на пару «вид задания, вид ошибки»,
+с числом свёрнутых.
+
+Обращение к модели идёт внутри области секретов профиля Hermes (`llm_scope`, её даёт мост —
+`shturman_bridge.hermes_llm_scope`). Исполнитель работает в фоновой задаче шлюза, вне хода
+ассистента; когда шлюз обслуживает несколько профилей, Hermes читает ключи только внутри такой
+области, а без неё отказывает (`UnscopedSecretError`) — решение Р-83.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import json
+import logging
+import re
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Sequence
+
+from .bridge_stats import Stats
+from .service_client import ServiceError, ServiceUnavailable
+from .textlimits import TELEGRAM_TEXT_LIMIT, cut_utf16, matches_schema
+
+logger = logging.getLogger("shturman.executor")
+
+LLM_STRUCTURED = "llm.structured"
+LLM_TEXT = "llm.text"
+NOTIFY_OWNER = "notify.owner"
+NOTIFY_EDIT = "notify.edit"
+BUSINESS_SEND = "business.send"
+HERMES_CRON = "hermes.cron"
+LLM_KINDS = (LLM_STRUCTURED, LLM_TEXT)
+BOT_KINDS = (NOTIFY_OWNER, NOTIFY_EDIT, BUSINESS_SEND)
+HERMES_KINDS = (HERMES_CRON,)
+HERMES_IDLE = 20.0                 # секунд между опросами дорожки «hermes»: расписание не торопится
+
+NOT_SENT_PREFIX = "not_sent:"
+BUSINESS_SEND_REFUSED = ("отправку от имени владельца ведёт только бот согласований сервиса; "
+                         "через бота в Hermes ответы не отправляются")
+CALLBACK_PREFIX = "sh:"           # чужие префиксы кнопок (ядра Hermes, плагина бизнес-режима) не пропускаются
+CALLBACK_DATA_LIMIT = 64          # байт — предел Telegram
+TEXT_LIMIT = TELEGRAM_TEXT_LIMIT  # единиц UTF-16 в одном сообщении Telegram
+MAX_BUTTON_ROWS = 20
+MAX_BUTTONS_IN_ROW = 8
+KEYBOARDS_REMEMBERED = 500
+
+# Вспомогательные задачи модели: владелец может закрепить за ними дешёвую модель в настройках Hermes.
+AUX_TASKS: dict[str, tuple[str, str]] = {
+    "shturman_extract": (
+        "Штурман: разбор переписки",
+        "Извлечение обязательств и сроков из переписки и проверка сообщений наблюдателем. "
+        "Фоновая работа: подойдёт недорогая модель.",
+    ),
+    "shturman_reply": (
+        "Штурман: текст ответа",
+        "Черновики ответов и автоответ доверенным собеседникам.",
+    ),
+    "shturman_watch": (
+        "Штурман: наблюдатель групп",
+        "Проверка сообщений из групп и каналов по правилам наблюдателя: относится ли сообщение "
+        "к тому, за чем владелец просил следить. Короткие частые запросы: подойдёт недорогая модель.",
+    ),
+    "shturman_media": (
+        "Штурман: фото и документы",
+        "Краткий разбор фото, сканов и документов из переписки. Нужна модель, которая понимает "
+        "изображения; не задана — используется основная модель.",
+    ),
+}
+DEFAULT_TASK = {LLM_STRUCTURED: "shturman_extract", LLM_TEXT: "shturman_reply"}
+DEFAULT_MAX_TOKENS = {LLM_STRUCTURED: 2000, LLM_TEXT: 1500}
+MAX_TOKENS_CAP = 8000
+
+IDLE_SECONDS = 2.5
+MAX_BACKOFF = 60.0
+REPORT_DELAYS = (0, 1, 2, 4, 8, 15)     # секунд перед попытками сообщить итог
+
+ServiceCall = Callable[..., Awaitable[dict[str, Any]]]
+Buttons = list[list[tuple[str, str]]]
+
+
+class NotSent(Exception):
+    """Telegram точно не принял сообщение: он ответил отказом либо запрос не покидал сервер."""
+
+    def __init__(self, reason: str, *, retry_after: int | None = None, replied: bool = True) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+        self.replied = replied          # False — Telegram не отвечал: запрос до него не дошёл
+
+
+MAX_IMAGES = 6
+MAX_IMAGE_BYTES = 2_500_000         # как bridge.MAX_IMAGE_BYTES в сервисе
+
+
+def _images(payload: Mapping[str, Any]) -> list[bytes]:
+    """Картинки задания (поле images: [{mime, data base64}]) — байтами для блоков Hermes."""
+    raw = payload.get("images")
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > MAX_IMAGES:
+        raise _Fail("поле images задано неверно", None)
+    out: list[bytes] = []
+    for item in raw:
+        data = item.get("data") if isinstance(item, dict) else None
+        if not isinstance(data, str) or item.get("mime") not in ("image/jpeg", "image/png"):
+            raise _Fail("поле images задано неверно", None)
+        try:
+            out.append(base64.b64decode(data, validate=True))
+        except ValueError:
+            raise _Fail("поле images задано неверно", None) from None
+    if sum(len(b) for b in out) > MAX_IMAGE_BYTES:
+        raise _Fail("поле images задано неверно", None)
+    return out
+
+
+class _Fail(Exception):
+    def __init__(self, error: str, retry_in: int | None) -> None:
+        super().__init__(error)
+        self.error, self.retry_in = error, retry_in
+
+
+@dataclass(frozen=True)
+class Outcome:
+    result: dict[str, Any] | None = None
+    error: str = ""
+    retry_in: int | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.result is not None
+
+    @property
+    def label(self) -> str:
+        """Вид ошибки для журнала (`error_label`); у удачного итога — пусто."""
+        return "" if self.ok else error_label(self.error)
+
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+# Постоянные строки ошибок этого исполнителя (их пишет код, а не переписка) и их коды для журнала.
+_KNOWN_ERRORS = (
+    ("у плагина нет доступа к модели", "no_model_access"),
+    ("в задании нет поля", "bad_payload"),
+    ("поле ", "bad_payload"),
+    ("кнопки заданы неверно", "bad_payload"),
+    ("данные кнопки", "bad_payload"),
+    ("владелец не привязан", "owner_unbound"),
+    ("бот не подключён", "bot_not_ready"),
+    ("keep_buttons_unavailable", "keep_buttons_unavailable"),
+    ("исполнитель не знает", "unknown_kind"),
+)
+
+
+def error_label(error: str) -> str:
+    """Вид ошибки для журнала: имя класса исключения либо короткий код — без свободного текста.
+
+    Строка ошибки задания бывает трёх родов: имя класса (`_brief`), постоянная фраза этого
+    исполнителя и фраза с вставкой (ответ Telegram, причина «не отправлено»). Вставку в журнал
+    не берём: в журнал Hermes попадает только то, что задано здесь, в коде."""
+    e = (error or "").strip()
+    if _IDENT.fullmatch(e):
+        return e
+    if e.startswith(NOT_SENT_PREFIX):
+        return "not_sent"
+    if e.startswith("исход неизвестен"):
+        tail = e.partition(":")[2].strip()
+        return f"unknown_outcome:{tail}" if _IDENT.fullmatch(tail) else "unknown_outcome"
+    if e.startswith("Telegram отказал"):
+        reason = e.partition(":")[2].strip()
+        head = reason.partition(":")[0].strip()
+        if _IDENT.fullmatch(head) and ":" in reason:
+            return f"Telegram:{head}"
+        if "подождать" in reason:
+            return "Telegram:RetryAfter"
+        if "нет связи" in reason:
+            return "Telegram:no_connection"
+        return "Telegram:other"
+    for prefix, code in _KNOWN_ERRORS:
+        if e.startswith(prefix):
+            return code
+    return "other"
+
+
+class FailureLog:
+    """Строка журнала о несделанном задании: не чаще раза в `every` секунд на пару
+    «вид задания, вид ошибки». Свёрнутые сбои считаются и называются числом в следующей строке."""
+
+    MAX_KEYS = 200
+
+    def __init__(self, log: logging.Logger, *, every: float = 60.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._log = log
+        self._every = every
+        self._clock = clock
+        self._seen: dict[tuple[str, str], tuple[float, int]] = {}
+
+    def failed(self, kind: str, label: str) -> None:
+        key, now = (str(kind)[:40], label or "other"), self._clock()
+        last = self._seen.get(key)
+        if last is not None and now - last[0] < self._every:
+            self._seen[key] = (last[0], last[1] + 1)
+            return
+        if last is not None and last[1]:
+            self._log.warning("shturman: задание вида %s не выполнено: %s (ещё %d таких за %d с)",
+                              key[0], key[1], last[1], int(now - last[0]))
+        else:
+            self._log.warning("shturman: задание вида %s не выполнено: %s", key[0], key[1])
+        if last is None and len(self._seen) >= self.MAX_KEYS:
+            self._seen.pop(next(iter(self._seen)))
+        self._seen[key] = (now, 0)
+
+
+@contextlib.asynccontextmanager
+async def _no_scope():
+    yield
+
+
+def parse_buttons(raw: Any) -> Buttons | None:
+    """Кнопки задания как строки пар (подпись, данные). Данные передаются без изменений.
+
+    Принимаются только кнопки сервиса (данные начинаются с «sh:»): иначе сервис мог бы показать
+    владельцу кнопку, которую разберёт ядро Hermes — например, одобрение команды.
+    """
+    if raw is None or raw == []:
+        return None
+    if not isinstance(raw, list) or len(raw) > MAX_BUTTON_ROWS:
+        raise ValueError("кнопки заданы неверно")
+    rows: Buttons = []
+    for row in raw:
+        if not isinstance(row, list) or not row or len(row) > MAX_BUTTONS_IN_ROW:
+            raise ValueError("кнопки заданы неверно")
+        out: list[tuple[str, str]] = []
+        for item in row:
+            text = item.get("text") if isinstance(item, dict) else None
+            data = item.get("data") if isinstance(item, dict) else None
+            if not isinstance(text, str) or not text.strip() or not isinstance(data, str):
+                raise ValueError("кнопки заданы неверно")
+            if not data.startswith(CALLBACK_PREFIX) or len(data.encode("utf-8")) > CALLBACK_DATA_LIMIT:
+                raise ValueError("данные кнопки не принадлежат сервису или длиннее 64 байт")
+            out.append((text, data))
+        rows.append(out)
+    return rows
+
+
+def _text(payload: Mapping[str, Any], key: str = "text") -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise _Fail(f"в задании нет поля {key}", None)
+    return value
+
+
+def _int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _brief(exc: BaseException) -> str:
+    """Только вид ошибки. Её текст сюда не попадает: в нём бывают куски ответа модели и переписки,
+    а строка уходит в сервис и хранится в очереди заданий (`jobs.error`)."""
+    return type(exc).__name__
+
+
+class Executor:
+    """Забирает задания у сервиса и выполняет их.
+
+    call   — обращение к сервису: `await call(method, path, json_body)`; бросает `ServiceError`;
+    llm    — `ctx.llm` Hermes (или None, пока его нет);
+    bot    — отправка в Telegram владельцу: `ready()`, `send_owner`, `edit_owner`;
+    owner  — функция, возвращающая привязанного владельца ({user_id, chat_id}) или {};
+    llm_scope — функция, возвращающая асинхронный контекст, внутри которого вызывается модель
+             (область секретов профиля Hermes); по умолчанию — пустой контекст.
+    """
+
+    def __init__(
+        self, call: ServiceCall, *, llm: Any, bot: Any, owner: Callable[[], Mapping[str, Any]],
+        stats: Stats | None = None, tasks: Sequence[str] = tuple(AUX_TASKS), worker: str = "shturman-plugin",
+        llm_slots: int = 2, idle: float = IDLE_SECONDS, llm_timeout: float = 90.0, bot_timeout: float = 30.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        llm_scope: Callable[[], AsyncContextManager[Any]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        cron: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    ) -> None:
+        self.call = call
+        self.llm = llm
+        self.bot = bot
+        self.owner = owner
+        self.stats = stats or Stats()
+        self.tasks = tuple(tasks)
+        self.worker = worker
+        self.llm_slots = max(1, min(int(llm_slots), 2))
+        self.idle = idle
+        self.llm_timeout = llm_timeout
+        self.bot_timeout = bot_timeout
+        self._sleep = sleep
+        self._llm_scope = llm_scope or _no_scope
+        self.cron = cron              # расписание сводок в Hermes (мост); None — дорожки «hermes» нет
+        self._failures = FailureLog(logger, clock=clock)
+        self._wake: dict[str, asyncio.Event] = {}
+        # Клавиатуры отправленных сообщений: Telegram снимает кнопки при правке текста,
+        # если их не передать заново, а спросить у него прежние нельзя.
+        self._keyboards: OrderedDict[int, Buttons] = OrderedDict()
+
+    # --- дорожки ---
+
+    def kinds(self, lane: str) -> tuple[str, ...]:
+        if lane == "llm":
+            return LLM_KINDS if self.llm is not None else ()
+        if lane == "hermes":
+            return HERMES_KINDS if self.cron is not None else ()
+        try:
+            return BOT_KINDS if self.bot is not None and self.bot.ready() else ()
+        except Exception:
+            return ()
+
+    def wake(self, lane: str = "bot") -> None:
+        """Просит дорожку проверить очередь сейчас, а не через паузу (после нажатия кнопки)."""
+        event = self._wake.get(lane)
+        if event is not None:
+            event.set()
+
+    async def run_lane(self, lane: str) -> None:
+        """Бесконечный цикл дорожки. Останавливается отменой задачи."""
+        self._wake[lane] = asyncio.Event()
+        failures = 0
+        while True:
+            handled = 0
+            try:
+                handled = await self.poll(lane)
+                failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # сервис недоступен или ответил неожиданно — пауза с нарастанием
+                failures += 1
+                if failures == 1 or failures % 20 == 0:
+                    logger.warning("shturman: очередь заданий недоступна (%s)", type(exc).__name__)
+            if handled:
+                continue          # была работа — сразу проверяем очередь снова
+            idle = max(self.idle, HERMES_IDLE) if lane == "hermes" else self.idle
+            pause = idle if not failures else min(MAX_BACKOFF, idle * 2 ** min(failures, 6))
+            await self._pause(lane, pause)
+
+    async def _pause(self, lane: str, seconds: float) -> None:
+        event = self._wake[lane]
+        try:
+            await asyncio.wait_for(event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+        event.clear()
+
+    async def poll(self, lane: str) -> int:
+        """Один заход: забрать задания дорожки и выполнить. Возвращает число забранных."""
+        kinds = self.kinds(lane)
+        if not kinds:
+            return 0
+        limit = self.llm_slots if lane == "llm" else 1
+        try:
+            out = await self.call("POST", "/api/jobs/claim",
+                                  {"kinds": list(kinds), "limit": limit, "worker": self.worker})
+        except ServiceUnavailable:
+            self.stats.seen(False)
+            raise
+        self.stats.seen(True)
+        jobs = [j for j in (out.get("jobs") or []) if isinstance(j, dict)]
+        if lane == "llm":
+            await asyncio.gather(*(self._handle_safely(job) for job in jobs))
+        else:
+            for job in jobs:
+                await self._handle_safely(job)
+        return len(jobs)
+
+    async def _handle_safely(self, job: Mapping[str, Any]) -> None:
+        try:
+            await self.handle(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — одно задание не должно ронять дорожку
+            logger.warning("shturman: сбой при обработке задания (%s)", type(exc).__name__)
+
+    async def handle(self, job: Mapping[str, Any]) -> None:
+        job_id, kind = _int(job.get("id")), job.get("kind")
+        if job_id is None or not isinstance(kind, str):
+            return
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        attempt = _int(job.get("attempt")) or 1
+        outcome = await self.execute(kind, payload, attempt)
+        self.stats.job_finished(outcome.ok)
+        if not outcome.ok:
+            if kind == BUSINESS_SEND and not outcome.error.startswith(NOT_SENT_PREFIX):
+                self.stats.bump("sends_unknown")
+            self._failures.failed(kind, outcome.label)
+        await self.report(job_id, outcome)
+
+    async def report(self, job_id: int, outcome: Outcome) -> bool:
+        """Сообщает итог сервису. Выполнение задания при этом не повторяется никогда."""
+        if outcome.ok:
+            path, body = f"/api/jobs/{job_id}/complete", {"result": outcome.result}
+        else:
+            # retry_in передаётся всегда: без поля сервис назначил бы повтор сам.
+            path, body = f"/api/jobs/{job_id}/fail", {"error": outcome.error[:1900], "retry_in": outcome.retry_in}
+        for delay in REPORT_DELAYS:
+            if delay:
+                await self._sleep(delay)
+            try:
+                await self.call("POST", path, body)
+                self.stats.seen(True)
+                return True
+            except ServiceUnavailable:
+                self.stats.seen(False)
+            except ServiceError:
+                break             # сервис задание уже закрыл (например, вышла аренда)
+        self.stats.bump("reports_lost")
+        logger.warning("shturman: итог задания не удалось сообщить сервису")
+        return False
+
+    # --- выполнение ---
+
+    async def execute(self, kind: str, payload: Mapping[str, Any], attempt: int = 1) -> Outcome:
+        """Выполняет одно задание. Исключений наружу не выпускает (кроме отмены)."""
+        if kind == BUSINESS_SEND:
+            return await self._business_send(payload)
+        handler = {LLM_STRUCTURED: self._llm_structured, LLM_TEXT: self._llm_text,
+                   NOTIFY_OWNER: self._notify_owner, NOTIFY_EDIT: self._notify_edit,
+                   HERMES_CRON: self._hermes_cron}.get(kind)
+        if handler is None:
+            return Outcome(error="исполнитель не знает такого вида заданий", retry_in=None)
+        try:
+            return Outcome(result=await handler(payload, attempt))
+        except asyncio.CancelledError:
+            raise
+        except _Fail as exc:
+            return Outcome(error=exc.error, retry_in=exc.retry_in)
+        except Exception as exc:  # noqa: BLE001 — любая ошибка становится итогом задания
+            return Outcome(error=_brief(exc), retry_in=self._backoff(attempt))
+
+    @staticmethod
+    def _backoff(attempt: int) -> int:
+        return int(min(600, 30 * 2 ** max(0, attempt - 1)))
+
+    # --- расписание сводок (Р-95) ---
+
+    async def _hermes_cron(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
+        if self.cron is None:
+            raise _Fail("в этом процессе Hermes расписание недоступно", None)
+        out = await self.cron(payload)
+        if not isinstance(out, dict):
+            raise _Fail("расписание: неожиданный ответ", None)
+        return out
+
+    # --- модель ---
+
+    def _llm_args(self, kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if self.llm is None:
+            raise _Fail("у плагина нет доступа к модели Hermes", 300)
+        task = payload.get("task")
+        if task not in self.tasks:
+            # Сервис не может направить запрос в чужую или встроенную задачу Hermes.
+            task = DEFAULT_TASK[kind]
+        tokens = _int(payload.get("max_tokens")) or DEFAULT_MAX_TOKENS[kind]
+        return {"task": task, "max_tokens": max(1, min(tokens, MAX_TOKENS_CAP)),
+                "timeout": self.llm_timeout, "purpose": f"shturman.{kind}"}
+
+    async def _llm_structured(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
+        instructions, text = _text(payload, "instructions"), _text(payload, "input")
+        schema = payload.get("json_schema") if isinstance(payload.get("json_schema"), dict) else None
+        name = payload.get("schema_name") if isinstance(payload.get("schema_name"), str) else None
+        args = self._llm_args(LLM_STRUCTURED, payload)
+        # Схема уходит модели текстом в указаниях, а не параметром `json_schema`. С параметром Hermes
+        # сам сверяет ответ со схемой и при расхождении бросает ValueError, не отдавая ни текста,
+        # ни разобранного JSON (agent/plugin_llm.py:316-334, 536): ответ, который сервис принял бы
+        # своей более терпимой проверкой, пропадал бы после трёх попыток. В режиме `json_mode`
+        # Hermes ничего не бросает: разобралось — отдаёт `parsed`, нет — `parsed=None` и текст.
+        # Один вызов модели в любом случае; запись схемы та же, какой её вставляет сам Hermes
+        # (agent/plugin_llm.py:293-298). Плата — провайдеру уходит подсказка «JSON-объект»
+        # вместо нестрогой схемы.
+        if schema is not None:
+            instructions = (f"{instructions.rstrip()}\n\nJSON schema:\n"
+                            f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}")
+        # Hermes ждёт входные данные списком блоков, а не строкой (agent/plugin_llm.py:239-262):
+        # текст и картинки (фото, страницы скана — разбор вложений сервиса). Других видов блоков нет.
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        blocks += [{"type": "image", "data": data, "mime_type": "image/jpeg", "file_name": f"image-{n + 1}.jpg"}
+                   for n, data in enumerate(_images(payload))]
+        async with self._llm_scope():
+            result = await asyncio.wait_for(
+                self.llm.acomplete_structured(
+                    instructions=instructions, input=blocks,
+                    json_mode=True, schema_name=name, **args),
+                timeout=self.llm_timeout + 15)
+        parsed = getattr(result, "parsed", None)
+        # Расхождение со схемой и неразборчивый JSON — не сбой задания: сервис проверяет ответ сам.
+        valid = parsed is not None and (schema is None or matches_schema(parsed, schema))
+        return {"parsed": parsed, "text": str(getattr(result, "text", "") or ""),
+                "model": str(getattr(result, "model", "") or ""), "schema_valid": valid}
+
+    async def _llm_text(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
+        raw = payload.get("messages")
+        if not isinstance(raw, list) or not raw:
+            raise _Fail("в задании нет поля messages", None)
+        messages = []
+        for item in raw:
+            role = item.get("role") if isinstance(item, dict) else None
+            content = item.get("content") if isinstance(item, dict) else None
+            if role not in ("system", "user", "assistant") or not isinstance(content, str):
+                raise _Fail("поле messages задано неверно", None)
+            messages.append({"role": role, "content": content})
+        args = self._llm_args(LLM_TEXT, payload)
+        async with self._llm_scope():
+            result = await asyncio.wait_for(self.llm.acomplete(messages, **args), timeout=self.llm_timeout + 15)
+        return {"text": str(getattr(result, "text", "") or ""), "model": str(getattr(result, "model", "") or "")}
+
+    # --- сообщения владельцу ---
+
+    def _owner_chat(self) -> int:
+        try:
+            chat_id = _int((self.owner() or {}).get("chat_id"))
+        except Exception:
+            chat_id = None
+        if chat_id is None:
+            raise _Fail("владелец не привязан к боту", 300)     # может привязаться позже
+        return chat_id
+
+    def _notify_retry(self, exc: NotSent, attempt: int) -> int | None:
+        """Когда повторить сообщение владельцу после отказа. Ответ Telegram с кодом 4xx («текст
+        слишком длинный», «бот заблокирован») окончателен: повтор дал бы тот же отказ. Повторяем,
+        только если Telegram просит подождать либо запрос до него не дошёл."""
+        if exc.retry_after:
+            return int(exc.retry_after) + 1
+        return None if exc.replied else self._backoff(attempt)
+
+    def _remember(self, message_id: int, buttons: Buttons) -> None:
+        self._keyboards[message_id] = buttons
+        self._keyboards.move_to_end(message_id)
+        while len(self._keyboards) > KEYBOARDS_REMEMBERED:
+            self._keyboards.popitem(last=False)
+
+    async def _notify_owner(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
+        text = cut_utf16(_text(payload), TEXT_LIMIT)
+        try:
+            buttons = parse_buttons(payload.get("buttons"))
+        except ValueError as exc:
+            raise _Fail(str(exc), None) from None
+        chat_id = self._owner_chat()
+        if not self.bot.ready():
+            raise _Fail("бот не подключён", 30)
+        try:
+            message_id = await asyncio.wait_for(
+                self.bot.send_owner(chat_id, text, buttons, bool(payload.get("silent"))),
+                timeout=self.bot_timeout)
+        except NotSent as exc:
+            raise _Fail(f"Telegram отказал: {exc.reason}", self._notify_retry(exc, attempt)) from None
+        if buttons and _int(message_id) is not None:
+            self._remember(message_id, buttons)
+        return {"message_id": message_id}
+
+    async def _notify_edit(self, payload: Mapping[str, Any], attempt: int) -> dict[str, Any]:
+        message_id = _int(payload.get("message_id"))
+        if message_id is None:
+            raise _Fail("в задании нет поля message_id", None)
+        text = cut_utf16(_text(payload), TEXT_LIMIT)
+        buttons = None
+        if payload.get("remove_buttons") is False:
+            buttons = self._keyboards.get(message_id)
+            if buttons is None:
+                # Не делаем молча другое: без клавиатуры в запросе Telegram снял бы кнопки.
+                raise _Fail("keep_buttons_unavailable: кнопки этого сообщения исполнителю неизвестны", None)
+        chat_id = self._owner_chat()
+        if not self.bot.ready():
+            raise _Fail("бот не подключён", 30)
+        try:
+            await asyncio.wait_for(self.bot.edit_owner(chat_id, message_id, text, buttons),
+                                   timeout=self.bot_timeout)
+        except NotSent as exc:
+            raise _Fail(f"Telegram отказал: {exc.reason}", self._notify_retry(exc, attempt)) from None
+        if buttons is None:
+            self._keyboards.pop(message_id, None)
+        return {}
+
+    # --- отправка от имени владельца ---
+
+    async def _business_send(self, payload: Mapping[str, Any]) -> Outcome:
+        """Отправку от имени владельца исполнитель плагина не выполняет никогда (Д-45).
+
+        Отправляет только свой бот сервиса: он перед обращением к Telegram проверяет выключатель
+        отправки, «Остановить всё» и что подключение принадлежит ему. Здесь этих проверок нет, поэтому
+        задание — например, оставшееся в очереди прежней версии — закрывается отказом «not_sent»:
+        сообщение точно не ушло, и сервис отметит черновик «не отправлен». В Telegram запроса нет."""
+        return Outcome(error=f"{NOT_SENT_PREFIX} {BUSINESS_SEND_REFUSED}", retry_in=None)

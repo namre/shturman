@@ -1,0 +1,731 @@
+name: ci
+on:
+  push:
+    branches: [main]
+    # Выпуски (docs/releases.md): на теге дополнительно проверяется, что выпуск собран верно.
+    tags: ['v*']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reply-regressions:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg16-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: shturman_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SHTURMAN_TEST_DSN: postgresql://postgres@127.0.0.1:5432/shturman_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e './service[dev]'
+      - name: reply and ingestion regressions
+        run: >-
+          pytest -q
+          tests/replies/test_owner_resume_age.py
+          tests/replies/test_source_failures.py
+          tests/test_direct_address_quotes.py
+          tests/test_telethon_group_vertical.py
+          tests/outbox/test_outbox_drafts.py::test_late_business_confirmation_corrects_only_unknown_task_and_its_one_metric
+          tests/outbox/test_outbox_autoreply.py::test_terminal_telemetry_records_once_and_warns_only_on_missing_model_answer
+          tests/outbox/test_outbox_autoreply.py::test_trusted_list_takes_numeric_ids_only_and_owner_is_told
+          tests/outbox/test_outbox_drafts.py::test_policy_route_clamps_values_and_tells_owner
+          tests/guard/test_guard_visibility.py::test_autoreply_ignores_a_hidden_message_and_keeps_it_out_of_the_prompt
+          tests/guard/test_guard_visibility.py::test_reply_prepared_for_a_message_that_got_hidden_is_not_sent
+          tests/test_archive.py::test_service_peers_with_codes_and_tokens_are_invisible
+          tests/test_core.py
+          tests/tg/test_tg_routes.py::test_owner_becoming_known_stops_assistant_session_of_the_same_account
+        working-directory: service
+
+  service:
+    needs: reply-regressions
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg16-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: shturman_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SHTURMAN_TEST_DSN: postgresql://postgres@127.0.0.1:5432/shturman_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e './service[dev]'
+      - name: targeted security mutations
+        run: python tests/security_mutations.py --output-dir "$RUNNER_TEMP/security-mutations" --include-db
+        working-directory: service
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-mutations
+          path: ${{ runner.temp }}/security-mutations
+      - run: pytest -q
+        if: ${{ !cancelled() }}
+        working-directory: service
+
+  plugin:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      # Тест обработчиков Telegram пропускается сам: библиотека приходит только вместе с Hermes.
+      - run: pytest -q plugins/shturman/tests
+      - run: node --check plugins/shturman/dashboard/dist/index.js && node --check plugins/shturman/public/app.js
+      # Скрипты страницы настройки и Mini App бота согласований (service/src/shturman/setup_page/static).
+      - run: for f in setup.js qr.js app.js; do node --check "service/src/shturman/setup_page/static/$f" || exit 1; done
+      - run: python -m json.tool releases.json > /dev/null
+      - run: python -m json.tool plugins/shturman/dashboard/manifest.json > /dev/null && python -m json.tool plugins/shturman/personas.json > /dev/null
+
+  # Браузерная проверка Mini App бота согласований (service/tests/e2e/README.md): стенд — настоящий сервис с
+  # подставными Telegram и Bot API, в сеть не ходит; сценарий — Playwright с Chromium, весь miniapp.mjs (около
+  # 3 мин). До Д-35 шла только вручную, и раздел обновлений (Р-101) упал на стенде незамеченным.
+  miniapp-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg16-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: shturman_e2e
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SHTURMAN_TEST_DSN: postgresql://postgres@127.0.0.1:5432/shturman_e2e
+      E2E_PORT: "8775"
+      E2E_SETUP_ORIGIN: https://shturman.example.ru:8443
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install -e './service[dev]'
+      - name: Playwright и Chromium
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm install --no-save --no-audit --no-fund playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: стенд и сценарий miniapp.mjs
+        working-directory: service
+        run: |
+          export E2E_OUT="$RUNNER_TEMP/miniapp-e2e" E2E_PLAYWRIGHT="$RUNNER_TEMP/pw/node_modules/playwright"
+          mkdir -p "$E2E_OUT"
+          PYTHONPATH=src python tests/e2e/miniapp_stand.py > "$E2E_OUT/stand.log" 2>&1 &
+          for i in $(seq 60); do grep -q '"ready": true' "$E2E_OUT/stand.log" && break; sleep 1; done
+          grep -q '"ready": true' "$E2E_OUT/stand.log" || { cat "$E2E_OUT/stand.log"; exit 1; }
+          node tests/e2e/miniapp.mjs 2>&1 | tee "$E2E_OUT/miniapp.log"
+          test "${PIPESTATUS[0]}" -eq 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: miniapp-e2e
+          path: ${{ runner.temp }}/miniapp-e2e
+
+  # Посредник (relay/, docs/relay.md): служба только на стандартной библиотеке Python 3.12, её тесты;
+  # установщик — справка, суммы скачанных выпусков frp и Caddy, файлы настройки для зоны, которые
+  # проверяют сами frps, frpc и Caddy; образ frpc экземпляра.
+  relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: pytest -q relay/tests
+      # Бот-менеджер (0.4.0, docs/approvals-bot.md): команды держателя на месте; справка не трогает базу.
+      - run: python3 relay/relayd.py --help | grep -q 'manager-link,manager-token,manager-status'
+      - run: shellcheck -S warning relay/install.sh
+      - name: установщик — справка, суммы, настройки
+        run: |
+          bash relay/install.sh --help | grep -q 'Установка и обновление посредника'
+          code=0; bash relay/install.sh --no-such-key > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          d="$RUNNER_TEMP/dl"; c="$RUNNER_TEMP/conf"; k="$RUNNER_TEMP/cred"
+          bash relay/install.sh --download-only "$d"
+          bash relay/install.sh --render "$c"
+          if grep -rq '@DOMAIN@' "$c"; then echo "зона не подставлена"; exit 1; fi
+          grep -qx 'subDomainHost = "sh.namre.app"' "$c/frps.toml"
+          grep -q -- '--domain sh.namre.app' "$c/systemd/shturman-relayd.service"
+          # Комментарии файлов frp — тоже шаблон: двойных фигурных скобок в них быть не должно.
+          if grep -En '^#.*\{\{' "$c/frps.toml" "$c/frpc.toml" frpc/frpc.toml; then echo "скобки шаблона в комментарии"; exit 1; fi
+          mkdir -p "$k"; bash relay/install.sh --make-cert "$k/frps.crt" "$k/frps.key"
+          test "$(stat -c '%a' "$k/frps.key")" = "600"
+          openssl x509 -in "$k/frps.crt" -noout -ext subjectAltName | grep -q 'DNS:relay.sh.namre.app'
+          FRP_AUTH_TOKEN=ci CREDENTIALS_DIRECTORY="$k" "$d/frps" verify -c "$c/frps.toml"
+          FRP_AUTH_TOKEN=ci FRPC_OPERATOR_KEY=ci "$d/frpc" verify -c "$c/frpc.toml"
+          "$d/caddy" validate --config "$c/Caddyfile" --adapter caddyfile
+          # Подменённая сумма — ничего не скачано в итоговый каталог, код ошибки.
+          sed 's/^FRP_SHA256_amd64=.*/FRP_SHA256_amd64=0000000000000000000000000000000000000000000000000000000000000000/' relay/install.sh > "$RUNNER_TEMP/bad.sh"
+          if bash "$RUNNER_TEMP/bad.sh" --download-only "$RUNNER_TEMP/dl-bad" > /dev/null 2>&1; then echo "неверная сумма должна останавливать"; exit 1; fi
+          test ! -e "$RUNNER_TEMP/dl-bad/frps"
+      - name: образ frpc экземпляра
+        run: |
+          docker build -t shturman-frpc:ci frpc
+          test "$(docker run --rm shturman-frpc:ci -v)" = "0.71.0"
+          docker run --rm -e SHTURMAN_RELAY_SERVER=relay.sh.namre.app -e SHTURMAN_RELAY_PORT=7000 -e SHTURMAN_RELAY_NAME=ivan \
+            -e SHTURMAN_RELAY_KEY=ci -e SHTURMAN_RELAY_TOKEN=ci -e SHTURMAN_RELAY_ADMIN_PASSWORD=ci \
+            shturman-frpc:ci verify -c /etc/frpc/frpc.toml
+          # Подменённая сумма — образ не собирается.
+          if docker build --build-arg FRP_SHA256_AMD64=0000000000000000000000000000000000000000000000000000000000000000 -t shturman-frpc:bad frpc; then
+            echo "образ с неверной суммой собираться не должен"; exit 1
+          fi
+
+  ops:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning ops/*.sh ops/tests/*.sh ops/tests/stub/docker
+      # Выпуск (тег vX.Y.Z или vX.Y.Z-rc.N): VERSION, CHANGELOG, UPGRADING и проверенный Hermes по умолчанию.
+      - name: выпуск — тег собран верно
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash ops/tests/release_check.sh "${GITHUB_REF#refs/tags/}"
+      # Список выпусков (Р-101): форма — та же, что принимает сервис; образы Hermes — те же, что в списке проверенных.
+      # Срок годности здесь не проверяется (на теге — release_check.sh; напоминание — еженедельная задача security).
+      - name: выпуски — список releases.json
+        run: python3 ops/release_manifest.py check releases.json --hermes-file config/hermes-versions.txt
+      # Образ Hermes по умолчанию — из списка проверенных версий (config/hermes-versions.txt, Р-97).
+      - name: ops — Hermes по умолчанию проверен
+        run: |
+          def="$(sed -n 's/.*hermes-agent:\${HERMES_VERSION:-\([^}]*\)}.*/\1/p' compose.yaml)"
+          test -n "$def"
+          bash -c '. ops/lib.sh; hermes_verified "$1"' _ "$def"
+          if bash -c '. ops/lib.sh; hermes_verified v1999.1.1'; then echo "непроверенная версия прошла"; exit 1; fi
+      # Замок от параллельного запуска (Д-9), разрешение владельца кнопкой в боте согласований — через сервис
+      # и без него, запасной путь — фраза человека только в терминале (Р-100), копия с описью,
+      # ротация и внешний каталог, восстановление каталогов, свежая копия перед миграциями в up.sh,
+      # выпуски и откат в update.sh — на подставном docker (ops/tests/stub/docker).
+      - name: ops — замок, копии, восстановление, обновление и откат (сценарии)
+        run: bash ops/tests/test_ops.sh
+      # Настоящая база: копия → порча → восстановление → сверка числа строк; переезд на пустое место.
+      - name: ops — восстановление на настоящей базе (Postgres 16 + pgvector)
+        run: bash ops/tests/e2e_restore.sh
+      # Оба режима установки. Без профилей (режим standalone) в стеке нет Hermes: его контейнер
+      # не создаётся и образ не скачивается; с профилем hermes — прежний состав.
+      - name: compose — режим без Hermes и режим с Hermes
+        run: |
+          docker compose config --quiet
+          test "$(docker compose config --services | sort | tr '\n' ' ')" = "postgres shturman "
+          if docker compose config --images | grep -q hermes-agent; then echo "образ Hermes в режиме без Hermes"; exit 1; fi
+          docker compose --profile hermes config --quiet
+          test "$(docker compose --profile hermes config --services | sort | tr '\n' ' ')" = "hermes postgres shturman "
+          docker compose --profile hermes --profile embeddings --profile guard config --quiet
+          test "$(docker compose --profile guard config --services | sort | tr '\n' ' ')" = "guard postgres shturman "
+          # Посредник (профиль relay): frpc в сети хоста, без опубликованных портов, сертификат
+          # посредника — только на чтение. Печатаются только эти свойства, не окружение.
+          test "$(docker compose --profile hermes --profile relay config --services | sort | tr '\n' ' ')" = "hermes postgres relay shturman "
+          rel() { docker compose --profile relay config --format json | python3 -c 'import json, sys; r = json.load(sys.stdin)["services"]["relay"]; print(r["network_mode"], len(r.get("ports") or []), r["read_only"], r["cap_drop"], [v["target"] + ":" + str(v.get("read_only")) for v in r["volumes"]])'; }
+          test "$(rel)" = "host 0 True ['ALL'] ['/etc/frpc/relay:True']"
+          # Р-76: у Hermes нет CAP_NET_RAW (в сети хоста с ним читается трафик сервера на 127.0.0.1),
+          # а каталог сокета сервиса для прокси подключён только сервису — у Hermes его нет, как и
+          # ничего из /run. Печатаются только эти свойства, не окружение.
+          iso() { docker compose --profile hermes config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; h, s = c["hermes"], c["shturman"]; print(h.get("cap_drop"), [v["source"] for v in h["volumes"] if v["source"].startswith(("/run", "/var/run", "/proc"))], [v["source"] + ":" + v["target"] for v in s["volumes"] if v["target"].startswith("/run")], s["environment"]["SHTURMAN_PROXY_SOCKET"])'; }
+          test "$(iso)" = "['NET_RAW'] [] ['/run/shturman-service:/run/shturman-service'] /run/shturman-service/proxy.sock"
+          # Р-104: токен оператора есть только у сервиса; в Hermes — токен плагина и токен архива, не он.
+          # Печатаются только имена переменных, не значения.
+          tok() { docker compose --profile hermes config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; print(sorted(k for k in c["hermes"]["environment"] if "TOKEN" in k or "API_KEY" in k), "SHTURMAN_OPERATOR_TOKEN" in c["shturman"]["environment"])'; }
+          test "$(tok)" = "['MCP_SHTURMAN_API_KEY', 'SHTURMAN_API_TOKEN'] True"
+          others() { docker compose --profile hermes --profile relay --profile embeddings --profile guard --profile asr config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; print(sorted(n for n, s in c.items() if n != "shturman" and any("shturman-service" in str(v) for v in s.get("volumes") or [])))'; }
+          test "$(others)" = "[]"
+          # Модель поиска по смыслу: без строк в .env — прежняя модель из прежнего каталога (экземпляру,
+          # развёрнутому раньше, править .env не нужно); со строками — выбранная. Сервис и контейнер
+          # получают одно и то же имя модели. Печатается только команда контейнера эмбеддингов.
+          emb() { docker compose --profile embeddings config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; print(" ".join(c["embeddings"]["command"]), c["shturman"]["environment"]["SHTURMAN_EMBEDDINGS_MODEL"])'; }
+          test "$(emb)" = "--model-id /data/model --served-model-name intfloat/multilingual-e5-small --max-batch-tokens 2048 intfloat/multilingual-e5-small"
+          export SHTURMAN_EMBEDDINGS_MODEL=deepvk/USER2-small SHTURMAN_EMBEDDINGS_MODEL_DIR=user2-small
+          test "$(emb)" = "--model-id /data/user2-small --served-model-name deepvk/USER2-small --max-batch-tokens 2048 deepvk/USER2-small"
+          # Страница настройки переписки: сервис получает СВОЙ адрес страницы (SHTURMAN_SETUP_URL) и,
+          # отдельно, адрес дашборда — только для сверки. Адрес дашборда адресом страницы не становится
+          # никогда. Порт сервиса по-прежнему опубликован только на локальном адресе сервера.
+          svc() { docker compose config --format json | python3 -c 'import json, sys; s = json.load(sys.stdin)["services"]["shturman"]; e = s["environment"]; print(e["SHTURMAN_SETUP_ORIGIN"] or "-", e["SHTURMAN_DASHBOARD_ORIGIN"] or "-", " ".join(p["host_ip"] + ":" + str(p["published"]) + ":" + str(p["target"]) for p in s["ports"]))'; }
+          test "$(svc)" = "- - 127.0.0.1:8765:8765"
+          export SHTURMAN_PUBLIC_URL=https://assistant.example.com
+          test "$(svc)" = "- https://assistant.example.com 127.0.0.1:8765:8765"
+          export SHTURMAN_SETUP_URL=https://assistant.example.com:8443
+          test "$(svc)" = "https://assistant.example.com:8443 https://assistant.example.com 127.0.0.1:8765:8765"
+          # Адрес API своей модели: пока строки в .env нет, контейнер переменную не получает вовсе.
+          # Иначе сервис считал бы адрес заданным на сервере, и страница настройки не давала бы его
+          # ввести. Со строкой — получает её значение.
+          llm() { docker compose config --format json | python3 -c 'import json, sys; e = json.load(sys.stdin)["services"]["shturman"]["environment"]; print(e.get("SHTURMAN_LLM_BASE_URL", "нет"))'; }
+          case "$(llm)" in None|нет) ;; *) echo "адрес модели не должен подставляться по умолчанию: $(llm)"; exit 1 ;; esac
+          export SHTURMAN_LLM_BASE_URL=https://openrouter.ai/api/v1
+          test "$(llm)" = "https://openrouter.ai/api/v1"
+          unset SHTURMAN_LLM_BASE_URL
+        env:
+          HERMES_UID: "1000"
+          HERMES_GID: "1000"
+          POSTGRES_PASSWORD: ci-only
+          SHTURMAN_API_TOKEN: ci-only-api-token-0123456789abcdef0123
+          SHTURMAN_MCP_TOKEN: ci-only-mcp-token-0123456789abcdef0123
+          SHTURMAN_OPERATOR_TOKEN: ci-only-operator-token-0123456789abcdef
+      # Режим записывается в .env и ведёт за собой профили Compose; экземпляр без строки режима
+      # остаётся режимом с Hermes и не теряет включённый поиск по смыслу.
+      - name: ops — режим установки и профили
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops .env.example "$tmp"/; cd "$tmp"
+          # Вариант установки выбирает владелец: на новой установке без --mode скрипт не выбирает сам.
+          grep -q 'режим установки: ещё не выбран' <<< "$(./ops/state.sh show)"
+          if ./ops/init-env.sh --auto; then echo "вариант установки не должен выбираться молча"; exit 1; fi
+          test ! -e .env
+          ./ops/init-env.sh --auto --mode standalone
+          grep -qx 'SHTURMAN_MODE=standalone' .env
+          grep -qx 'COMPOSE_PROFILES=' .env
+          ./ops/init-env.sh --auto
+          if ./ops/init-env.sh --auto --mode hermes; then echo "режим не должен меняться молча"; exit 1; fi
+          if ./ops/activation-link.sh; then echo "без Hermes ссылки входа нет"; exit 1; fi
+          ./ops/mode.sh set hermes
+          grep -qx 'SHTURMAN_MODE=hermes' .env
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          printf 'POSTGRES_PASSWORD=x\nCOMPOSE_PROFILES=embeddings\n' > .env
+          ./ops/init-env.sh --auto
+          grep -qx 'SHTURMAN_MODE=hermes' .env
+          grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
+          test "$(stat -c '%a' .env)" = "600"
+          # Неразборчивый адрес в .env ./ops/up.sh останавливает до любого обращения к Docker: сервис
+          # переписки с таким значением не запустился бы. Путь у адреса дашборда допустим, у адреса
+          # страницы настройки — нет; сам запуск стека здесь подменён отказом.
+          mkdir stub; printf '#!/bin/sh\necho "docker $*" >> "%s/docker-called"\nexit 1\n' "$tmp" > stub/docker; chmod +x stub/docker
+          for bad in 'SHTURMAN_PUBLIC_URL=assistant.example.com' 'SHTURMAN_PUBLIC_URL=https://user@assistant.example.com' \
+                     'SHTURMAN_SETUP_URL=https://assistant.example.com:8443/shturman-setup/' 'SHTURMAN_SETUP_URL=assistant.example.com:8443' \
+                     'SHTURMAN_PUBLIC_URL=https://10.0.0.1' 'SHTURMAN_PUBLIC_URL=https://0xcb.0.113.10' 'SHTURMAN_SETUP_URL=https://203.0.113.010:8443' \
+                     'SHTURMAN_SETUP_URL=https://127.0.0.1:8443' 'SHTURMAN_PUBLIC_URL=http://010.0.0.1:8080'; do
+            printf 'SHTURMAN_MODE=hermes\n%s\n' "$bad" > .env
+            code=0; PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1 || code=$?
+            [ "$code" -eq 1 ] || { echo "$bad: код $code вместо 1"; exit 1; }
+            grep -q "^${bad%%=*} в .env записан не как" out.txt || { echo "$bad: нет объяснения"; cat out.txt; exit 1; }
+            if [ -e docker-called ]; then echo "$bad: до Docker дело дойти не должно"; exit 1; fi
+          done
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com/dash/\nSHTURMAN_SETUP_URL=https://assistant.example.com:8443/\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "адрес с путём у дашборда и с косой чертой у страницы допустимы"; cat out.txt; exit 1; fi
+          rm -f docker-called
+          # Без домена: внешний IP по https и любой адрес по http проходят проверку, как и прежде.
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://203.0.113.10\nSHTURMAN_SETUP_URL=https://203.0.113.10:8443\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "внешний IP-адрес допустим"; cat out.txt; exit 1; fi
+          rm -f docker-called
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=http://192.168.1.10:8080\n' > .env
+          if PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1; then echo "подставной Docker должен был отказать"; exit 1; fi
+          if grep -q 'записан не как' out.txt; then echo "адрес http:// принимается, как и раньше"; cat out.txt; exit 1; fi
+          test -e docker-called
+          rm -f docker-called
+          # Неизвестный часовой пояс ./ops/up.sh тоже останавливает до Docker (Р-90).
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_TIMEZONE=Mars/Base\n' > .env
+          code=0; PATH="$tmp/stub:$PATH" ./ops/up.sh > out.txt 2>&1 || code=$?
+          [ "$code" -eq 1 ] && grep -q 'неизвестный часовой пояс' out.txt && test ! -e docker-called
+          rm -rf stub docker-called out.txt
+          # Часовой пояс владельца (Р-90): --timezone пишет или заменяет одну строку, неизвестный —
+          # отказ без изменений, без ключа строка не появляется.
+          printf 'SHTURMAN_MODE=hermes\nPOSTGRES_PASSWORD=x\n' > .env
+          grep -q -- '--timezone' <<< "$(./ops/init-env.sh --help)"
+          ./ops/init-env.sh --auto > /dev/null
+          if grep -q '^SHTURMAN_TIMEZONE=' .env; then echo "без --timezone строка не пишется"; exit 1; fi
+          grep -q 'записан пояс: Asia/Yekaterinburg' <<< "$(./ops/init-env.sh --auto --timezone Asia/Yekaterinburg)"
+          before="$(sha256sum .env)"
+          grep -q 'без изменений' <<< "$(./ops/init-env.sh --auto --timezone Asia/Yekaterinburg)"
+          [ "$before" = "$(sha256sum .env)" ]
+          ./ops/init-env.sh --auto --timezone=Europe/Astrakhan > /dev/null
+          [ "$(grep -c '^SHTURMAN_TIMEZONE=' .env)" -eq 1 ] && grep -qx 'SHTURMAN_TIMEZONE=Europe/Astrakhan' .env
+          for bad in Mars/Base ../../etc/passwd 'Europe/Moscow; id' ''; do
+            code=0; ./ops/init-env.sh --auto --timezone "$bad" > /dev/null 2>&1 || code=$?
+            [ "$code" -eq 2 ] || { echo "пояс «$bad»: код $code вместо 2"; exit 1; }
+          done
+          grep -qx 'SHTURMAN_TIMEZONE=Europe/Astrakhan' .env
+          test "$(stat -c '%a' .env)" = "600"
+          # Поиск по смыслу и защита включаются независимо: каждый скрипт убирает только свой
+          # профиль и не трогает ни чужой, ни профиль Hermes. Запуск стека здесь подменён.
+          printf '#!/bin/sh\nexit 0\n' > ops/up.sh
+          printf 'SHTURMAN_MODE=hermes\nCOMPOSE_PROFILES=hermes,embeddings,guard\nSHTURMAN_GUARD=on\n' > .env
+          ./ops/guard.sh off
+          grep -qx 'COMPOSE_PROFILES=hermes,embeddings' .env
+          if grep -q '^SHTURMAN_GUARD=' .env; then echo "выключатель защиты должен исчезнуть"; exit 1; fi
+          ./ops/embeddings.sh off
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          # Модель поиска по смыслу — только из перечня; без ключа — записанная в .env, иначе e5-small.
+          # Скачивание модели здесь не запускается: проверяются разбор параметров и отказы.
+          grep -qx 'модель: e5-small (intfloat/multilingual-e5-small)' <<< "$(./ops/embeddings.sh status)"
+          if ./ops/embeddings.sh on --model bge-m3; then echo "модель не из перечня"; exit 1; fi
+          if ./ops/embeddings.sh off --model e5-small; then echo "--model только вместе с on"; exit 1; fi
+          printf 'SHTURMAN_EMBEDDINGS_MODEL=deepvk/USER2-small\n' >> .env
+          grep -qx 'модель: user2-small (deepvk/USER2-small)' <<< "$(./ops/embeddings.sh status)"
+          sed -i 's|^SHTURMAN_EMBEDDINGS_MODEL=.*|SHTURMAN_EMBEDDINGS_MODEL=acme/unknown|' .env
+          if ./ops/embeddings.sh on; then echo "незнакомая модель в .env не должна молча заменяться"; exit 1; fi
+          sed -i '/^SHTURMAN_EMBEDDINGS_MODEL=/d' .env
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          ./ops/init-env.sh --auto > /dev/null
+          grep -qx 'COMPOSE_PROFILES=hermes' .env
+          test "$(stat -c '%a' .env)" = "600"
+          # Посредник — только с Hermes: при переходе в режим без Hermes профиль relay убирается,
+          # остальные профили остаются.
+          printf 'SHTURMAN_MODE=hermes\nCOMPOSE_PROFILES=hermes,relay,guard\n' > .env
+          ./ops/mode.sh set standalone > /dev/null
+          grep -qx 'COMPOSE_PROFILES=guard' .env
+      # Подключение к посреднику (./ops/relay.sh, docs/relay.md) без сети: отказы до обращения
+      # к посреднику и готовая настройка Caddy. Настоящее подключение проверено на стенде (PR).
+      - name: ops — посредник
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops config .env.example "$tmp"/; cd "$tmp"
+          mkdir stub; printf '#!/bin/sh\necho "$(basename "$0") $*" >> "%s/called"\nexit 1\n' "$tmp" > stub/curl; cp stub/curl stub/docker; chmod +x stub/*
+          export PATH="$tmp/stub:$PATH"
+          printf 'SHTURMAN_MODE=standalone\n' > .env
+          code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX ivan > out.txt 2>&1 || code=$?
+          [ "$code" -eq 2 ] && grep -q 'Режим без Hermes' out.txt
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\n' > .env; before="$(cat .env)"
+          for name in setup-ivan Ivan ab -ivan 'iv an'; do
+            for c in join check; do
+              code=0; ./ops/relay.sh "$c" ABCD-EFGH-JKMN-PQRS-TVWX "$name" > /dev/null 2>&1 || code=$?
+              [ "$code" -eq 2 ] || { echo "$c, имя $name: код $code вместо 2"; exit 1; }
+            done
+          done
+          code=0; ./ops/relay.sh join 'x"y' ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          code=0; ./ops/relay.sh check 'x"y' ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          code=0; SHTURMAN_RELAY_API=http://relay.example.com ./ops/relay.sh check ABCD-EFGH-JKMN-PQRS-TVWX ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          # Значение с переводом строки — отказ (проверка целиком, а не построчно).
+          nl=$'\n'
+          for bad in "ivan${nl}x" "ivan${nl}"; do
+            code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX "$bad" > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          done
+          code=0; ./ops/relay.sh join "ABCD-EFGH-JKMN-PQRS-TVWX${nl}x" ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          code=0; SHTURMAN_RELAY_API=http://relay.example.com ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX ivan > /dev/null 2>&1 || code=$?; [ "$code" -eq 2 ]
+          test "$(cat .env)" = "$before"
+          test ! -e called
+          # Уже подключён — повторный join отказывается, не обращаясь к посреднику.
+          printf 'SHTURMAN_RELAY_KEY=ci-only-relay-key\nSHTURMAN_RELAY_NAME=ivan\nSHTURMAN_RELAY_DOMAIN=sh.namre.app\n' >> .env
+          code=0; ./ops/relay.sh join ABCD-EFGH-JKMN-PQRS-TVWX petr > out.txt 2>&1 || code=$?
+          [ "$code" -eq 2 ] && grep -q 'уже подключён' out.txt && test ! -e called
+          code=0; ./ops/relay.sh check ABCD-EFGH-JKMN-PQRS-TVWX petr > out.txt 2>&1 || code=$?
+          [ "$code" -eq 2 ] && grep -q 'уже подключён' out.txt && test ! -e called
+          # status и off не печатают секретов; off убирает профиль, --forget — и строки подключения.
+          printf 'COMPOSE_PROFILES=hermes,relay\nSHTURMAN_RELAY_TOKEN=ci-only-relay-token\n' >> .env
+          ./ops/relay.sh status > out.txt; ./ops/relay.sh off >> out.txt
+          if grep -q 'ci-only' out.txt; then echo "секрет в выводе"; exit 1; fi
+          grep -qx 'COMPOSE_PROFILES=hermes' .env && grep -q '^SHTURMAN_RELAY_KEY=' .env
+          ./ops/relay.sh off --forget > /dev/null
+          if grep -q '^SHTURMAN_RELAY_' .env; then echo "строки подключения должны исчезнуть"; exit 1; fi
+          # Готовая настройка Caddy: тот же образец, отличия — только заголовки двух блоков, путь
+          # к репозиторию и чтение протокола PROXY в глобальном блоке; её проверяет Caddy 2.11.7.
+          export PATH="${PATH#"$tmp/stub:"}"
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_RELAY_NAME=ivan\nSHTURMAN_RELAY_DOMAIN=sh.namre.app\n' > .env
+          ./ops/relay.sh caddyfile > relay.Caddyfile
+          f=config/Caddyfile.example
+          diff <(grep -Ev '^[[:space:]]*#' "$f" | sed -n '/^{$/,$p' | sed '/^$/d') <(grep -Ev '^[[:space:]]*#' relay.Caddyfile | sed '/^$/d') > d.txt || true
+          test "$(grep -c '^>' d.txt)" = "19" && test "$(grep -c '^<' d.txt)" = "3"
+          grep -qx '> ivan.sh.namre.app {' d.txt && grep -qx '> setup-ivan.sh.namre.app {' d.txt
+          grep -qx $'> \t\t\t\tallow 127.0.0.1/32' d.txt
+          # Отказ изменяющим запросам с чужого адреса — в блоке дашборда (соседние экземпляры — один сайт).
+          grep -qx $'> \t\tnot header Sec-Fetch-Site same-origin' d.txt && grep -qx $'> \t\trespond 403' d.txt
+          awk '$0 == "ivan.sh.namre.app {" {f=1} f {print} f && /^}/ {exit}' relay.Caddyfile | grep -q '@cross_site'
+          awk '$0 == "setup-ivan.sh.namre.app {" {f=1} f {print} f && /^}/ {exit}' relay.Caddyfile | grep -Eq '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$'
+          grep -Eq '^#[[:space:]]+not header Sec-Fetch-Site same-origin$' "$f"
+          grep -Eq '^#[[:space:]]+ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com \{$' "$f"
+          grep -Eq '^#[[:space:]]+setup-ivan\.sh\.namre\.app \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com:8443 \{$' "$f"
+          docker run --rm -v "$PWD/relay.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7@sha256:f2a1290d0463aad60660d4ec134943f183ee2a5f6c3eb7bf32dd984f2f020772 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      # Проверка имени у посредника (./ops/relay.sh check) и варианты на занятое имя в join — разбор
+      # ответов посредника; вместо curl — подставной, который отдаёт заготовленный ответ. Настоящая
+      # служба 0.3.0 проверена на стенде (PR) и в relay/tests.
+      - name: ops — посредник, проверка имени
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops config .env.example "$tmp"/; cd "$tmp"
+          mkdir stub; printf '#!/bin/sh\ncat "%s/resp"\n' "$tmp" > stub/curl; chmod +x stub/curl
+          export PATH="$tmp/stub:$PATH"
+          printf 'SHTURMAN_MODE=hermes\n' > .env; before="$(cat .env)"
+          answer() { printf '%s\n%s' "$2" "$1" > resp; }
+          rc() { code=0; ./ops/relay.sh "$@" > out.txt 2>&1 || code=$?; echo "$code"; }
+          answer 200 '{"name": "ivan", "domain": "sh.namre.app", "available": true, "reason": null, "message": "", "suggestions": []}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 0
+          grep -q 'Имя «ivan» свободно: адреса будут https://ivan.sh.namre.app и https://setup-ivan.sh.namre.app' out.txt
+          answer 200 '{"name": "ivan", "domain": "sh.namre.app", "available": false, "reason": "taken", "message": "", "suggestions": ["ivan2", "bad name", "ivan3"]}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 3
+          grep -qx 'Имя «ivan» уже занято.' out.txt && grep -qx 'Свободные варианты: ivan2, ivan3' out.txt
+          answer 200 '{"name": "petr", "domain": "sh.namre.app", "available": true, "reason": null, "message": "", "suggestions": []}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 1 && grep -q 'не разобран' out.txt
+          answer 403 '{"error": "bad_code", "message": "Код приглашения не подошёл"}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 2 && grep -q 'Код приглашения не подошёл' out.txt
+          answer 404 '{"error": "not_found"}'
+          test "$(rc check ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 1 && grep -q 'не умеет проверять имя заранее' out.txt
+          test "$(cat .env)" = "$before"
+          # join на занятое имя: код остался, варианты и подсказка про check.
+          answer 409 '{"error": "name_taken", "message": "Это имя уже занято", "suggestions": ["ivan2"]}'
+          test "$(rc join ABCD-EFGH-JKMN-PQRS-TVWX ivan)" = 2
+          grep -q 'Свободные варианты: ivan2' out.txt && grep -q 'relay.sh check КОД ИМЯ' out.txt
+          if grep -q '^SHTURMAN_RELAY_NAME=' .env; then echo "отказ не должен записывать подключение"; exit 1; fi
+      # Отчёт сессии сопровождения (Р-102) — тем же белым списком, ни одна строка secrets.txt не проходит ни через
+      # строки doctor, ни через свободный текст агента; список выпусков и тревога по уязвимостям — unittest ниже.
+      # Молчаливые сбои и утечки (Р-98): токен архива не выдаётся команде агента (без терминала) и выдаётся
+      # человеку (псевдотерминал программы script); адрес внешнего сторожа — только https и нигде целиком;
+      # очистка по умолчанию ничего не удаляет, копии — только после «Разрешить» владельца в боте (Р-100); диагностический пакет —
+      # белым списком: ни одна строка из ops/tests/fixtures/secrets.txt в него не попадает; новые строки doctor
+      # (tg-session, pulse, disk-usage, jobs — Д-25) с подставным Docker и без ошибок оболочки; память и
+      # процессор контейнеров без docker inspect без шаблона (Д-26).
+      - name: ops — токен архива, сторож, очистка, диагностический пакет, строки doctor, ресурсы
+        run: |
+          bash ops/tests/mcp_token.sh
+          bash ops/tests/pulse.sh
+          bash ops/tests/cleanup.sh
+          python3 -m unittest discover -s ops/tests -p 'test_*.py'
+          bash ops/tests/diag.sh
+          bash ops/tests/report.sh
+          bash ops/tests/doctor_rows.sh
+          bash ops/tests/doctor_hermes.sh
+          bash ops/tests/resources.sh
+      # Отпечаток файлов плагина: по нему ./ops/up.sh решает, перезапускать ли Hermes после обновления
+      # репозитория (Hermes держит плагин в памяти с запуска), а ./ops/doctor.sh — предупреждать ли.
+      # Тесты плагина в отпечаток не входят; любая правка его кода отпечаток меняет.
+      - name: ops — отпечаток плагина
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops plugins "$tmp"/; cd "$tmp"
+          printf '. ops/lib.sh\nplugin_print\n' > print.sh
+          a="$(bash print.sh)"; test "${#a}" = "64"
+          test "$(bash print.sh)" = "$a"
+          echo 'правка' > plugins/shturman/tests/new-file.txt; test "$(bash print.sh)" = "$a"
+          echo '# правка' >> plugins/shturman/cli.py; test "$(bash print.sh)" != "$a"
+          grep -q 'plugin_print' ops/up.sh && grep -q 'plugin-code' ops/doctor.sh
+      # Адрес страницы настройки переписки. Она обязана стоять на отдельном адресе (origin), не на
+      # адресе дашборда: на общем адресе ассистент в Hermes мог бы действовать на ней от имени
+      # вошедшего владельца. По умолчанию — то же имя, порт 8443.
+      - name: ops — адрес страницы настройки переписки
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops "$tmp"/; cd "$tmp"
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_API_TOKEN=ci-only-secret-value\n' > .env; chmod 600 .env
+          url() { grep -E "^$1=" .env | cut -d= -f2-; }
+          # Адрес дашборда записывается вместе с адресом страницы по умолчанию — с портом.
+          ./ops/set-public-url.sh https://assistant.example.com > out.txt
+          test "$(url SHTURMAN_PUBLIC_URL)" = "https://assistant.example.com"
+          test "$(url SHTURMAN_SETUP_URL)" = "https://assistant.example.com:8443"
+          grep -q 'https://assistant.example.com:8443' out.txt
+          if grep -q 'ci-only-secret-value' out.txt; then echo "скрипт напечатал чужую строку .env"; exit 1; fi
+          # Совпадающий адрес — отказ с кодом 2 и объяснением; .env не меняется. Регистр, обычный порт
+          # и косая черта на конце адрес другим не делают.
+          before="$(cat .env)"
+          for same in https://assistant.example.com https://ASSISTANT.example.com:443/ https://assistant.example.com:443; do
+            code=0; ./ops/set-setup-url.sh "$same" > out.txt 2>&1 || code=$?
+            [ "$code" -eq 2 ] || { echo "$same: код $code вместо 2"; exit 1; }
+            grep -q 'ОТКАЗ' out.txt && grep -q 'Ничего не записано' out.txt
+          done
+          test "$(cat .env)" = "$before"
+          # Не https, путь, имя пользователя, IP-адрес, неверный порт — тоже отказ.
+          for bad in http://assistant.example.com:8443 https://assistant.example.com:8443/shturman-setup/ \
+                     https://user@assistant.example.com:8443 https://10.0.0.1:8443 https://assistant.example.com:99999 assistant.example.com; do
+            if ./ops/set-setup-url.sh "$bad" > /dev/null 2>&1; then echo "$bad: адрес не должен приниматься"; exit 1; fi
+          done
+          test "$(cat .env)" = "$before"
+          # Другой порт и отдельное имя принимаются; адрес записывается в приведённом виде.
+          ./ops/set-setup-url.sh https://Assistant.example.com:9443/ > /dev/null
+          test "$(url SHTURMAN_SETUP_URL)" = "https://assistant.example.com:9443"
+          ./ops/set-setup-url.sh https://setup.example.com > /dev/null
+          test "$(url SHTURMAN_SETUP_URL)" = "https://setup.example.com"
+          # Заданный вручную адрес set-public-url.sh не трогает, а занять его дашбордом не даёт.
+          ./ops/set-public-url.sh https://new.example.com > /dev/null
+          test "$(url SHTURMAN_SETUP_URL)" = "https://setup.example.com"
+          if ./ops/set-public-url.sh https://setup.example.com > /dev/null 2>&1; then echo "адрес дашборда не должен совпасть с адресом страницы"; exit 1; fi
+          test "$(url SHTURMAN_PUBLIC_URL)" = "https://new.example.com"
+          # Убранный адрес остаётся убранным: строка пустая, по умолчанию её никто не возвращает.
+          ./ops/set-setup-url.sh --clear > /dev/null
+          grep -qx 'SHTURMAN_SETUP_URL=' .env
+          printf '. ops/lib.sh\nensure_setup_url "$1"\n' > ensure.sh
+          bash ensure.sh hermes
+          grep -qx 'SHTURMAN_SETUP_URL=' .env
+          # Экземпляр, развёрнутый до появления этой строки: ./ops/up.sh дописывает адрес по умолчанию
+          # (здесь — та же функция, которой он пользуется), ничего другого в .env не меняя.
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\nSHTURMAN_API_TOKEN=ci-only-secret-value\n' > .env
+          bash ensure.sh hermes > out.txt
+          test "$(url SHTURMAN_SETUP_URL)" = "https://assistant.example.com:8443"
+          test "$(grep -c . .env)" = "4" && grep -qx 'SHTURMAN_API_TOKEN=ci-only-secret-value' .env
+          if grep -q 'ci-only-secret-value' out.txt; then echo "функция напечатала чужую строку .env"; exit 1; fi
+          bash ensure.sh hermes; test "$(grep -c '^SHTURMAN_SETUP_URL=' .env)" = "1"
+          grep -q 'ensure_setup_url "\$MODE"' ops/up.sh
+          # Адрес дашборда без https или уже на порту 8443: адреса по умолчанию нет, строка не появляется.
+          printf 'SHTURMAN_MODE=hermes\nSHTURMAN_PUBLIC_URL=http://assistant.example.com\n' > .env
+          bash ensure.sh hermes; if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "для http адреса по умолчанию нет"; exit 1; fi
+          # Без домена: внешний IPv4-адрес вместо имени. Адрес страницы по умолчанию — тот же IP на порту
+          # 8443, и скрипт объясняет, что ещё нужно (профиль shortlived, порт 80). Адрес закрытой сети,
+          # самого сервера, служебный и IP в необычной записи — отказ с кодом 2, .env не меняется.
+          printf 'SHTURMAN_MODE=hermes\n' > .env; chmod 600 .env
+          ./ops/set-public-url.sh https://203.0.113.10 > out.txt
+          test "$(url SHTURMAN_PUBLIC_URL)" = "https://203.0.113.10"
+          test "$(url SHTURMAN_SETUP_URL)" = "https://203.0.113.10:8443"
+          grep -q 'shortlived' out.txt && grep -q 'порт 80' out.txt
+          before="$(cat .env)"
+          for bad in https://10.0.0.1 https://127.0.0.1 https://192.168.1.10 https://172.16.0.1 https://100.64.0.1 \
+                     https://169.254.169.254 https://0.0.0.0 https://224.0.0.1 https://203.0.113.010 https://0x7f.0.0.1 https://203.0.113; do
+            code=0; ./ops/set-public-url.sh "$bad" > out.txt 2>&1 || code=$?
+            [ "$code" -eq 2 ] || { echo "$bad: код $code вместо 2"; exit 1; }
+            grep -q 'Ничего не записано' out.txt
+          done
+          for bad in https://203.0.113.10 https://203.0.113.10:443 https://192.168.1.10:8443 https://127.0.0.1:8443 https://203.0.113.010:8443; do
+            if ./ops/set-setup-url.sh "$bad" > /dev/null 2>&1; then echo "$bad: адрес не должен приниматься"; exit 1; fi
+          done
+          test "$(cat .env)" = "$before"
+          ./ops/set-setup-url.sh https://203.0.113.10:9443 > out.txt
+          test "$(url SHTURMAN_SETUP_URL)" = "https://203.0.113.10:9443" && grep -q 'shortlived' out.txt
+          # Адрес http:// — как и раньше: принимается с предупреждением, в том числе адрес закрытой сети.
+          ./ops/set-public-url.sh http://192.168.1.10:8080 > out.txt 2>&1
+          test "$(url SHTURMAN_PUBLIC_URL)" = "http://192.168.1.10:8080" && grep -q 'ВНИМАНИЕ: адрес без https' out.txt
+          # Необычная запись IP — отказ и по http: с ней сервис переписки не запустился бы.
+          if ./ops/set-public-url.sh http://010.0.0.1:8080 > /dev/null 2>&1; then echo "необычная запись IP не должна приниматься"; exit 1; fi
+          test "$(url SHTURMAN_PUBLIC_URL)" = "http://192.168.1.10:8080"
+          ./ops/set-public-url.sh https://assistant.example.com > out.txt
+          if grep -q 'shortlived' out.txt; then echo "для имени пояснения про IP-адрес не нужно"; exit 1; fi
+          # Без Hermes внешний адрес не задаётся вовсе, а ссылка входа — только на локальный адрес.
+          printf 'SHTURMAN_MODE=standalone\nSHTURMAN_PUBLIC_URL=https://assistant.example.com\n' > .env
+          bash ensure.sh standalone; if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "без Hermes адрес не пишется"; exit 1; fi
+          code=0; ./ops/set-setup-url.sh https://assistant.example.com:8443 > /dev/null 2>&1 || code=$?
+          [ "$code" -eq 2 ] || { echo "без Hermes адрес страницы не задаётся: код $code вместо 2"; exit 1; }
+          if grep -q '^SHTURMAN_SETUP_URL=' .env; then echo "без Hermes адрес не пишется"; exit 1; fi
+          # Ссылка входа строится только из адреса страницы: адрес дашборда в неё не попадает.
+          if grep -Eq 'base=.*SHTURMAN_PUBLIC_URL' ops/setup-link.sh; then echo "ссылка входа не должна строиться из адреса дашборда"; exit 1; fi
+          grep -q 'env_get SHTURMAN_SETUP_URL' ops/setup-link.sh
+      # Образец настройки прокси: блок дашборда не отдаёт страницу настройки переписки и ничего
+      # не проксирует на порт сервиса; из порта сервиса наружу выходит один префикс, во втором блоке.
+      - name: прокси — страница настройки переписки только в своём блоке
+        run: |
+          f=config/Caddyfile.example
+          block() { awk -v head="$1" '$0 == head {f=1} f {print} f && /^}/ {exit}' "$f" | grep -Ev '^[[:space:]]*#'; }
+          dash="$(block 'assistant.example.com {')"; setup="$(block 'assistant.example.com:8443 {')"
+          [ -n "$dash" ] && [ -n "$setup" ] || { echo "в образце должно быть два блока сайта"; exit 1; }
+          # Блок дашборда: порта сервиса нет вовсе, а на /shturman-setup* стоит явный отказ.
+          if grep -q '8765' <<< "$dash"; then echo "блок дашборда не должен проксировать на порт сервиса"; exit 1; fi
+          test "$(grep -c 'shturman-setup' <<< "$dash")" = "1"
+          grep -Eq '^[[:space:]]*@no_setup_page path /shturman-setup\*$' <<< "$dash"
+          grep -A1 -E '^[[:space:]]*handle @no_setup_page \{$' <<< "$dash" | grep -Eq '^[[:space:]]*respond 404$'
+          test "$(grep -c 'reverse_proxy' <<< "$dash")" = "1" && grep -Eq '^[[:space:]]*reverse_proxy 127\.0\.0\.1:9119$' <<< "$dash"
+          # Блок страницы: один выход к сервису — через его Unix-сокет (Р-76), только под префиксом;
+          # дашборда нет; остальное — отказ. На порт сервиса 8765 прокси не ходит нигде.
+          test "$(grep -c 'reverse_proxy' <<< "$setup")" = "1" && grep -Eq '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$' <<< "$setup"
+          if grep -q '9119' <<< "$setup"; then echo "в блоке страницы настройки не должно быть дашборда"; exit 1; fi
+          grep -B1 -E '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$' <<< "$setup" | grep -Eq '^[[:space:]]*handle @setup_page \{$'
+          if grep -q 'shturman-service' <<< "$dash"; then echo "блок дашборда не должен вести к сервису"; exit 1; fi
+          for g in "$f" config/Caddyfile.remote-mcp.example; do
+            if grep -Ev '^[[:space:]]*#' "$g" | grep -q '8765'; then echo "$g: прокси не должен ходить на порт сервиса 8765"; exit 1; fi
+          done
+          grep -Eq '^[[:space:]]*reverse_proxy unix//run/shturman-service/proxy\.sock$' config/Caddyfile.remote-mcp.example
+          # Каталог сокета: строка systemd-tmpfiles — владелец пользователь стека, группа caddy, 2710;
+          # команда из шапки файла подставляет имя пользователя только в эту строку.
+          test "$(grep -Ev '^[[:space:]]*(#|$)' config/shturman-service-socket.conf | tr -s ' ')" = "d /run/shturman-service 2710 shturman caddy -"
+          test "$(sed 's/ shturman caddy / ivan caddy /' config/shturman-service-socket.conf | grep -Ev '^[[:space:]]*(#|$)' | tr -s ' ')" = "d /run/shturman-service 2710 ivan caddy -"
+          grep -q '@setup_page expression' <<< "$setup" && grep -q '\^/shturman-setup/' <<< "$setup"
+          grep -Eq '^[[:space:]]*respond 404$' <<< "$setup"
+          grep -q 'Strict-Transport-Security' <<< "$setup"
+          # Заголовок Host не подменяется, журнал запросов не включён — ни в одном блоке.
+          if grep -Ev '^[[:space:]]*#' "$f" | grep -Eq 'header_up[[:space:]]+Host|^[[:space:]]*log([[:space:]]|$)'; then echo "Host не подменяется, журнал не включается"; exit 1; fi
+          # Настройку проверяет сам Caddy той версии, с которой она проверена.
+          docker run --rm -v "$PWD/$f:/etc/caddy/Caddyfile:ro" caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -v "$PWD/config/Caddyfile.remote-mcp.example:/etc/caddy/Caddyfile:ro" caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          # Вариант без домена (конец образца): те же два блока на IP-адресе, в каждом — профиль
+          # сертификата shortlived (Let's Encrypt выдаёт сертификат на IP только с ним), в глобальном
+          # блоке — default_sni (сервер за NAT). Вариант собирается ровно по описанию из образца,
+          # отличается от него только этими строками, и его проверяет Caddy той версии, с которой
+          # он проверен.
+          grep -Eq '^#[[:space:]]+203\.0\.113\.10 \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com \{$' "$f"
+          grep -Eq '^#[[:space:]]+203\.0\.113\.10:8443 \{[[:space:]]+вместо[[:space:]]+assistant\.example\.com:8443 \{$' "$f"
+          grep -A4 -E '^#[[:space:]]+tls \{$' "$f" | grep -Eq '^#[[:space:]]+profile shortlived$'
+          grep -Eq '^#[[:space:]]+default_sni 203\.0\.113\.10$' "$f"
+          python3 - "$f" ip.Caddyfile <<'PY'
+          import sys
+          text = open(sys.argv[1], encoding="utf-8").read()
+          tls = "\ttls {\n\t\tissuer acme {\n\t\t\tprofile shortlived\n\t\t}\n\t}\n\n"
+          for head, new in (("assistant.example.com {\n", "203.0.113.10 {\n"), ("assistant.example.com:8443 {\n", "203.0.113.10:8443 {\n")):
+              assert text.count("\n" + head) == 1, head
+              text = text.replace("\n" + head, "\n" + new + tls, 1)
+          admin = "{\n\tadmin unix//run/caddy-admin/admin.sock\n}\n"
+          assert text.count(admin) == 1
+          text = text.replace(admin, "{\n\tdefault_sni 203.0.113.10\n" + admin[2:])
+          open(sys.argv[2], "w", encoding="utf-8").write(text)
+          PY
+          added="$(diff <(grep -Ev '^[[:space:]]*#' "$f") <(grep -Ev '^[[:space:]]*#' ip.Caddyfile) | grep -c '^>' || true)"
+          test "$added" = "15"
+          grep -qx $'\tdefault_sni 203.0.113.10' ip.Caddyfile
+          docker run --rm -v "$PWD/ip.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7@sha256:f2a1290d0463aad60660d4ec134943f183ee2a5f6c3eb7bf32dd984f2f020772 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: реальные маршруты Caddy и отсутствие TCP admin
+        run: python service/tests/proxy_smoke.py
+      # Справка и неизвестные ключи. На -h и --help каждый скрипт печатает своё назначение и выходит
+      # с кодом 0 до любых действий: в каталоге без .env и данных он ничего не создаёт и не зовёт
+      # ни Docker, ни curl (вместо них подставлены заглушки, которые записывают вызов). На
+      # неизвестный ключ — сообщение и код 2, тоже без действий. Так ./ops/activation-link.sh --help
+      # не выпустит настоящую ссылку входа.
+      - name: ops — справка и неизвестные ключи
+        run: |
+          tmp="$(mktemp -d)"; cp -r ops "$tmp"/; mkdir "$tmp/stub" "$tmp/empty"
+          for tool in docker curl ssh; do
+            printf '#!/bin/sh\necho "%s $*" >> "%s/called"\nexit 1\n' "$tool" "$tmp" > "$tmp/stub/$tool"
+          done
+          chmod +x "$tmp"/stub/*
+          export PATH="$tmp/stub:$PATH"
+          cd "$tmp/empty"
+          listing() { find "$tmp" | sort; }
+          before="$(listing)"
+          run() { code=0; out="$(bash "$@" < /dev/null 2>&1)" || code=$?; }
+          for f in ../ops/*.sh; do
+            for key in --help -h; do
+              run "$f" "$key"
+              [ "$code" -eq 0 ] || { echo "$f $key: код $code вместо 0"; exit 1; }
+              [ -n "$out" ] || { echo "$f $key: справка пустая"; exit 1; }
+            done
+            run "$f" --no-such-key
+            [ "$code" -eq 2 ] || { echo "$f --no-such-key: код $code вместо 2"; exit 1; }
+            grep -q 'no-such-key' <<< "$out" || { echo "$f --no-such-key: в сообщении нет имени ключа"; exit 1; }
+          done
+          # Справка побеждает и после других параметров; лишний параметр — тоже ошибка, а не действие.
+          for args in "up.sh --pull --help" "guard.sh on --help" "embeddings.sh on --model e5-small --help" \
+                      "mode.sh set standalone --help" "setup-link.sh --local --help" "backup.sh --list --help" \
+                      "restore.sh --from latest --help" "update.sh --check --help" "backup.sh --verify --help" \
+                      "diag.sh --print --help" "cleanup.sh --backups --help" "pulse.sh set https://x.example.com --help" \
+                      "mcp-token.sh --pipe --help"; do
+            # shellcheck disable=SC2086
+            run ../ops/$args
+            [ "$code" -eq 0 ] || { echo "$args: код $code вместо 0"; exit 1; }
+          done
+          for args in "activation-link.sh сейчас" "bot-bind.sh x" "setup-link.sh x" "guard.sh on x" \
+                      "backup.sh x" "doctor.sh x" "preflight.sh x" "logout-all.sh x" "up.sh x" \
+                      "set-setup-url.sh --clear https://assistant.example.com:8443" "set-setup-url.sh a b" \
+                      "restore.sh x" "update.sh x" "update.sh --channel nightly" "restore.sh --only all x" \
+                      "diag.sh x" "cleanup.sh --images --backups" "pulse.sh x" "mcp-token.sh x"; do
+            # shellcheck disable=SC2086
+            run ../ops/$args
+            [ "$code" -eq 2 ] || { echo "$args: код $code вместо 2"; exit 1; }
+          done
+          test "$(listing)" = "$before"
+          if [ -e "$tmp/called" ]; then echo "справка обратилась к внешней программе:"; cat "$tmp/called"; exit 1; fi
+          # Без Hermes и без запущенного сервиса ссылка настройки переписки не выдаётся; из .env
+          # читаются только режим и адреса дашборда и страницы настройки.
+          cd "$tmp"; printf 'SHTURMAN_MODE=standalone\n' > .env
+          if ./ops/setup-link.sh > link.out 2>&1; then echo "без сервиса ссылки быть не должно"; exit 1; fi
+          grep -q 'не запущен' link.out
+      # Образ сервиса должен собираться и запускаться: без базы он обязан выйти с понятной ошибкой.
+      - run: docker build -t shturman-service:ci service
+      - run: docker run --rm shturman-service:ci --help
+      # Страница настройки и миграции — данные пакета (pyproject.toml, package-data): в образе они
+      # должны лежать рядом с кодом, иначе сервис запустится, а страница ответит ошибкой.
+      - name: образ — файлы страницы настройки и миграции на месте
+        run: |
+          docker run --rm --entrypoint python shturman-service:ci -c '
+          from importlib import resources
+          root = resources.files("shturman")
+          for name in ("index.html", "setup.js", "setup.css", "qr.js", "app.html", "app.js", "app.css"):
+              assert (root / "setup_page" / "static" / name).read_bytes(), name
+          names = sorted(p.name for p in (root / "migrations").iterdir() if p.name.endswith(".sql"))
+          assert names and names[-1] >= "0030_miniapp.sql", names
+          print("страница:", "ok", "миграций:", len(names))'

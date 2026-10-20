@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>Штурман — первый вход</title>
+<link rel="stylesheet" href="shturman.css">
+</head>
+<body data-page="activate">
+<div class="side">
+  <div class="brand">
+    <svg width="36" height="36" viewBox="0 0 36 36" fill="none" aria-hidden="true"><circle cx="18" cy="18" r="16" stroke="#E8EEF3" stroke-width="1.5"/><path d="M18 5l4 13-4 13-4-13z" fill="#F2B441"/><circle cx="18" cy="18" r="2" fill="#0F1D2E"/></svg>
+    Штурман
+  </div>
+  <div class="motto">
+    <strong>Вы ведёте. Он читает дорогу.</strong>
+    <span>Личный ассистент на вашем сервере. Переписка и ключи не покидают его.</span>
+  </div>
+</div>
+
+<main>
+  <div class="panel">
+    <div class="eyebrow" id="eyebrow">Первый вход</div>
+
+    <div id="view-ok" hidden>
+      <div class="panel">
+        <h1 id="title">Сервер готов. Осталась настройка</h1>
+        <p class="lead" id="lead">Вы открыли одноразовую ссылку активации. Она подтверждает, что сервер ваш, и срабатывает один раз.</p>
+        <div class="card" id="needs">
+          <b>Что понадобится</b>
+          <div class="need"><b>1</b><span>Ключ от OpenRouter или OpenAI либо подписка ChatGPT.</span></div>
+          <div class="need"><b>2</b><span>Telegram под рукой: создадим бота и привяжем его к вам.</span></div>
+          <div class="need"><b>3</b><span>Около десяти минут.</span></div>
+        </div>
+        <div><button class="btn" id="go" type="button">Начать настройку</button></div>
+        <p class="small">Ссылка действует 30 минут. Если она устарела, попросите ИИ-агента, который разворачивал сервер, выдать новую. После привязки бота входить по ссылке больше не придётся.</p>
+      </div>
+    </div>
+
+    <div id="view-bad" hidden>
+      <div class="panel">
+        <h1>Ссылка неполная</h1>
+        <p class="lead">В адресе нет кода активации. Скопируйте ссылку целиком, вместе с частью после знака «#», и откройте её снова.</p>
+        <p class="small">Если ссылки нет, попросите ИИ-агента на сервере выдать новую.</p>
+      </div>
+    </div>
+
+    <noscript><p class="note warn">Для входа нужен включённый JavaScript.</p></noscript>
+  </div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
