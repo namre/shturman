@@ -238,6 +238,9 @@ async def test_without_asr_voice_is_refused_plainly_and_text_sketch_still_works(
     await press(dv, dv.data)
     [ask] = force_prompts(dv.tg)
     assert "расшифровка голосовых выключена" in ask["text"] and "./ops/asr.sh on" in ask["text"]
+    # владельца не отправляют в терминал: включает агент по его просьбе (стоп-точка)
+    assert "попросите агента" in ask["text"] and "попросите агента" in dictation.NO_ASR
+    assert "владелец на сервере" not in ask["text"] and "владелец на сервере" not in dictation.NO_ASR
     prompt_id = dv.tg.last_message_id()
     await say_voice(dv, reply_to=prompt_id)
     assert dv.tg.calls("getFile") == []                    # голос даже не скачивается

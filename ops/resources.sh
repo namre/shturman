@@ -7,7 +7,7 @@
 # полей ниже (State.Status, HostConfig.Memory, HostConfig.NanoCpus, RestartCount, State.OOMKilled).
 # Шаблон не выводит окружение контейнера (Config.Env), команду запуска и подключённые каталоги.
 # Оператору этот скрипт вместо docker inspect: docker inspect без шаблона печатает переменные
-# окружения с токенами (Д-26).
+# окружения с токенами.
 # Параметров нет. -h, --help — эта справка. Код 1 — Docker недоступен.
 set -u
 cd "$(dirname "$0")/.." || exit 1
