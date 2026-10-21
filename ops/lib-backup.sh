@@ -357,7 +357,7 @@ restore_db() {
     echo "Мало места на диске: свободно $((free / 1024)) МБ, для восстановления базы нужно около $((need / 1024)) МБ (втрое больше выгрузки и 1 ГБ запаса). Ничего не изменено." >&2
     return 1
   fi
-  pg_start || { echo "База не запустилась (docker logs --tail 50 $PG). Ничего не изменено." >&2; return 1; }
+  pg_start || { echo "База не запустилась (место на диске — ./ops/doctor.sh, строка disk; счётчики журнала — ./ops/diag.sh --print). Ничего не изменено." >&2; return 1; }
   docker exec "$PG" dropdb -U shturman --if-exists shturman_restore > /dev/null 2>&1 || true
   docker exec "$PG" createdb -U shturman -O shturman shturman_restore || { echo "Не удалось создать базу shturman_restore. Ничего не изменено." >&2; return 1; }
   echo "Восстанавливаю выгрузку в отдельную базу shturman_restore…"

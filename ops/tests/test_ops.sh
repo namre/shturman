@@ -520,7 +520,13 @@ has "сервис переписки работает с прежним кодо
 grep -q '^scope=code$' local/update/last.env || die "Hermes не перезапускался, а откат — с базой"
 if grep -q 'ops-consent ask' "$STUB_LOG"; then die "откат только кода спрашивал владельца"; fi
 [ "$(git rev-parse HEAD)" = "$(git rev-parse v0.0.1)" ] || die "Hermes: код не вернулся"
+hasnt "версия закреплена строкой HERMES_VERSION"
 ok "Hermes: образ не сменился (сборка упала) — откат только кода, без запроса владельцу"
+chain_inst hermes2; printf 'SHTURMAN_MODE=hermes\nHERMES_VERSION=v2026.9.10\n' > .env
+STUB_HERMES_IMAGE="nousresearch/hermes-agent:v2026.9.10" STUB_SERVICE=running run ./ops/update.sh --check; want 0 "закреплённый Hermes, план: код $code"
+has "Hermes:   тот же образ nousresearch/hermes-agent:v2026.9.10"; has "версия закреплена строкой HERMES_VERSION в .env"
+hasnt "HERMES_VERSION=v2026"
+ok "план называет закреплённую строкой .env версию Hermes (агент .env не читает), саму строку не печатает"
 chain_inst chain4
 rm -f local/doctor-fail; : > "$STUB_LOG"
 STUB_SERVICE="" run ./ops/update.sh; want 1 "сервиса нет: код $code"; has "контейнер сервиса переписки не работает"; has "ИТОГ ОБНОВЛЕНИЯ: НЕ УСТАНОВЛЕНО"

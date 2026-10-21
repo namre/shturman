@@ -7,7 +7,9 @@
   service-log    журнал сервиса переписки (формат `asctime levelname name: message`, cli.py): время до
                  минуты, уровень, имя журнала (модуль кода) и имена классов исключений из текста
                  (ConnectionError, AuthKeyUnregisteredError…) и коды HTTP. Сам текст сообщения — нет:
-                 в нём бывают номера чатов, роли и подписи. Строки другого вида — только счётчиком.
+                 в нём бывают номера чатов, роли и подписи. Строки другого вида — только счётчиком,
+                 кроме отказа запуска из-за настройки (config.py, «SHTURMAN_…: …»): от неё берётся
+                 только имя переменной окружения — значение и пример адреса не берутся.
   hermes-errors  журнал ошибок Hermes (logs/errors.log, `asctime levelname [сессия] name: message`):
                  только счётчики по уровню и имени журнала за последние сутки. Hermes 0.21.5 пишет
                  в свои журналы начало текста входящих сообщений («inbound message: … msg=…»,
@@ -19,6 +21,10 @@
                  (done@время, короткое слово), записи журнала — время и «set ключ»; остальное — длиной.
   counts         любой журнал (база, дополнения): только число строк и число строк с ERROR, FATAL,
                  PANIC, WARNING, Traceback.
+  relay          журнал frpc (shturman-relay): то же, что counts, и сколько раз встретилась каждая
+                 причина отказа посредника из закрытого перечня (тексты relay/relayd.py, «посредник: …»)
+                 и каждый вид сбоя соединения frpc. Строки целиком — нет: в них номер подключения,
+                 по которому сосед по посреднику может перехватить имя (docs/relay.md, риски 8 и 9).
 
 Вход — stdin, выход — stdout. Ошибка разбора строки — строка пропускается.
 """
@@ -39,16 +45,23 @@ _HERMES = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:[,.]\d+)? (DEBUG|INFO
 _EXC = re.compile(r"\b([A-Z][A-Za-z0-9]{1,60}(?:Error|Exception|Timeout|Refused|Unknown|Left|Locked|Rejected|"
                   r"Expired|Revoked|Unregistered|Duplicated|Invalid|Unavailable|Closed|Reset|Interrupted))\b")
 _HTTP = re.compile(r"\bHTTP[ /]?(\d{3})\b")
+# Отказ запуска из-за настройки (ConfigError, sys.exit): строка начинается с имени переменной окружения.
+_CONFIG = re.compile(r"^(?:не заданы переменные окружения: )?((?:SHTURMAN|TELEGRAM|HERMES|MCP|POSTGRES)_[A-Z0-9_]{1,60})\b")
 
 
 def service_log(lines: list[str]) -> list[str]:
     out: list[str] = []
     kinds: Counter[tuple[str, str]] = Counter()
+    config: Counter[str] = Counter()
     other = 0
     for line in lines:
         m = _SERVICE.match(line)
         if not m:
-            other += line.strip() != ""
+            c = _CONFIG.match(line.strip())
+            if c:
+                config[c.group(1)] += 1
+            else:
+                other += line.strip() != ""
             continue
         when, level, name = m.groups()
         kinds[(level, name)] += 1
@@ -61,6 +74,9 @@ def service_log(lines: list[str]) -> list[str]:
             "# Счётчики по уровню и модулю:"]
     head += [f"#   {level:<8} {name:<40} {n}" for (level, name), n in sorted(kinds.items())]
     head.append(f"#   строк другого вида (не взяты): {other}")
+    if config:
+        head.append("# Отказ запуска из-за настройки (только имя переменной окружения): "
+                    + "; ".join(f"{name} — {n}" for name, n in sorted(config.items())))
     head.append("# Предупреждения и ошибки:")
     return head + out
 
@@ -177,8 +193,40 @@ def counts(lines: list[str]) -> list[str]:
     return [f"строк: {total}"] + [f"с «{w}»: {n}" for w, n in found.items()]
 
 
+# Причины отказа посредника — дословно тексты relay/relayd.py после «посредник: » (тест сверяет перечень).
+RELAY_REASONS = (
+    "неизвестный экземпляр или неверный ключ",
+    "экземпляр отключён держателем посредника",
+    "это подключение принадлежит другому экземпляру",
+    "разрешены только пересылки https и http",
+    "customDomains не разрешены, только subdomain",
+    "группы пересылок не разрешены",
+    "этому экземпляру разрешены только его имена",
+    "неверный запрос",
+    "операция не поддерживается",
+    "внутренняя ошибка",
+)
+# Виды сбоя самого frpc: подстрока его сообщения → как назвать.
+RELAY_FAILURES = (
+    ("login to the server failed", "вход к посреднику не удался"),
+    ("start error", "пересылка не запущена"),
+    ("i/o timeout", "посредник не ответил вовремя"),
+    ("connection refused", "посредник отклонил соединение"),
+    ("x509", "сертификат посредника не прошёл проверку"),
+)
+
+
+def relay(lines: list[str]) -> list[str]:
+    out = counts(lines)
+    reasons = Counter(r for line in lines for r in RELAY_REASONS if f"посредник: {r}" in line)
+    failures = Counter(name for line in lines for key, name in RELAY_FAILURES if key in line)
+    out.append("отказы посредника: " + ("; ".join(f"«{r}» — {n}" for r, n in sorted(reasons.items())) or "нет"))
+    out.append("сбои соединения: " + ("; ".join(f"{r} — {n}" for r, n in sorted(failures.items())) or "нет"))
+    return out
+
+
 MODES = {"service-log": service_log, "hermes-errors": hermes_errors, "doctor": doctor, "state": state,
-         "counts": counts}
+         "counts": counts, "relay": relay}
 
 
 def main(argv: list[str]) -> int:

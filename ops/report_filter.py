@@ -54,8 +54,8 @@ DOCTOR = re.compile(r"^(PASS|WARN|FAIL|SKIP)  ([a-z0-9][a-z0-9-]{0,40}): (.*)$")
 # Словарь — весь текст репозитория, кроме тестов и примеров (Д-41): так в нём есть обычные слова, которыми агент
 # описывает работу («шлют», «предпросмотр», «мусор»), а слов переписки нет. Примеры переписки в документах стоят в
 # блоках ``` и в кавычках «…» / "…", в скиллах сводок — образцы ответа: они в словарь не берутся.
-CORPUS = ("AGENTS.md", "README.md", "UPGRADING.md", "CHANGELOG.md", "docs", "prompts", "ops", "service/src",
-          "plugins/shturman")
+CORPUS = ("AGENTS.md", "DEVELOPING.md", "README.md", "UPGRADING.md", "CHANGELOG.md", "docs", "prompts", "ops",
+          "service/src", "plugins/shturman")
 SKIP_PARTS = frozenset({"tests", "e2e", "skills", "fixtures"})
 _FENCE = re.compile(r"^```.*?^```", re.S | re.M)
 _QUOTED = re.compile(r"«[^«»\n]{0,200}»|\"[^\"\n]{0,200}\"|“[^“”\n]{0,200}”")

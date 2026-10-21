@@ -117,7 +117,7 @@ sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/s
 
 ## Документы
 
-**Владельцу:** [`docs/hosting.md`](docs/hosting.md), [`docs/setup.md`](docs/setup.md), [`docs/address.md`](docs/address.md), [`docs/miniapp.md`](docs/miniapp.md). **Агенту:** [`AGENTS.md`](AGENTS.md), [`docs/runbooks/`](docs/runbooks/), [`UPGRADING.md`](UPGRADING.md), [`docs/scenarios-ops.md`](docs/scenarios-ops.md). **Устройство:** [`docs/architecture.md`](docs/architecture.md), [`docs/deployment.md`](docs/deployment.md), [`docs/service.md`](docs/service.md), [`service/README.md`](service/README.md), [`docs/target-model.md`](docs/target-model.md), [`docs/scenarios-product.md`](docs/scenarios-product.md), [`docs/decisions.md`](docs/decisions.md), [`docs/reuse.md`](docs/reuse.md).
+**Владельцу:** [`docs/hosting.md`](docs/hosting.md), [`docs/setup.md`](docs/setup.md), [`docs/address.md`](docs/address.md), [`docs/miniapp.md`](docs/miniapp.md). **Агенту:** [`AGENTS.md`](AGENTS.md) (меняет код и документы — ещё [`DEVELOPING.md`](DEVELOPING.md)), [`docs/runbooks/`](docs/runbooks/), [`UPGRADING.md`](UPGRADING.md), [`docs/scenarios-ops.md`](docs/scenarios-ops.md). **Устройство:** [`docs/architecture.md`](docs/architecture.md), [`docs/deployment.md`](docs/deployment.md), [`docs/service.md`](docs/service.md), [`service/README.md`](service/README.md), [`docs/target-model.md`](docs/target-model.md), [`docs/scenarios-product.md`](docs/scenarios-product.md), [`docs/decisions.md`](docs/decisions.md), [`docs/reuse.md`](docs/reuse.md).
 
 ## Лицензия
 

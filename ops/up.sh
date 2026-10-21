@@ -327,7 +327,7 @@ need=""
 if [ -d data/postgres ]; then
   if ! pg_running; then
     echo "Запускаю базу первой — сверить миграции…"
-    pg_start || { echo "База не запустилась: docker logs --tail 50 $PG. Ничего не перезапущено." >&2; exit 1; }
+    pg_start || { echo "База не запустилась. Ничего не перезапущено. Место на диске — строка disk в ./ops/doctor.sh; счётчики журнала базы — ./ops/diag.sh --print." >&2; exit 1; }
   fi
   if applied="$(db_migrations shturman 2> /dev/null)"; then
     if [ -n "$applied" ]; then
@@ -420,7 +420,7 @@ docker compose up -d --remove-orphans
 
 echo "Жду запуска сервиса переписки…"
 if ! wait_service; then
-  echo "Сервис переписки не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-service" >&2
+  echo "Сервис переписки не ответил за 90 секунд. Виды ошибок сервиса — ./ops/diag.sh --print; ./ops/doctor.sh, строка service." >&2
   exit 1
 fi
 
@@ -442,7 +442,7 @@ except Exception:
         echo "Каталог сокета для прокси готов, а сервис переписки запущен раньше — перезапускаю его, чтобы он открыл сокет…"
         docker compose restart shturman
         if ! wait_service; then
-          echo "Сервис переписки не ответил за 90 секунд. Смотрите: docker logs --tail 50 shturman-service" >&2
+          echo "Сервис переписки не ответил за 90 секунд. Виды ошибок сервиса — ./ops/diag.sh --print; ./ops/doctor.sh, строка service." >&2
           exit 1
         fi ;;
     esac ;;

@@ -9,7 +9,7 @@ src="$(cd "$(dirname "$0")/../.." && pwd)"
 fx="$src/ops/tests/fixtures"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/repo/local/update" "$tmp/stub" "$tmp/repo/docs"
-cp -r "$src/ops" "$src/AGENTS.md" "$src/prompts" "$tmp/repo/"
+cp -r "$src/ops" "$src/AGENTS.md" "$src/DEVELOPING.md" "$src/prompts" "$tmp/repo/"
 cp -r "$src/docs/runbooks" "$src/docs/scenarios-ops.md" "$src/docs/releases.md" "$src/docs/deployment.md" "$tmp/repo/docs/"
 rm -rf "$tmp/repo/ops/tests"
 cd "$tmp/repo"

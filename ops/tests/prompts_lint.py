@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 """Линт стартовых промптов и runbook шага 0 (CI, задание ops).
 
-1. Пути в обратных кавычках (`docs/…`, `prompts/…`, `ops/…`, `config/…`, `AGENTS.md` и т. п.) существуют в репозитории.
+1. Пути в обратных кавычках (`docs/…`, `prompts/…`, `ops/…`, `config/…`, `AGENTS.md`, `DEVELOPING.md` и т. п.) существуют в репозитории.
 2. `./ops/<скрипт>.sh --ключ` — скрипт существует, а каждый `--ключ` упомянут в его тексте (шапка-справка или код).
-3. Текст для владельца без технического жаргона: строки-цитаты (`> `) в docs/runbooks/hosting.md и разделы
+3. Текст для владельца без технического жаргона: строки-цитаты (`> `) в runbook из QUOTE_OWNER_FILES и разделы
    между строками <!-- owner-text --> и <!-- /owner-text --> (метка — одна на строке; упоминание в тексте не в счёт)
    во всех файлах *.md репозитория (находятся сами) не содержат слов из ops/tests/owner-terms-blocklist.txt;
    каждый такой раздел закрыт.
 4. Относительные ссылки Markdown `[…](путь)` в проверяемых файлах ведут на существующие файлы.
 
-Запуск из корня репозитория: python3 ops/tests/prompts_lint.py [файлы…]. Без файлов — промпты, runbook шага 0,
-README.md и все *.md с разделами для владельца. Код выхода 1 — есть замечания.
+Запуск из корня репозитория: python3 ops/tests/prompts_lint.py [файлы…]. Без файлов — промпты, runbook из QUOTE_OWNER_FILES,
+README.md, AGENTS.md, DEVELOPING.md и все *.md с разделами для владельца. Код выхода 1 — есть замечания.
 """
 import os
 import re
@@ -20,12 +20,16 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 DEFAULT_FILES = ['prompts/deploy-remote.md', 'prompts/deploy.md', 'prompts/deploy-standalone.md',
                  'prompts/guided-chat.md', 'prompts/operate-codex.md',
-                 'docs/runbooks/hosting.md', 'docs/hosting.md', 'README.md']
-QUOTE_OWNER_FILES = {'docs/runbooks/hosting.md'}   # здесь текст для владельца — строки-цитаты «> »
+                 'docs/runbooks/hosting.md', 'docs/hosting.md', 'README.md', 'AGENTS.md', 'DEVELOPING.md',
+                 'docs/runbooks/server-prepare.md', 'docs/runbooks/deploy.md', 'docs/runbooks/update.md',
+                 'docs/runbooks/restore.md', 'docs/runbooks/symptoms.md']
+# Здесь текст для владельца — строки-цитаты «> » (готовые фразы на стоп-точках runbook).
+QUOTE_OWNER_FILES = {'docs/runbooks/hosting.md', 'docs/runbooks/server-prepare.md', 'docs/runbooks/deploy.md',
+                     'docs/runbooks/update.md', 'docs/runbooks/restore.md', 'docs/runbooks/symptoms.md'}
 OPEN_MARK, CLOSE_MARK = '<!-- owner-text -->', '<!-- /owner-text -->'
 SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist'}
 PATH_RE = re.compile(r'^(?:docs|prompts|ops|config|plugins|service|relay|asr|frpc|\.github)/[A-Za-z0-9_./\-]+$|'
-                     r'^(?:AGENTS|README|UPGRADING|CHANGELOG|THIRD_PARTY_NOTICES|LICENSE)\.md$|^(?:VERSION|compose\.yaml|releases\.json)$')
+                     r'^(?:AGENTS|DEVELOPING|README|UPGRADING|CHANGELOG|THIRD_PARTY_NOTICES|LICENSE)\.md$|^(?:VERSION|compose\.yaml|releases\.json)$')
 SCRIPT_RE = re.compile(r'^\./ops/([A-Za-z0-9_\-]+\.sh)((?:\s+[^`]*)?)$')
 FLAG_RE = re.compile(r'(?<!\S)(--?[A-Za-z][A-Za-z0-9\-]*)')
 LINK_RE = re.compile(r'\]\(([^)\s]+)\)')
