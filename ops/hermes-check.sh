@@ -64,7 +64,7 @@ cat <<EOF
    - планировщике и часовом поясе профиля (hermes cron, timezone в config.yaml — строки hermes-tz, cron-schedule);
    - журналах: пишет ли Hermes текст сообщений (тогда ./ops/diag.sh берёт только счётчики — ops/diag_filter.py);
    - подсказке об обновлении: updates.check, баннер, кнопка в дашборде, команда /update в Telegram — что видит
-     владелец при установке из образа (docs/deferred.md, О-12);
+     владелец при установке из образа (docs/deferred.md, ОТ-12);
    - бизнес-режиме Telegram (issue NousResearch/hermes-agent #127430: бот Hermes в бизнес-режиме не подключаем).
    Есть локальный клон — то же по коду: git -C <клон> diff <прежний тег> $tag -- hermes_cli gateway.
 2. Стенд (не экземпляр владельца): ./ops/backup.sh; в .env стенда HERMES_VERSION=$tag; ./ops/up.sh --pull

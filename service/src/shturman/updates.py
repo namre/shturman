@@ -608,15 +608,17 @@ def codex_text(tag: str) -> str:
 def hermes_text(h: HermesRelease, run: Running) -> str:
     return (f"Вышла версия Hermes {h.version} ({h.tag}) — с вашим «Штурманом» она проверена "
             f"{h.verified.strftime('%d.%m.%Y')}. У вас сейчас Hermes {run.hermes}.\n\n"
-            "Обновлять ли Hermes — решаете вы: ассистент перезапустится, а вернуть прежнюю версию можно только "
-            "из резервной копии. Если решили — нажмите «Как обновить».")
+            "Обычно она приходит вместе со следующим выпуском «Штурмана». Хотите раньше — нажмите «Как обновить»: "
+            "агент скажет, можно ли это на вашем сервере. Ассистент при обновлении перезапустится, а вернуть "
+            "прежнюю версию можно только из резервной копии.")
 
 
 def hermes_codex_text(tag: str) -> str:
     return ("Текст для Codex — откройте новую сессию с промптом prompts/operate-codex.md и вставьте в конце:\n\n"
-            f"Обнови Hermes на моём «Штурмане» до {tag}: docs/runbooks/update.md, раздел «Новая версия Hermes», "
-            "сначала резервная копия. Версия проверена — она есть в config/hermes-versions.txt. Строку "
-            "HERMES_VERSION в .env записываю я — скажи, как. В конце сессии — ./ops/report.sh.")
+            f"Вышла версия Hermes {tag}: задание «Вышла версия Hermes» в prompts/operate-codex.md, "
+            "runbook docs/runbooks/update.md, раздел «Новая версия Hermes». Скажи мне, как она придёт на мой "
+            "сервер. Разрешения я даю кнопкой в боте согласований — в терминал меня не отправляй. "
+            "В конце сессии — ./ops/report.sh.")
 
 
 def model_text(w: ModelWarning, days_left: int) -> str:

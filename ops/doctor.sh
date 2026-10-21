@@ -22,7 +22,7 @@
 # в журнале ошибок Hermes (logs/errors.log) считаются строки отказа 401 архива за последний час —
 # печатается только число. Строка jobs — очередь заданий: всего ждут, неудачных за всё время и по
 # группам «модель» и «бот» — ждут, давность самого старого готового, выполнено за час (jobs_queue в
-# /api/status, только числа; Д-25). Строка jobs-failing — задания модели за час по счётчику сервиса
+# /api/status, только числа). Строка jobs-failing — задания модели за час по счётчику сервиса
 # (llm_jobs в /api/status: числа и виды ошибок, без текстов). Строка stopped (Р-87) — остановил ли
 # владелец ассистента кнопкой «Остановить всё» (WARN, пока остановлено); setup-code-login (Р-88) —
 # включён ли вход на страницу по коду из бота и сколько было таких входов за 7 суток, без кодов.
@@ -42,10 +42,10 @@
 # Строка hermes-version сверяет тег образа Hermes со списком проверенных версий config/hermes-versions.txt.
 # Строка archive-guard (Р-104) — граница выдачи архива ассистенту: открыта, приторможена после тревоги или закрыта
 # (FAIL — если закрыла ловушка); выдано за час и сутки против пределов, ловушки, тревоги за 7 дней — только числа.
-# С Hermes без своей модели сервиса к закрытой выдаче дописано, что обработка переписки идёт через Hermes (Д-54);
+# С Hermes без своей модели сервиса к закрытой выдаче дописано, что обработка переписки идёт через Hermes;
 # строка model говорит то же и при открытой.
 # Строка replies (Р-105) — ответы: доступна ли доставка «Отправить» и чего не хватает, а без неё — «В чат», черновики ответов
-# (готовятся ли сами, числа за 7 дней), автоответ доверенным (включён ли; Д-51) — только признаки и числа (replies в /api/status).
+# (готовятся ли сами, числа за 7 дней), автоответ доверенным (включён ли) — только признаки и числа (replies в /api/status).
 # Строка updates (Р-101) — какой код запущен в сервисе (тег, коммит; против git в каталоге), итог последней
 # проверки списка выпусков releases.json и что доступно (updates в /api/status: только теги, коды и время).
 # Параметров нет. -h, --help — эта справка; проверки при этом не выполняются.
@@ -327,7 +327,7 @@ if [ -n "$public_url" ]; then
   if curl -s -m 5 http://127.0.0.1:9119/api/auth/providers 2>/dev/null | grep -q '"name":"shturman"'; then
     pass login "способ входа «Штурман» подключён"
   else
-    fail login "плагин shturman не зарегистрировал вход — ./ops/up.sh; не помогло — ./ops/diag.sh --print (журнал Hermes — только счётчики ошибок; сам журнал — только с разрешения владельца: в нём начало текста его сообщений)"
+    fail login "плагин shturman не зарегистрировал вход — ./ops/up.sh; не помогло — ./ops/diag.sh --print (журнал Hermes — только счётчики ошибок; сам журнал не читают и с разрешения владельца: в нём начало текста его сообщений)"
   fi
   page="$(curl -s -o /dev/null -m 8 -w '%{http_code}' "$public_url/shturman-auth/login.html" 2>/dev/null)"
   case "${page:-000}" in
@@ -433,11 +433,11 @@ done <<EOF_JOBS
 $tz_jobs
 EOF_JOBS
 if [ -n "$tz_bad" ]; then
-  warn cron-schedule "$tz_bad. ./ops/up.sh пересчитает расписание (hermes cron edit <id> --schedule <та же запись>)"
+  warn cron-schedule "$tz_bad. ./ops/up.sh пересчитает расписание, затем снова ./ops/doctor.sh; задачу в Hermes руками не править"
 elif [ -n "$tz_ok" ]; then
   pass cron-schedule "следующий запуск по поясу ${tz_zone:-сервера (UTC)}: $tz_ok"
 elif [ "$tz_listed" != yes ]; then
-  warn cron-schedule "расписание задач shturman:* не проверено: список задач Hermes прочитать не удалось — docker exec shturman-hermes hermes cron list --all"
+  warn cron-schedule "расписание задач shturman:* не проверено: список задач Hermes прочитать не удалось — смотрите строки hermes и hermes-version; ./ops/up.sh, затем снова ./ops/doctor.sh"
 else
   pass cron-schedule "задач сводок shturman:* в Hermes нет — их заводит плагин (POST /api/plugins/shturman/cron/install)"
 fi
@@ -506,7 +506,7 @@ else
       running)   pass summary-last "$title: идёт сейчас" ;;
       queued)    warn summary-last "$title ($when) составлена, но ждёт доставки: шлюз Hermes не на связи с Telegram — смотрите строку bot-live" ;;
       delivery_failed) fail summary-last "$title ($when) составлена, но не доставлена: Telegram не принял сообщение бота ассистента или некуда доставлять — строки bot-live и bot-owner. Повторный запуск — только по решению владельца: сводка придёт ему и потратит запросы к модели" ;;
-      failed)    fail summary-last "$title: последний запуск ($when) упал — чаще всего модель ассистента не ответила (ключ, лимит, сеть) или архив недоступен (строки archive-mcp, jobs-failing). Текст ошибки — в журнале Hermes, его без разрешения владельца не читают: в нём может быть его переписка. Повторный запуск — только по решению владельца" ;;
+      failed)    fail summary-last "$title: последний запуск ($when) упал — чаще всего модель ассистента не ответила (ключ, лимит, сеть) или архив недоступен (строки archive-mcp, jobs-failing). Текст ошибки — только в журнале Hermes, его не читают и с разрешения владельца: в нём может быть его переписка; счётчики ошибок — ./ops/diag.sh --print. Повторный запуск — только по решению владельца" ;;
       *)         warn summary-last "$title: итог последнего запуска не распознан (код $code)" ;;
     esac
   done <<EOF_LAST2
@@ -608,7 +608,7 @@ case "$biz" in
 esac
 if [ "$hermes_business" = "yes" ]; then
   # Ответы через такое подключение не уходят никогда (Д-45): отправку ведёт только бот согласований сервиса.
-  warn business-hermes "бот-ассистент сейчас подключён в бизнес-режиме Telegram (схема до 0.0.6). Ответы через него не отправляются (Д-45) — отправляет только бот согласований; что с этим делать, решает владелец — UPGRADING.md, «0.0.5 → 0.0.6» и «0.0.11 → следующая версия»"
+  warn business-hermes "бот-ассистент сейчас подключён в бизнес-режиме Telegram (схема до 0.0.6). Ответы через него не отправляются — отправляет только бот согласований; что с этим делать, решает владелец — UPGRADING.md, «0.0.5 → 0.0.6» и «0.0.11 → 0.0.12»"
 fi
 
 else
@@ -828,7 +828,7 @@ EOF6
       else
         lj_pct=$((lj_failed * 100 / lj_total))
         lj_msg="$lj_where заданий модели: $lj_total, не удалось: $lj_failed ($lj_pct%)${lj_top:+; чаще всего: $lj_top}"
-        if [ "$MODE" = hermes ]; then lj_hint="причина — в журнале Hermes: docker exec $c grep -a 'shturman.executor' /opt/data/logs/errors.log | tail -n 5"
+        if [ "$MODE" = hermes ]; then lj_hint="журнал Hermes не читают; счётчики ошибок по модулям — ./ops/diag.sh --print"
         else lj_hint="состояние своей модели — строка model ниже и docker exec $svc shturman bot-status"; fi
         if [ "$lj_failed" -ge 10 ] && [ "$lj_pct" -ge 50 ]; then fail jobs-failing "$lj_msg — $lj_hint"
         elif [ "$lj_failed" -ge 5 ] && [ "$lj_pct" -ge 20 ]; then warn jobs-failing "$lj_msg — $lj_hint"
