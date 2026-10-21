@@ -199,6 +199,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck -S warning ops/*.sh ops/tests/*.sh ops/tests/stub/docker
+      # Стартовые промпты и runbook шага 0: пути существуют, ключи ./ops/*.sh есть в скриптах,
+      # текст для владельца без жаргона (ops/tests/owner-terms-blocklist.txt).
+      - name: промпты — пути, ключи скриптов, текст для владельца
+        run: python3 ops/tests/prompts_lint.py
       # Выпуск (тег vX.Y.Z или vX.Y.Z-rc.N): VERSION, CHANGELOG, UPGRADING и проверенный Hermes по умолчанию.
       - name: выпуск — тег собран верно
         if: startsWith(github.ref, 'refs/tags/v')

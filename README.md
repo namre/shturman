@@ -65,7 +65,7 @@
 
 Проект рассчитан на то, что развёртывание и сопровождение выполняет ИИ-агент под вашим присмотром.
 
-**Основной путь — ваш агент делает всё сам.** Откройте новую сессию Claude Code (в приложении Claude — режим работы с кодом) или Codex у себя на компьютере и вставьте текст из [`prompts/deploy-remote.md`](prompts/deploy-remote.md). Терминал и SSH вам не нужны: агент сам создаст ключ доступа, подготовит сервер (`docs/runbooks/server-prepare.md`) и развернёт ассистента. От вас — ответы на его вопросы, пара действий в панели хостинга (и у регистратора домена, если он есть), которые он покажет по шагам, и «да» на стоп-точках. Нужны: сервер (VPS) с Ubuntu 24.04 и вход в панель его хостинга. Домен — по желанию: как вы будете открывать ассистента — по своему домену, по IP-адресу сервера или через посредника, — агент спросит вас сам, проверив сервер (`docs/address.md`).
+**Основной путь — ваш агент делает всё сам.** Откройте новую сессию Claude Code (в приложении Claude — режим работы с кодом) или Codex у себя на компьютере и вставьте текст из [`prompts/deploy-remote.md`](prompts/deploy-remote.md). Терминал и SSH вам не нужны: агент сам создаст ключ доступа, подготовит сервер (`docs/runbooks/server-prepare.md`) и развернёт ассистента. От вас — ответы на его вопросы, пара действий в панели хостинга (и у регистратора домена, если он есть), которые он покажет по шагам, и «да» на стоп-точках. Нужны: сервер (VPS) с Ubuntu 24.04 и вход в панель его хостинга; сервера ещё нет — агент сначала поможет выбрать и купить его (`docs/hosting.md`). Домен — по желанию: как вы будете открывать ассистента — по своему домену, по IP-адресу сервера или через посредника, — агент спросит вас сам, проверив сервер (`docs/address.md`).
 
 **Режим «агент на сервере»** — для тех, кто сам работает с SSH: Claude Code или Codex CLI запущен на самом сервере, репозиторий склонирован в `/opt/shturman` (образец прокси ждёт именно этот путь; домашний каталог прокси прочитать не сможет):
 
@@ -116,7 +116,7 @@ sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/s
 
 ## Документы
 
-`docs/target-model.md` · `docs/external-sources.md` · `docs/remote-mcp.md` · `docs/runbooks/validate.md` · `docs/scenarios-product.md` · `docs/scenarios-ops.md` · `docs/architecture.md` · `docs/deployment.md` · `docs/service.md` · `docs/setup.md` · `docs/miniapp.md` · `docs/standalone.md` · `docs/security-review.md` · `docs/guard.md` · `docs/search.md` · `docs/voice.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `docs/runbooks/deploy-standalone.md` · `UPGRADING.md` · `service/README.md` · `AGENTS.md`
+`docs/hosting.md` · `docs/target-model.md` · `docs/external-sources.md` · `docs/remote-mcp.md` · `docs/runbooks/validate.md` · `docs/scenarios-product.md` · `docs/scenarios-ops.md` · `docs/architecture.md` · `docs/deployment.md` · `docs/service.md` · `docs/setup.md` · `docs/miniapp.md` · `docs/standalone.md` · `docs/security-review.md` · `docs/guard.md` · `docs/search.md` · `docs/voice.md` · `docs/reuse.md` · `docs/memory.md` · `docs/personas.md` · `docs/decisions.md` · `docs/runbooks/deploy.md` · `docs/runbooks/deploy-standalone.md` · `UPGRADING.md` · `service/README.md` · `AGENTS.md`
 
 ## Лицензия
 

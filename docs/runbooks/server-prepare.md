@@ -21,6 +21,8 @@
 В примерах `203.0.113.10` — адрес сервера, который назвал владелец; подставляй свой.
 
 ### 1. Что знает владелец
+Был шаг 0 (`docs/runbooks/hosting.md`, сервер покупали вместе) — хостинг, адрес, вход и размер уже известны; спроси только то, чего ещё нет.
+
 Спроси только это:
 - у какого хостинга сервер и есть ли у него вход в панель этого хостинга;
 - адрес сервера (IP) — он есть в панели или в письме хостинга;
@@ -156,7 +158,7 @@
 - Каталог — именно `/opt/shturman`: образец прокси (`config/Caddyfile.example`) отдаёт страницы входа из `/opt/shturman/plugins/shturman/public`, а домашний каталог пользователя прокси прочитать не может.
 - Если клонирование просит логин — репозиторий закрыт. Не вводи ничего: сказать владельцу, что для этого пути репозиторий должен быть открытым (или у сервера должен быть свой ключ доступа к нему — отдельная задача).
 - Проверка: `ssh shturman-app 'cd /opt/shturman && cat VERSION && ./ops/state.sh show && ./ops/preflight.sh'` → версия, «развёртывание не начато», и в `preflight` нет `FAIL`, кроме `FAIL docker`, если группа `docker` ещё не применилась (переподключиться). `WARN memory`, `WARN cpu` и `WARN net:…` — пересказать владельцу простыми словами, что из дополнений на этом сервере не включится; это не стоп.
-- Запись: выбор адреса из отчёта (шаг 5ж) — `ssh shturman-app 'cd /opt/shturman && ./ops/state.sh set address ip'` (`domain`, `ip` или `relay`; в режиме без Hermes — не записывать), затем `./ops/state.sh done server-prepare`. Проверка: `./ops/state.sh get address` печатает выбор.
+- Запись: выбор адреса из отчёта (шаг 5ж) — `ssh shturman-app 'cd /opt/shturman && ./ops/state.sh set address ip'` (`domain`, `ip` или `relay`; в режиме без Hermes — не записывать), затем `./ops/state.sh done server-prepare`. Был шаг 0 — запиши и его итог: `./ops/state.sh set hosting "<провайдер>/<страна>"`, `./ops/state.sh set backup-place snapshot` (копии у провайдера включены; `none` — не включены), `./ops/state.sh done hosting`. Проверка: `./ops/state.sh get address` печатает выбор.
 
 Дальше — `docs/runbooks/deploy.md` с шага 1. Каждую команду runbook выполнять как `ssh shturman-app 'cd /opt/shturman && …'`; долгие (`./ops/up.sh`, скачивание моделей) — в фоне: `nohup ./ops/up.sh > /tmp/shturman-up.log 2>&1 &`, затем проверять конец файла, пока не появится `ИТОГ:`. Шаги runbook с `sudo` (прокси, firewall) — от `shturman` через `sudo`, как стоп-точки.
 
