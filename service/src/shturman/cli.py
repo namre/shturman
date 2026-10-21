@@ -500,14 +500,28 @@ async def _guard(action: str, *, as_json: bool) -> None:
     print(alerts.summary_text(waiting))
 
 
-def _serve() -> None:
+# Журналы, которые на уровне INFO пишут адрес каждого запроса целиком: httpx — «HTTP Request: POST
+# https://…», httpcore — ход соединения. Среди адресов — адрес внешнего сторожа, а его целиком не
+# печатает даже ./ops/pulse.sh (только имя узла). Журнал сервиса оператор не читает, но он попадает
+# в диагностический пакет (через белый список) и остаётся на диске сервера, — поэтому эти два
+# журнала пишут только WARNING и выше.
+QUIET_LOGGERS = ("httpx", "httpcore")
+
+
+def configure_logging() -> None:
     import logging
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _serve() -> None:
     from . import listen
     from .app import build_app
     from .config import Config, ConfigError
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure_logging()
     try:
         config = Config.from_env()
     except ConfigError as exc:

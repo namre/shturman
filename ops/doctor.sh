@@ -96,13 +96,13 @@ ip_cert_checks() {
     # это не обязательно неполадка: многие хостинги не пускают сервер к его же внешнему адресу
     # через NAT. Тогда проверить можно только из браузера.
     if ! timeout 5 bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$host" "$port" 2> /dev/null; then
-      warn proxy-cert "$host:$port — сервер не достаёт до своего внешнего адреса (порт закрыт, прокси его не слушает или хостинг не пускает сервер к его же адресу) — проверьте адрес из браузера; если там ошибка — порт $port в firewall сервера и хостинга и journalctl -u caddy"
+      warn proxy-cert "$host:$port — сервер не достаёт до своего внешнего адреса (порт закрыт, прокси его не слушает или хостинг не пускает сервер к его же адресу) — проверьте адрес из браузера; если там ошибка — порт $port в firewall сервера и хостинга; журнал прокси (sudo journalctl -u caddy) смотрит человек, не агент"
       continue
     fi
     pem="$(timeout 10 openssl s_client -connect "$host:$port" -noservername < /dev/null 2> /dev/null \
       | openssl x509 2> /dev/null)" || pem=""
     if [ -z "$pem" ]; then
-      fail proxy-cert "$host:$port — соединение есть, но прокси не отдал сертификат: сертификат на IP-адрес ещё не получен (journalctl -u caddy; порт 80 должен быть открыт из интернета) или сервер за NAT, а в глобальном блоке прокси нет default_sni (config/Caddyfile.example, вариант «без домена»)"
+      fail proxy-cert "$host:$port — соединение есть, но прокси не отдал сертификат: сертификат на IP-адрес ещё не получен (порт 80 должен быть открыт из интернета; журнал прокси смотрит человек, не агент) или сервер за NAT, а в глобальном блоке прокси нет default_sni (config/Caddyfile.example, вариант «без домена»)"
       continue
     fi
     if ! printf '%s\n' "$pem" | openssl x509 -noout -checkip "$host" 2> /dev/null | grep -q 'does match'; then
@@ -110,13 +110,13 @@ ip_cert_checks() {
       continue
     fi
     if ! printf '%s\n' "$pem" | openssl x509 -noout -checkend 0 > /dev/null 2>&1; then
-      fail proxy-cert "$host:$port — сертификат на IP-адрес просрочен: Caddy не смог его продлить — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (journalctl -u caddy)"
+      fail proxy-cert "$host:$port — сертификат на IP-адрес просрочен: Caddy не смог его продлить — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (журнал прокси смотрит человек, не агент)"
       continue
     fi
     code=0; curl -s -o /dev/null -m 8 "https://$host:$port/" 2> /dev/null || code=$?
     case "$code" in
       35|51|58|59|60|77|83|90|91)
-        fail proxy-cert "$host:$port — сертификат не проходит проверку (код curl $code): его выдал не общепризнанный центр (например, внутренний центр Caddy) или цепочка неполна — сверьте блоки прокси с вариантом «без домена» (config/Caddyfile.example) и journalctl -u caddy"
+        fail proxy-cert "$host:$port — сертификат не проходит проверку (код curl $code): его выдал не общепризнанный центр (например, внутренний центр Caddy) или цепочка неполна — сверьте блоки прокси с вариантом «без домена» (config/Caddyfile.example); журнал прокси смотрит человек, не агент"
         continue ;;
     esac
     # Пороги — средствами openssl (-checkend), без разбора даты; часы — только для показа.
@@ -128,7 +128,7 @@ ip_cert_checks() {
       [ "$left_h" -ge 24 ] || left="$left_h ч"
     fi
     if ! printf '%s\n' "$pem" | openssl x509 -noout -checkend 172800 > /dev/null 2>&1; then
-      warn proxy-cert "$host:$port — сертификату на IP-адрес осталось меньше двух суток${left:+ ($left)}. Caddy обычно продлевает его за 2–3 дня до конца; раз не продлил — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (journalctl -u caddy)"
+      warn proxy-cert "$host:$port — сертификату на IP-адрес осталось меньше двух суток${left:+ ($left)}. Caddy обычно продлевает его за 2–3 дня до конца; раз не продлил — проверьте, что порт 80 открыт из интернета и сервер достаёт до Let's Encrypt (журнал прокси смотрит человек, не агент)"
     else
       pass proxy-cert "$host:$port — сертификат на IP-адрес действителен${left:+, осталось $left} (живёт 160 ч, продлевает Caddy)"
     fi
@@ -184,7 +184,7 @@ if [ -n "$relay_name" ]; then
     if [ "$rstate" = running ]; then
       pass relay "контейнер frpc работает: имя $relay_name, посредник ${relay_server:-?}:${relay_port:-?}"
     else
-      fail relay "контейнер shturman-relay в состоянии: $rstate — ./ops/up.sh; docker logs --tail 50 shturman-relay"
+      fail relay "контейнер shturman-relay в состоянии: $rstate — ./ops/up.sh; счётчики журнала — ./ops/diag.sh --print"
     fi
     if ! grep -Eq '^SHTURMAN_RELAY_KEY=.+' .env || ! grep -Eq '^SHTURMAN_RELAY_TOKEN=.+' .env; then
       fail relay-key "в .env нет ключа подключения или токена посредника — подключение заново: ./ops/relay.sh off --forget, затем join с новым кодом"
@@ -202,9 +202,9 @@ if [ -n "$relay_name" ]; then
       if [ "$running" -eq 4 ]; then
         pass relay-proxies "пересылки дашборда и страницы настройки работают (4 из 4)"
       elif [ -z "$rstatus" ]; then
-        fail relay-proxies "frpc не отдал состояние пересылок — docker logs --tail 50 shturman-relay"
+        fail relay-proxies "frpc не отдал состояние пересылок — причина отказа посредника: ./ops/diag.sh --print (other-logs.txt, shturman-relay)"
       else
-        fail relay-proxies "работают $running из 4 ($bad): посредник не принял подключение или имена — docker logs --tail 50 shturman-relay (там причина отказа посредника)"
+        fail relay-proxies "работают $running из 4 ($bad): посредник не принял подключение или имена — причина отказа посредника: ./ops/diag.sh --print (other-logs.txt, shturman-relay)"
       fi
     fi
     if [ -n "$relay_server" ] && timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$relay_server" "${relay_port:-7000}" 2>/dev/null; then
@@ -415,7 +415,7 @@ case "$tz_state:$tz_pending" in
   missing:*) fail hermes-tz "шлюз Hermes считает расписание по часам сервера (UTC): в config.yaml профиля нет timezone, а переменную HERMES_TIMEZONE=$tz_want шлюз при нескольких профилях не читает — сводка придёт не в то время. ./ops/up.sh запишет пояс и перезапустит Hermes" ;;
   differs:*) fail hermes-tz "шлюз Hermes считает расписание по поясу $tz_have, а ожидается $tz_want (SHTURMAN_TIMEZONE) — сводка придёт не в то время. ./ops/up.sh запишет пояс и перезапустит Hermes" ;;
   invalid:*) fail hermes-tz "в окружении Hermes неизвестный часовой пояс «$tz_want» — исправьте SHTURMAN_TIMEZONE в .env (вид Europe/Moscow) и запустите ./ops/up.sh" ;;
-  *) warn hermes-tz "часовой пояс шлюза Hermes не проверен: в этой версии Hermes нет нужных функций либо контейнер не ответил — docker exec shturman-hermes hermes config show | grep timezone" ;;
+  *) warn hermes-tz "часовой пояс шлюза Hermes не проверен: в этой версии Hermes нет нужных функций либо контейнер не ответил — смотрите строки hermes и hermes-version; ./ops/up.sh, затем снова ./ops/doctor.sh; не проверяется и дальше — строка дефекта" ;;
 esac
 tz_ok=""; tz_bad=""
 while IFS="$tab" read -r name drift expr at; do
@@ -505,8 +505,8 @@ else
       never)     pass summary-last "$title: ещё не запускалась; первый запуск — $nxt" ;;
       running)   pass summary-last "$title: идёт сейчас" ;;
       queued)    warn summary-last "$title ($when) составлена, но ждёт доставки: шлюз Hermes не на связи с Telegram — смотрите строку bot-live" ;;
-      delivery_failed) fail summary-last "$title ($when) составлена, но не доставлена: Telegram не принял сообщение бота ассистента или некуда доставлять — строки bot-live и bot-owner. Повторный запуск — только по решению владельца: сводка придёт ему и потратит запросы к модели" ;;
-      failed)    fail summary-last "$title: последний запуск ($when) упал — чаще всего модель ассистента не ответила (ключ, лимит, сеть) или архив недоступен (строки archive-mcp, jobs-failing). Текст ошибки — только в журнале Hermes, его не читают и с разрешения владельца: в нём может быть его переписка; счётчики ошибок — ./ops/diag.sh --print. Повторный запуск — только по решению владельца" ;;
+      delivery_failed) fail summary-last "$title ($when) составлена, но не доставлена: Telegram не принял сообщение бота ассистента или некуда доставлять — строки bot-live и bot-owner. Команды повторного запуска нет: следующая сводка придёт по расписанию" ;;
+      failed)    fail summary-last "$title: последний запуск ($when) упал — чаще всего модель ассистента не ответила (ключ, лимит, сеть) или архив недоступен (строки archive-mcp, jobs-failing). Текст ошибки — только в журнале Hermes, его не читают и с разрешения владельца: в нём может быть его переписка; счётчики ошибок — ./ops/diag.sh --print. Команды повторного запуска нет: следующая сводка придёт по расписанию" ;;
       *)         warn summary-last "$title: итог последнего запуска не распознан (код $code)" ;;
     esac
   done <<EOF_LAST2
@@ -625,7 +625,7 @@ if docker inspect "$svc" >/dev/null 2>&1; then
   svc_state="$(container_state "$svc")"
   code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8765/health 2>/dev/null)"
   if [ "$svc_state" = "running" ] && [ "${code:-000}" = "200" ]; then pass service "сервис переписки работает"
-  else fail service "сервис переписки не отвечает (контейнер: $svc_state, HTTP ${code:-000}) — docker logs --tail 50 $svc"; fi
+  else fail service "сервис переписки не отвечает (контейнер: $svc_state, HTTP ${code:-000}) — ./ops/up.sh; виды ошибок — ./ops/diag.sh --print"; fi
 
   if ! command -v ss >/dev/null 2>&1; then
     warn service-bind "нет программы ss (пакет iproute2) — не проверено, какие адреса слушают сервис и база"
@@ -731,7 +731,7 @@ EOF5
         else
           pass archive-mcp "архив подключён к Hermes: токен виден в области профиля, архив его принимает$mcp_mux"
         fi ;;
-      *) warn archive-mcp "подключение архива к Hermes не проверено: в этой версии Hermes нет нужных функций либо контейнер не ответил — проверьте вручную: docker exec shturman-hermes hermes mcp test shturman" ;;
+      *) warn archive-mcp "подключение архива к Hermes не проверено: в этой версии Hermes нет нужных функций либо контейнер не ответил — смотрите строки hermes и hermes-version; ./ops/up.sh, затем снова ./ops/doctor.sh; не проверяется и дальше — строка дефекта" ;;
     esac
   else
     # Без токена архив обязан отказать: так видно и что он отвечает, и что закрыт. Сам токен не нужен.
@@ -1030,9 +1030,9 @@ EOF4
     elif [ "$setup_enabled" != "yes" ] && [ "$same" != yes ]; then
       # При совпавших адресах сервис тоже сообщает enabled=false, но на локальном адресе страницу
       # отдаёт — её отсутствие там уже неполадка (ветка ниже).
-      warn setup-page "страница настройки переписки в сервисе не запущена (HTTP ${probe_code:-000} на локальном адресе) — docker logs --tail 50 $svc"
+      warn setup-page "страница настройки переписки в сервисе не запущена (HTTP ${probe_code:-000} на локальном адресе) — виды ошибок сервиса: ./ops/diag.sh --print"
     else
-      fail setup-page "страница настройки переписки не отвечает на 127.0.0.1:8765/shturman-setup/ (HTTP ${probe_code:-000}) — docker logs --tail 50 $svc"
+      fail setup-page "страница настройки переписки не отвечает на 127.0.0.1:8765/shturman-setup/ (HTTP ${probe_code:-000}) — виды ошибок сервиса: ./ops/diag.sh --print"
     fi
 
     # 2. У страницы свой адрес — не тот, что у дашборда.
@@ -1120,7 +1120,7 @@ EOF4
     if [ "$MODE" = hermes ]; then
       sock_dir=/run/shturman-service; sock="$sock_dir/proxy.sock"; caddyfile=/etc/caddy/Caddyfile
       sock_want="$(id -un):caddy 2710"
-      fix_dir="каталог создаёт systemd-tmpfiles по config/shturman-service-socket.conf (стоп-точка, sudo: docs/runbooks/deploy.md, шаг 5б; на работающем экземпляре — UPGRADING.md), затем ./ops/up.sh"
+      fix_dir="каталог создаёт systemd-tmpfiles по config/shturman-service-socket.conf (стоп-точка, sudo: docs/runbooks/deploy.md, шаг 5б, пункт 5), затем ./ops/up.sh"
       fix_caddy="в блоке страницы настройки обратного прокси — reverse_proxy unix/$sock вместо 127.0.0.1:8765, как в config/Caddyfile.example (правка прокси — стоп-точка)"
       caddy_way=unknown
       if [ -r "$caddyfile" ]; then
@@ -1157,7 +1157,7 @@ EOF4
             rm -f "$hdr"
             sock_perm="$(stat -c '%G %a' "$sock" 2>/dev/null || true)"
             if [ "${sock_code:-000}" != 200 ] || [ "$sock_mark" != yes ]; then
-              sock_bad "сервис открыл сокет, но страница настройки через него не отвечает (HTTP ${sock_code:-000}) — docker logs --tail 50 $svc"
+              sock_bad "сервис открыл сокет, но страница настройки через него не отвечает (HTTP ${sock_code:-000}) — виды ошибок сервиса: ./ops/diag.sh --print"
             elif [ "$sock_perm" != "caddy 660" ]; then
               sock_bad "сокет $sock с правами «${sock_perm:-нет}» вместо «caddy 660» — прокси не сможет к нему подключиться: $fix_dir"
             else
@@ -1172,7 +1172,7 @@ EOF4
           off) sock_bad "сервис переписки запущен без SHTURMAN_PROXY_SOCKET — ./ops/up.sh (compose.yaml задаёт его сам); если не помогло, проверьте compose.override.yaml" ;;
           dir_missing|dir_owner|dir_mode)
             sock_bad "каталог сокета теперь в порядке, но сервис переписки запущен, когда он ещё не был готов ($setup_socket) — ./ops/up.sh перезапустит сервис, и он откроет сокет" ;;
-          *) sock_bad "сервис переписки не открыл сокет ($setup_socket) — docker logs --tail 50 $svc" ;;
+          *) sock_bad "сервис переписки не открыл сокет ($setup_socket) — виды ошибок сервиса: ./ops/diag.sh --print" ;;
         esac
       fi
     fi
@@ -1209,7 +1209,7 @@ EOF4
       gnext=""; [ "${waiting:-0}" -gt 0 ] && gnext=" — решить разом: /guard в боте согласований; почему скрыто: ./ops/guard.sh stats"
       case "$st" in
         *'"guard_problem":"unreachable"'*)
-          fail guard "модель-классификатор не отвечает (контейнер: $grd) — входящие сообщения видны ассистенту НЕПРОВЕРЕННЫМИ: ${unchecked:-0}; docker logs --tail 50 shturman-guard" ;;
+          fail guard "модель-классификатор не отвечает (контейнер: $grd) — входящие сообщения видны ассистенту НЕПРОВЕРЕННЫМИ: ${unchecked:-0}; память и перезапуски — ./ops/resources.sh, счётчики журнала — ./ops/diag.sh --print" ;;
         *'"guard_problem":"model_mismatch"'*)
           fail guard "контейнер классификатора отдаёт не ту модель — входящие сообщения не проверяются: ${unchecked:-0}; запустите ./ops/guard.sh on" ;;
         *'"guard_model_used":false'*)
@@ -1282,7 +1282,7 @@ print("llm_ok_age=" + age(m.get("last_ok_age")))' 2>/dev/null)
 EOF3
 
   if [ "$bot_configured" = unknown ]; then
-    if [ "$MODE" = standalone ]; then fail approvals-bot "сервис не отдал состояние бота согласований — docker logs --tail 50 $svc"; fi
+    if [ "$MODE" = standalone ]; then fail approvals-bot "сервис не отдал состояние бота согласований — виды ошибок сервиса: ./ops/diag.sh --print"; fi
   elif [ "$bot_configured" = no ]; then
     warn approvals-bot "бот согласований не настроен: решения, которые должен подтвердить владелец (принять обязательство, включить чат), не применяются. Это первый шаг страницы настройки переписки; запасной путь — ./ops/init-env.sh (вводит владелец), затем ./ops/up.sh"
   else
@@ -1326,7 +1326,7 @@ EOF3
           warn miniapp "у страницы настройки нет внешнего адреса https — приложению «Штурман» в Telegram он нужен: ./ops/set-setup-url.sh (docs/miniapp.md). Решения пока — кнопками в боте согласований"
         fi ;;
       no_owner) warn miniapp "кнопка «Штурман» появится в боте согласований после привязки владельца" ;;
-      failed) warn miniapp "Telegram не принял кнопку «Штурман» — сервис повторит через 10 минут; подробности: docker logs --tail 50 $svc" ;;
+      failed) warn miniapp "Telegram не принял кнопку «Штурман» — сервис повторит через 10 минут; виды ошибок сервиса — ./ops/diag.sh --print" ;;
       *) warn miniapp "кнопка «Штурман» ещё не сверялась — повторите проверку через минуту" ;;
     esac
   fi
@@ -1378,7 +1378,7 @@ EOF3
         *'"embeddings_problem":"model_mismatch"'*)
           fail embeddings "контейнер эмбеддингов отдаёт не ту модель, что записана в настройках (${emb_model:-?}) — векторы не считаются, поиск идёт по словам; запустите ./ops/embeddings.sh on" ;;
         *'"embeddings_problem":"unreachable"'*)
-          fail embeddings "сервер эмбеддингов не отвечает (контейнер: $emb) — поиск идёт только по словам; docker logs --tail 50 shturman-embeddings" ;;
+          fail embeddings "сервер эмбеддингов не отвечает (контейнер: $emb) — поиск идёт только по словам; память и перезапуски — ./ops/resources.sh, счётчики журнала — ./ops/diag.sh --print" ;;
         *)
           if [ "$emb" != "running" ]; then
             fail embeddings "контейнер эмбеддингов в состоянии: $emb — запустите ./ops/embeddings.sh on"
@@ -1404,11 +1404,11 @@ EOF3
   case "$st" in
     *'"voice_enabled":true'*)
       if [ "$asr" != "running" ]; then
-        fail voice "контейнер распознавания речи в состоянии: $asr — голосовые ждут; docker logs --tail 50 shturman-asr, ./ops/asr.sh on"
+        fail voice "контейнер распознавания речи в состоянии: $asr — голосовые ждут; ./ops/asr.sh on; память и перезапуски — ./ops/resources.sh, счётчики журнала — ./ops/diag.sh --print"
       else
         case "$st" in
           *'"voice_problem":"unreachable"'*)
-            fail voice "контейнер распознавания речи не отвечает — голосовые ждут (${v_pending:-0}); docker logs --tail 50 shturman-asr" ;;
+            fail voice "контейнер распознавания речи не отвечает — голосовые ждут (${v_pending:-0}); память и перезапуски — ./ops/resources.sh, счётчики журнала — ./ops/diag.sh --print" ;;
           *)
             pass voice "расшифровка голосовых включена; готово: ${v_done:-0}, ждут: ${v_pending:-0}, не получилось: ${v_failed:-0}" ;;
         esac
@@ -1521,7 +1521,7 @@ print(head + "; " + tail)' 2>/dev/null)"
       in_sync) pass summaries "расписание сводок в Hermes совпадает с выбором владельца в «Настройках Штурмана»" ;;
       pending) pass summaries "владелец только что сменил расписание сводок — плагин Hermes применяет (обычно меньше минуты)" ;;
       drift) warn summaries "расписание в Hermes не совпадает с выбором владельца (${s_differs:-сводки}) — правили в самом Hermes? Владелец вернёт кнопкой «Применить снова» в «Настройках Штурмана», блок «Утренняя сводка»" ;;
-      no_report) warn summaries "владелец выбрал расписание сводок, а плагин Hermes его не применил — проверьте строки hermes и bridge; плагин заберёт задание сам, когда мост заработает" ;;
+      no_report) warn summaries "владелец выбрал расписание сводок, а плагин Hermes его не применил — проверьте строки hermes, plugin и jobs; плагин заберёт задание сам, когда мост заработает" ;;
       error) warn summaries "плагин Hermes не смог применить расписание сводок (${s_differs:-сводки}) — частая причина: не задан чат владельца в Hermes (мастер настройки, привязка бота)" ;;
       *) ;;   # выбора нет: сводки — как заведены в Hermes (строка cron-schedule)
     esac

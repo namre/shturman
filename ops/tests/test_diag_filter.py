@@ -37,6 +37,20 @@ class Clean(unittest.TestCase):
         self.assertIn("строк другого вида (не взяты): 6", text)
         self.assertNotIn("RuntimeError: ", text)          # строка трассировки не взята вовсе
 
+    def test_service_config_error_keeps_variable_name_only(self):
+        out = diag_filter.service_log([
+            "SHTURMAN_SETUP_ORIGIN: нужен адрес вида https://assistant.example.com:8443",
+            "SHTURMAN_FEEDBACK_CHAT: номер чата записан неверно",
+            "не заданы переменные окружения: SHTURMAN_API_TOKEN, SHTURMAN_MCP_TOKEN",
+            "Иван Петров написал что-то"])
+        self.assertClean(out)
+        text = "\n".join(out)
+        self.assertIn("SHTURMAN_SETUP_ORIGIN — 1", text)
+        self.assertIn("SHTURMAN_FEEDBACK_CHAT — 1", text)
+        self.assertIn("SHTURMAN_API_TOKEN — 1", text)
+        self.assertIn("строк другого вида (не взяты): 1", text)
+        self.assertNotIn("example.com", text)
+
     def test_hermes_errors_are_counts_only(self):
         out = diag_filter.hermes_errors(lines("hermes-errors.log"))
         self.assertClean(out)
@@ -77,6 +91,31 @@ class Clean(unittest.TestCase):
         out = diag_filter.counts(["ERROR: duplicate key value Иван Петров", "LOG: ok", "FATAL: x"])
         self.assertClean(out)
         self.assertEqual(out[0], "строк: 3")
+
+    def test_relay_keeps_only_known_reasons_and_failure_kinds(self):
+        log = ["2026-10-16 09:12:01.123 [W] [client/service.go:295] login to the server failed: "
+               "посредник: экземпляр отключён держателем посредника. With loginFailExit enabled…",
+               "2026-10-16 09:12:00.001 [I] [client/service.go:287] [a1b2c3d4e5f60718] login to server success, "
+               "get run id [a1b2c3d4e5f60718]",
+               "2026-10-16 09:13:00 [W] [proxy] [dashboard-https] start error: посредник: этому экземпляру "
+               "разрешены только его имена (ivanpetrov.sh.namre.app)",
+               "2026-10-16 09:14:00 [W] connect to server error: dial tcp 203.0.113.7:7000: i/o timeout"]
+        out = diag_filter.relay(log)
+        self.assertClean(out)
+        text = "\n".join(out)
+        self.assertEqual(out[0], "строк: 4")
+        self.assertIn("«экземпляр отключён держателем посредника» — 1", text)
+        self.assertIn("«этому экземпляру разрешены только его имена» — 1", text)
+        self.assertIn("вход к посреднику не удался — 1", text)
+        self.assertIn("посредник не ответил вовремя — 1", text)
+        for leak in ("a1b2c3d4e5f60718", "203.0.113.7", "namre"):
+            self.assertNotIn(leak, text)
+
+    def test_relay_reasons_match_relayd(self):
+        import re
+        code = (HERE.parent.parent / "relay" / "relayd.py").read_text(encoding="utf-8")
+        found = set(re.findall(r'"посредник: ([^"]+)"', code))
+        self.assertEqual(found, set(diag_filter.RELAY_REASONS))
 
     def test_mask_spares_names_of_code_and_settings(self):
         line = ("смотрите docs/deployment.md и config/Caddyfile.example; SHTURMAN_PROCESSING_HOURLY_CAP; "

@@ -56,7 +56,7 @@ services:
       SHTURMAN_API_TOKEN: ${SHTURMAN_API_TOKEN:-}
       MCP_SHTURMAN_API_KEY: ${SHTURMAN_MCP_TOKEN:-}
     # Подключено только это. Каталог сокета сервиса (/run/shturman-service), каталог данных сервиса,
-    # /run и /proc хоста, сокет Docker сюда не подключаются никогда (AGENTS.md, Р-76).
+    # /run и /proc хоста, сокет Docker сюда не подключаются никогда (docs/runbooks/deploy.md, «Инварианты»; Р-76).
     volumes:
       - ./data/hermes:/opt/data
       # Плагин «Штурмана» подключается из репозитория только для чтения: обновляется вместе с git pull.
