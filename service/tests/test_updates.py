@@ -285,8 +285,11 @@ async def test_buttons_how_later_skip(rig, conn):
     assert (await bridge.dispatch_callback(conn, f"sh:up:skip:{notice}", 2001))["answer"] == "Кнопка недоступна."
     with authority.owner_context(1000, chat_id=1000, action="test.telegram.callback"):
         await bridge.dispatch_callback(conn, f"sh:up:later:{notice}", 1000)
-    assert await updates.tell_news(conn, state, NOON + timedelta(days=6)) == []
-    assert await updates.tell_news(conn, state, NOON + timedelta(days=8)) == ["release"]
+    # «Напомнить через неделю» считает срок от настоящего времени базы, а не от NOON теста.
+    until = await conn.fetchval("SELECT snoozed_until FROM update_notices WHERE id = $1", notice)
+    at_noon = lambda day: NOON.replace(year=day.year, month=day.month, day=day.day)  # днём, не в тихие часы
+    assert await updates.tell_news(conn, state, at_noon((until - timedelta(days=1)).date())) == []
+    assert await updates.tell_news(conn, state, at_noon((until + timedelta(days=1)).date())) == ["release"]
     with authority.owner_context(1000, chat_id=1000, action="test.telegram.callback"):
         out = await bridge.dispatch_callback(conn, f"sh:up:skip:{notice}", 1000)
     assert "пропущена" in out["answer"]
