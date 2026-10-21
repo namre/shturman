@@ -13,13 +13,13 @@
 """
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from setup_fakes import API, API_HASH, ORIGIN, bind_owner, stand  # noqa: F401, I001 — stand — фикстура; первым: добавляет пути
 from conftest import API_AUTH, MCP_AUTH
 import exec_fakes  # noqa: E402
 from tg_fakes import (C_NEWS, C_SUPER, G_FAMILY, HELPER, IVAN, MARIA, U_BOT, U_IVAN, U_MARIA, U_TELEGRAM,  # noqa: E402
-                      DIALOGS_NOW, World, dialogs_loaded, folder, user, wait_for)
+                      World, dialogs_loaded, folder, user, wait_for)
 from tg_fakes import msg as tg_msg  # noqa: E402
 
 from test_miniapp import MODULES, OWNER, TOKEN, App, signed  # noqa: E402
@@ -41,10 +41,12 @@ def foldered() -> World:
     ]
     world.muted = {("chat", G_FAMILY.id)}
     # время последнего сообщения — убывает по списку, как у Telegram
+    recent = datetime.now(timezone.utc) - timedelta(minutes=5)
     for n, entity in enumerate(world.dialogs):
         key = ("user" if entity in (U_IVAN, U_MARIA, U_BOT, U_TELEGRAM) or entity in CLIENTS else
                "chat" if entity is G_FAMILY else "channel", entity.id)
-        world.dates[key] = DIALOGS_NOW - timedelta(days=(0 if n < 2 else 10 if n < 4 else 45 if n < 6 else 400))
+        # Раскладка «по активности» считает от настоящего «сейчас» базы — даты тоже от него, а не от DIALOGS_NOW.
+        world.dates[key] = recent - timedelta(days=(0 if n < 2 else 10 if n < 4 else 45 if n < 6 else 400))
     return world
 
 
