@@ -1,0 +1,17 @@
+# Слова, которых не должно быть в тексте для владельца (образцы вопросов в docs/runbooks/hosting.md —
+# строки, начинающиеся с «> », и разделы docs/hosting.md между <!-- owner-text --> и <!-- /owner-text -->).
+# Одна строка — одно регулярное выражение (Python, без учёта регистра). Строки с # — комментарии.
+# Замены: ssh → «вход на сервер», vps → «сервер», dns → «запись у регистратора», docker/контейнер → не упоминать,
+# firewall → «защита сети», snapshot → «снимок сервера», sudo/root → «права администратора».
+\bssh\b
+\bvps\b
+\bdns\b
+\bdocker\b
+контейнер
+\bfirewall\b
+\bsnapshot\b
+\bsudo\b
+\broot\b
+\bcaddy\b
+\bcompose\b
+\bapi\b
