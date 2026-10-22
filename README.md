@@ -4,6 +4,8 @@
 
 Это пилот: на настоящих аккаунтах Telegram и с настоящими моделями проверено не всё (раздел «Что готово»).
 
+**Агенту (Claude Code, Codex).** Вас попросили развернуть «Штурман» — хватит и ссылки на этот репозиторий — работайте по [`prompts/deploy-remote.md`](prompts/deploy-remote.md), если вы на компьютере владельца (сервер — по SSH, его готовите вы), или по [`prompts/deploy.md`](prompts/deploy.md), если вы на самом сервере; так, будто владелец вставил текст промпта: с первого пункта, со всеми его вопросами и стоп-точками. На компьютер, где вы запущены, «Штурман» не ставится, если владелец не назвал его своим сервером; неясно, где вы, — спросите. Сопровождать уже развёрнутый — [`prompts/operate-codex.md`](prompts/operate-codex.md). Правила для любой задачи — [`AGENTS.md`](AGENTS.md).
+
 ## Прежде чем ставить
 
 <!-- owner-text -->
@@ -79,10 +81,10 @@
 
 ## Другие способы развёртывания
 
-**Агент на сервере** — для тех, кто сам работает с SSH: Claude Code или Codex CLI на сервере, репозиторий в `/opt/shturman` (образец прокси ждёт этот путь):
+**Агент на сервере** — для тех, кто сам работает с SSH: Claude Code или Codex CLI на сервере, репозиторий в `/opt/shturman` (образец прокси ждёт этот путь). Команда — для самого сервера, не для вашего компьютера:
 
 ```
-sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/shturman.git /opt/shturman && cd /opt/shturman
+sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/shturman.git /opt/shturman && cd /opt/shturman && ./ops/install-ref.sh
 ```
 
 Затем [`prompts/deploy.md`](prompts/deploy.md) или [`prompts/deploy-standalone.md`](prompts/deploy-standalone.md); runbook — [`docs/runbooks/`](docs/runbooks/). **Обычный чат, у которого нет доступа к серверу**, — [`prompts/guided-chat.md`](prompts/guided-chat.md): команды в терминале сервера выполняете сами. **Сопровождение** — [`prompts/operate-codex.md`](prompts/operate-codex.md). Облачные агенты в своей песочнице до сервера не дотянутся; ключ доступа к серверу в облако не отдавайте.
