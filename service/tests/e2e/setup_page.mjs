@@ -1297,11 +1297,12 @@ await shot(page, "27-app-done-desktop-light");
   }
 }
 
-// --- репетиция ответов (Р-85) ---------------------------------------------------------------------
-// Раздел «Репетиция ответов»: включить, выбрать человека из личных чатов, предел. Живое сообщение Анны
-// (пульт `POST /rehearsal/live`) — карточка в боте стенда с предложенным ответом и тремя оценками, без
-// отдельного уведомления; оценка нажатием в Telegram (`POST /rehearsal/press`) отмечает кнопку и видна в
-// статистике раздела. Собеседнику — ничего. Снимки раздела в четырёх видах — в `E2E_REHEARSAL_OUT`.
+// --- черновики ответов (Р-85, Р-105) --------------------------------------------------------------
+// Раздел «Черновики ответов»: включить, выбрать человека из личных чатов, предел. Живое сообщение Анны
+// (пульт `POST /rehearsal/live`) — карточка «✍️ Черновик ответа» в боте стенда с предложенным ответом, без
+// отдельного уведомления. Отправка на стенде выключена: «Отправить» под карточкой нет (`replies/delivery.py`).
+// «Не годится» нажатием в Telegram (`POST /rehearsal/press?rating=bad`) снимает черновик, отмечает кнопку и
+// видна в статистике раздела. Собеседнику — ничего. Снимки раздела в пяти видах — в `E2E_REHEARSAL_OUT`.
 {
   const RH_OUT = process.env.E2E_REHEARSAL_OUT || OUT;
   mkdirSync(RH_OUT, { recursive: true });
@@ -1321,14 +1322,14 @@ await shot(page, "27-app-done-desktop-light");
   await page.goto(URL_PAGE);
   await page.waitForSelector("#screen-app:not([hidden])");
   await page.waitForFunction(() => document.getElementById("st-rehearsal").textContent !== "", null, { timeout: 10000 }).catch(() => {});
-  check("репетиция: раздел виден, по умолчанию выключена", await page.isVisible("#s-rehearsal") &&
-        (await page.textContent("#st-rehearsal")) === "выключена", await page.textContent("#st-rehearsal"));
+  check("черновики: раздел виден, сами не готовятся — «только по кнопке»", await page.isVisible("#s-rehearsal") &&
+        (await page.textContent("#st-rehearsal")) === "только по кнопке", await page.textContent("#st-rehearsal"));
   await page.click("#rehearsal-details > summary");
   await page.waitForSelector("#rh-stats .rh-tile");
-  check("репетиция: сказано, что отправить нельзя; основной аккаунт подключён — предупреждения нет",
-        (await page.textContent(".rh-safe")).includes("Отправить отсюда нельзя") && !(await page.isVisible("#rh-noaccount")) &&
+  check("черновики: сказано, что сам сервис ничего не отправляет; основной аккаунт подключён — предупреждения нет",
+        (await page.textContent(".rh-safe")).includes("Сам сервис ничего не отправляет") && !(await page.isVisible("#rh-noaccount")) &&
         !(await page.isVisible("#rh-nobot")));
-  check("репетиция: в разделе нет кнопки отправки",
+  check("черновики: в разделе нет кнопки отправки",
         !(await page.locator("#s-rehearsal button", { hasText: /Отправ/ }).count()));
   await cardShot(page, "rehearsal-off-desktop-light");
 
@@ -1338,42 +1339,42 @@ await shot(page, "27-app-done-desktop-light");
   await page.click("#rh-people-found button");
   await page.fill("#rh-cap", "20");
   await page.click("#rehearsal-save");
-  check("репетиция: включена со страницы сразу — Анна по номеру, 20 в сутки", await waitFor(async () => {
+  check("черновики: включены со страницы сразу — Анна по номеру, 20 в сутки", await waitFor(async () => {
     const s = (await seen()).settings; return s && s.enabled && s.people.length === 1 && s.people[0] === 5101 && s.daily_cap === 20; }),
         JSON.stringify((await seen()).settings));
-  await page.waitForFunction(() => document.getElementById("st-rehearsal").textContent.startsWith("включена"));
+  await page.waitForFunction(() => document.getElementById("st-rehearsal").textContent === "сами · 1 человек");
 
   const notifiedBefore = (await seen()).notified.length;
   await control("POST", "/rehearsal/live");
   const shown = await waitFor(async () => (await seen()).cards.length === 1, 30000);
   const after = await seen();
   const card = after.cards[0] || { text: "", buttons: [] };
-  check("репетиция: карточка ушла в бот — кто, сообщение, предложенный ответ", shown &&
+  check("черновики: карточка ушла в бот — «Черновик ответа», кто, сообщение, предложенный ответ, отправить нельзя", shown &&
+        card.text.startsWith("✍️ Черновик ответа — ничего не отправлено") &&
         card.text.includes("Вам написали: Анна Ким") && card.text.includes("Завтра в 10 на объекте получится?") &&
-        card.text.includes("Да, в 10 буду на объекте") && card.text.includes("отправить отсюда нельзя"), card.text);
-  check("репетиция: под карточкой только три оценки",
-        JSON.stringify(card.buttons) === JSON.stringify([["Годится"], ["Почти — поправил бы"], ["Не годится"]]),
+        card.text.includes("Да, в 10 буду на объекте") && card.text.includes("Отправить отсюда сейчас нельзя"), card.text);
+  // «В чат» первой строкой — только когда сессия основного аккаунта на связи (`delivery.why_no_put`); остальное — всегда
+  const labels = card.buttons.map((row) => row.join(" | "));
+  const rest = labels[0] === "В чат" ? labels.slice(1) : labels;
+  check("черновики: под карточкой «Скопировать», «🎙 Наговорить свой», «Не годится», «Открыть чат»; «Отправить» нет",
+        JSON.stringify(rest) === JSON.stringify(["Скопировать", "🎙 Наговорить свой", "Не годится", "Открыть чат"]),
         JSON.stringify(card.buttons));
-  check("репетиция: отдельного уведомления об этом сообщении нет",
+  check("черновики: отдельного уведомления об этом сообщении нет",
         !after.notified.slice(notifiedBefore).some((t) => t.includes("Завтра в 10")), JSON.stringify(after.notified));
 
-  await control("POST", "/rehearsal/press?rating=almost");
-  check("репетиция: оценка «Почти» сохранена и отмечена на кнопке; ниже — «Не писать свой вариант»", await waitFor(async () => {
+  await control("POST", "/rehearsal/press?rating=bad");
+  check("черновики: «Не годится» сохранена и отмечена на кнопке; остаются «Наговорить свой» и «Открыть чат»", await waitFor(async () => {
     const s = await seen();
-    return s.items.some((i) => i.rating === "almost") && s.marked.some((m) => JSON.stringify(m) ===
-      JSON.stringify(["Годится", "✓ Почти — поправил бы", "Не годится", "Не писать свой вариант"]));
+    return s.items.some((i) => i.rating === "bad") && s.marked.some((m) => JSON.stringify(m) ===
+      JSON.stringify(["🎙 Наговорить свой", "✓ Не годится", "Открыть чат"]));
   }), JSON.stringify((await seen()).marked));
-  // Р-89: после «Почти» бот просит свой вариант (поле ответа); ответ на эту просьбу сохраняется у карточки
-  check("репетиция: бот просит «Напишите, как ответили бы вы» с полем ответа", await waitFor(async () =>
-    (await control("GET", "/bot/sent")).some((m) => (m.text || "").includes("как ответили бы вы") && m.reply_markup && m.reply_markup.force_reply)));
-  await control("POST", "/bot/reply?text=" + encodeURIComponent("Доброе утро! Да, буду в 10, смету привезу."));
-  check("репетиция: свой вариант сохранён у карточки", await waitFor(async () => (await seen()).items.some((i) => i.variant)));
   const final = await seen();
-  check("репетиция: собеседнику ничего — ни сообщения бота, ни черновика, ни задачи ответа",
-        final.business_sent === 0 && final.drafts === 0 && final.tasks === 0, JSON.stringify(final));
-  check("журнал: репетиция и оценка записаны — без имён, номеров людей и текста",
+  check("черновики: собеседнику ничего — ни сообщения бота, ни задачи ответа; черновик снят",
+        final.business_sent === 0 && final.tasks === 0 && final.draft_states.length === 1 &&
+        final.draft_states[0] === "rejected", JSON.stringify(final));
+  check("журнал: настройки черновиков и оценка записаны — без имён, номеров людей и текста",
         final.audit.some((r) => r.action === "rehearsal.settings") && final.audit.some((r) => r.action === "rehearsal.rate") &&
-        !["Анна", "5101", "Завтра", "смету", "привезу"].some((w) => JSON.stringify(final.audit).includes(w)), JSON.stringify(final.audit));
+        !["Анна", "5101", "Завтра", "смету", "объекте"].some((w) => JSON.stringify(final.audit).includes(w)), JSON.stringify(final.audit));
 
   await page.goto(URL_PAGE);
   await page.waitForSelector("#screen-app:not([hidden])");
@@ -1381,7 +1382,7 @@ await shot(page, "27-app-done-desktop-light");
   await page.waitForFunction(() => document.querySelector("#rh-stats .rh-tile .rh-num") &&
                              document.querySelector("#rh-stats .rh-tile .rh-num").textContent === "1");
   const stats = await page.textContent("#rh-stats");
-  check("репетиция: статистика за 7 дней — 1 карточка, 1 «почти»", stats.includes("1карточка") && stats.includes("1почти"), stats);
+  check("черновики: статистика за 7 дней — 1 карточка, 1 «не годится»", stats.includes("1карточка") && stats.includes("1не годится"), stats);
   await cardShot(page, "rehearsal-on-desktop-light");
 
   const views = [["desktop-dark", { ...desktop, colorScheme: "dark" }], ["phone-light", phone],
@@ -1397,7 +1398,7 @@ await shot(page, "27-app-done-desktop-light");
     await p.waitForSelector("#rh-people li .btn");
     await cardShot(p, `rehearsal-on-${name}`);
     const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
-    check(`вёрстка (репетиция; ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
+    check(`вёрстка (черновики ответов; ${name}): страница не шире экрана`, overflow <= 1, "лишних пикселей: " + overflow);
     await ctx.close();
   }
 }
