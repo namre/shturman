@@ -357,8 +357,9 @@ stack_stop_but_db() {
 # Отметка живой базы: «none» (базы или таблицы нет), «running» (не остановлен) или три SQL-литерала для
 # halt_carry — время, откуда, аккаунты на паузе. База недоступна — код 1.
 halt_live() {
-  local has
-  [ "$(pg_q postgres "SELECT count(*) FROM pg_database WHERE datname = 'shturman'")" = 1 ] || { echo none; return 0; }
+  local has db
+  db="$(pg_q postgres "SELECT count(*) FROM pg_database WHERE datname = 'shturman'")" || return 1
+  [ "$db" = 1 ] || { echo none; return 0; }
   has="$(pg_q shturman "SELECT to_regclass('public.assistant_halt') IS NOT NULL")" || return 1
   [ "$has" = t ] || { echo none; return 0; }
   pg_q shturman "SELECT COALESCE((SELECT format('%L::timestamptz, %L::text, %L::bigint[]', since, via, paused_accounts) FROM assistant_halt WHERE id = 1 AND stopped), 'running')"
@@ -386,9 +387,16 @@ halt_carry() {
   fi
   was="$(pg_q shturman_restore "SELECT stopped FROM assistant_halt WHERE id = 1")" || return 1
   case "$live" in
-    none|running|"")
-      [ -n "$live" ] || echo "Остановлен ли ассистент сейчас, прочитать не удалось (нынешняя база недоступна) — после восстановления остановка такая, как в копии."
-      [ "$was" != t ] || echo "В копии ассистент остановлен («Остановить всё») — после восстановления он остановлен; продолжить — только владелец, «Продолжить» в боте согласований."
+    none|running)
+      [ "$was" != t ] || echo "В копии ассистент остановлен («Остановить всё») — после восстановления он остановлен, чтение переписки — как в копии; продолжить — только владелец, «Продолжить» в боте согласований."
+      return 0 ;;
+    "")
+      # Прочитать нынешнюю отметку не удалось — нельзя и знать, что владелец не нажимал «Остановить всё».
+      # Ошибаемся в сторону остановки: снять её владелец может сам, а молча снятую он не заметит.
+      if [ "$was" != t ]; then
+        pg_q shturman_restore "WITH u AS (UPDATE assistant_halt h SET stopped = true, since = now(), via = NULL, resume_nonce = NULL, updated_at = now() WHERE h.id = 1 AND NOT h.stopped RETURNING 1) SELECT count(*) FROM u" > /dev/null || return 1
+      fi
+      echo "ВНИМАНИЕ: остановлен ли ассистент сейчас, прочитать не удалось — на всякий случай после восстановления он остановлен («Остановить всё»). Скажите владельцу: если он не останавливал ассистента, продолжить — «Продолжить» в боте согласований."
       return 0 ;;
   esac
   # Значения пришли из базы через format(%L); всё же — только ожидаемого вида, прежде чем вставить их в запрос.
@@ -636,7 +644,7 @@ rollback_run() {
     [ -n "$stamp" ] || { echo "В $UPDATE_LAST не записана копия, снятая перед обновлением, — откат базы невозможен. Ничего не изменено." >&2; return 1; }
     dir="$(bk_find "$stamp")" || { echo "Копии $stamp, снятой перед обновлением, нет ни в $BK_LOCAL, ни во внешнем каталоге — откат базы невозможен. Ничего не изменено." >&2; return 1; }
     rollback_copy_ok "$dir" "$stamp" || return 1
-    run="local/restore/rollback-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$run"; chmod 700 local/restore "$run"
+    run="local/restore/rollback-$(date -u +%Y%m%dT%H%M%SZ)"; [ ! -e "$run" ] || run="$run-$$"; mkdir -p "$run"; chmod 700 local/restore "$run"
     echo "Останавливаю ассистента и сервис (база остаётся запущенной)…"
     stack_stop_but_db || true
     if [ -f "$dir/db-$stamp.dump" ]; then

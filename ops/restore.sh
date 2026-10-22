@@ -178,7 +178,8 @@ do_restore() {
 
   ops_lock "восстановление из копии $from (./ops/restore.sh)"
   ./ops/state.sh log "восстановление из копии $from: начато (только: $only)" > /dev/null 2>&1 || true
-  run="local/restore/$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$run/src"; chmod 700 local/restore "$run"
+  run="local/restore/$(date -u +%Y%m%dT%H%M%SZ)"; [ ! -e "$run" ] || run="$run-$$"   # два запуска в одну секунду
+  mkdir -p "$run/src"; chmod 700 local/restore "$run"
   # Источник — в рабочий каталог (жёсткой ссылкой, если тот же диск): ротация копии перед
   # восстановлением не должна удалить ту, из которой восстанавливаем.
   for s in "data-$from.tar.gz" "db-$from.dump" "meta-$from.txt"; do

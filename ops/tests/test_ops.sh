@@ -226,8 +226,12 @@ ok "остановлен до восстановления, в копии — н
 STUB_HALT_LIVE=running STUB_HALT_COPY=t run ./ops/restore.sh --from "$s"; want 0; has "В копии ассистент остановлен"
 if grep -q "UPDATE assistant_halt" "$STUB_LOG"; then die "не остановленный сейчас — отметка всё равно переписана"; fi
 ok "не остановлен сейчас, остановлен в копии — остаётся остановленным (как в копии), владельцу сказано"
-STUB_HALT_LIVE=down STUB_HALT_COPY=f run ./ops/restore.sh --from "$s"; want 0; has "прочитать не удалось"
-ok "нынешняя база не читается — восстановление идёт, остановка как в копии, об этом сказано"
+: > "$STUB_LOG"
+STUB_HALT_LIVE=down STUB_HALT_COPY=f run ./ops/restore.sh --from "$s"; want 0; has "прочитать не удалось"; has "на всякий случай после восстановления он остановлен"
+upd="$(grep -n "shturman_restore .*UPDATE assistant_halt h SET stopped = true, since = now(), via = NULL" "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+ren="$(grep -n "RENAME TO shturman_replaced" "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+[ -n "$upd" ] && [ -n "$ren" ] && [ "$upd" -lt "$ren" ] || die "нынешняя отметка не прочитана — восстановленная база не остановлена до подмены"
+ok "нынешняя база не читается — восстановление идёт, ассистент на всякий случай остановлен, об этом сказано"
 STUB_HALT_LIVE=stopped run ./ops/restore.sh --from "$s"; want 0; has "копия сделана до появления «Остановить всё»"
 ok "копия старше «Остановить всё» — восстановление идёт, владельцу сказать, что остановить снова"
 for bad in odd fail; do
