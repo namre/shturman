@@ -42,7 +42,7 @@ HERMES_HOME=/путь/к/новому/каталогу python bridge_hermes.py
 1. Hermes той версии, для которой написан плагин (`git clone --branch v2026.9.24`), установленный в отдельное окружение Python: `pip install -e 'hermes-agent[web,messaging]'`.
 2. Пустой каталог `HERMES_HOME`; в нём `plugins/shturman` — ссылка на этот плагин, а в `config.yaml` — `plugins: {enabled: [shturman]}`.
 3. Имя `shturman.test`, указывающее на `127.0.0.1`.
-4. Caddy с первым блоком из `config/Caddyfile.example` (дашборд и страницы входа): адрес `http://shturman.test:8080`, каталог страниц входа — `plugins/shturman/public` этого репозитория. Проверено с Caddy 2.10.2. Сервис переписки стенду не нужен; второй блок образца (страница настройки переписки на отдельном порту) сценарии не используют — его маршрутизация проверяется отдельно, подставными сервисами (`docs/deployment.md`, «Проверено и не проверено»).
+4. Caddy с первым блоком из `config/Caddyfile.example` (дашборд и страницы входа): адрес `http://shturman.test:8080`, каталог страниц входа — `plugins/shturman/public` этого репозитория. Проверено с Caddy 2.10.2. Сервис переписки стенду не нужен; второй блок образца (страница настройки переписки на отдельном порту) сценарии не используют — его маршрутизация проверяется отдельно, подставными сервисами (`docs/deployment-checks.md`, «Маршрутизация образца прокси»).
 5. Дашборд: `HERMES_DASHBOARD_PUBLIC_URL=http://shturman.test:8080 hermes dashboard --host 127.0.0.1 --port 9119 --no-open`.
 
 ## Запуск

@@ -11,7 +11,7 @@
 
 **Чужое сообщение может управлять ассистентом.** Текст в читаемом чате может пытаться заставить ассистента вынести переписку наружу: интернет у него есть. Пределы выдачи архива и защита от таких сообщений (по умолчанию выключена) это сужают, но не исключают.
 
-**Что может уйти от вашего имени.** Отправка выключена, пока вы её не включите. По кнопке «В чат» текст ложится в поле ввода вашего чата — отправляете вы. Включите отправку и автоответ доверенным — он уйдёт без вашего нажатия. Дадите боту согласований право отвечать в ваших чатах — писать от вашего имени в обход выключателя сможет любой, у кого есть его ключ: ваш сервер, его администратор, а у бота «в одно нажатие» — держатель посредника. Создавайте бота сами.
+**Что может уйти от вашего имени.** Отправка выключена, пока вы её не включите. По кнопке «В чат» текст ложится в поле ввода вашего чата — отправляете вы. Включите отправку и автоответ доверенным — он уйдёт без вашего нажатия. Дадите боту согласований право отвечать в ваших чатах — писать от вашего имени в обход выключателя сможет любой, у кого есть его ключ: вы в @BotFather, «Штурман» на сервере, администратор сервера, а у бота «в одно нажатие» — держатель посредника. Создавайте бота сами.
 
 **Копии.** Сам «Штурман» снимает копию перед обновлением и по просьбе, не по расписанию; она лежит на том же сервере, не зашифрована и содержит вход в ваш Telegram. Включите автоматические копии у провайдера сервера; от закрытия аккаунта у него спасает только копия у другого.
 
@@ -94,20 +94,20 @@ sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/s
 | Часть | Состояние |
 |---|---|
 | Документы, [`AGENTS.md`](AGENTS.md), стартовые промпты | Есть |
-| `compose.yaml` со стоковым Hermes, скрипты `ops/` | Hermes 0.21.5 поднят на эталонном сервере (Ubuntu 24.04); стек целиком — только на стенде ([`docs/deployment.md`](docs/deployment.md)) |
+| `compose.yaml` со стоковым Hermes, скрипты `ops/` | Hermes 0.21.5 поднят на эталонном сервере (Ubuntu 24.04); стек целиком — только на стенде ([`docs/deployment-checks.md`](docs/deployment-checks.md)) |
 | Runbook развёртывания | Черновики; шаги 1–4 режима с Hermes пройдены на живом сервере |
 | Плагин: вход, привязка владельца, мастер; страница «Настройки Штурмана» на своём адресе | Стенд в браузере; с настоящим аккаунтом и на эталонном сервере — нет ([`docs/setup.md`](docs/setup.md)) |
-| Сервис переписки: архив, импорт, сессии, поиск, архив для агента (MCP), граница выдачи архива | Тесты, частично стенд; с настоящим Telegram — нет ([`docs/service.md`](docs/service.md)) |
-| Свой бот согласований, своя модель сервиса | Бот работает вживую; доставка ответа собеседнику и подписка ChatGPT вживую не проверены; бот «в одно нажатие» — стенд ([`docs/approvals-bot.md`](docs/approvals-bot.md)) |
+| Сервис переписки: архив, импорт, сессии, поиск, архив для агента (MCP), граница выдачи архива | Тесты, частично стенд; с настоящим Telegram — нет ([`docs/service-checks.md`](docs/service-checks.md)) |
+| Свой бот согласований, своя модель сервиса | Бот работает вживую; доставка ответа собеседнику, ещё несколько путей бота и подписка ChatGPT вживую не проверены; бот «в одно нажатие» — стенд ([`docs/approvals-bot.md`](docs/approvals-bot.md)) |
 | Черновики ответов, «В чат», задачи ответа | Отправка выключена; «В чат» вживую проверен частично ([`docs/runbooks/validate.md`](docs/runbooks/validate.md)) |
-| Память, обязательства, ночная обработка; сводка и обзор недели | Стенд с подставной моделью ([`docs/memory.md`](docs/memory.md)) |
+| Память, обязательства, ночная обработка; сводка и обзор недели | Тесты с подставной моделью; на живом экземпляре — два первых прогона договорённостей, качество не измерено ([`docs/memory.md`](docs/memory.md)) |
 | Приложение «Штурман» в Telegram | Стенд; в настоящем Telegram не открывалось ([`docs/miniapp.md`](docs/miniapp.md)) |
 | Сферы, шаг 1 | Стенд ([`docs/spheres.md`](docs/spheres.md)) |
 | Поиск по смыслу, разбор фото и документов, голосовые, защита | Выключены по умолчанию; стенд ([`docs/search.md`](docs/search.md), [`docs/media.md`](docs/media.md), [`docs/voice.md`](docs/voice.md), [`docs/guard.md`](docs/guard.md)) |
 | Режим без Hermes | Стенд ([`docs/standalone.md`](docs/standalone.md)) |
 | Обновление, восстановление, копии на другой диск | Стенд и CI; выпуски пока кандидатами `-rc` ([`docs/releases.md`](docs/releases.md)) |
 | Сбои ловит система, сообщения о новых версиях | Стенд ([`docs/runbooks/symptoms.md`](docs/runbooks/symptoms.md)) |
-| Без домена: HTTPS по IP | Сертификат получен на живом сервере; вход по IP в браузере — нет |
+| Без домена: HTTPS по IP | Сертификат получен на живом сервере; с внешнего компьютера страница входа и «Настройки Штурмана» по IP открываются (коды ответа), вход в дашборд до конца — нет ([`docs/address.md`](docs/address.md)) |
 | Посредник `sh.namre.app` | Стенд и временные экземпляры вживую; постоянно не работает ни один ([`docs/relay.md`](docs/relay.md)) |
 | Внешние источники, внешний архив по OAuth | Код есть, выключено ([`docs/external-sources.md`](docs/external-sources.md), [`docs/remote-mcp.md`](docs/remote-mcp.md)) |
 | Копии по расписанию и шифрование, аудиофайлы во вложениях, проверочный набор вопросов | Запланированы |
@@ -117,7 +117,7 @@ sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/s
 
 ## Документы
 
-**Владельцу:** [`docs/hosting.md`](docs/hosting.md), [`docs/setup.md`](docs/setup.md), [`docs/address.md`](docs/address.md), [`docs/miniapp.md`](docs/miniapp.md). **Агенту:** [`AGENTS.md`](AGENTS.md) (меняет код и документы — ещё [`DEVELOPING.md`](DEVELOPING.md)), [`docs/runbooks/`](docs/runbooks/), [`UPGRADING.md`](UPGRADING.md), [`docs/scenarios-ops.md`](docs/scenarios-ops.md). **Устройство:** [`docs/architecture.md`](docs/architecture.md), [`docs/deployment.md`](docs/deployment.md), [`docs/service.md`](docs/service.md), [`service/README.md`](service/README.md), [`docs/target-model.md`](docs/target-model.md), [`docs/scenarios-product.md`](docs/scenarios-product.md), [`docs/decisions.md`](docs/decisions.md), [`docs/reuse.md`](docs/reuse.md).
+**Владельцу:** [`docs/hosting.md`](docs/hosting.md), [`docs/setup.md`](docs/setup.md), [`docs/address.md`](docs/address.md), [`docs/miniapp.md`](docs/miniapp.md). **Агенту:** [`AGENTS.md`](AGENTS.md) (меняет код и документы — ещё [`DEVELOPING.md`](DEVELOPING.md)), [`docs/runbooks/`](docs/runbooks/), [`UPGRADING.md`](UPGRADING.md), [`docs/scenarios-ops.md`](docs/scenarios-ops.md). **Устройство:** [`docs/architecture.md`](docs/architecture.md), [`docs/deployment.md`](docs/deployment.md), [`docs/service.md`](docs/service.md), [`docs/service-reference.md`](docs/service-reference.md), [`docs/service-checks.md`](docs/service-checks.md), [`docs/deployment-checks.md`](docs/deployment-checks.md), [`service/README.md`](service/README.md), [`docs/target-model.md`](docs/target-model.md), [`docs/scenarios-product.md`](docs/scenarios-product.md), [`docs/decisions.md`](docs/decisions.md), [`docs/reuse.md`](docs/reuse.md).
 
 ## Лицензия
 

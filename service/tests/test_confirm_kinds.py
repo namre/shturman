@@ -6,7 +6,7 @@ from shturman.app import MODULES
 # Виды действий и модуль, который их применяет. Если тест упал — в сервисе появилось новое
 # действие через confirm: проверьте, что его маршрут отличает расширение от ужесточения по
 # значению, что функция применения вызывает confirm.must_not_widen, и допишите его сюда,
-# в таблицу docs/service.md и в тесты «ждёт владельца / применяется сразу».
+# в таблицу docs/service-reference.md («Что подтверждает владелец: виды подтверждений») и в тесты «ждёт владельца / применяется сразу».
 EXPECTED = {
     "outbox.policy", "outbox.account_drafting", "outbox.chat_drafting", "outbox.autoreply",
     "outbox.trusted_add", "watch.rule_create", "watch.rule_update", "watch.rule_delete",

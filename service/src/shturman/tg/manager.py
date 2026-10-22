@@ -1295,7 +1295,7 @@ class TgManager:
              вызов ждёт переподключения Telethon (до минуты); перед записью связь проверяется ещё раз.
         Известный предел: другое устройство владельца может прислать в облако свой черновик между чтением
         и записью (доли секунды) — тогда запись его заменит. Это видно только вживую
-        (`docs/runbooks/validate.md`, «В чат: живые проверки»)."""
+        (`docs/runbooks/validate.md`, «„В чат“: живые проверки»)."""
         from ..replies import put as put_rules
         put_rules.require_press()
         role = await self._role_of(account_id)

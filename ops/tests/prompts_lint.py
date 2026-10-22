@@ -22,10 +22,11 @@ DEFAULT_FILES = ['prompts/deploy-remote.md', 'prompts/deploy.md', 'prompts/deplo
                  'prompts/guided-chat.md', 'prompts/operate-codex.md',
                  'docs/runbooks/hosting.md', 'docs/hosting.md', 'README.md', 'AGENTS.md', 'DEVELOPING.md',
                  'docs/runbooks/server-prepare.md', 'docs/runbooks/deploy.md', 'docs/runbooks/update.md',
-                 'docs/runbooks/restore.md', 'docs/runbooks/symptoms.md']
+                 'docs/runbooks/restore.md', 'docs/runbooks/symptoms.md', 'docs/runbooks/deploy-standalone.md']
 # Здесь текст для владельца — строки-цитаты «> » (готовые фразы на стоп-точках runbook).
 QUOTE_OWNER_FILES = {'docs/runbooks/hosting.md', 'docs/runbooks/server-prepare.md', 'docs/runbooks/deploy.md',
-                     'docs/runbooks/update.md', 'docs/runbooks/restore.md', 'docs/runbooks/symptoms.md'}
+                     'docs/runbooks/update.md', 'docs/runbooks/restore.md', 'docs/runbooks/symptoms.md',
+                     'docs/runbooks/deploy-standalone.md'}
 OPEN_MARK, CLOSE_MARK = '<!-- owner-text -->', '<!-- /owner-text -->'
 SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist'}
 PATH_RE = re.compile(r'^(?:docs|prompts|ops|config|plugins|service|relay|asr|frpc|\.github)/[A-Za-z0-9_./\-]+$|'
