@@ -14,6 +14,7 @@
 # Восстановление базы идёт в отдельную базу shturman_restore; живая база заменяется переименованием
 # только после того, как выгрузка легла без ошибок и число строк совпало с описью. Ошибки pg_restore
 # пишутся в файл в local/restore/ (в них может оказаться строка данных) и на экран не выводятся.
+# Отметка «Остановить всё» живой базы переносится в восстановленную до подмены (halt_carry, Р-106).
 #
 # Несекретные строки .env, которые здесь читаются: SHTURMAN_BACKUP_DIR, SHTURMAN_BACKUP_KEEP,
 # SHTURMAN_BACKUP_FRESH_MINUTES, HERMES_VERSION. Секрет читается один — POSTGRES_PASSWORD, и только
@@ -346,11 +347,72 @@ stack_stop_but_db() {
   docker stop $names > /dev/null
 }
 
+# --- «Остановить всё» переживает восстановление базы (Р-106, ОТ-51) ---
+# Отметка остановки (таблица assistant_halt) лежит в базе, и восстановление из копии раньше возвращало её из копии:
+# копия старше нажатия «Остановить всё» — ассистент после восстановления снова работал без «Продолжить». Теперь
+# отметка живой базы переносится в восстановленную до подмены: остановлен после восстановления, если был остановлен
+# до него ИЛИ в копии. Вместе с ней — пауза чтения аккаунтов по галочке «И перестать читать переписку». Читается
+# только эта строка (время, откуда, номера аккаунтов) — ни строк переписки, ни их счёта; на экран не печатается.
+#
+# Отметка живой базы: «none» (базы или таблицы нет), «running» (не остановлен) или три SQL-литерала для
+# halt_carry — время, откуда, аккаунты на паузе. База недоступна — код 1.
+halt_live() {
+  local has
+  [ "$(pg_q postgres "SELECT count(*) FROM pg_database WHERE datname = 'shturman'")" = 1 ] || { echo none; return 0; }
+  has="$(pg_q shturman "SELECT to_regclass('public.assistant_halt') IS NOT NULL")" || return 1
+  [ "$has" = t ] || { echo none; return 0; }
+  pg_q shturman "SELECT COALESCE((SELECT format('%L::timestamptz, %L::text, %L::bigint[]', since, via, paused_accounts) FROM assistant_halt WHERE id = 1 AND stopped), 'running')"
+}
+# Остановлен ли ассистент сейчас — для плана восстановления и отката. Печатает строку, только если остановлен.
+halt_plan_note() {
+  local live
+  pg_running || return 0
+  live="$(halt_live 2> /dev/null)" || return 0
+  case "$live" in none|running|"") return 0 ;; esac
+  echo "  ассистент сейчас остановлен владельцем («Остановить всё») — останется остановленным и после восстановления базы"
+}
+# Перенести отметку в восстановленную базу shturman_restore (до подмены). $1 — вывод halt_live (пусто — прочитать
+# не удалось). Печатает, что вышло. Код 1 — отметку перенести не удалось: подменять базу нельзя.
+halt_carry() {
+  local live="$1" has was out
+  has="$(pg_q shturman_restore "SELECT to_regclass('public.assistant_halt') IS NOT NULL")" || return 1
+  if [ "$has" != t ]; then
+    case "$live" in
+      none|running) ;;
+      "") echo "ВНИМАНИЕ: остановлен ли ассистент сейчас, прочитать не удалось, а копия сделана до появления «Остановить всё» — после восстановления он не остановлен. Скажите владельцу: остановить снова можно той же кнопкой." ;;
+      *) echo "ВНИМАНИЕ: копия сделана до появления «Остановить всё» — перенести в неё остановку нельзя, после запуска ассистент не будет остановлен. Скажите владельцу: остановить снова — той же кнопкой в боте или в «Настройках Штурмана»." ;;
+    esac
+    return 0
+  fi
+  was="$(pg_q shturman_restore "SELECT stopped FROM assistant_halt WHERE id = 1")" || return 1
+  case "$live" in
+    none|running|"")
+      [ -n "$live" ] || echo "Остановлен ли ассистент сейчас, прочитать не удалось (нынешняя база недоступна) — после восстановления остановка такая, как в копии."
+      [ "$was" != t ] || echo "В копии ассистент остановлен («Остановить всё») — после восстановления он остановлен; продолжить — только владелец, «Продолжить» в боте согласований."
+      return 0 ;;
+  esac
+  # Значения пришли из базы через format(%L); всё же — только ожидаемого вида, прежде чем вставить их в запрос.
+  if ! printf '%s' "$live" | grep -Eq "^('[0-9 :.+-]+'|NULL)::timestamptz, ('(page|app|bot)'|NULL)::text, '\{[0-9,]*\}'::bigint\[\]$"; then
+    echo "Отметка «Остановить всё» в нынешней базе неожиданного вида — перенести её нельзя." >&2
+    return 1
+  fi
+  out="$(pg_q shturman_restore "WITH live(since, via, paused) AS (SELECT $live),
+    s AS (UPDATE tg_sessions t SET paused = true FROM live WHERE t.account_id = ANY(live.paused) AND NOT t.paused RETURNING 1),
+    u AS (UPDATE assistant_halt h SET stopped = true, since = COALESCE(live.since, now()), via = live.via, resume_nonce = NULL,
+                 paused_accounts = ARRAY(SELECT DISTINCT a FROM unnest(h.paused_accounts || live.paused) AS a ORDER BY a),
+                 updated_at = now()
+          FROM live WHERE h.id = 1 RETURNING 1)
+    SELECT (SELECT count(*) FROM u) || ' ' || (SELECT count(*) FROM s)")" || return 1
+  [ "${out%% *}" = 1 ] || return 1
+  echo "Ассистент остановлен владельцем («Остановить всё») — остановка сохранена и после восстановления; продолжить — только владелец, «Продолжить» в боте согласований."
+  [ "${out#* }" = 0 ] || echo "Чтение переписки тоже остаётся на паузе, как было до восстановления (аккаунтов: ${out#* })."
+}
+
 # Восстановить базу из выгрузки. Живая база не трогается, пока выгрузка не легла в отдельную базу
 # и число строк не совпало с описью. $1 — выгрузка, $2 — опись (может отсутствовать), $3 — рабочий
 # каталог восстановления. Печатает ход; ошибки pg_restore — в файл $3/pg_restore.log.
 restore_db() {
-  local dump="$1" meta="$2" run="$3" got bad free need
+  local dump="$1" meta="$2" run="$3" got bad free need live
   free="$(df -Pk . | awk 'NR == 2 {print $4}')"
   need=$(( $(stat -c %s "$dump") / 1024 * 3 + 1048576 ))
   if [ "${free:-0}" -lt "$need" ]; then
@@ -376,6 +438,13 @@ restore_db() {
     echo "Число строк совпало с описью: $got"
   else
     echo "Описи нет — сверить число строк не с чем; в восстановленной базе: $got"
+  fi
+  # «Остановить всё» владельца переживает восстановление (Р-106): отметка живой базы — в восстановленную, до подмены.
+  live="$(halt_live 2> /dev/null)" || live=""
+  if ! halt_carry "$live"; then
+    docker exec "$PG" dropdb -U shturman --if-exists shturman_restore > /dev/null 2>&1 || true
+    echo "Не удалось сохранить в восстановленной базе остановку ассистента («Остановить всё»), которую нажал владелец. Живая база не тронута." >&2
+    return 1
   fi
   # Подмена: живая база уходит под другим именем, восстановленная получает её имя; прежняя удаляется.
   pg_q postgres "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname IN ('shturman', 'shturman_restore') AND pid <> pg_backend_pid()" > /dev/null || true

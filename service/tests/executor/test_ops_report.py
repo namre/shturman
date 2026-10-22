@@ -109,6 +109,17 @@ async def test_card_then_send_gives_forwardable_messages(rep_rig):
     assert await rig.conn.fetchval("SELECT sent_to FROM ops_reports WHERE id = $1", row_id) == "owner"
 
 
+async def test_report_card_comes_while_the_assistant_is_stopped(rep_rig):
+    """ОТ-51, Р-106: отчёт сопровождения — не действие ассистента; при «Остановить всё» карточка приходит сразу."""
+    rig = rep_rig
+    await bind(rig)
+    await rig.conn.execute("UPDATE assistant_halt SET stopped = true, since = now(), via = 'bot' WHERE id = 1")
+    row_id, card = await submitted(rig)
+    await press(rig, card, "Отправить")
+    assert await rig.conn.fetchval("SELECT status FROM ops_reports WHERE id = $1", row_id) == "sent"
+    assert await rig.conn.fetchval("SELECT stopped FROM assistant_halt WHERE id = 1") is True
+
+
 async def test_decline_sends_nothing(rep_rig):
     rig = rep_rig
     await bind(rig)

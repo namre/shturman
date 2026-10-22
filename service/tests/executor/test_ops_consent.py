@@ -131,6 +131,53 @@ async def test_rejection_and_expiry(ops_rig):
     assert (await use(rig, out3["consent_id"]))[0] == 409
 
 
+async def test_stop_does_not_block_maintenance_cards(ops_rig):
+    """ОТ-51, Р-106: «Остановить всё» — про действия ассистента, а не про сопровождение сервера. При остановке
+    разрешение заводится и выдаётся нажатием в боте (раньше база не давала завести карточку, сервис отвечал 500,
+    и скрипт считал его зависшим); ждущее остановка не снимает; подтверждения ассистента — по-прежнему нет."""
+    import asyncpg
+
+    from shturman import halt
+
+    from conftest import HERMES_AUTH
+
+    rig = ops_rig
+    await bind(rig)
+    _, waiting = await ask(rig)
+    first = await card(rig)
+    first_id = rig.tg.last_message_id()
+    result = await halt.stop(rig.state, via="bot")
+    assert result["counts"]["actions"] == 0
+    assert (await rig.client.get(f"/api/ops/consents/{waiting['consent_id']}")).json()["status"] == "pending"
+    # Новый запрос при остановке — карточка в боте, а не 500.
+    restore = {"action": "restore", "target": "20261016T081500Z:all:keep", "details": {"parts": "база"}}
+    code, out = await ask(rig, restore)
+    assert code == 202 and out["status"] == "pending", out
+    second = await card(rig)
+    await press(rig, second, "Разрешить")
+    assert (await rig.client.get(f"/api/ops/consents/{out['consent_id']}")).json()["status"] == "granted"
+    code, used = await use(rig, out["consent_id"], target=restore["target"], action="restore")
+    assert code == 200 and used["status"] == "used"
+    rig.tg.press(buttons_of(first)["Разрешить"], user=OWNER_USER, message_id=first_id)
+    await rig.bot.poll_once()
+    assert (await rig.client.get(f"/api/ops/consents/{waiting['consent_id']}")).json()["status"] == "granted"
+    # Ассистенту в Hermes путь к этим карточкам закрыт (Р-104): остановка не даёт ему нового способа писать владельцу.
+    before = await rig.conn.fetchval("SELECT count(*) FROM pending_actions")
+    for body in (UPDATE, restore):
+        response = await rig.client.post("/api/ops/consents", json=body, headers=HERMES_AUTH)
+        assert response.status_code == 403 and response.json()["code"] == "hermes_forbidden"
+    assert await rig.conn.fetchval("SELECT count(*) FROM pending_actions") == before
+    # Ассистент остановлен по-прежнему: его подтверждения в базу не попадают, остановка не снята.
+    with pytest.raises(asyncpg.PostgresError) as caught:
+        await rig.conn.execute("INSERT INTO pending_actions (kind, summary, payload, nonce, expires_at) "
+                               "VALUES ('outbox.trusted_add', 'x', '{}', 'n', now() + interval '1 hour')")
+    assert halt.is_halt_error(caught.value)
+    with pytest.raises(confirm.Refused) as refused:
+        await confirm.request(rig.conn, halt.RESUME_KIND, "x", {})
+    assert refused.value.code == halt.CODE
+    assert await halt.is_stopped(rig.conn)
+
+
 async def test_stranger_or_foreign_chat_press_is_refused(ops_rig):
     rig = ops_rig
     await bind(rig)

@@ -5,8 +5,10 @@
 #   3. порча: часть сообщений удалена, чаты очищены, файл в data/ испорчен;
 #   4. ./ops/restore.sh --from — «человек» набирает фразу в псевдотерминале; сверка числа строк
 #      ключевых таблиц с состоянием до порчи и файла в data/;
+#      Между копией и восстановлением владелец нажал «Остановить всё» с «И перестать читать переписку»:
+#      после восстановления ассистент остаётся остановленным, аккаунт — на паузе (Р-106);
 #   5. переезд: базы, data/, .env и local/ нет совсем, копия — на «внешнем диске» (--dir);
-#      восстановление на пустое место и та же сверка.
+#      восстановление на пустое место и та же сверка; остановка — как в копии (не остановлен).
 # Нужен Docker с Compose; запускает контейнер shturman-postgres (проект shturman) — на сервере
 # с экземпляром НЕ запускать. Запуск из корня репозитория: bash ops/tests/e2e_restore.sh
 #   E2E_FULL=1 — вместо подставного ./ops/up.sh (только база) настоящий: собирает образ сервиса,
@@ -84,6 +86,7 @@ INSERT INTO messages (chat_id, tg_message_id, sent_at, sender_name, is_outgoing,
          'Синтетическое сообщение ' || g || ' — обещаю прислать отчёт до пятницы', ARRAY['import']
   FROM chats c CROSS JOIN generate_series(1, $msgs / 200) g;
 INSERT INTO people (display_name) SELECT 'Человек ' || g FROM generate_series(1, 150) g;
+INSERT INTO tg_sessions (account_id, slot) SELECT id, 'owner' FROM accounts WHERE tg_user_id = 1000;
 SQL
 before="$(counts)"
 ok "синтетический архив: чаты, сообщения, люди, миграции, сумма длин текстов — $before"
@@ -100,6 +103,11 @@ ok "копия $s ($(du -h "local/backups/db-$s.dump" | cut -f1) база, $(( $
 q -c "DELETE FROM messages WHERE id % 3 = 0" > /dev/null
 q -c "SET client_min_messages = warning; TRUNCATE chats CASCADE" > /dev/null
 echo "испорчено" > data/shturman/marker
+# Владелец нажал «Остановить всё» и «И перестать читать переписку» уже после копии.
+q -c "UPDATE assistant_halt SET stopped = true, since = now(), via = 'bot', paused_accounts = ARRAY(SELECT account_id FROM tg_sessions) WHERE id = 1" > /dev/null
+q -c "UPDATE tg_sessions SET paused = true" > /dev/null
+halt() { q -c "SELECT h.stopped || ' ' || coalesce(h.via, '-') || ' ' || cardinality(h.paused_accounts) || ' ' || (SELECT bool_and(paused) FROM tg_sessions) FROM assistant_halt h WHERE id = 1"; }
+[ "$(halt)" = "true bot 1 true" ] || die "остановка перед восстановлением не записана: $(halt)"
 broken="$(counts)"
 [ "$broken" != "$before" ] || die "порча не удалась"
 ok "порча: $broken"
@@ -119,6 +127,9 @@ after="$(counts)"
 [ "$(q -c "SELECT count(*) FROM pg_database WHERE datname IN ('shturman_restore', 'shturman_replaced')")" = 0 ] || die "остались временные базы"
 ./ops/backup.sh --list | grep -q 'причина: before-restore' || die "нет копии перед восстановлением"
 if grep -q 'Синтетическое сообщение' "$tmp/out"; then die "в выводе восстановления текст сообщений"; fi
+[ "$(halt)" = "true bot 1 true" ] || die "восстановление из копии до остановки сняло «Остановить всё»: $(halt)"
+grep -q 'остановка сохранена' "$tmp/out" || die "владельцу не сказано, что остановка сохранена"
+ok "«Остановить всё», нажатое после копии, пережило восстановление: остановлен, аккаунт на паузе"
 ok "восстановление ($(( $(date +%s) - start )) с): число строк и сумма длин текстов как до порчи ($after), data/ на месте, временных баз нет, копия «до» сделана, текста в выводе нет"
 
 # Переезд: на «новом сервере» ничего нет, копия — на внешнем диске.
@@ -133,6 +144,7 @@ code=0; python3 "$pty" right -- ./ops/restore.sh --from "$s" --dir "$tmp/disk" >
 after="$(counts)"
 [ "$after" = "$before" ] || die "после переезда $after, а было $before"
 [ "$(cat data/shturman/marker)" = "страница памяти v1" ] || die "data/ не восстановлен"
+[ "$(halt)" = "false - 0 false" ] || die "переезд: остановка не как в копии: $(halt)"
 ok "переезд на пустое место с внешнего диска ($(( $(date +%s) - start )) с): .env, база ($after) и data/ на месте"
 
 echo "Все проверки пройдены: $n."

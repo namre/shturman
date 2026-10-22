@@ -335,6 +335,13 @@ MUTATIONS = (
              "    IF false THEN\n        RAISE EXCEPTION 'assistant_stopped'",
              "tests/test_halt.py::test_database_is_the_second_line",
              database=True),
+    # Р-106: при остановке триггер пропускает, кроме «Продолжить» и входа по коду, только карточки сопровождения
+    # (`ops.consent`, `ops.report`) — не подтверждения ассистента.
+    Mutation("halt_database_lets_only_ops_cards", "src/shturman/migrations/0048_halt_ops_cards.sql",
+             "'ops.consent', 'ops.report'))",
+             "'ops.consent', 'ops.report', 'outbox.trusted_add'))",
+             "tests/test_halt.py::test_database_is_the_second_line",
+             database=True),
     Mutation("halt_refuses_sending", "src/shturman/outbox/policy.py",
              "    decision = await check_halt(conn)\n    if not decision.ok:\n        return decision\n    decision = check_switch(rules)",
              "    decision = check_switch(rules)",

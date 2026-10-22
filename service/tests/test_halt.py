@@ -117,10 +117,16 @@ async def test_database_is_the_second_line(env, own_bot):
         with pytest.raises(asyncpg.PostgresError) as caught:
             await env.conn.execute(sql, *args)
         assert halt.is_halt_error(caught.value), sql
-    # уведомление владельцу и карточка «Продолжить» — можно
+    # уведомление владельцу, карточка «Продолжить», вход по коду и карточки сопровождения (Р-106) — можно
     await bridge.notify_owner(env.conn, "Вам написали")
-    await env.conn.execute("INSERT INTO pending_actions (kind, summary, payload, nonce, expires_at) "
-                           "VALUES ('halt.resume', 'x', '{}', 'n2', now() + interval '1 hour')")
+    for i, kind in enumerate(("halt.resume", "setup.code_login", "ops.consent", "ops.report")):
+        await env.conn.execute("INSERT INTO pending_actions (kind, summary, payload, nonce, expires_at) "
+                               "VALUES ($1, 'x', '{}', $2, now() + interval '1 hour')", kind, f"k{i}")
+    # те же виды остановка не снимает (кроме входа по коду — его снимает, как раньше)
+    assert set(halt.KEEP_ON_STOP) == {"halt.resume", "ops.consent", "ops.report"}
+    await stop(env)
+    left = {r["kind"] for r in await env.conn.fetch("SELECT kind FROM pending_actions WHERE status = 'pending'")}
+    assert left == {"halt.resume", "ops.consent", "ops.report"}
 
 
 async def test_stop_cancels_what_waits_and_keeps_settings(env, own_bot, approvals):
