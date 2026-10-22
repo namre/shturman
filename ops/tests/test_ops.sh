@@ -752,4 +752,37 @@ grep -q '^SHTURMAN_GUARD_THRESHOLD=0.98$' .env || die "порог по кноп�
 grep -q "ops-consent ask --action guard_threshold --target 0.98 .*--detail old=0.9" "$STUB_LOG" || die "запрос порога без цели"
 ok "порог защиты меняет только владелец: кнопкой в боте или (бота нет) фразой человека в терминале; иначе — код 4"
 
+# --- Новая установка — с последнего выпуска, а не с main (install-ref.sh) ---
+o4="$tmp/origin-ref"; mkdir -p "$o4"; cd "$o4"; git init -q -b main .
+cp -r "$root/ops" "$root/.env.example" .; rm -rf ops/tests; printf 'local/\ndata/\n.env\n' > .gitignore
+refrel() { echo "$1" > VERSION; g add -A .; g commit -q --allow-empty -m "$1"; shift; for t in "$@"; do g tag "$t"; done; }
+refrel 0.0.1 v0.0.1-rc.1
+refrel 0.0.2 v0.0.2-rc.1
+refrel 0.0.2 v0.0.9-rc.1                       # VERSION не совпадает с номером — не выпуск
+refrel 0.0.3                                    # main впереди кандидата
+inst() { rm -rf "${tmp:?}/$1"; git clone -q "$o4" "$tmp/$1"; cd "$tmp/$1"; }
+inst ref1
+run ./ops/install-ref.sh --check; want 0; has "кандидат v0.0.2-rc.1"
+[ "$(cat VERSION)" = 0.0.3 ] || die "--check переключил код"
+run ./ops/install-ref.sh; want 0 "install-ref: код $code"; has "Код переключён на кандидат v0.0.2-rc.1"; has "канал обновлений pilot"
+[ "$(cat VERSION)" = 0.0.2 ] && [ "$(git rev-parse HEAD)" = "$(git rev-parse 'v0.0.2-rc.1^{commit}')" ] || die "код не на последнем кандидате"
+run ./ops/init-env.sh --auto --mode standalone; want 0 "init-env: код $code"; has "канал обновлений: pilot"
+grep -qx 'SHTURMAN_UPDATE_CHANNEL=pilot' .env || die "кандидат без канала pilot"
+run ./ops/init-env.sh --auto; want 0; hasnt "канал обновлений"
+[ "$(grep -c '^SHTURMAN_UPDATE_CHANNEL=' .env)" = 1 ] || die "канал записан дважды"
+run ./ops/install-ref.sh; want 2; has "уже развёрнут"
+ok "новая установка — с последнего кандидата, а не с main; канал pilot записан при создании .env; развёрнутый экземпляр не трогается"
+cd "$o4"; git checkout -q main; refrel 0.0.4 v0.0.4-rc.1 v0.0.4
+inst ref2
+run ./ops/install-ref.sh; want 0; has "Код переключён на выпуск v0.0.4"; hasnt "канал обновлений pilot"
+run ./ops/init-env.sh --auto --mode standalone; want 0; hasnt "канал обновлений"
+grep -q '^SHTURMAN_UPDATE_CHANNEL=' .env && die "выпуск получил канал pilot"
+inst ref3; echo x >> VERSION
+run ./ops/install-ref.sh; want 2; has "Отслеживаемые файлы изменены"
+cd "$o4"; refrel 0.0.5; for t in $(git tag); do git tag -d "$t" > /dev/null; done
+inst ref4
+run ./ops/install-ref.sh; want 1; has "Тегов выпусков"
+[ "$(cat VERSION)" = 0.0.5 ] || die "без тегов код переключён"
+ok "есть выпуск — ставится выпуск, канал не трогается; изменённые файлы и отсутствие тегов — отказ без изменений"
+
 echo "Все проверки пройдены: $n."

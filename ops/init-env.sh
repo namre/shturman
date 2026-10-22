@@ -24,6 +24,10 @@
 #                                часы уведомлений, ночной разбор, сроки и напоминания (сервис).
 #                                Работающему экземпляру новый пояс передаёт ./ops/up.sh.
 #
+# Новая установка с кандидата (./ops/install-ref.sh: выпусков ещё нет) — при создании .env записывается
+# SHTURMAN_UPDATE_CHANNEL=pilot: иначе ./ops/update.sh не увидит следующих кандидатов. На работающем
+# экземпляре канал не трогается (./ops/update.sh --set-channel).
+#
 # Вариант установки выбирает владелец. При первой установке без --mode скрипт спрашивает его сам,
 # а с --auto останавливается и просит назвать вариант: агент не выбирает за владельца. Экземпляр,
 # развёрнутый до появления вариантов (в .env уже есть значения, но нет SHTURMAN_MODE), остаётся
@@ -105,6 +109,7 @@ if [ ! -s "$dst" ] && [ -z "$want" ]; then
   done
 fi
 
+fresh=no; [ -s "$dst" ] || fresh=yes
 umask 077
 touch "$dst"; chmod 600 "$dst"
 
@@ -122,6 +127,16 @@ else
     exit 2
   fi
   echo "[SHTURMAN_MODE] режим: $mode"
+fi
+# Новая установка с кандидата (./ops/install-ref.sh: выпусков ещё нет) — канал обновлений pilot, иначе
+# ./ops/update.sh не увидит следующих кандидатов. Только при создании .env: выбор канала на работающем
+# экземпляре не трогается (./ops/update.sh --set-channel).
+if [ "$fresh" = yes ] && [ -z "$(env_get SHTURMAN_UPDATE_CHANNEL)" ]; then
+  t="$(code_tag)"
+  case "$t" in
+    *-rc.*) env_put SHTURMAN_UPDATE_CHANNEL pilot
+            echo "[SHTURMAN_UPDATE_CHANNEL] установлен кандидат $t — канал обновлений: pilot (следующие кандидаты и выпуски)" ;;
+  esac
 fi
 # Профили Compose следуют за режимом; включённый поиск по смыслу сохраняется.
 profiles="$(compose_profiles "$mode" keep)"
