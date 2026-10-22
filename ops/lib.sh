@@ -410,7 +410,8 @@ EOF_LOCK
 #       нельзя (бот не настроен, владелец не привязан, сервис запущен, но не отвечает, образа нет).
 #       OWNER_CONSENT_VIA — bot (через сервис) или bot-direct (без сервиса).
 #       OWNER_CONSENT_MAY_STOP=1 — можно остановить зависший сервис, чтобы спросить напрямую (восстановление
-#       и откат всё равно его останавливают).
+#       и откат всё равно его останавливают). Разрешения не дали — остановленный так сервис запускается снова.
+#       «Остановить всё» владельца сюда не относится: карточку сопровождения сервис заводит и при остановке (Р-106).
 #   confirm_owner ВИД ЦЕЛЬ СЛОВО КОМАНДА [поле=значение]… — бот, а если через бот нельзя — запасной путь:
 #       человек в терминале набирает фразу «СЛОВО число» (human_confirm). Код 0 — подтверждено, 1 — нет.
 # Предел: оператор с правами на сервере может подменить и базу сервиса, и копию владельца — это граница прав,
@@ -419,7 +420,7 @@ EOF_LOCK
 OPS_NEED_HUMAN=4
 OWNER_CONSENT_VIA=""
 owner_consent() {
-  local action="$1" target="$2" rc=0 st d
+  local action="$1" target="$2" rc=0 st d stopped=no
   shift 2
   local args=(ops-consent ask --action "$action" --target "$target" --wait "${OPS_CONSENT_WAIT:-300}")
   for d in "$@"; do args+=(--detail "$d"); done
@@ -445,16 +446,31 @@ owner_consent() {
         return 2
       fi
       echo "Останавливаю контейнер сервиса (он не отвечает), чтобы спросить владельца напрямую; данные не трогаются."
-      docker stop shturman-service > /dev/null 2>&1 || true ;;
+      docker stop shturman-service > /dev/null 2>&1 || true
+      stopped=yes ;;
   esac
+  rc=0
+  owner_consent_direct "${args[@]}" || rc=$?
+  # Разрешения нет (отклонено, не ответил, бот недоступен), а сервис остановили ради этого запроса — вернуть его
+  # как было: после «Отклонить» сервис не должен остаться выключенным. С разрешением восстановление и откат
+  # останавливают его сами.
+  if [ "$rc" -ne 0 ] && [ "$stopped" = yes ]; then
+    echo "Разрешения нет — запускаю контейнер сервиса снова, как было до запроса; ничего не изменено."
+    docker start shturman-service > /dev/null 2>&1 \
+      || echo "Контейнер сервиса снова не запустился — ./ops/doctor.sh, затем ./ops/up.sh." >&2
+  fi
+  return "$rc"
+}
+# Запрос без сервиса: одноразовый контейнер из образа сервиса (коды — как у owner_consent). $@ — параметры ops-consent.
+owner_consent_direct() {
+  local rc=0
   [ -f .env ] || { echo "Нет .env (новый сервер) — бот согласований недоступен." >&2; return 2; }
   if ! docker image inspect shturman-service:local > /dev/null 2>&1; then
     echo "Образа сервиса (shturman-service:local) нет — спросить через бот без сервиса нечем." >&2
     return 2
   fi
   HERMES_UID="$(id -u)"; HERMES_GID="$(id -g)"; export HERMES_UID HERMES_GID
-  rc=0
-  docker compose run --rm --no-deps -T shturman "${args[@]}" --direct || rc=$?
+  docker compose run --rm --no-deps -T shturman "$@" --direct || rc=$?
   case "$rc" in
     0) OWNER_CONSENT_VIA=bot-direct; return 0 ;;
     4|5) return 1 ;;

@@ -6,7 +6,9 @@
 #   более новой версии; проверка свежей копии в up.sh; выбор версии в update.sh (выпуски, кандидаты,
 #   перескок, неверный тег, откат назад), разрешение человека, решение «откатывать ли базу», успех,
 #   откат только кода, остановка с откатом для человека и сам откат; --all — по выпуску за шаг до последнего,
-#   итог каждого шага — сервису (Р-101); сброс истории репозитория — переход по ops/history-reset и отказ без него.
+#   итог каждого шага — сервису (Р-101); сброс истории репозитория — переход по ops/history-reset и отказ без него;
+#   «Остановить всё» переживает восстановление базы, сервис, остановленный ради запроса напрямую, после отказа
+#   запускается снова (Р-106).
 # Настоящая база (pg_dump → порча → восстановление → сверка строк) — ops/tests/e2e_restore.sh.
 # Запуск из корня репозитория: bash ops/tests/test_ops.sh
 set -eu
@@ -18,7 +20,7 @@ trap cleanup EXIT
 export PATH="$root/ops/tests/stub:$PATH" STUB_LOG="$tmp/docker.log" OPS_UPDATE_RETRY_PAUSE=0
 unset STUB_PG STUB_APPLIED STUB_APPLIED_FILE STUB_HERMES_IMAGE STUB_IMAGES STUB_COMPOSE_OK SHTURMAN_BACKUP_DIR \
   STUB_SERVICE STUB_CONSENT STUB_IMAGE STUB_DIRECT STUB_CONSENT_STATUS STUB_RUNNING_COMMIT_FILE UP_FAIL STUB_RM_DUMPS \
-  2> /dev/null || true
+  STUB_HALT_LIVE STUB_HALT_COPY STUB_HALT_FAIL 2> /dev/null || true
 pty="$root/ops/tests/pty_confirm.py"
 n=0
 ok() { n=$((n + 1)); echo "ok $n — $1"; }
@@ -150,6 +152,14 @@ hasnt "Наберите:"
 ok "сервис работает: запрос в бот; владелец не ответил или отклонил — код 4, данные не тронуты, фразы не спрашивает"
 STUB_SERVICE=running STUB_CONSENT=7 run ./ops/restore.sh --from "$s"; want 4; has "запасной путь\|Запасной путь"
 grep -q "docker stop shturman-service" "$STUB_LOG" || die "зависший сервис не остановлен перед путём без сервиса"
+grep -q "docker start shturman-service" "$STUB_LOG" || die "без разрешения остановленный ради запроса сервис не запущен снова"
+has "запускаю контейнер сервиса снова"
+: > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=7 STUB_IMAGE=1 STUB_DIRECT=5 run ./ops/restore.sh --from "$s"; want 4
+[ "$(cat data/shturman/file)" = v2 ] || die "отклонённое напрямую восстановил"
+grep -q "docker stop shturman-service" "$STUB_LOG" && grep -q "docker start shturman-service" "$STUB_LOG" \
+  || die "после «Отклонить» на пути напрямую сервис оставлен остановленным"
+ok "сервис остановлен ради запроса напрямую, владелец отклонил или бот недоступен — сервис запущен снова, данные не тронуты"
 : > "$STUB_LOG"
 STUB_IMAGE=1 STUB_DIRECT=5 run ./ops/restore.sh --from "$s"; want 4; [ "$(cat data/shturman/file)" = v2 ] || die "без сервиса восстановил отклонённое"
 grep -q "compose run --rm --no-deps -T shturman ops-consent ask --action restore .*--direct" "$STUB_LOG" || die "путь без сервиса не через одноразовый контейнер"
@@ -176,6 +186,12 @@ ok "--with-env возвращает .env из копии (права 600)"
 echo v3 > data/shturman/file
 run_tty right ./ops/restore.sh --from "$s" --no-start; want 0; has "стек не запущен"; hasnt "подставной up.sh"; [ "$(cat data/shturman/file)" = v1 ] || die "--no-start не восстановил"
 ok "--no-start: данные восстановлены, стек не запускается (следом — код другой версии)"
+echo v1 > data/shturman/file; run ./ops/backup.sh; want 0; s="$(./ops/backup.sh --list | awk 'NR == 1 {print $1}')"
+echo v2 > data/shturman/file; : > "$STUB_LOG"
+STUB_SERVICE=running STUB_CONSENT=7 STUB_IMAGE=1 STUB_DIRECT=0 run ./ops/restore.sh --from "$s"; want 0 "напрямую после остановки зависшего: код $code"
+[ "$(cat data/shturman/file)" = v1 ] || die "разрешённое напрямую не восстановил"
+if grep -q "docker start shturman-service" "$STUB_LOG"; then die "с разрешением сервис запущен до восстановления"; fi
+ok "зависший сервис остановлен, владелец разрешил напрямую — восстановление идёт без промежуточного запуска сервиса"
 # Копия более новой версии: в описи миграция, которой нет в коде.
 export STUB_PG=running STUB_APPLIED="0001_archive.sql,9999_future.sql"
 run ./ops/backup.sh; want 0
@@ -183,6 +199,52 @@ s="$(./ops/backup.sh --list | awk 'NR == 1 {print $1}')"
 run ./ops/restore.sh --from "$s" --dry-run; want 1; has "более новой версией"; has "9999_future.sql"
 unset STUB_PG STUB_APPLIED
 ok "копия более новой версии кода — отказ до подтверждения"
+
+# --- 3б. «Остановить всё» переживает восстановление базы (Р-106, ОТ-51) ---
+d="$(mkinst halt)"; cd "$d"; echo v1 > data/shturman/file; mkdir -p data/postgres
+run ./ops/backup.sh --set-keep 30; want 0      # каждое восстановление снимает копию «до»: исходная не должна уйти в ротацию
+STUB_APPLIED="$(cd service/src/shturman/migrations && ls -1 ./*.sql | sed 's|^\./||' | LC_ALL=C sort | paste -sd, -)"
+export STUB_PG=running STUB_APPLIED
+run ./ops/backup.sh; want 0
+s="$(./ops/backup.sh --list | awk 'NR == 1 {print $1}')"
+printf '#!/bin/sh\necho "подставной up.sh"\nexit 0\n' > ops/up.sh
+export STUB_SERVICE=running STUB_CONSENT=0
+STUB_HALT_LIVE=stopped run ./ops/restore.sh --from "$s" --dry-run; want 0; has "останется остановленным"
+STUB_HALT_LIVE=running run ./ops/restore.sh --from "$s" --dry-run; want 0; hasnt "останется остановленным"
+ok "план восстановления говорит, что остановка владельца сохранится"
+echo v2 > data/shturman/file; : > "$STUB_LOG"
+STUB_HALT_LIVE=stopped STUB_HALT_COPY=f run ./ops/restore.sh --from "$s"; want 0 "остановлен до, не в копии: код $code"
+has "остановка сохранена"; has "Чтение переписки тоже остаётся на паузе"; has "ИТОГ ВОССТАНОВЛЕНИЯ: OK"
+grep -q "shturman_restore .*WITH live(since, via, paused) AS (SELECT '2026-10-20 10:00:00+00'::timestamptz, 'bot'::text, '{7}'::bigint\[\])" "$STUB_LOG" \
+  || die "отметка живой базы не перенесена в восстановленную"
+upd="$(grep -n "UPDATE assistant_halt h SET stopped = true" "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+ren="$(grep -n "RENAME TO shturman_replaced" "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+[ -n "$upd" ] && [ -n "$ren" ] && [ "$upd" -lt "$ren" ] || die "отметка перенесена не до подмены базы"
+[ "$(cat data/shturman/file)" = v1 ] || die "данные не восстановлены"
+ok "остановлен до восстановления, в копии — нет: отметка и пауза чтения перенесены в восстановленную базу до подмены"
+: > "$STUB_LOG"
+STUB_HALT_LIVE=running STUB_HALT_COPY=t run ./ops/restore.sh --from "$s"; want 0; has "В копии ассистент остановлен"
+if grep -q "UPDATE assistant_halt" "$STUB_LOG"; then die "не остановленный сейчас — отметка всё равно переписана"; fi
+ok "не остановлен сейчас, остановлен в копии — остаётся остановленным (как в копии), владельцу сказано"
+: > "$STUB_LOG"
+STUB_HALT_LIVE=down STUB_HALT_COPY=f run ./ops/restore.sh --from "$s"; want 0; has "прочитать не удалось"; has "на всякий случай после восстановления он остановлен"
+upd="$(grep -n "shturman_restore .*UPDATE assistant_halt h SET stopped = true, since = now(), via = NULL" "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+ren="$(grep -n "RENAME TO shturman_replaced" "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+[ -n "$upd" ] && [ -n "$ren" ] && [ "$upd" -lt "$ren" ] || die "нынешняя отметка не прочитана — восстановленная база не остановлена до подмены"
+ok "нынешняя база не читается — восстановление идёт, ассистент на всякий случай остановлен, об этом сказано"
+STUB_HALT_LIVE=stopped run ./ops/restore.sh --from "$s"; want 0; has "копия сделана до появления «Остановить всё»"
+ok "копия старше «Остановить всё» — восстановление идёт, владельцу сказать, что остановить снова"
+for bad in odd fail; do
+  echo v2 > data/shturman/file; : > "$STUB_LOG"
+  if [ "$bad" = odd ]; then STUB_HALT_LIVE=odd STUB_HALT_COPY=f run ./ops/restore.sh --from "$s"; has "неожиданного вида"
+  else STUB_HALT_LIVE=stopped STUB_HALT_COPY=f STUB_HALT_FAIL=1 run ./ops/restore.sh --from "$s"; fi
+  want 1 "перенос отметки не удался ($bad): код $code"; has "Живая база не тронута"
+  if grep -q "RENAME TO shturman_replaced\|UPDATE assistant_halt h" "$STUB_LOG" && [ "$bad" = odd ]; then die "значение неожиданного вида попало в запрос"; fi
+  if grep -q "RENAME TO" "$STUB_LOG"; then die "база подменена, хотя остановку перенести не удалось ($bad)"; fi
+  [ "$(cat data/shturman/file)" = v2 ] || die "данные заменены, хотя восстановление базы остановилось ($bad)"
+done
+ok "отметку остановки перенести нельзя (значение не того вида, сбой записи) — база не подменена, данные не тронуты"
+unset STUB_PG STUB_APPLIED STUB_SERVICE STUB_CONSENT
 
 # --- 4. Решение «что откатывать» ---
 (

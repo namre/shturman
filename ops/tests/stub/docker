@@ -23,6 +23,11 @@
 #   STUB_HERMES_STARTED=…  — время запуска контейнера Hermes ({{.State.StartedAt}})
 #   local/late-mig         — миграции, которые «лягут» к моменту `docker stop shturman-service` (пишет подставной
 #                            up.sh при STUB_LATE_MIG): дописываются в $STUB_APPLIED_FILE
+#   STUB_HALT_LIVE=…       — «Остановить всё» в живой базе (Р-106): stopped — остановлен (аккаунт 7 на паузе),
+#                            running — нет, down — таблица есть, но строку прочитать нельзя, odd — значение
+#                            неожиданного вида; не задано — живой базы нет
+#   STUB_HALT_COPY=t|f     — остановлен ли ассистент в восстановленной базе (не задано — таблицы в копии нет)
+#   STUB_HALT_FAIL=1       — перенос отметки в восстановленную базу не удался
 echo "docker $*" >> "${STUB_LOG:-/dev/null}"
 case "$1" in
   inspect)
@@ -39,6 +44,7 @@ case "$1" in
       *) exit 1 ;;
     esac ;;
   ps) exit 0 ;;
+  start) exit 0 ;;
   stop)
     if [ "${*: -1}" = shturman-service ] && [ -f local/late-mig ] && [ -n "${STUB_APPLIED_FILE:-}" ]; then
       { tr ',' '\n' < "$STUB_APPLIED_FILE"; cat local/late-mig; } | grep -v '^$' | LC_ALL=C sort -u | paste -sd, - > "$STUB_APPLIED_FILE.new"
@@ -68,6 +74,19 @@ case "$1" in
       *"to_regclass('public.schema_migrations')"*) echo t ;;
       *"string_agg(name"*)
         if [ -n "${STUB_APPLIED_FILE:-}" ] && [ -f "$STUB_APPLIED_FILE" ]; then cat "$STUB_APPLIED_FILE"; else echo "${STUB_APPLIED:-}"; fi ;;
+      *"datname = 'shturman'"*) if [ -n "${STUB_HALT_LIVE:-}" ]; then echo 1; fi ;;
+      *"-d shturman -X"*"to_regclass('public.assistant_halt')"*) if [ -n "${STUB_HALT_LIVE:-}" ]; then echo t; fi ;;
+      *"-d shturman -X"*"FROM assistant_halt WHERE id = 1 AND stopped"*)
+        case "${STUB_HALT_LIVE:-}" in
+          stopped) echo "'2026-10-20 10:00:00+00'::timestamptz, 'bot'::text, '{7}'::bigint[]" ;;
+          odd) echo "'x'); DROP TABLE messages; --'::timestamptz, 'bot'::text, '{}'::bigint[]" ;;
+          down) exit 1 ;;
+          *) echo running ;;
+        esac ;;
+      *"-d shturman_restore -X"*"to_regclass('public.assistant_halt')"*)
+        if [ -n "${STUB_HALT_COPY:-}" ]; then echo t; else echo f; fi ;;
+      *"-d shturman_restore -X"*"SELECT stopped FROM assistant_halt"*) echo "${STUB_HALT_COPY:-f}" ;;
+      *"-d shturman_restore -X"*"UPDATE assistant_halt"*) [ -z "${STUB_HALT_FAIL:-}" ] || exit 1; echo "1 1" ;;
       *pg_dump*) printf 'PGDMP-stub-dump' ;;
       *"pg_restore --list"*) cat > /dev/null; echo "215; 1259 16390 TABLE public messages shturman" ;;
       *) exit 0 ;;
