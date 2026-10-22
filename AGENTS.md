@@ -107,7 +107,7 @@
 | Сопровождение | `prompts/operate-codex.md`, `docs/scenarios-ops.md` |
 | Обновление | `docs/runbooks/update.md`, `UPGRADING.md`, `docs/releases.md` |
 | Восстановление из копии, откат | `docs/runbooks/restore.md` |
-| Что-то не работает | `docs/runbooks/symptoms.md` |
+| Что-то не работает; карточка «Подтвердите» в боте | `docs/runbooks/symptoms.md` |
 | Отправка, остановка, выдача архива, повтор | `docs/service.md` |
 | Копии, сторож, диск | `docs/deployment.md` |
 | Сервер посредника (его держатель) | `relay/README.md` |
