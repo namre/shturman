@@ -591,11 +591,11 @@ async def main() -> None:
             "requests": [r["state"] for r in await conn.fetch("SELECT state FROM processing_requests ORDER BY job_id")],
             "audit": [dict(r) for r in rows]})
 
-    # --- репетиция ответов (Р-85) ---
+    # --- черновики ответов (Р-85, Р-105; внутреннее имя — rehearsal) ---
 
     async def rehearsal_live(request):
         """Анна Ким (из `/notify/seed`) пишет в личку живое сообщение; подставная модель ответит так, как
-        ответила бы на задачу ответа. Репетиция готовит карточку через бота стенда."""
+        ответила бы на задачу ответа. Сервис готовит карточку «Черновик ответа» через бота стенда."""
         from shturman import events, store
         from shturman.records import MessageRecord
 
@@ -639,11 +639,12 @@ async def main() -> None:
         return JSONResponse({"ok": True, "message_id": message_id})
 
     def rehearsal_cards() -> list[dict]:
-        return [p for p in telegram.calls("sendMessage") if str(p.get("text", "")).startswith("🎭")]
+        return [p for p in telegram.calls("sendMessage") if str(p.get("text", "")).startswith("✍️ Черновик ответа")]
 
     async def rehearsal_press(request):
-        """Владелец нажимает оценку под последней карточкой репетиции в Telegram."""
-        label = {"good": "Годится", "almost": "Почти — поправил бы", "bad": "Не годится"}[request.query_params["rating"]]
+        """Владелец нажимает кнопку под последней карточкой «Черновик ответа» в Telegram. ?rating=bad — «Не годится»
+        (других оценок под карточкой с Р-105 нет); ?label=… — кнопка по подписи."""
+        label = request.query_params.get("label") or {"bad": "Не годится"}[request.query_params["rating"]]
         card = rehearsal_cards()[-1]
         buttons = exec_fakes.buttons_of(card)
         telegram.press(buttons[label], user=exec_fakes.OWNER_USER, message_id=card["_message_id"],
@@ -651,7 +652,8 @@ async def main() -> None:
         return JSONResponse({"ok": True})
 
     async def rehearsal_seen(request):
-        """Карточки, ушедшие владельцу, правки кнопок, настройки, строки репетиции, журнал — для проверок.
+        """Карточки, ушедшие владельцу, правки кнопок, настройки, строки подготовки черновиков, состояния
+        черновиков, журнал — для проверок.
         И главное: ни одной отправки собеседнику."""
         rows = await conn.fetch(
             "SELECT action, outcome, detail FROM setup_audit WHERE action LIKE 'rehearsal.%' ORDER BY id")
@@ -665,6 +667,7 @@ async def main() -> None:
                          if str(p.get("text", "")).startswith(("💬", "🔔"))],
             "business_sent": len(telegram.sent(business=True)),
             "drafts": await conn.fetchval("SELECT count(*) FROM outbox_drafts"),
+            "draft_states": [r["status"] for r in await conn.fetch("SELECT status FROM outbox_drafts ORDER BY id")],
             "tasks": await conn.fetchval("SELECT count(*) FROM reply_tasks"),
             "settings": json.loads(await conn.fetchval("SELECT value::text FROM settings WHERE key = 'rehearsal.settings'")
                                    or "null"),
