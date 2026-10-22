@@ -81,7 +81,7 @@
 
 ## Другие способы развёртывания
 
-**Агент на сервере** — для тех, кто сам работает с SSH: Claude Code или Codex CLI на сервере, репозиторий в `/opt/shturman` (образец прокси ждёт этот путь):
+**Агент на сервере** — для тех, кто сам работает с SSH: Claude Code или Codex CLI на сервере, репозиторий в `/opt/shturman` (образец прокси ждёт этот путь). Команда — для самого сервера, не для вашего компьютера:
 
 ```
 sudo install -d -o "$USER" /opt/shturman && git clone https://github.com/namre/shturman.git /opt/shturman && cd /opt/shturman && ./ops/install-ref.sh
