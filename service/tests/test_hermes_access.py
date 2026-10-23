@@ -149,7 +149,7 @@ async def _commitment(conn, status="open"):
     return item
 
 
-@pytest.mark.parametrize("action, body", [("close", {}), ("cancel", {}), ("reschedule", {"due": "к пятнице"})])
+@pytest.mark.parametrize("action, body", [("close", {}), ("cancel", {}), ("reschedule", {"due": "через неделю"})])
 async def test_hermes_cannot_close_cancel_or_move_an_approved_commitment_without_a_press(
         make_client, conn, own_bot, approvals, action, body):
     item = await _commitment(conn)
