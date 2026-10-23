@@ -25,6 +25,7 @@
   | Сводка скрытого (Р-99) | `guard/alerts.py` | «Показать ассистенту все», «Все, кроме сильных правил», «Оставить все скрытыми», «Разбирать по одной» | `alerts._pressed` → карточка подтверждения `confirm` |
   | Договорённость и изменение договорённости | `processing/commitments.py` | «Верно», «Не так» / «Применить», «Оставить как есть» | `commitments.handle_callback` |
   | Факт о владельце | `processing/facts.py` | «Запомнить», «Не запоминать» | `facts.on_button` |
+  | Значение проекта со слов другого | `processing/facts.py` | «Принять», «Оставить прежнее» | `facts.on_button` |
   | Страница о человеке | `processing/pages_build.py` | «Завести страницу», «Не нужно» | `pages_build.on_button` |
   | Предложенный проект | `processing/projects.py` | «Завести проект», «Не нужно» | `projects.on_button` |
 

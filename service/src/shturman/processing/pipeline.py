@@ -666,6 +666,7 @@ async def _run_tokens(conn: asyncpg.Connection, run_id: int) -> int:
 async def send_digests(conn: asyncpg.Connection, *, label: int | str, tz: str) -> dict[str, int]:
     """Сводки владельцу: договорённости (с кнопками), проекты и факты профиля — каждые одним
     сообщением, только то, что ещё не показано. `label` — метка пачки (номер прогона или слота)."""
+    from ..brief import core as brief      # сигнал о просрочке — в те же часы сводки
     zone = ZoneInfo(tz or "UTC")
     today = datetime.now(zone).date()
     digests = await commitments.build_digests(conn, run_id=label, today=today, tz=zone)
@@ -676,7 +677,8 @@ async def send_digests(conn: asyncpg.Connection, *, label: int | str, tz: str) -
     return {"digest_messages": len(digests),
             "projects_shown": await projects.send_digest(conn, run_id=label),
             "owner_facts_shown": await facts.send_owner_digest(conn, run_id=label),
-            "project_facts_shown": await facts.send_project_digest(conn, run_id=label)}
+            "project_facts_shown": await facts.send_project_digest(conn, run_id=label),
+            "overdue_signaled": await brief.send_overdue(conn, today=today, label=str(label))}
 
 
 async def finish_run(conn: asyncpg.Connection, run_id: int) -> int:
