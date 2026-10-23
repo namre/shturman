@@ -218,3 +218,35 @@ async def test_subject_merges_all_accounts_of_a_person(conn):
     at = T0 + timedelta(hours=2)
     mid = await incoming(conn, second, 2077, "Иван", "Это мой второй номер", at, 70)
     assert await brief.on_message(conn, mid, tz=TZ, now=at) is not None
+
+
+# --- после независимой проверки (С8, С9) ----------------------------------------------------------------
+
+async def test_muted_and_forwarded_messages_do_not_bring_a_brief(conn):
+    from shturman.notify import settings as ns
+    w = await world(conn)
+    at = T0 + timedelta(hours=2)
+    forwarded = await incoming(conn, w.ivan_chat, IVAN, "Иван Петров", "Переслано", at, 10)
+    await conn.execute("UPDATE messages SET is_forwarded = true WHERE id = $1", forwarded)
+    assert await brief.on_message(conn, forwarded, tz=TZ, now=at) is None
+    s = await ns.load(conn)
+    await ns.save(conn, {**s, "muted_chats": [w.ivan_chat]})
+    mid = await incoming(conn, w.ivan_chat, IVAN, "Иван Петров", "Добрый день", at, 11)
+    assert await brief.on_message(conn, mid, tz=TZ, now=at) is None          # «Не сообщать об этом чате»
+
+
+async def test_overdue_signal_returns_when_not_delivered(conn):
+    w = await world(conn)
+    today = (T0 + timedelta(days=3)).date()
+    assert await brief.send_overdue(conn, today=today, label="t1") == 1
+    job, = [j for j in await sent(conn) if j["payload"]["text"].startswith("Срок прошёл")]
+    await bridge.deliver_failure(conn, job["id"], "бот недоступен", retry_in=None,
+                                 executor=bridge.executor_for(bridge.NOTIFY_OWNER))
+    assert await conn.fetchval("SELECT overdue_signaled_due FROM commitments WHERE id = $1", w.commitment) is None
+    assert await brief.send_overdue(conn, today=today, label="t2") == 1
+
+
+async def test_no_overdue_signal_when_stopped(conn):
+    await world(conn)
+    await conn.execute("UPDATE assistant_halt SET stopped = true WHERE id = 1")
+    assert await brief.send_overdue(conn, today=(T0 + timedelta(days=3)).date(), label="t1") == 0

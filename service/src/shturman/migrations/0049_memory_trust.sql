@@ -17,6 +17,11 @@ ALTER TABLE facts
     ADD COLUMN conflicts_with bigint REFERENCES facts (id) ON DELETE SET NULL;
 
 -- Записанное раньше: применено тогда, когда записано или решено; основание не восстановить (NULL).
-UPDATE facts SET applied_at = COALESCE(decided_at, created_at) WHERE status IN ('active', 'retracted');
+UPDATE facts SET applied_at = COALESCE(decided_at, created_at) WHERE status = 'active';
+-- Значимые значения проекта, записанные раньше, тоже выходят из смены по ключу: иначе значение, которое
+-- владелец заменил кнопкой «Принять», открыла бы снова следующая пересборка ключа. Что уже закрыто — остаётся
+-- закрытым, что действует — действует.
+UPDATE facts SET chained = false
+ WHERE subject_type = 'project' AND slot IN ('реквизиты', 'бюджет', 'цена', 'подрядчик', 'ответственный', 'срок');
 
 CREATE INDEX facts_project_proposed ON facts (project_id) WHERE subject_type = 'project' AND status = 'proposed';

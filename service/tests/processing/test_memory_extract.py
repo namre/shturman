@@ -150,3 +150,17 @@ def test_prompt_version_and_instructions():
                                        projects=["ЖК Северный", "<script>", ""])
     assert "Проекты владельца: ЖК Северный; ‹script›." in text and text.endswith("</переписка>")
     assert "Проекты владельца" not in extract.build_extract_input(EPISODE, LABELS, timezone.utc, chat_kind="личный")
+
+
+@pytest.mark.parametrize("text, source, ok", [
+    ("бюджет 15 млн", "бюджет 1.5 млн", False),                         # ошибка в 10 раз
+    ("бюджет 1.5 млн", "бюджет 1.5 млн", True),
+    ("+7 (912) 345-67-89", "мой номер +7 912 345-67-89", True),         # тот же номер в другой записи
+    ("бюджет 1 млн", "бюджет 1 000 000 руб", True),                     # то же значение
+    ("этапы 1, 2, 3", "этапы 1, 2 и 3", True),
+    ("р/с 40702810900000012345", "р/с 4070 2810 9000 0001 2345", True),
+    ("счёт 4070281090", "р/с 40702810900000012345", False),             # кусок номера не засчитывается
+    ("сдача 15.10", "сдать к 15.10", True),
+])
+def test_numbers_of_the_fact_must_be_in_the_message(text, source, ok):
+    assert extract.numbers_grounded(text, source) is ok

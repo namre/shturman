@@ -963,7 +963,8 @@ async def _apply_memory(conn: asyncpg.Connection, ctx: dict[str, Any], result: d
         _, outcome = await facts.record(
             conn, fact, subject_type=subject_type, person_id=person_id, project_id=project_id,
             tz=ctx.get("tz") or "UTC", run_id=ctx.get("run_id"), model=model)
-        _bump(stats, {"active": "facts_recorded", "proposed": "owner_facts_proposed",
+        proposed = "project_facts_proposed" if subject_type == "project" else "owner_facts_proposed"
+        _bump(stats, {"active": "facts_recorded", "proposed": proposed,
                       "duplicate": "facts_duplicates"}.get(outcome, f"facts_skipped_{outcome}"))
     mentions, dropped = extract.validate_projects(parsed, episode)
     for key, value in dropped.items():

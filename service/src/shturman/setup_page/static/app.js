@@ -330,7 +330,8 @@
 
   function laterText(later) {
     var words = {
-      commitment: "договорённостей", owner_fact: "фактов о вас", page: "страниц о людях",
+      commitment: "договорённостей", owner_fact: "фактов о вас", project_fact: "значений проектов",
+      page: "страниц о людях",
       project: "проектов"
     };
     var parts = [];

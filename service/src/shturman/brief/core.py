@@ -28,6 +28,7 @@ from .. import bridge
 from ..processing import commitments, dates, people
 
 CALLBACK_MODULE = "br"
+HANDLER_OVERDUE = "brief.overdue"
 BRIEF_GAP = timedelta(hours=4)        # не чаще раза в столько на одного человека (решение владельца 23.10)
 SNOOZE = timedelta(hours=24)          # «Отложить»
 MAX_AGE = timedelta(hours=3)          # справка — только на свежее сообщение (как «Вам написали»)
@@ -40,7 +41,8 @@ _MESSAGE = """
 SELECT m.id, m.chat_id, m.sent_at, m.kind, m.is_outgoing, m.deleted_at, m.edited_at, m.agent_visible,
        m.is_forwarded, m.telegram_via_bot, m.telegram_sender_bot, m.sender_peer_id,
        c.type AS chat_type, c.excluded, c.peer_id AS chat_peer_id, a.role AS account_role,
-       p.class AS chat_peer_class, p.is_bot AS chat_peer_is_bot,
+       p.class AS chat_peer_class, p.is_bot AS chat_peer_is_bot, p.tg_id AS chat_peer_tg_id,
+       p.username AS chat_peer_username,
        sp.class AS sender_class, sp.is_bot AS sender_is_bot
 FROM messages m
 JOIN chats c ON c.id = m.chat_id
@@ -68,6 +70,8 @@ def sender_peer(row: Mapping[str, Any]) -> int | None:
     """Собеседник-человек, написавший входящее; None — не человек, не входящее, служебное, бот."""
     if row["kind"] != "message" or row["deleted_at"] is not None or row["excluded"]:
         return None
+    if row["account_role"] != "owner":
+        return None    # чаты аккаунта помощника — не переписка владельца (как и у «Вам написали»)
     if row["is_outgoing"] is not False or row["edited_at"] is not None or row["is_forwarded"]:
         return None
     if row["telegram_via_bot"] or row["telegram_sender_bot"] or not row["agent_visible"]:
@@ -200,10 +204,17 @@ async def _halted(conn: asyncpg.Connection) -> bool:
     return bool(await conn.fetchval("SELECT shturman_halted()"))
 
 
-async def _quiet(conn: asyncpg.Connection, local: datetime) -> bool:
+async def _silenced(conn: asyncpg.Connection, row: Mapping[str, Any], local: datetime) -> bool:
+    """Тихие часы, «Не сообщать об этом чате», служебные чаты Telegram и управляющий бот — как у
+    «Вам написали» (`notify/core.py`): справки там нет."""
+    from .. import control_peers, store
     from ..notify import core as notify_core
     from ..notify import settings as notify_settings
-    return notify_core.in_quiet(await notify_settings.load(conn), local)
+    s = await notify_settings.load(conn)
+    if notify_core.in_quiet(s, local) or row["chat_id"] in set(s.get("muted_chats") or ()):
+        return True
+    return store.is_blocked_peer(row["chat_peer_class"], row["chat_peer_tg_id"], row["chat_peer_username"]) \
+        or await control_peers.is_blocked(conn, row["chat_peer_class"], row["chat_peer_tg_id"])
 
 
 async def on_message(conn: asyncpg.Connection, message_id: int, *, tz: str,
@@ -220,7 +231,7 @@ async def on_message(conn: asyncpg.Connection, message_id: int, *, tz: str,
         return None
     zone_ = zone(tz)
     local = now.astimezone(zone_)
-    if await _quiet(conn, local):
+    if await _silenced(conn, row, local):
         return None
     key, peers, person_id = await subject_of(conn, peer_id)
     today = local.date()
@@ -280,11 +291,20 @@ async def send_overdue(conn: asyncpg.Connection, *, today: date, label: str) -> 
         name = (party or {}).get("name") or "собеседник"
         if name not in names:
             names.append(name)
-    for item in items:
-        await conn.execute("UPDATE commitments SET overdue_signaled_due = due_date WHERE id = $1", item["id"])
-    await bridge.notify_owner(conn, overdue_text(items, names), dedup_key=f"overdue:{label}",
+    ids = [item["id"] for item in items]
+    await conn.execute("UPDATE commitments SET overdue_signaled_due = due_date WHERE id = ANY($1::bigint[])", ids)
+    await bridge.notify_owner(conn, overdue_text(items, names), dedup_key=f"overdue:{today.isoformat()}:{label}",
+                              handler=HANDLER_OVERDUE, context={"commitment_ids": ids},
                               buttons=[[bridge.button("Показать", CALLBACK_MODULE, f"o:{today:%Y%m%d}")]])
     return len(items)
+
+
+@bridge.on_failure(HANDLER_OVERDUE)
+async def _overdue_not_delivered(conn: asyncpg.Connection, job: dict[str, Any], error: str) -> None:
+    """Сигнал не доставлен: отметка «уже сообщено» снимается — просрочка попадёт в следующий сигнал."""
+    ids = [i for i in (job.get("context") or {}).get("commitment_ids") or [] if isinstance(i, int)]
+    if ids:
+        await conn.execute("UPDATE commitments SET overdue_signaled_due = NULL WHERE id = ANY($1::bigint[])", ids)
 
 
 # --- нажатия ----------------------------------------------------------------------------------------------

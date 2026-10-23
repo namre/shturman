@@ -71,12 +71,12 @@ async def test_owner_accepts_conflict_and_can_undo(conn):
     card, = [j for j in await notifications(conn) if j["payload"]["text"].startswith("Проекты:")]
     text = card["payload"]["text"]
     assert "Сейчас действует" in text and OLD_ACC in text and "Сказал Неизвестный" in text
-    accept, keep = buttons([card], "of")
+    accept, keep = [d for d in buttons([card], "of") if not d.startswith("sh:of:k:")]
     # без проверенного владельца принять нельзя
     with pytest.raises(confirm.Refused):
         await facts.decide_owner_fact(conn, new, True)
     # приложение «Штурман» показывает ту же карточку с теми же кнопками
-    shown = await facts.awaiting_owner(conn)
+    shown = await facts.awaiting_project(conn)
     assert [i["title"] for i in shown["items"]] == ["Значение проекта со слов другого"]
     assert all(approvals.REF.match(b["data"]) for line in shown["items"][0]["buttons"] for b in line)
     out = await press_button(conn, accept)
@@ -96,7 +96,7 @@ async def test_keep_previous_value(conn):
     new = await stranger_says_new_requisites(conn, w)
     await facts.send_project_digest(conn, run_id=1)
     card, = [j for j in await notifications(conn) if j["payload"]["text"].startswith("Проекты:")]
-    _, keep = buttons([card], "of")
+    keep, = [d for d in buttons([card], "of") if d.startswith("sh:of:r:")]
     assert (await press_button(conn, keep))["answer"] == "Оставлено прежнее."
     assert await conn.fetchval("SELECT status FROM facts WHERE id = $1", new) == "rejected"
     assert await current(conn, w.project) == [f"реквизиты подрядчика: р/с {OLD_ACC}"]
@@ -175,3 +175,102 @@ async def test_owner_question_does_not_become_a_value(conn):
         fact(1, "бюджет кровли 5 млн", "ПРОЕКТ", "бюджет кровли 5 млн", slot="бюджет", project="Северный")]})
     assert await conn.fetchval("SELECT count(*) FROM facts WHERE project_id = $1", project) == 0
     assert out is not None
+
+
+# --- после независимой проверки (Б1, С1–С4, С7) -------------------------------------------------------------
+
+async def proposal_card(conn):
+    await facts.send_project_digest(conn, run_id=99)
+    cards = [j for j in await notifications(conn) if j["payload"]["text"].startswith("Проекты:")]
+    return cards[-1]
+
+
+async def test_replaced_legacy_value_stays_closed(conn):
+    """Б1: значение, записанное до 0.0.16 (chained), после «Принять» не открывается снова пересборкой ключа."""
+    w = await project_with_requisites(conn)
+    await conn.execute("UPDATE facts SET chained = true WHERE id = $1", w.old)        # как до миграции
+    new = await stranger_says_new_requisites(conn, w)
+    with owner():
+        await facts.decide_owner_fact(conn, new, True)
+    await facts.rechain(conn, "project", None, w.project, "реквизиты")
+    await facts.repair_chains(conn)
+    assert await current(conn, w.project) == [f"реквизиты подрядчика: р/с {NEW_ACC}"]
+
+
+async def test_owner_can_state_a_value_that_was_proposed_by_someone_else(conn):
+    """С1: чужое предложение отклонено; владелец сам называет то же — его слово записывается."""
+    w = await project_with_requisites(conn)
+    new = await stranger_says_new_requisites(conn, w)
+    with owner():
+        await facts.decide_owner_fact(conn, new, False)
+    await say(conn, w.group, [(OWNER, "Евгений Тестов", f"Решили: реквизиты подрядчика теперь р/с {NEW_ACC}.")],
+              start=T0 + timedelta(days=2), first_id=60)
+    await run_with(conn, lambda job: {"commitments": [], "facts": [
+        fact(1, f"реквизиты подрядчика теперь р/с {NEW_ACC}", "ПРОЕКТ", f"реквизиты подрядчика: р/с {NEW_ACC}",
+             slot="реквизиты", project="Северный")]}, now=T0 + timedelta(days=2, hours=2))
+    row = await conn.fetchrow("SELECT status, basis FROM facts WHERE text LIKE $1 AND source_message_id <> "
+                              "(SELECT source_message_id FROM facts WHERE id = $2)", f"%{NEW_ACC}%", new)
+    assert (row["status"], row["basis"]) == ("active", "owner")
+
+
+async def test_accept_keeping_the_previous_value(conn):
+    """С3: противоречие может быть значением другой работы — «Принять, прежнее тоже верно»."""
+    w = await project_with_requisites(conn)
+    new = await stranger_says_new_requisites(conn, w)
+    card = await proposal_card(conn)
+    keep, = [d for d in buttons([card], "of") if d.startswith("sh:of:k:")]
+    assert (await press_button(conn, keep))["answer"].startswith("Принято; прежнее")
+    assert sorted(await current(conn, w.project)) == sorted([f"реквизиты подрядчика: р/с {OLD_ACC}",
+                                                             f"реквизиты подрядчика: р/с {NEW_ACC}"])
+    assert approvals.REF.match(keep)
+    assert await conn.fetchval("SELECT status FROM facts WHERE id = $1", new) == "active"
+
+
+async def test_stale_conflict_is_not_applied(conn):
+    """С4: два предложения против одного значения; после первого «Принять» второе — по устаревшей карточке."""
+    w = await project_with_requisites(conn)
+    first = await stranger_says_new_requisites(conn, w)
+    other = await chat(conn, w.account, 2078, "Ещё один")
+    await say(conn, other, [(2078, "Ещё один", "Решили по Северному: реквизиты подрядчика теперь р/с 40702810900000077777.")],
+              start=T0 + timedelta(days=1, hours=1), first_id=80)
+    await run_with(conn, lambda job: {"commitments": [], "facts": [
+        fact(1, "реквизиты подрядчика теперь р/с 40702810900000077777", "ПРОЕКТ",
+             "реквизиты подрядчика: р/с 40702810900000077777", slot="реквизиты", project="Северный")]},
+        now=T0 + timedelta(days=1, hours=3))
+    second = await conn.fetchval("SELECT id FROM facts WHERE text LIKE '%77777'")
+    assert await conn.fetchval("SELECT conflicts_with FROM facts WHERE id = $1", second) == w.old
+    with owner():
+        await facts.decide_owner_fact(conn, first, True)
+        out = await facts.decide_owner_fact(conn, second, True)
+    assert out["ok"] is False and out["code"] == "changed_meanwhile"
+    row = await conn.fetchrow("SELECT status, conflicts_with, batch FROM facts WHERE id = $1", second)
+    assert (row["status"], row["conflicts_with"], row["batch"]) == ("proposed", first, None)   # придёт заново
+    assert await current(conn, w.project) == [f"реквизиты подрядчика: р/с {NEW_ACC}"]
+
+
+async def test_project_status_follows_the_latest_owner_word(conn):
+    """С2: прочие ключи проекта (статус) — значение проекта целиком: новое сменяет прежнее."""
+    w = await seed(conn)
+    with owner():
+        project = (await projects.create_project(conn, "ЖК Северный", [w.group], ["Северный"]))["project"]["id"]
+    await say(conn, w.group, [(OWNER, "Евгений Тестов", "Решили по Северному: этап — проектирование"),
+                              (OWNER, "Евгений Тестов", "Решили по Северному: этап — стройка", {"at": T0 + timedelta(days=1)})])
+    def reply(job):
+        late = "стройка" in job["payload"]["input"]
+        quote, text = ("этап — стройка", "этап: стройка") if late else ("этап — проектирование", "этап: проектирование")
+        return {"commitments": [], "facts": [fact(1, quote, "ПРОЕКТ", text, slot="статус", project="Северный")]}
+    await run_with(conn, reply, now=T0 + timedelta(days=1, hours=1))
+    assert await current(conn, project) == ["этап: стройка"]
+
+
+async def test_project_values_are_listed_for_the_page_and_the_app(conn):
+    """С7: ждущие значения проектов видны на странице настройки и в приложении «Штурман»."""
+    w = await project_with_requisites(conn)
+    new = await stranger_says_new_requisites(conn, w)
+    page = await facts.pending_project(conn)
+    assert [(p["id"], p["slot"], p["current"]) for p in page] == [
+        (new, "реквизиты", f"реквизиты подрядчика: р/с {OLD_ACC}")]
+    await proposal_card(conn)
+    app = await facts.awaiting_project(conn)
+    assert [i["id"] for i in app["items"]] == [new] and app["later"] == 0
+    assert (await facts.awaiting_owner(conn))["items"] == []      # факты о владельце — отдельно

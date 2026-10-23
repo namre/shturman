@@ -205,14 +205,18 @@ async def rechain(conn: asyncpg.Connection, subject_type: str, person_id: int | 
 
 
 async def _duplicate(conn: asyncpg.Connection, subject_type: str, person_id: int | None,
-                     project_id: int | None, kind: str, slot: str | None, norm: str, message_id: int) -> bool:
+                     project_id: int | None, kind: str, slot: str | None, norm: str, message_id: int,
+                     *, owner_said: bool = False) -> bool:
     """Тот же факт уже есть: тот же текст в действующих сейчас, в ждущих, отклонённых или
-    отмеченных неверными, либо тот же текст из того же сообщения."""
+    отмеченных неверными, либо тот же текст из того же сообщения. Значение проекта, которое сказал сам
+    владелец, чужое ждущее или отклонённое предложение с тем же текстом не перекрывает: его слово —
+    решение, а не повтор предложения."""
+    decided = "" if owner_said else "OR f.status IN ('proposed', 'rejected', 'retracted')"
     return bool(await conn.fetchval(
-        """SELECT 1 FROM facts f
+        f"""SELECT 1 FROM facts f
            WHERE f.subject_type = $1 AND f.person_id IS NOT DISTINCT FROM $2
              AND f.project_id IS NOT DISTINCT FROM $3 AND f.kind = $4 AND f.text_norm = $5
-             AND (f.source_message_id = $6 OR f.status IN ('proposed', 'rejected', 'retracted')
+             AND (f.source_message_id = $6 {decided}
                   OR (f.status = 'active' AND f.valid_to IS NULL AND f.slot IS NOT DISTINCT FROM $7))
            LIMIT 1""",
         subject_type, person_id, project_id, kind, norm, message_id, slot))
@@ -232,17 +236,26 @@ PROTECTED_PROJECT_SLOTS = frozenset({"реквизиты", "бюджет", "це
 # Тип поля неясен (ключа нет), но по тексту это деньги, счёт, подрядчик или срок — тоже значимое.
 _PROTECTED_TEXT_RE = re.compile(
     r"(?:\d[\d\s.,]*\s*(?:₽|руб|р\.|тыс|млн|млрд|k\b|к\b|\$|€|usd|eur|%)"
-    r"|р/с|к/с|бик|инн|расч[её]тн|реквизит|сч[её]т\b|сч[её]та\b|оплат|аванс|предоплат"
-    r"|подрядчик|субподряд|исполнител|ответственн|срок|дедлайн|перенес|перенос|сдач[аиу]|бюджет|смет|цен[аеуы]|стоимост"
-    r"|\d{5,})",
+    r"|р/с|к/с|бик|инн|кпп|огрн|расч[её]тн|реквизит|сч[её]т\b|сч[её]та\b|оплат|аванс|предоплат|плат[её]ж"
+    r"|подрядчик|субподряд|исполнител|ответственн|срок|дедлайн|перенес|перенос|сдач[аиу]|сдать|сдади|сдаём|сдаем"
+    r"|бюджет|смет|цен[аеуы]|стоимост|договор"
+    r"|\b(?:ооо|оао|зао|пао|ао|ип)\b"
+    r"|\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b"                 # дата: «к 15.10», «15/10/2026»
+    r"|\b(?:январ|феврал|март|апрел|ма[йяе]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*)",
     re.IGNORECASE)
+_LONG_NUMBER_RE = re.compile(r"\d(?:[\d \u00a0\u202f().-]*\d)?")
 BASES = ("owner", "self", "member", "said", "approved")
 
 
 def looks_protected(text: str) -> bool:
-    """По формулировке — значимое значение проекта, даже если модель не поставила ключ. Цитата здесь не
-    смотрится: в одном сообщении бывает и решение о фасаде, и цена, а записывается формулировка."""
-    return bool(_PROTECTED_TEXT_RE.search(text or ""))
+    """По формулировке — значимое значение проекта, даже если модель не поставила ключ: деньги, счёт,
+    подрядчик, срок, дата или число от четырёх цифр («3 500 000», «4070-2810…»). Цитата здесь не смотрится:
+    в одном сообщении бывает и решение о фасаде, и цена, а записывается формулировка. Ошибка здесь
+    безопасна в одну сторону: лишнее значимое — лишняя карточка владельцу, а не подмена значения."""
+    text = text or ""
+    if _PROTECTED_TEXT_RE.search(text):
+        return True
+    return any(len(re.sub(r"\D", "", m.group())) >= 4 for m in _LONG_NUMBER_RE.finditer(text))
 
 
 async def _project_member(conn: asyncpg.Connection, message: extract.Msg, project_id: int | None) -> bool:
@@ -311,8 +324,10 @@ async def record(
                 return None, "third_party_contact"
             slot, basis = None, "said"
     else:
-        chained = False
         protected = slot in PROTECTED_PROJECT_SLOTS or looks_protected(candidate.text)
+        # Значимые значения проекта сами по ключу друг друга не сменяют: «бюджет» кровли и электрики —
+        # разные работы. Прочие ключи проекта (статус, этап, площадь) — значение проекта целиком.
+        chained = not protected
         if message.is_outgoing:
             status, basis = "active", "owner"
         elif protected:
@@ -321,7 +336,8 @@ async def record(
             status, basis = "active", "member"
         else:
             status, basis, slot = "active", "said", None
-    if await _duplicate(conn, subject_type, person_id, project_id, kind, slot, norm, message.id):
+    if await _duplicate(conn, subject_type, person_id, project_id, kind, slot, norm, message.id,
+                        owner_said=subject_type == "project" and message.is_outgoing):
         return None, "duplicate"
     if subject_type == "project" and status == "proposed":
         conflicts_with = await _current_value(conn, project_id, slot, norm)
@@ -385,6 +401,7 @@ async def _reopen_replaced(conn: asyncpg.Connection, fact_id: int | None = None)
 
 async def decide_owner_fact(
     conn: asyncpg.Connection, fact_id: int, accept: bool, *, expected_fingerprint: str | None = None,
+    keep_previous: bool = False,
 ) -> dict[str, Any]:
     """Решение владельца о предложенном факте: о нём самом или о значимом значении проекта со слов
     другого. Согласие — только по проверенному владельцу (authority) и только для того содержания,
@@ -395,7 +412,7 @@ async def decide_owner_fact(
         if row is None or row["subject_type"] not in ("owner", "project"):
             raise FactsError("Такого предложения нет.", "not_found")
         if row["subject_type"] == "project":
-            return await _decide_project(conn, row, accept, principal, expected_fingerprint)
+            return await _decide_project(conn, row, accept, principal, expected_fingerprint, keep_previous)
         if expected_fingerprint is not None and fingerprint(row) != expected_fingerprint:
             raise FactsError("Содержание изменилось. Подтвердите новое предложение.", "changed_meanwhile")
         if row["status"] != "proposed":
@@ -418,7 +435,8 @@ async def decide_owner_fact(
 
 
 async def _decide_project(conn: asyncpg.Connection, row: asyncpg.Record, accept: bool,
-                         principal: Any, expected_fingerprint: str | None) -> dict[str, Any]:
+                         principal: Any, expected_fingerprint: str | None, keep_previous: bool = False
+                         ) -> dict[str, Any]:
     fact_id = row["id"]
     if expected_fingerprint is not None and fingerprint(row) != expected_fingerprint:
         raise FactsError("Содержание изменилось. Подтвердите новое предложение.", "changed_meanwhile")
@@ -427,15 +445,26 @@ async def _decide_project(conn: asyncpg.Connection, row: asyncpg.Record, accept:
     if not accept:
         await conn.execute("UPDATE facts SET status = 'rejected', decided_at = now() WHERE id = $1", fact_id)
         return {"ok": True, "changed": True, "status": "rejected", "fact": await get_fact(conn, fact_id)}
+    if row["conflicts_with"] is not None and not keep_previous and not await conn.fetchval(
+            "SELECT 1 FROM facts WHERE id = $1 AND status = 'active' AND valid_to IS NULL", row["conflicts_with"]):
+        # то, что было на карточке «сейчас действует», уже не действует: решение по устаревшей карточке
+        # не применяется — предложение придёт заново с тем, что действует сейчас
+        current = await _current_value(conn, row["project_id"], row["slot"], row["text_norm"])
+        await conn.execute(
+            """UPDATE facts SET conflicts_with = $2, batch = NULL, pos = NULL, notified_at = NULL,
+                      digest_fingerprint = NULL, digest_attempts = 0 WHERE id = $1""", fact_id, current)
+        return {"ok": False, "changed": False, "status": "proposed", "code": "changed_meanwhile",
+                "error": "Пока вы решали, прежнее значение изменилось. Пришлю карточку заново."}
     await conn.execute(
         """UPDATE facts SET status = 'active', decided_at = now(), approved_at = now(), applied_at = now(),
                   basis = 'approved', approved_by = $2, approved_via = $3, approval_fingerprint = $4
            WHERE id = $1""",
         fact_id, str(authority.current_owner_id()), principal.source, fingerprint(row))
-    if row["conflicts_with"] is not None:
-        # «Принять» — это и есть решение сменить прежнее значение: прежнее закрывается датой нового
+    if row["conflicts_with"] is not None and not keep_previous:
+        # «Принять» — это и есть решение сменить прежнее значение: прежнее закрывается датой нового и
+        # выходит из смены по ключу (иначе следующая пересборка ключа открыла бы его снова)
         await conn.execute(
-            """UPDATE facts SET valid_to = GREATEST(valid_from, $2::date), superseded_by = $3
+            """UPDATE facts SET valid_to = GREATEST(valid_from, $2::date), superseded_by = $3, chained = false
                WHERE id = $1 AND status = 'active' AND valid_to IS NULL""",
             row["conflicts_with"], row["valid_from"], fact_id)
     await touch_pages(conn, "project", None, row["project_id"])
@@ -545,6 +574,17 @@ async def send_owner_digest(conn: asyncpg.Connection, *, run_id: int | str,
     return len(rows)
 
 
+def _project_buttons(row: Any, print_: str, prefix: str = "") -> list[list[dict[str, str]]]:
+    """«Принять» (сменяет то, с чем расходится), «Оставить прежнее»; при противоречии — ещё «Принять, не
+    меняя прежнее»: это может быть значение другой работы того же проекта (ключ без уточнения)."""
+    lines = [[bridge.button(f"{prefix}принять", CALLBACK_MODULE, f"a:{row['id']}:{print_[:24]}"),
+              bridge.button(f"{prefix}оставить прежнее", CALLBACK_MODULE, f"r:{row['id']}")]]
+    if row["current_text"]:
+        lines.append([bridge.button(f"{prefix}принять, прежнее тоже верно", CALLBACK_MODULE,
+                                    f"k:{row['id']}:{print_[:24]}")])
+    return lines
+
+
 _PROJECT_SELECT = f"""SELECT f.*, fm.sent_at AS source_sent_at, fm.chat_id, fm.is_outgoing AS source_outgoing,
        fm.sender_name AS source_sender, fc.title AS chat_title, pr.title AS project_title,
        cf.text AS current_text, cf.slot AS current_slot
@@ -579,8 +619,7 @@ async def send_project_digest(conn: asyncpg.Connection, *, run_id: int | str,
     for pos, row in enumerate(rows, start=1):
         lines.append(f"{pos}. {bridge.fit_message(_project_item_text(row), budget // max(1, len(rows)))}")
         print_ = fingerprint(row)
-        buttons.append([bridge.button(f"{pos} — принять", CALLBACK_MODULE, f"a:{row['id']}:{print_[:24]}"),
-                        bridge.button(f"{pos} — оставить прежнее", CALLBACK_MODULE, f"r:{row['id']}")])
+        buttons.extend(_project_buttons(row, print_, f"{pos} — "))
         await conn.execute(
             """UPDATE facts SET batch = $2, pos = $3, notified_at = now(), digest_attempts = digest_attempts + 1,
                       digest_fingerprint = $4 WHERE id = $1""",
@@ -639,17 +678,33 @@ async def awaiting_owner(conn: asyncpg.Connection, *, limit: int = 100) -> dict[
               "buttons": [[bridge.button("Запомнить", CALLBACK_MODULE, f"a:{r['id']}:{r['digest_fingerprint'][:24]}"),
                            bridge.button("Не запоминать", CALLBACK_MODULE, f"r:{r['id']}")]],
               "card_message_id": None} for r in rows]
-    projects_rows = await conn.fetch(
+    later = await conn.fetchval(
+        f"""SELECT count(*) {_FROM} WHERE {VISIBLE} AND f.subject_type = 'owner' AND f.status = 'proposed'
+            AND f.batch IS NULL AND f.digest_attempts < $1""", DIGEST_MAX_SENDS)
+    return {"items": items, "later": int(later or 0)}
+
+
+async def awaiting_project(conn: asyncpg.Connection, *, limit: int = 100) -> dict[str, Any]:
+    """Значения проектов со слов других из уже отправленной карточки — для приложения «Штурман» (те же
+    кнопки, что в боте). Ещё не показанные только считаются (`later`); решить их можно и на странице
+    настройки («Память» → «Ждут решения»)."""
+    rows = await conn.fetch(
         f"""{_PROJECT_SELECT} AND f.batch IS NOT NULL AND f.digest_fingerprint IS NOT NULL
             ORDER BY f.notified_at NULLS LAST, f.id LIMIT $1""", limit)
-    items += [{"id": r["id"], "title": "Значение проекта со слов другого", "text": _project_item_text(r),
-               "buttons": [[bridge.button("Принять", CALLBACK_MODULE, f"a:{r['id']}:{r['digest_fingerprint'][:24]}"),
-                            bridge.button("Оставить прежнее", CALLBACK_MODULE, f"r:{r['id']}")]],
-               "card_message_id": None} for r in projects_rows]
-    later = await conn.fetchval(
-        f"""SELECT count(*) {_FROM} WHERE {VISIBLE} AND f.subject_type IN ('owner', 'project')
-            AND f.status = 'proposed' AND f.batch IS NULL AND f.digest_attempts < $1""", DIGEST_MAX_SENDS)
+    items = [{"id": r["id"], "title": "Значение проекта со слов другого", "text": _project_item_text(r),
+              "buttons": _project_buttons(r, r["digest_fingerprint"]), "card_message_id": None} for r in rows]
+    later = await conn.fetchval(f"SELECT count(*) FROM ({_PROJECT_SELECT} AND f.batch IS NULL) x")
     return {"items": items, "later": int(later or 0)}
+
+
+async def pending_project(conn: asyncpg.Connection, *, limit: int = 100) -> list[dict[str, Any]]:
+    """Все ждущие значения проектов со слов других — для страницы настройки, показанные или нет."""
+    rows = await conn.fetch(f"{_PROJECT_SELECT} ORDER BY f.id LIMIT $1", limit)
+    return [{"id": r["id"], "project": _short(r["project_title"], 80), "slot": r["slot"],
+             "text": _short(r["text"], 240), "said_by": _short(r["source_sender"], 60) or "собеседник",
+             "since": r["valid_from"].isoformat(), "quote": _short(r["source_quote"], 200),
+             "current": _short(r["current_text"], 200) if r["current_text"] else None,
+             "fingerprint": fingerprint(r)} for r in rows]
 
 
 @bridge.on_callback(CALLBACK_MODULE)
@@ -658,7 +713,7 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
     refused = {"answer": "Кнопка недоступна.", "edit_text": None, "remove_buttons": False}
     action, _, tail = rest.partition(":")
     raw, _, shown = tail.partition(":")
-    if action not in ("a", "r") or not raw.isdigit() or len(raw) > 18:
+    if action not in ("a", "r", "k") or not raw.isdigit() or len(raw) > 18:
         return refused
     fact_id = int(raw)
     row = await conn.fetchrow(
@@ -668,14 +723,22 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
         return {"answer": "Это предложение уже удалено.", "edit_text": None, "remove_buttons": False}
     if row["status"] != "proposed":
         answer = f"Уже решено: {STATUS_TEXT[row['status']]}."
-    elif action == "a":
+    elif action in ("a", "k"):
         if not row["digest_fingerprint"] or shown != row["digest_fingerprint"][:24]:
             return {"answer": "Карточка устарела. Дождитесь нового сообщения.", "edit_text": None,
                     "remove_buttons": True}
         project = row["subject_type"] == "project"
+        if action == "k" and not project:
+            return refused
         try:
-            await decide_owner_fact(conn, fact_id, True, expected_fingerprint=row["digest_fingerprint"])
-            answer = "Принято: теперь действует это." if project else "Запомнено."
+            out = await decide_owner_fact(conn, fact_id, True, expected_fingerprint=row["digest_fingerprint"],
+                                          keep_previous=action == "k")
+            if not out.get("ok", True):
+                answer = out["error"]
+            elif action == "k":
+                answer = "Принято; прежнее значение тоже действует."
+            else:
+                answer = "Принято: теперь действует это." if project else "Запомнено."
         except FactsError as exc:
             answer = str(exc)
     else:
