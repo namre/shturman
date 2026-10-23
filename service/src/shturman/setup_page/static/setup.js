@@ -770,10 +770,11 @@
     hidden: ["скрытое сообщение", "скрытых сообщения", "скрытых сообщений"],
     commitment: ["договорённость", "договорённости", "договорённостей"],
     owner_fact: ["факт о вас", "факта о вас", "фактов о вас"],
+    project_fact: ["значение проекта", "значения проекта", "значений проектов"],
     page: ["страница о человеке", "страницы о человеке", "страниц о людях"],
     project: ["проект", "проекта", "проектов"]
   };
-  var IN_APP = ["draft", "action", "question", "source", "hidden"], ON_PAGE = ["commitment", "owner_fact", "page", "project"];
+  var IN_APP = ["draft", "action", "question", "source", "hidden"], ON_PAGE = ["commitment", "owner_fact", "project_fact", "page", "project"];
 
   function kindsLine(pending, kinds) {
     return kinds.filter(function (k) { return pending[k]; }).map(function (k) {
@@ -3161,21 +3162,26 @@
     });
   }
 
-  function pendingItem(head, lines, yes, no) {
-    var item = el("li", { class: "mem-item" }, [
+  function pendingItem(head, lines, yes, no, more) {
+    var item;
+    var extra = (more || []).map(function (m) {
+      return el("button", { class: "btn ghost small-btn", type: "button", text: m[0], onclick: function () { m[1](this, item); } });
+    });
+    item = el("li", { class: "mem-item" }, [
       el("div", { class: "mem-item-main" }, [el("b", { text: head })].concat(lines)),
       el("p", { class: "note warn mem-error", role: "alert", hidden: true }),
       el("div", { class: "row" }, [
         el("button", { class: "btn small-btn", type: "button", text: yes[0], onclick: function () { yes[1](this, item); } }),
         el("button", { class: "btn ghost small-btn", type: "button", text: no[0], onclick: function () { no[1](this, item); } })
-      ])
+      ].concat(extra))
     ]);
     return item;
   }
 
   function drawPending() {
     var d = mem.pending || {};
-    var groups = { projects: d.projects || [], owner_facts: d.owner_facts || [], pages: d.pages || [], commitments: d.commitments || [] };
+    var groups = { projects: d.projects || [], owner_facts: d.owner_facts || [], project_facts: d.project_facts || [],
+                   pages: d.pages || [], commitments: d.commitments || [] };
     var nodes = [el("p", { class: "small", text: "То же, что бот согласований присылает карточками с кнопками. Решение здесь действует сразу — как нажатие в боте." })];
     if (!d.total) {
       nodes.push(el("p", { class: "note ok", text: "Сейчас ничего не ждёт вашего решения." }));
@@ -3203,6 +3209,23 @@
           ],
             ["Запомнить", function (b, item) { decide(b, item, path, { accept: true, fingerprint: f.fingerprint }, "Запомнено в профиле."); }],
             ["Не запоминать", function (b, item) { decide(b, item, path, { accept: false }, "Не запоминаем."); }]);
+        }))]));
+    }
+    if (groups.project_facts.length) {
+      nodes.push(memSection("Значения проектов со слов других", "Реквизиты, бюджет, цену, подрядчика, ответственного и срок проекта меняете только вы. «Принять» — теперь действует это. «Оставить прежнее» — ничего не меняется.",
+        [el("ul", { class: "mem-items" }, groups.project_facts.map(function (f) {
+          var path = "memory/pending/project-facts/" + f.id;
+          var more = f.current ? [["Принять, прежнее тоже верно", function (b, item) {
+            decide(b, item, path, { accept: true, fingerprint: f.fingerprint, keep_previous: true }, "Принято; прежнее тоже действует.");
+          }]] : [];
+          return pendingItem(f.project + " — " + (f.slot ? f.slot + ": " : "") + f.text, [
+            el("span", { class: "mem-meta", text: "сказал " + f.said_by + ", " + day(f.since) }),
+            f.current ? el("span", { class: "mem-meta", text: "Сейчас действует: " + f.current }) : null,
+            f.quote ? el("q", { class: "mem-quote", text: f.quote }) : null
+          ],
+            ["Принять", function (b, item) { decide(b, item, path, { accept: true, fingerprint: f.fingerprint }, "Принято."); }],
+            ["Оставить прежнее", function (b, item) { decide(b, item, path, { accept: false }, "Оставлено прежнее."); }],
+            more);
         }))]));
     }
     if (groups.pages.length) {

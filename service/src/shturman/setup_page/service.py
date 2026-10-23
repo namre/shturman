@@ -809,7 +809,8 @@ async def page_overview(request: Request) -> JSONResponse:
 # Карточка «Сейчас» (пакет 3 ревизии удобства, С4): только числа и время — ни текста переписки, ни
 # имён. Что ждёт решения — тот же список, что у «Согласований» в приложении (`approvals.collect`), но
 # сюда уходят лишь счётчики по видам; сбои модели за сутки — те же условия, что у «Повторить» (`retry`).
-NOW_KINDS = ("draft", "action", "question", "source", "hidden", "commitment", "owner_fact", "page", "project")
+NOW_KINDS = ("draft", "action", "question", "source", "hidden", "commitment", "owner_fact", "project_fact", "page",
+             "project")
 
 
 async def _now_state(state: AppState) -> dict[str, Any]:

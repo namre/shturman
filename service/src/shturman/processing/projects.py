@@ -650,6 +650,7 @@ async def after_run(conn: asyncpg.Connection, run_id: int, *, now: datetime | No
     stats = await propose(conn, run_id=run_id, now=now)
     stats["projects_shown"] = await send_digest(conn, run_id=run_id)
     stats["owner_facts_shown"] = await facts.send_owner_digest(conn, run_id=run_id)
+    stats["project_facts_shown"] = await facts.send_project_digest(conn, run_id=run_id)
     return stats
 
 

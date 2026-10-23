@@ -93,6 +93,8 @@ ACTIONS = {
     "memory.fact_retract": "Факт отмечен как неверный",
     "memory.owner_fact_accept": "Факт о вас принят в профиль",
     "memory.owner_fact_reject": "Факт о вас отклонён",
+    "memory.project_fact_accept": "Принято значение проекта со слов другого",
+    "memory.project_fact_reject": "Значение проекта со слов другого не принято",
     "memory.profile_block": "Изменены ваши правила и указания ассистенту",
     # Сферы (setup_page/spheres.py, Р-82). В подробностях — номера сфер, папок и число чатов, без названий.
     "sphere.create": "Заведена сфера",
@@ -191,7 +193,7 @@ IMPORTANT = frozenset({
     "tg.keys", "tg.keys_removed", "tg.login", "tg.login_done", "tg.logout", "tg.forget",
     "llm.save", "llm.removed", "llm.chatgpt_start", "llm.chatgpt", "llm.chatgpt_removed",
     # заметки владельца ассистент читает как его собственные слова: их правку не вытеснить из вида
-    "memory.owner_block", "memory.profile_block", "memory.owner_fact_accept",
+    "memory.owner_block", "memory.profile_block", "memory.owner_fact_accept", "memory.project_fact_accept",
     # вход в приложение и решения в нём — то же, что вход на страницу и нажатие в боте
     "app.login", "app.decide", "app.answer",
     # выбор чатов из приложения: войти в него может и держатель токена бота согласований (Р-80) —
