@@ -675,7 +675,8 @@ async def send_digests(conn: asyncpg.Connection, *, label: int | str, tz: str) -
                                   dedup_key=f"cm-digest:{digest['batch']}")
     return {"digest_messages": len(digests),
             "projects_shown": await projects.send_digest(conn, run_id=label),
-            "owner_facts_shown": await facts.send_owner_digest(conn, run_id=label)}
+            "owner_facts_shown": await facts.send_owner_digest(conn, run_id=label),
+            "project_facts_shown": await facts.send_project_digest(conn, run_id=label)}
 
 
 async def finish_run(conn: asyncpg.Connection, run_id: int) -> int:

@@ -1051,6 +1051,29 @@ def sanitize_fact(text: str) -> str:
     return cleaned[:FACT_LIMIT].rstrip()
 
 
+QUOTE_MIN_CHARS = 8          # цитата-основание факта: не меньше стольких знаков после нормализации
+QUOTE_MIN_WORDS = 2          # и не меньше стольких слов — «Ок» основанием не служит
+_DIGITS_RE = re.compile(r"\d(?:[\d\s.,:/-]*\d)?")
+
+
+def digit_runs(text: str) -> set[str]:
+    """Числа текста строками цифр: «10 млн», «15.10», «40702 810…» — разделители внутри числа не важны."""
+    return {re.sub(r"\D", "", m.group()) for m in _DIGITS_RE.finditer(text or "")}
+
+
+def quote_too_short(quote: str) -> bool:
+    needle = normalize(quote)
+    return len(needle) < QUOTE_MIN_CHARS or len(needle.split()) < QUOTE_MIN_WORDS
+
+
+def numbers_grounded(text: str, source: str) -> bool:
+    """Каждое число формулировки есть в тексте сообщения: суммы, сроки и счета модель не придумывает.
+    Число сравнивается целиком; длинное (от 5 цифр) может стоять в сообщении частью записи с пробелами."""
+    source_runs = digit_runs(source)
+    joined = "|".join(source_runs)
+    return all(run in source_runs or (len(run) >= 5 and run in joined) for run in digit_runs(text))
+
+
 def _sensitive(text: str, quote: str) -> bool:
     """Пароли, коды, PIN и номера карт не извлекаются никогда — при любом ключе: номер карты
     длиннее телефона, поэтому телефонам это не мешает."""
@@ -1063,6 +1086,7 @@ def validate_facts(
     """Проверяет факты и решения из ответа модели по тексту эпизода. Возвращает принятое и
     счётчики отброшенного. Нет ключа facts — не ошибка: так отвечала модель до версии 3."""
     dropped = {"malformed": 0, "bad_index": 0, "forwarded": 0, "by_service": 0, "ungrounded_quote": 0,
+               "short_quote": 0, "ungrounded_number": 0,
                "hedged": 0, "question": 0, "empty": 0, "bad_subject": 0, "sensitive": 0, "over_limit": 0}
     items = parsed.get("facts") if isinstance(parsed, dict) else None
     if items is None:
@@ -1096,6 +1120,11 @@ def validate_facts(
         if not grounded(quote, message.text):
             dropped["ungrounded_quote"] += 1
             continue
+        if quote_too_short(quote):
+            # «Ок», «да» основанием факта не служат: формулировку пишет модель, и короткой цитатой её
+            # не проверить (записка «держать, подкладывать, сигналить», шаг 1)
+            dropped["short_quote"] += 1
+            continue
         around = quote_context(quote, message.text)
         if any(is_hedged(part) for part in around) or is_hedged(quote):
             dropped["hedged"] += 1
@@ -1106,6 +1135,10 @@ def validate_facts(
         text = sanitize_fact(text)
         if len(text) < 3:
             dropped["empty"] += 1
+            continue
+        if not numbers_grounded(text, message.text):
+            # число формулировки (сумма, срок, счёт) должно стоять в самом сообщении
+            dropped["ungrounded_number"] += 1
             continue
         kind = item.get("kind") if item.get("kind") in ("fact", "decision") else "fact"
         slot = slot_of(item.get("slot"))

@@ -43,7 +43,7 @@ def test_facts_are_checked_against_the_message_text():
         fact(2, "фасад делаем из керамогранита", "ПРОЕКТ", "фасад из керамогранита", kind="decision",
              project="ЖК Северный"),
         fact(2, "бюджет 12 млн", "ПРОЕКТ", "бюджет 12 млн", slot="бюджет", project="ЖК «Северный»"),
-        fact(2, "решили", "ВЛАДЕЛЕЦ", "владелец решает по фасадам", kind="decision"),   # решение без проекта
+        fact(2, "По ЖК Северный решили", "ВЛАДЕЛЕЦ", "владелец решает по фасадам", kind="decision"),   # решение без проекта
     ]}
     found, dropped = extract.validate_facts(parsed, EPISODE, LABELS)
     assert [(f.about, f.slot, f.kind, f.project, f.origin) for f in found] == [
@@ -68,6 +68,10 @@ def test_facts_are_checked_against_the_message_text():
     (fact(1, "директор по развитию", "У7", "директор"), "bad_subject"),             # нет такого участника
     (fact(1, "директор по развитию", "ПРОЕКТ", "директор"), "bad_subject"),         # ПРОЕКТ без названия
     (fact(1, "директор по развитию", "У1", "  "), "empty"),
+    # шаг 1 записки: короткая цитата не основание; число формулировки должно быть в сообщении
+    (fact(2, "решили", "ВЛАДЕЛЕЦ", "владелец решает по фасадам"), "short_quote"),
+    (fact(1, "директор по развитию", "У1", "директор по развитию с окладом 300 тысяч"), "ungrounded_number"),
+    (fact(2, "бюджет 12 млн", "ПРОЕКТ", "бюджет 15 млн", project="ЖК Северный"), "ungrounded_number"),
     ({"message": "1", "source_quote": "x", "about": "У1", "text": "x"}, "malformed"),
     ("строка", "malformed"),
 ])
@@ -85,7 +89,7 @@ def test_context_messages_cannot_be_cited():
 
 
 def test_fact_limits_unknown_slots_and_old_answers():
-    many = {"facts": [fact(1, "директор по развитию", "У1", f"факт номер {n}") for n in range(12)]}
+    many = {"facts": [fact(1, "директор по развитию", "У1", f"факт «{chr(0x430 + n)}»") for n in range(12)]}
     found, dropped = extract.validate_facts(many, EPISODE, LABELS)
     assert len(found) == extract.MAX_FACTS and dropped["over_limit"] == 12 - extract.MAX_FACTS
     weird = {"facts": [fact(1, "директор по развитию", "У1", "директор", slot="любимый цвет")]}
