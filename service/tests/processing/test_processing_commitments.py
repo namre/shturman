@@ -492,8 +492,13 @@ async def test_deleted_evidence_removes_the_proposed_change(conn):
     later = await say(conn, ivan_chat, [(IVAN, "Иван Петров", "Давайте перенесём смету на понедельник")],
                       first_id=9, start=T0 + timedelta(days=1))
     await plan(conn, now=T0 + timedelta(days=1, hours=1))
-    job, = await claim(conn)
+    # «перенесём» — ещё и признак факта (0.0.17): эпизод уходит и на извлечение; здесь нужен запрос о статусе
+    claimed = await claim(conn)
+    job, = [j for j in claimed if j["payload"].get("schema_name") == "commitment_updates"]
     await answer(conn, job, {"updates": [upd(1, "rescheduled", 1, "перенесём смету на понедельник", "на понедельник")]})
+    for other in claimed:
+        if other is not job:
+            await answer(conn, other, {"commitments": []})
     change = dict(await conn.fetchrow("SELECT * FROM commitment_changes"))
     assert (change["kind"], change["new_due_date"]) == ("rescheduled", date(2026, 10, 12))
     assert (await press(conn, f"sh:cm:ca:{change['id']}"))["answer"] == "Срок перенесён."

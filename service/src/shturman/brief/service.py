@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import Any, AsyncIterator
@@ -38,8 +39,20 @@ async def lifespan(state: AppState) -> AsyncIterator[None]:
             async with state.pool.acquire() as conn:
                 await remind.drop_chat(conn, chat_id)
 
+    async def meetings() -> None:
+        while True:
+            try:
+                async with state.pool.acquire() as conn:
+                    await core.send_before_meetings(conn, tz=state.config.timezone)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # справка не главное: следующий обход — через MEETING_EVERY
+                logger.error("справка перед встречей не собрана: %s", type(exc).__name__)
+            await asyncio.sleep(core.MEETING_EVERY)
+
     state.events.subscribe(MESSAGE_LIVE, on_message)
     state.events.subscribe(CHAT_EXCLUDED, chat_excluded)
+    state.spawn(meetings(), name="brief-meetings")
     try:
         yield
     finally:
