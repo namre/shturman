@@ -310,7 +310,11 @@ def test_app_routes_are_few_and_all_behind_the_app_session():
         (miniapp.APP_API + "/replies/autoreply/{account_id:int}", ["PUT"]),
         (miniapp.APP_API + "/replies/groups", ["POST"]), (miniapp.APP_API + "/replies/groups/{chat_id:int}", ["DELETE"]),
         (miniapp.APP_API + "/replies/addressing", ["PUT"]),
-        (miniapp.APP_API + "/summaries", ["GET"]), (miniapp.APP_API + "/summaries", ["PUT"])])
+        (miniapp.APP_API + "/summaries", ["GET"]), (miniapp.APP_API + "/summaries", ["PUT"]),
+        # экран «Память» (шаг 6 записки, tests/setup_page/test_memory_app.py): история, «на дату», «Поправить»
+        (miniapp.APP_API + "/memory", ["GET"]), (miniapp.APP_API + "/memory/{kind}/{subject_id:int}", ["GET"]),
+        (miniapp.APP_API + "/memory/facts/{fact_id:int}/correct", ["POST"]),
+        (miniapp.APP_API + "/memory/facts/{fact_id:int}/wrong", ["POST"])])
     for route in routes:
         if route.path != APP_PATH:
             assert getattr(route.endpoint, "miniapp", False), route.path     # своя обёртка — своя сессия

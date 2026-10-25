@@ -36,6 +36,8 @@ superseded_by — следующий; открыт (valid_to IS NULL) тольк
       «что ассистент знал на момент» — по времени записи; у каждой строки `state_at`: active | proposed.
   get_fact(conn, fact_id) -> dict | None
   retract_fact(conn, fact_id) -> dict                       только владелец (authority)
+  correct_fact(conn, fact_id, text) -> dict                 «Поправить»: исправление, только владелец
+  history(conn, subject_type, subject_id) -> list[dict]     все версии с состоянием (`state`)
   decide_owner_fact(conn, fact_id, accept, *, expected_fingerprint=None) -> dict
       accept=True — только владелец (authority); accept=False — отклонить можно и без него.
 
@@ -460,6 +462,77 @@ async def retract_fact(conn: asyncpg.Connection, fact_id: int) -> dict[str, Any]
         await rechain(conn, row["subject_type"], row["person_id"], row["project_id"], row["slot"])
         await touch_pages(conn, row["subject_type"], row["person_id"], row["project_id"])
     return {"ok": True, "changed": True, "fact": await get_fact(conn, fact_id)}
+
+
+CORRECT_LIMIT = 240          # как у формулировки факта (facts_text_check)
+
+
+async def correct_fact(conn: asyncpg.Connection, fact_id: int, text: str) -> dict[str, Any]:
+    """«Поправить»: владелец исправляет ошибку извлечения (опечатка, не то число, не так сказано) в действующем
+    значении. Это исправление, а не смена решения: новая версия с тем же источником, ключом и датой, вид
+    смены `correction`, основание — владелец; прежняя — «неверно» (`retracted`) со ссылкой на исправление
+    (`superseded_by`), в истории видны обе. Только владелец (authority)."""
+    principal = authority.requires_owner()
+    text = " ".join((text or "").split())
+    if not text:
+        raise FactsError("Напишите, как правильно.", "empty")
+    if len(text) > CORRECT_LIMIT:
+        raise FactsError(f"Не длиннее {CORRECT_LIMIT} знаков.", "too_long")
+    async with conn.transaction():
+        row = await _locked(conn, fact_id)
+        if row is None:
+            raise FactsError("Такого факта нет.", "not_found")
+        if row["status"] != "active" or row["valid_to"] is not None:
+            raise FactsError("Поправить можно только то, что действует сейчас.", "not_current")
+        norm = text_norm(text)
+        if norm == row["text_norm"]:
+            raise FactsError("Текст тот же — поправлять нечего.", "same")
+        new_id = await conn.fetchval(
+            """INSERT INTO facts (subject_type, person_id, project_id, kind, slot, text, text_norm, valid_from,
+                                  effective_from, status, origin, source_message_id, source_quote, basis, change_kind,
+                                  chained, applied_at, decided_at)
+               SELECT subject_type, person_id, project_id, kind, slot, $2, $3, valid_from, effective_from, 'active',
+                      'owner', source_message_id, source_quote, 'owner', 'correction', chained, now(), now()
+               FROM facts WHERE id = $1 RETURNING id""", fact_id, text, norm)
+        if row["subject_type"] == "owner":
+            fresh = await conn.fetchrow("SELECT * FROM facts WHERE id = $1", new_id)
+            await conn.execute(
+                """UPDATE facts SET approved_at = now(), approved_by = $2, approved_via = $3, approval_fingerprint = $4
+                   WHERE id = $1""", new_id, str(authority.current_owner_id()), principal.source, fingerprint(fresh))
+        await conn.execute(
+            "UPDATE facts SET status = 'retracted', decided_at = now(), superseded_by = $2 WHERE id = $1",
+            fact_id, new_id)
+        # то, что исправленная версия сменила кнопкой «Принять», теперь сменено исправлением
+        await conn.execute(
+            "UPDATE facts SET superseded_by = $2 WHERE superseded_by = $1 AND NOT chained AND status = 'active'",
+            fact_id, new_id)
+        await rechain(conn, row["subject_type"], row["person_id"], row["project_id"], row["slot"])
+        await touch_pages(conn, row["subject_type"], row["person_id"], row["project_id"])
+    return {"ok": True, "changed": True, "fact": await get_fact(conn, new_id), "replaced": fact_id}
+
+
+STATE_WORDS = {
+    "current": "действует", "closed": "сменено", "proposed": "ждёт вашего решения", "rejected": "не принято",
+    "wrong": "отмечено неверным", "corrected": "исправлено",
+}
+
+
+def history_state(row: Any) -> str:
+    if row["status"] == "active":
+        return "current" if row["valid_to"] is None else "closed"
+    if row["status"] == "retracted":
+        return "corrected" if row["superseded_by"] is not None else "wrong"
+    return row["status"]
+
+
+async def history(conn: asyncpg.Connection, subject_type: str, subject_id: int | None,
+                  *, limit: int = 200) -> list[dict[str, Any]]:
+    """Лента изменений субъекта: все версии — действующие, сменённые, предложенные, не принятые, неверные и
+    исправленные, — от новых к старым по времени записи. У строки — `state` (см. `STATE_WORDS`), когда
+    ассистент узнал (`created_at`), когда применено и когда решено, основание и вид смены."""
+    rows = await _subject_rows(conn, subject_type, subject_id)
+    rows.sort(key=lambda r: (r["created_at"], r["id"]), reverse=True)
+    return [{**to_dict(r), "state": history_state(r)} for r in rows[:limit]]
 
 
 async def _reopen_replaced(conn: asyncpg.Connection, fact_id: int | None = None) -> None:

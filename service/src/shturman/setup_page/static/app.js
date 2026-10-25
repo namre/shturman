@@ -48,7 +48,7 @@
   var listShown = false;                         // список уже был на экране хотя бы раз
   var signedIn = false;                          // на экране — разделы, а не вход или его неудача
   var tab = "approvals";                         // открытый раздел: approvals | commitments | chats | spheres | rehearsal | notify | history
-  var TABS = ["approvals", "commitments", "chats", "spheres", "rehearsal", "notify", "history"];
+  var TABS = ["approvals", "commitments", "chats", "spheres", "memory", "rehearsal", "notify", "history"];
   var GROUPS_NAME = "shturman-app-groups";       // свёрнутые разделы (только эта вкладка Telegram, sessionStorage)
   var halt = { stopped: false };                 // «Остановить всё»: из списка согласований (и GET halt)
   var setupUrl = null;                           // адрес «Настроек Штурмана» — для кнопки «Открыть настройки в браузере»
@@ -282,6 +282,7 @@
     if (tab === "commitments" && signedIn) loadCommitments(false);
     if (tab === "notify" && signedIn) { loadNotify(false); loadSummaries(); }
     if (tab === "history" && signedIn) loadHistory(false);
+    if (tab === "memory" && signedIn) loadMemory(false);
   }
 
   // Ключ сессии больше не действует (срок, «выйти везде», смена владельца): войти заново можно,
@@ -522,6 +523,7 @@
     if (first && tab === "commitments") loadCommitments(false);
     if (first && tab === "notify") { loadNotify(false); loadSummaries(); }
     if (first && tab === "history") loadHistory(false);
+    if (first && tab === "memory") loadMemory(false);
     if (first) refreshSphereList();
   }
 
@@ -2779,6 +2781,187 @@
     });
   }
 
+  /* ------------------------------------------------------------ «Память» (шаг 6 записки) */
+
+  var mm = { loaded: false, list: null, subject: null, kind: null, id: null, timer: null, editing: null };
+
+  function ddmm(iso) {
+    if (!iso) return "";
+    var d = String(iso).slice(0, 10).split("-");
+    return d.length === 3 ? d[2] + "." + d[1] + "." + d[0] : String(iso);
+  }
+
+  function mmFailed(text) {
+    $("mm-failed-text").textContent = text;
+    show("mm-loading", false);
+    show("mm-failed", true);
+  }
+
+  function loadMemory(quiet) {
+    if (mm.kind) return openSubject(mm.kind, mm.id, true);
+    if (!quiet && !mm.loaded) { show("mm-loading", true); show("mm-failed", false); }
+    var q = $("mm-q").value.trim();
+    return request("GET", "memory" + (q ? "?q=" + encodeURIComponent(q) : "")).then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) { mmFailed(got.data.error || "Сервер не ответил. Попробуйте ещё раз через минуту."); return; }
+      mm.loaded = true;
+      mm.list = got.data;
+      show("mm-loading", false);
+      show("mm-failed", false);
+      drawMemoryList();
+    }, function () { mmFailed("Нет связи с сервером. Проверьте интернет и попробуйте ещё раз."); });
+  }
+
+  function mmEntry(item, label) {
+    var li = el("li", "cm");
+    var b = el("button", "link-btn", item.title);
+    b.type = "button";
+    b.addEventListener("click", function () { openSubject(item.kind, item.id, false); });
+    li.appendChild(b);
+    var meta = el("div", "cm-meta");
+    meta.appendChild(el("span", null, label));
+    if (item.waiting) meta.appendChild(el("span", "cm-due late", "ждут решения: " + item.waiting));
+    li.appendChild(meta);
+    return li;
+  }
+
+  function drawMemoryList() {
+    var list = $("mm-list"), d = mm.list || { people: [], projects: [] };
+    list.textContent = "";
+    if (!$("mm-q").value.trim()) list.appendChild(mmEntry(d.owner, "о вас: профиль"));
+    d.projects.forEach(function (p) { list.appendChild(mmEntry(p, "проект")); });
+    d.people.forEach(function (p) { list.appendChild(mmEntry(p, "человек")); });
+    show("mm-empty", !list.childNodes.length);
+  }
+
+  function mmMeta(item, history) {
+    var meta = el("div", "cm-meta");
+    if (item.slot) meta.appendChild(el("span", null, item.slot));
+    meta.appendChild(el("span", null, "с " + ddmm(item.since) + (item.until ? " по " + ddmm(item.until) : "")));
+    if (item.basis) meta.appendChild(el("span", null, item.basis));
+    if (item.correction) meta.appendChild(el("span", null, "исправлено вами"));
+    if (item.chat) meta.appendChild(el("span", null, "чат: " + item.chat));
+    if (history) meta.appendChild(el("span", "mm-state", "узнал " + ddmm(item.learned_at) +
+      (item.decided_at ? ", решено " + ddmm(item.decided_at) : "")));
+    return meta;
+  }
+
+  function mmAct(item, action, body) {
+    return request("POST", "memory/facts/" + item.id + "/" + action, body ? { v: item.v, text: body.text } : { v: item.v }).then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      toast(got.data.answer || got.data.error || "Не получилось.");
+      mm.editing = null;
+      openSubject(mm.kind, mm.id, true);
+    }, function () { toast("Нет связи с сервером."); });
+  }
+
+  function mmCurrent(item, editable) {
+    var li = el("li", "cm");
+    li.appendChild(el("div", "cm-what", item.text));
+    li.appendChild(mmMeta(item, false));
+    if (item.quote) li.appendChild(el("div", "mm-quote", "«" + item.quote + "» — " + ddmm(item.said_at)));
+    if (!editable) return li;
+    if (mm.editing === item.id) {
+      var box = el("div", "mm-edit");
+      var area = document.createElement("textarea");
+      area.maxLength = 240;
+      area.value = item.text;
+      area.setAttribute("aria-label", "Как правильно");
+      box.appendChild(area);
+      var row = el("div", "actions");
+      var save = el("button", "primary", "Сохранить");
+      save.type = "button";
+      save.addEventListener("click", function () { save.disabled = true; mmAct(item, "correct", { text: area.value }); });
+      var cancel = el("button", "secondary", "Отмена");
+      cancel.type = "button";
+      cancel.addEventListener("click", function () { mm.editing = null; drawSubject(); });
+      row.appendChild(save);
+      row.appendChild(cancel);
+      box.appendChild(row);
+      li.appendChild(box);
+      return li;
+    }
+    var actions = el("div", "actions");
+    var fix = el("button", "secondary", "Поправить");
+    fix.type = "button";
+    fix.addEventListener("click", function () { mm.editing = item.id; drawSubject(); });
+    var wrong = el("button", "secondary", "Не так");
+    wrong.type = "button";
+    wrong.addEventListener("click", function () { wrong.disabled = true; mmAct(item, "wrong"); });
+    actions.appendChild(fix);
+    actions.appendChild(wrong);
+    li.appendChild(actions);
+    return li;
+  }
+
+  function drawSubject() {
+    var d = mm.subject;
+    if (!d) return;
+    $("mm-subject-title").textContent = d.title;
+    var cur = $("mm-current"), hist = $("mm-history");
+    cur.textContent = "";
+    hist.textContent = "";
+    d.current.forEach(function (item) { cur.appendChild(mmCurrent(item, d.editable)); });
+    var empty = d.as_of ? "В тот день ничего не действовало — или ассистент этого не видел." :
+      d.known_at ? "К тому дню ассистент ничего об этом не знал." : "Пока ничего не записано.";
+    $("mm-current-empty").textContent = empty;
+    show("mm-current-empty", !d.current.length);
+    var note = d.as_of ? "Действовало " + ddmm(d.as_of) + " — по дате сообщения, в котором это сказано." :
+      d.known_at ? "Что ассистент знал к концу " + ddmm(d.known_at) + ": записанное позже сюда не попадает." : "";
+    $("mm-when-note").textContent = note;
+    show("mm-when-note", !!note);
+    var pending = d.pending.length;
+    $("mm-pending-text").textContent = pending ? (d.known_at ? "Ждало вашего решения: " : "Ждут вашего решения: ") + pending : "";
+    show("mm-pending", pending > 0 && !d.known_at);
+    d.history.forEach(function (item) {
+      var li = el("li", "cm");
+      li.appendChild(el("div", "cm-what", item.text));
+      var st = el("div", "mm-state", item.state_text);
+      li.appendChild(st);
+      li.appendChild(mmMeta(item, true));
+      hist.appendChild(li);
+    });
+  }
+
+  function openSubject(kind, id, quiet) {
+    mm.kind = kind;
+    mm.id = id;
+    show("mm-list-box", false);
+    show("mm-subject", true);
+    var mode = $("mm-mode").value, day = $("mm-date").value;
+    var query = mode !== "now" && day ? "?" + mode + "=" + encodeURIComponent(day) : "";
+    return request("GET", "memory/" + kind + "/" + id + query).then(function (got) {
+      if (got.status === 401) { sessionLost(got.data); return; }
+      if (got.status !== 200) { toast(got.data.error || "Не загрузилось."); if (!quiet) backToList(); return; }
+      mm.subject = got.data;
+      drawSubject();
+    }, function () { toast("Нет связи с сервером."); });
+  }
+
+  function backToList() {
+    mm.kind = mm.id = mm.subject = mm.editing = null;
+    $("mm-mode").value = "now";
+    $("mm-date").value = "";
+    show("mm-date", false);
+    show("mm-subject", false);
+    show("mm-list-box", true);
+    loadMemory(true);
+  }
+
+  function wireMemory() {
+    $("mm-retry").addEventListener("click", function () { loadMemory(false); });
+    $("mm-back").addEventListener("click", backToList);
+    $("mm-q").addEventListener("input", function () { clearTimeout(mm.timer); mm.timer = setTimeout(function () { loadMemory(true); }, 300); });
+    $("mm-mode").addEventListener("change", function () {
+      var dated = $("mm-mode").value !== "now";
+      show("mm-date", dated);
+      if (dated && !$("mm-date").value) $("mm-date").value = new Date().toISOString().slice(0, 10);
+      if (mm.kind) openSubject(mm.kind, mm.id, true);
+    });
+    $("mm-date").addEventListener("change", function () { if (mm.kind) openSubject(mm.kind, mm.id, true); });
+    $("mm-pending-open").addEventListener("click", function () { openTab("approvals"); });
+  }
+
   /* ------------------------------------------------------------ запуск */
 
   $("refresh").addEventListener("click", function () { load(); });
@@ -2789,7 +2972,9 @@
   $("tab-rehearsal").addEventListener("click", function () { openTab("rehearsal"); });
   $("tab-notify").addEventListener("click", function () { openTab("notify"); });
   $("tab-history").addEventListener("click", function () { openTab("history"); });
+  $("tab-memory").addEventListener("click", function () { openTab("memory"); });
   wireChats();
+  wireMemory();
   wireSpheres();
   wireNotify();
   wireHalt();
@@ -2825,6 +3010,7 @@
     if (tab === "commitments") loadCommitments(true);
     if (tab === "notify") { loadNotify(true); loadSummaries(); }
     if (tab === "history") loadHistory(true);
+    if (tab === "memory") loadMemory(true);
   });
 
   postEvent("web_app_ready");
