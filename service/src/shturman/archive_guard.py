@@ -67,6 +67,7 @@ ALARM_HOUR_FLOOR = 800         # сообщений в час: ниже — не
 ALARM_FACTOR = 4               # во сколько раз больше обычного часа — тревога
 BASELINE_DAYS = 14
 ALARM_CHATS = 30               # разных чатов, из которых выданы сообщения за полчаса
+ALARM_CHATS_SCHEDULED = 200    # то же, пока идёт плановая сводка или обзор недели (`summaries.running_now`)
 ALARM_WALK = 15                # вызовов-перебора (страницы, даты, буквы) за полчаса
 WINDOW = timedelta(minutes=30)
 QUIET = timedelta(hours=24)    # «Это я, продолжить»: сутки без тревог
@@ -283,7 +284,13 @@ async def _anomaly(conn: asyncpg.Connection, caller: str, stats: Stats) -> tuple
         """SELECT count(DISTINCT c) FROM archive_disclosures, unnest(chats) AS c
            WHERE caller = $1 AND at > now() - $2::interval AND refused IS NULL""", caller, WINDOW)
     if chats >= ALARM_CHATS:
-        return "chats", {"chats": int(chats), "minutes": int(WINDOW.total_seconds() // 60)}
+        # Обзор недели и утренняя сводка Hermes по расписанию читают много чатов подряд — это их работа,
+        # а не вынос (ложная тревога на пилоте в пятницу 23.10). В их окно порог выше; объём, пределы и ловушки —
+        # те же. Только для ассистента (mcp): у внешнего клиента своих сводок нет.
+        from . import summaries
+        threshold = ALARM_CHATS_SCHEDULED if caller == "mcp" and await summaries.running_now(conn) else ALARM_CHATS
+        if chats >= threshold:
+            return "chats", {"chats": int(chats), "minutes": int(WINDOW.total_seconds() // 60)}
     walk = await conn.fetchval(
         """SELECT count(*) FROM archive_disclosures
            WHERE caller = $1 AND at > now() - $2::interval AND pattern IS NOT NULL""", caller, WINDOW)
