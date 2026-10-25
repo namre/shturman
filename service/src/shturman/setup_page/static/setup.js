@@ -422,6 +422,7 @@
     if ($("spheres-details").open) showSpheres();
     if ($("notify-details").open) showNotify(); else refreshNotify();
     if ($("rehearsal-details").open) showRehearsal(); else refreshRehearsal();
+    if ($("remind-details").open) showRemind(); else refreshRemind();
     if ($("watch-details").open) showWatch(); else refreshWatch();
     if ($("summaries-details").open) showSummaries(); else refreshSummaries();
     if ($("replies-details").open) refreshReplies().then(drawReplies); else refreshReplies();
@@ -693,6 +694,7 @@
 
   /* Раскрыть шаг или карточку и перейти к ней: строка прогресса, быстрые ссылки, «Сейчас». */
   var DETAILS_OF = { "s-spheres": "spheres-details", "s-notify": "notify-details", "s-rehearsal": "rehearsal-details",
+                     "s-remind": "remind-details",
                      "s-watch": "watch-details", "s-memory": "memory-details", "s-audit": "audit-details",
                      "s-replies": "replies-details", "s-summaries": "summaries-details",
                      "s-import": "import-details", "s-media": "media-details", "s-ready": "ready-details" };
@@ -4074,6 +4076,118 @@
     });
   }
 
+  /* ------------------------------------------- напоминания исполнителям (brief/remind.py) */
+
+  var rm = { data: null, people: [], groups: [], timer: null, groupTimer: null };
+
+  function refreshRemind() {
+    return call("GET", "remind", undefined, true).then(function (r) {
+      if (!r.ok) return;
+      rm.data = r.data;
+      var s = r.data.settings;
+      pill("remind", !s.enabled ? "выключено" : s.who === "all" ? "всем, кто обещал" :
+           "выбранным · " + (s.people.length + s.groups.length), s.enabled ? "done" : "");
+    });
+  }
+
+  function rmList(id, items, name, empty) {
+    var list = $(id);
+    list.textContent = "";
+    if (!items.length) list.appendChild(el("li", { class: "mem-chat mem-note", text: empty }));
+    items.forEach(function (x, i) {
+      list.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", {}, [name(x)]),
+        el("button", { class: "btn ghost small-btn", type: "button", text: "Убрать", "aria-label": "Убрать " + name(x),
+          onclick: function () { items.splice(i, 1); drawRmLists(); } })
+      ]));
+    });
+  }
+
+  function drawRmLists() {
+    rmList("rm-people", rm.people, personName, "Пока никого. Найдите человека ниже.");
+    rmList("rm-groups", rm.groups, trChatName, "Пока ни одной группы.");
+  }
+
+  function drawRemindWho() {
+    var chosen = $("rm-who-chosen").checked;
+    show("rm-chosen", chosen && $("rm-enabled").checked);
+  }
+
+  function drawRemind() {
+    var d = rm.data;
+    if (!d) return;
+    var s = d.settings;
+    $("rm-enabled").checked = s.enabled;
+    $("rm-who-all").checked = s.who === "all";
+    $("rm-who-chosen").checked = s.who === "chosen";
+    rm.people = d.people.slice();
+    rm.groups = d.groups.slice();
+    drawRmLists();
+    drawRemindWho();
+  }
+
+  function rmFound(found, items, chosen, key, name, add) {
+    items.forEach(function (x) {
+      var has = chosen.some(function (y) { return y[key] === x[key]; });
+      found.appendChild(el("li", { class: "mem-chat" }, [
+        el("span", {}, [name(x)]),
+        has ? el("span", { class: "badge ok", text: "выбран" }) : el("button", { class: "btn ghost small-btn", type: "button", text: "Добавить",
+          onclick: function () { chosen.push(x); drawRmLists(); add(); } })
+      ]));
+    });
+  }
+
+  function searchRmPeople() {
+    var q = $("rm-people-q").value.trim(), found = $("rm-people-found");
+    found.textContent = "";
+    if (!q) return;
+    call("GET", "notify/people?limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+      found.textContent = "";
+      if (!r.ok) { found.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+      if (!r.data.items.length) { found.appendChild(el("li", { class: "mem-chat mem-note", text: "Ничего не нашлось среди ваших личных чатов." })); return; }
+      rmFound(found, r.data.items, rm.people, "tg_id", personName, searchRmPeople);
+    });
+  }
+
+  function searchRmGroups() {
+    var q = $("rm-groups-q").value.trim(), found = $("rm-groups-found");
+    found.textContent = "";
+    if (!q) return;
+    call("GET", "watch/chats?limit=8&q=" + encodeURIComponent(q)).then(function (r) {
+      found.textContent = "";
+      if (!r.ok) { found.appendChild(el("li", { class: "mem-note", text: r.error })); return; }
+      var groups = r.data.items.filter(function (c) { return c.type !== "public_channel" && c.type !== "private_channel"; });
+      if (!groups.length) { found.appendChild(el("li", { class: "mem-chat mem-note", text: "Такой группы нет в архиве." })); return; }
+      rmFound(found, groups, rm.groups, "id", trChatName, searchRmGroups);
+    });
+  }
+
+  function showRemind() { return refreshRemind().then(drawRemind); }
+
+  function wireRemind() {
+    $("remind-details").addEventListener("toggle", function () { if ($("remind-details").open) showRemind(); });
+    ["rm-enabled", "rm-who-all", "rm-who-chosen"].forEach(function (id) { $(id).addEventListener("change", drawRemindWho); });
+    $("rm-people-q").addEventListener("input", function () { clearTimeout(rm.timer); rm.timer = setTimeout(searchRmPeople, 300); });
+    $("rm-groups-q").addEventListener("input", function () { clearTimeout(rm.groupTimer); rm.groupTimer = setTimeout(searchRmGroups, 300); });
+    $("remind-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var save = $("remind-save");
+      var body = { enabled: $("rm-enabled").checked, who: $("rm-who-chosen").checked ? "chosen" : "all",
+                   people: rm.people.map(function (p) { return p.tg_id; }), groups: rm.groups.map(function (c) { return c.id; }) };
+      busy(save, true);
+      note("remind-error", "warn", "");
+      call("PUT", "remind", body).then(function (r) {
+        busy(save, false);
+        if (!r.ok) { note("remind-error", "warn", r.error); return; }
+        rm.data = r.data;
+        drawRemind();
+        refreshRemind();
+        toast(!body.enabled ? "Кнопки «Напомнить» не будет." : body.who === "all" ? "«Напомнить» — у всех, кто обещал вам." :
+              (body.people.length || body.groups.length) ? "«Напомнить» — только у выбранных." : "Выбранных пока нет — кнопки «Напомнить» не будет.");
+      });
+    });
+  }
+
   /* -------------------------------------------- утренняя сводка и обзор недели (Р-95, Х3)
    * Выбор хранит сервис, применяет ассистент в Hermes (плагин) и сообщает, что у него на самом деле.
    * Карточка видна, только когда ассистент хоть раз ответил: в режиме без Hermes её нет. */
@@ -4714,7 +4828,7 @@
 
   /* ------------------------------------------------------------- запуск */
 
-  wireLogin(); wireHalt(); wireCodeLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireWatch(); wireRetry(); wireMemory(); wireSession(); wirePult();
+  wireLogin(); wireHalt(); wireCodeLogin(); wireMode(); wireBot(); wireKeys(); wireAccounts(); wireChats(); wireImport(); wireBusiness(); wireLlm(); wireMedia(); wireSpheres(); wireNotify(); wireRehearsal(); wireRemind(); wireWatch(); wireRetry(); wireMemory(); wireSession(); wirePult();
   wireSummaries(); wireReplies(); wireHistory();
 
   function offerLink() {

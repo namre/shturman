@@ -26,6 +26,7 @@ import asyncpg
 
 from .. import bridge
 from ..processing import commitments, dates, people
+from . import remind as remind_mod
 
 CALLBACK_MODULE = "br"
 HANDLER_OVERDUE = "brief.overdue"
@@ -177,22 +178,25 @@ def item_text(pos: int, item: Mapping[str, Any], today: date, tz: tzinfo | str |
             f"{commitments.due_line(item, today, tz)}\n{status}")
 
 
-def item_buttons(pos: int, item: Mapping[str, Any]) -> list[dict[str, str]]:
+def item_buttons(pos: int, item: Mapping[str, Any], *, remind: bool = False) -> list[dict[str, str]]:
     if item["status"] == "proposed":
         return [bridge.button(f"{pos} — принять", CALLBACK_MODULE, f"a:{item['id']}:{item['approval_fingerprint'][:24]}"),
                 bridge.button(f"{pos} — не так", CALLBACK_MODULE, f"w:{item['id']}")]
-    return [bridge.button(f"{pos} — выполнено", CALLBACK_MODULE, f"d:{item['id']}"),
-            bridge.button(f"{pos} — не так", CALLBACK_MODULE, f"w:{item['id']}")]
+    row = [bridge.button(f"{pos} — выполнено", CALLBACK_MODULE, f"d:{item['id']}"),
+           bridge.button(f"{pos} — не так", CALLBACK_MODULE, f"w:{item['id']}")]
+    if remind:
+        row.append(remind_mod.button(pos, int(item["id"])))
+    return row
 
 
 def details(head: str, items: Sequence[Mapping[str, Any]], today: date, tz: tzinfo | str | None,
-            *, brief_id: int | None = None) -> dict[str, Any]:
+            *, brief_id: int | None = None, remind: set[int] | frozenset[int] = frozenset()) -> dict[str, Any]:
     shown = list(items)[:SHOW_LIMIT]
     lines = [head, *(item_text(pos, item, today, tz) for pos, item in enumerate(shown, start=1))]
     if len(items) > len(shown):
         lines.append(f"Ещё {len(items) - len(shown)} — в приложении «Штурман», экран «Договорённости».")
     lines.append("Перенести срок — в приложении, экран «Договорённости».")
-    buttons = [item_buttons(pos, item) for pos, item in enumerate(shown, start=1)]
+    buttons = [item_buttons(pos, item, remind=int(item["id"]) in remind) for pos, item in enumerate(shown, start=1)]
     if brief_id is not None:
         buttons.append([bridge.button("Отложить на сутки", CALLBACK_MODULE, f"z:{brief_id}")])
     return {"text": bridge.fit_message("\n\n".join(lines)), "buttons": buttons}
@@ -280,6 +284,7 @@ def overdue_text(items: Sequence[Mapping[str, Any]], names: Sequence[str]) -> st
 
 async def send_overdue(conn: asyncpg.Connection, *, today: date, label: str) -> int:
     """Сигнал о новых просрочках — одним сообщением. Возвращает число договорённостей в нём."""
+    await remind_mod.prune(conn)
     if not bridge.owns_bot() or await _halted(conn):
         return 0
     items = await overdue(conn, today=today, only_new=True)
@@ -316,10 +321,12 @@ def _refused(text: str = "Кнопка недоступна.") -> dict[str, Any]
 async def handle(conn: asyncpg.Connection, rest: str, *, tz: str, clock: Callable[[], datetime] = _now
                  ) -> dict[str, Any]:
     """s:<справка> — показать; z:<справка> — отложить на сутки; o:<ГГГГММДД> — показать просроченные;
-    d:<договорённость> — выполнено; a:<договорённость>:<отпечаток> — принять; w:<договорённость> — не так."""
+    d:<договорённость> — выполнено; a:<договорённость>:<отпечаток> — принять; w:<договорённость> — не так;
+    n:<договорённость> — напомнить (`remind.py`); p:<напоминание>:<метка> — «В чат» под напоминанием."""
     action, _, tail = rest.partition(":")
     raw, _, shown = tail.partition(":")
-    if action not in ("s", "z", "o", "d", "a", "w") or not raw.isdigit() or len(raw) > 18:
+    if action not in ("s", "z", "o", "d", "a", "w", "n", "p") or not raw.isascii() or not raw.isdigit() \
+            or len(raw) > 18:
         return _refused()
     now = clock()
     zone_ = zone(tz)
@@ -336,15 +343,20 @@ async def handle(conn: asyncpg.Connection, rest: str, *, tz: str, clock: Callabl
         items = await open_with(conn, brief["peer_ids"], today=today)
         if not items:
             return _refused("Открытых договорённостей с ним уже нет.")
-        shown_ = details("Договорённости:", items, today, zone_, brief_id=brief["id"])
+        shown_ = details("Договорённости:", items, today, zone_, brief_id=brief["id"],
+                         remind=await remind_mod.offered(conn, items))
         return {"answer": "", "edit_text": None, "remove_buttons": False, "reply": shown_}
     if action == "o":
         items = await overdue(conn, today=today)
         if not items:
             return _refused("Просроченных договорённостей сейчас нет.")
-        shown_ = details("Срок прошёл:", items, today, zone_)
+        shown_ = details("Срок прошёл:", items, today, zone_, remind=await remind_mod.offered(conn, items))
         return {"answer": "", "edit_text": None, "remove_buttons": False, "reply": shown_}
     target = int(raw)
+    if action == "n":
+        return await remind_mod.on_remind(conn, target, today=today)
+    if action == "p":
+        return await remind_mod.on_put(conn, target, shown)
     if action == "d":
         out = await commitments.close(conn, target, actor="owner", details={"via": "brief"})
         return _refused("Отмечено: выполнено." if out["ok"] else out["error"])

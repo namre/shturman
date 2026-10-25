@@ -149,7 +149,8 @@ async def test_show_done_wrong_and_snooze(conn):
     mid = await incoming(conn, w.ivan_chat, IVAN, "Иван Петров", "Добрый день", at, 10)
     brief_id = await brief.on_message(conn, mid, tz=TZ, now=at)
     reply = (await press(conn, f"sh:br:s:{brief_id}"))["reply"]
-    done, wrong = [b["data"] for b in reply["buttons"][0]]
+    done, wrong, remind_ = [b["data"] for b in reply["buttons"][0]]
+    assert remind_ == f"sh:br:n:{w.commitment}"            # «напомнить» — у обещанного вам (`brief/remind.py`)
     assert reply["buttons"][-1][0]["data"] == f"sh:br:z:{brief_id}"
     assert (await press(conn, done))["answer"] == "Отмечено: выполнено."
     event = await conn.fetchrow("SELECT actor, action, details FROM commitment_events WHERE commitment_id = $1 "

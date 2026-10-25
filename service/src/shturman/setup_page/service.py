@@ -1474,6 +1474,7 @@ def routes() -> list[BaseRoute]:
     from . import history as history_page
     from . import notify as notify_page
     from . import rehearsal as rehearsal_page
+    from . import remind as remind_page
     from . import replies as replies_page
     from . import spheres as spheres_page
     from . import summaries as summaries_page
@@ -1532,6 +1533,7 @@ def routes() -> list[BaseRoute]:
         *spheres_page.routes(),
         *notify_page.routes(),
         *rehearsal_page.routes(),
+        *remind_page.routes(),         # круг напоминаний исполнителям (brief/remind.py)
         *halt_page.routes(),
         *code_login.routes(),
         *agenda_page.routes(),

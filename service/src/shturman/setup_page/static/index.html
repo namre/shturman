@@ -116,6 +116,7 @@
         <a href="#s-spheres" data-go="s-spheres">Сферы</a>
         <a href="#s-notify" data-go="s-notify">Уведомления</a>
         <a href="#s-rehearsal" data-go="s-rehearsal">Черновики ответов</a>
+        <a href="#s-remind" data-go="s-remind">Напоминания</a>
         <a href="#s-replies" data-go="s-replies">Доверие</a>
         <a href="#s-memory" data-go="s-memory">Память</a>
         <a href="#s-audit" data-go="s-audit">История</a>
@@ -1254,6 +1255,53 @@
               <dd>Вы — здесь, во вкладке «Черновики» приложения «Штурман» и командой /drafts в боте согласований. Ассистент может попросить: выключить и убрать людей — сразу, а включить или добавить людей — только после вашего «Да» в боте.</dd>
             </dl>
           </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================== напоминания исполнителям (brief/remind.py) -->
+    <section class="card memory" id="s-remind" aria-labelledby="h-remind">
+      <details id="remind-details">
+        <summary>
+          <span class="memory-head">
+            <span class="card-head">
+              <span class="h2" id="h-remind" role="heading" aria-level="2">Напоминания исполнителям</span>
+              <span class="pill" id="st-remind"></span>
+            </span>
+            <span class="memory-lead">Под договорённостью «вам обещали» в справке и в сообщении о просрочке — кнопка «Напомнить»: ассистент готовит текст напоминания, отправляете вы.</span>
+          </span>
+        </summary>
+        <div class="memory-body" id="remind-body">
+          <div class="rh-safe" role="note">
+            <b>Сам сервис ничего не отправляет.</b> Есть личный чат вашего основного аккаунта с человеком — «В чат» положит текст в поле ввода, поправите и отправите сами. Нет — «Скопировать» и подсказка, куда отправить: в чат аккаунта помощника или в группу, где договорились.
+          </div>
+          <form class="mem-form" id="remind-form" autocomplete="off" novalidate>
+            <label class="check rh-switch"><input type="checkbox" id="rm-enabled"><span>Предлагать «Напомнить»</span></label>
+            <fieldset class="mem-fieldset">
+              <legend>Кому предлагать</legend>
+              <label class="check"><input type="radio" name="rm-who" id="rm-who-all" value="all"><span>Всем, кто обещал вам</span></label>
+              <label class="check"><input type="radio" name="rm-who" id="rm-who-chosen" value="chosen"><span>Только выбранным людям и договорённостям из выбранных групп</span></label>
+            </fieldset>
+            <fieldset class="mem-fieldset" id="rm-chosen">
+              <legend>Люди</legend>
+              <ul class="mem-items" id="rm-people"></ul>
+              <div class="field">
+                <label for="rm-people-q">Добавить человека из ваших личных чатов</label>
+                <input id="rm-people-q" type="search" placeholder="Имя или @имя" autocomplete="off">
+              </div>
+              <ul class="mem-items sph-found" id="rm-people-found"></ul>
+              <h4>Группы</h4>
+              <ul class="mem-items" id="rm-groups"></ul>
+              <div class="field">
+                <label for="rm-groups-q">Добавить группу из архива</label>
+                <input id="rm-groups-q" type="search" placeholder="Название группы" autocomplete="off">
+              </div>
+              <ul class="mem-items sph-found" id="rm-groups-found"></ul>
+            </fieldset>
+            <p class="note warn" id="remind-error" role="alert" hidden></p>
+            <div class="row"><button class="btn" id="remind-save" type="submit">Сохранить</button></div>
+          </form>
+          <p class="small">Напоминание собирается по шаблону — что обещано и срок, без модели. Хранится сутки. Не больше 30 напоминаний в сутки.</p>
         </div>
       </details>
     </section>
