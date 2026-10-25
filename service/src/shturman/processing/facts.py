@@ -30,6 +30,10 @@ superseded_by — следующий; открыт (valid_to IS NULL) тольк
       не нужен). include_closed=False — только действующие сейчас; True — ещё и закрытые датой
       и отмеченные владельцем как неверные. Предложенные факты владельца здесь не возвращаются:
       они в `projects.pending_approvals`.
+  facts_in_force(conn, subject_type, subject_id, on: date) -> list[dict]
+      «что действовало на дату» — по времени «стало верно» (пока не определено — дата сообщения).
+  facts_known_at(conn, subject_type, subject_id, at: datetime) -> list[dict]
+      «что ассистент знал на момент» — по времени записи; у каждой строки `state_at`: active | proposed.
   get_fact(conn, fact_id) -> dict | None
   retract_fact(conn, fact_id) -> dict                       только владелец (authority)
   decide_owner_fact(conn, fact_id, accept, *, expected_fingerprint=None) -> dict
@@ -155,6 +159,78 @@ async def list_facts(
     rows = await conn.fetch(
         f"{_SELECT} AND {where} AND {status} ORDER BY f.valid_from, fm.sent_at, f.id", *args)
     return [to_dict(r) for r in rows]
+
+
+async def _subject_rows(conn: asyncpg.Connection, subject_type: str, subject_id: int | None) -> list[asyncpg.Record]:
+    if subject_type not in SUBJECTS:
+        raise FactsError("Субъект факта: person, project или owner.")
+    if subject_type != "owner":
+        if not isinstance(subject_id, int) or isinstance(subject_id, bool):
+            raise FactsError("Нужен идентификатор человека или проекта.")
+        if subject_type == "person":
+            from . import people
+            subject_id = await people.active_id(conn, subject_id)
+            if subject_id is None:
+                return []
+    where, args = _subject_where(subject_type, subject_id)
+    return list(await conn.fetch(f"{_SELECT} AND {where} ORDER BY f.valid_from, fm.sent_at, f.id", *args))
+
+
+async def facts_in_force(conn: asyncpg.Connection, subject_type: str, subject_id: int | None,
+                         on: date) -> list[dict[str, Any]]:
+    """«Что действовало на дату»: по времени «стало верно» — `effective_from`, а пока оно не определено —
+    по дате сообщения (`valid_from`). Действующие на тот день версии, без отмеченных владельцем неверными
+    и без предложенных. Позднее сообщение о прошлом («с марта подрядчик другой») меняет этот ответ: это
+    вопрос о мире, а не о том, что ассистент знал (см. `facts_known_at`)."""
+    out = []
+    for row in await _subject_rows(conn, subject_type, subject_id):
+        start = row["effective_from"] or row["valid_from"]
+        if row["status"] == "active" and start <= on and (row["valid_to"] is None or row["valid_to"] > on):
+            out.append({**to_dict(row), "state_at": "active"})
+    return out
+
+
+def _order(row: Any) -> tuple[Any, ...]:
+    return (row["valid_from"], row["source_sent_at"], row["id"])
+
+
+async def facts_known_at(conn: asyncpg.Connection, subject_type: str, subject_id: int | None,
+                         at: datetime) -> list[dict[str, Any]]:
+    """«Что ассистент знал на момент»: только версии, записанные до `at` (`created_at`), в том состоянии, в
+    каком они были тогда: применённая (`applied_at`) — «действовала», ещё не решённая владельцем — «предложено»;
+    отклонённое и отмеченное неверным до `at` — не знал как верное. Смена по ключу пересчитывается на тот
+    момент: более поздняя версия не закрывает задним числом то, что тогда было действующим. Значимое
+    значение проекта (не в цепочке) закрыто, только если «Принять» нового было до `at`."""
+    rows = [r for r in await _subject_rows(conn, subject_type, subject_id) if r["created_at"] <= at]
+    by_id = {r["id"]: r for r in rows}
+
+    def withdrawn(row: Any) -> bool:
+        return row["status"] in ("rejected", "retracted") and row["decided_at"] is not None and row["decided_at"] <= at
+
+    def applied(row: Any) -> bool:
+        return row["applied_at"] is not None and row["applied_at"] <= at and not withdrawn(row)
+
+    latest: dict[tuple[Any, ...], Any] = {}
+    for row in rows:
+        if applied(row) and row["chained"] and row["slot"]:
+            key = (row["slot"],)
+            if key not in latest or _order(row) > _order(latest[key]):
+                latest[key] = row
+    out = []
+    for row in rows:
+        if withdrawn(row):
+            continue
+        if not applied(row):
+            if row["status"] == "proposed" or row["decided_at"] is None or row["decided_at"] > at:
+                out.append({**to_dict(row), "state_at": "proposed"})
+            continue
+        if row["chained"] and row["slot"] and latest.get((row["slot"],)) is not row:
+            continue
+        successor = by_id.get(row["superseded_by"]) if not row["chained"] else None
+        if successor is not None and applied(successor):
+            continue
+        out.append({**to_dict(row), "state_at": "active"})
+    return out
 
 
 async def get_fact(conn: asyncpg.Connection, fact_id: int) -> dict[str, Any] | None:

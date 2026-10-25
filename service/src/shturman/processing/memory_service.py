@@ -10,6 +10,9 @@
   PUT  /api/projects/{id}/owner-block      {text} — блок владельца страницы проекта (confirm, pages.owner_block)
   POST /api/projects/proposals/{id}        {accept: true|false} — согласие ждёт владельца, отказ — сразу
   GET  /api/facts                          ?subject=person:12|project:3|owner&include_closed=true
+                                           или &as_of=ГГГГ-ММ-ДД — что действовало в тот день;
+                                           или &known_at=ГГГГ-ММ-ДД — что ассистент знал к концу того дня
+                                           (по часам владельца); у строк — `state_at`: active | proposed
   POST /api/facts/{id}/retract             отметить факт как неверный (confirm)
   GET  /api/owner/profile                  профиль владельца: одобренные факты и блок владельца
   PUT  /api/owner/profile/owner-block      {text} — правила и постоянные указания (confirm, pages.owner_block)
@@ -34,6 +37,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from typing import Annotated, Any, AsyncIterator, Literal
 
 import asyncpg
@@ -367,16 +372,49 @@ async def list_facts(request: Request) -> JSONResponse:
     kind = found.group(1) or "owner"
     subject_id = int(found.group(2)) if found.group(2) else None
     include_closed = (request.query_params.get("include_closed") or "").lower() in ("1", "true", "yes")
-    async with state_of(request).ro_pool.acquire() as conn:
+    as_of, known_at = _day(request, "as_of"), _day(request, "known_at")
+    if sum(map(bool, (include_closed, as_of, known_at))) > 1:
+        raise BadRequest("include_closed, as_of и known_at вместе не задаются")
+    state = state_of(request)
+    async with state.ro_pool.acquire() as conn:
         if kind == "person":
             from . import people
             if await people.visible_id(conn, subject_id) is None:
                 raise BadRequest("такого человека нет в реестре", status=404)
         try:
-            items = await facts.list_facts(conn, kind, subject_id, include_closed)
+            if as_of is not None:
+                items = await facts.facts_in_force(conn, kind, subject_id, as_of)
+            elif known_at is not None:
+                items = await facts.facts_known_at(conn, kind, subject_id, end_of_day(known_at, state.config.timezone))
+            else:
+                items = await facts.list_facts(conn, kind, subject_id, include_closed)
         except facts.FactsError as exc:
             raise _http(exc) from None
-    return JSONResponse({"subject": found.group(0), "facts": items})
+    out: dict[str, Any] = {"subject": found.group(0), "facts": items}
+    if as_of is not None:
+        out["as_of"] = as_of.isoformat()
+    if known_at is not None:
+        out["known_at"] = known_at.isoformat()
+    return JSONResponse(out)
+
+
+def _day(request: Request, name: str) -> date | None:
+    raw = (request.query_params.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise BadRequest(f"параметр {name}: дата ГГГГ-ММ-ДД") from None
+
+
+def end_of_day(day: date, tz: str | None) -> datetime:
+    """Конец дня по часам владельца — граница «что ассистент знал к этому дню»."""
+    try:
+        zone = ZoneInfo(tz or "UTC")
+    except Exception:
+        zone = ZoneInfo("UTC")
+    return datetime.combine(day + timedelta(days=1), time.min, tzinfo=zone)
 
 
 @confirm.applier(FACT_RETRACT)

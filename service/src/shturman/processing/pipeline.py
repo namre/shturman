@@ -928,19 +928,29 @@ async def _mention(conn: asyncpg.Connection, label: str, episode: Episode, ctx: 
 
 
 async def _subject(conn: asyncpg.Connection, fact: extract.FactCandidate, episode: Episode,
-                   ctx: dict[str, Any], stats: dict[str, int]) -> tuple[str, int | None, int | None] | None:
+                   ctx: dict[str, Any], stats: dict[str, int]) -> tuple[str, int | None, int | None] | str:
     """О ком факт — решает код: владелец; подтверждённый владельцем человек (о неподтверждённом
-    факты не пишутся); действующий проект."""
+    факты не пишутся); действующий проект. Не о ком записать — код причины для счётчика
+    `facts_without_subject_<причина>` (шаг 5 записки «держать, подкладывать, сигналить»: люди и проекты
+    считаются отдельно, чтобы было видно, что теряется):
+      * `project_unnamed`  — модель сказала «о проекте», но не назвала его;
+      * `project_inactive` — проект назван, но не заведён (ещё предложен, отклонён или в архиве);
+      * `person_unknown`   — автор — не человек из реестра (бот, канал, неизвестный);
+      * `person_unconfirmed` — человек есть, но владелец его не подтвердил (или это сам владелец)."""
     if fact.about == "owner":
         return "owner", None, None
     if fact.about == "project":
-        project_id = await _mention(conn, fact.project, episode, ctx, stats) if fact.project else None
-        return ("project", None, project_id) if project_id is not None else None
+        if not fact.project:
+            return "project_unnamed"
+        project_id = await _mention(conn, fact.project, episode, ctx, stats)
+        return ("project", None, project_id) if project_id is not None else "project_inactive"
     peer_id = fact.speaker_key[1] if fact.speaker_key and fact.speaker_key[0] == "peer" else None
     person_id = await people.person_for_peer(conn, peer_id) if peer_id is not None else None
-    if person_id is None or not await conn.fetchval(
+    if person_id is None:
+        return "person_unknown"
+    if not await conn.fetchval(
             "SELECT confirmed AND NOT is_owner AND merged_into IS NULL FROM people WHERE id = $1", person_id):
-        return None
+        return "person_unconfirmed"
     if fact.project:
         await _mention(conn, fact.project, episode, ctx, stats)
     return "person", person_id, None
@@ -956,8 +966,9 @@ async def _apply_memory(conn: asyncpg.Connection, ctx: dict[str, Any], result: d
     model = result.get("model") if isinstance(result.get("model"), str) else None
     for fact in found:
         subject = await _subject(conn, fact, episode, ctx, stats)
-        if subject is None:
-            _bump(stats, "facts_without_subject")
+        if isinstance(subject, str):
+            _bump(stats, "facts_without_subject")            # общий счётчик — как до 0.0.17
+            _bump(stats, f"facts_without_subject_{subject}")
             continue
         subject_type, person_id, project_id = subject
         _, outcome = await facts.record(
