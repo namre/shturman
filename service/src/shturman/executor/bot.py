@@ -483,7 +483,7 @@ class Bot:
         reply = out.get("reply")
         if isinstance(reply, dict) and isinstance(reply.get("text"), str):
             # Ответ на кнопку меню (owner_chat.on_menu): новым сообщением в этот же личный чат владельца.
-            await self._say(chat_id, reply["text"], buttons=reply.get("buttons"))
+            await self._say(chat_id, reply["text"], buttons=_reply_buttons(reply.get("buttons")))
         prompt = out.get("prompt")
         if isinstance(prompt, dict) and isinstance(prompt.get("text"), str):
             # Ответ на сообщение с нажатой кнопкой тоже относится к просьбе (голосовое ответом на карточку).
@@ -652,3 +652,19 @@ def _own_keyboard(markup: Any) -> dict[str, Any] | None:
         if kept:
             out.append(kept)
     return {"inline_keyboard": out} if out else None
+
+
+def _reply_buttons(raw: Any) -> Any:
+    """Кнопки под ответом на нажатие. Меню бота (`owner_chat`) отдаёт их парами (подпись, данные), а
+    модули сервиса — как кнопки задания, словарями `bridge.button` (справка «Показать», граница выдачи
+    архива): такие проверяются и переводятся в пары тем же правилом, что у заданий (`worker.parse_buttons`).
+    Без перевода словарь разобрался бы на свои ключи — кнопка с подписью «text» и данными «data»."""
+    if not isinstance(raw, list) or not any(
+            isinstance(item, dict) for row in raw if isinstance(row, list) for item in row):
+        return raw
+    from .worker import parse_buttons
+    try:
+        return parse_buttons(raw)
+    except ValueError:
+        logger.warning("бот согласований: кнопки ответа заданы неверно — ответ без кнопок")
+        return None
