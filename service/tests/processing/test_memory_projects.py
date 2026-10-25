@@ -185,8 +185,9 @@ async def test_extraction_assigns_projects_and_records_project_facts(conn):
     assert [(r["what"], r["project_id"]) for r in rows] == [("прислать смету", project_id),     # по метке модели
                                                              ("сделать разметку", project_id)]  # по чату проекта
     got = await conn.fetch("SELECT kind, slot, text, status FROM facts WHERE project_id = $1 ORDER BY id", project_id)
+    # цену сказал Иван в личном чате: значимое значение проекта ждёт «да» владельца (шаг 1 записки)
     assert [tuple(r) for r in got] == [("decision", None, "фасад из керамогранита", "active"),
-                                       ("fact", "цена", "цена фасада 5 тыс за метр", "active")]
+                                       ("fact", "цена", "цена фасада 5 тыс за метр", "proposed")]
     assert await conn.fetchval("SELECT count(*) FROM facts") == 2                 # «Омега» — проекта нет
     assert group_msgs
     # проект в чатах указан как действующий: модель видит его название в запросе

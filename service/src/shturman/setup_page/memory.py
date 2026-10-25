@@ -18,6 +18,8 @@
   POST   /shturman-setup/api/memory/pending/commitments/{id}       договорённость верна или нет: {accept, fingerprint}
   POST   /shturman-setup/api/memory/pending/projects/{id}          завести предложенный проект или нет: {accept}
   POST   /shturman-setup/api/memory/pending/owner-facts/{id}       факт о вас верен или нет: {accept, fingerprint}
+  POST   /shturman-setup/api/memory/pending/project-facts/{id}     значение проекта со слов другого:
+                                                                    {accept, fingerprint, keep_previous?}
 
 Те же функции сервиса, что у внутреннего API (`processing/pages_service.py`, `processing/service.py`),
 но напрямую: внутренний API страница не проксирует. Изменение — действие самого владельца и
@@ -485,8 +487,10 @@ async def pending_items(conn: Any, today: date) -> dict[str, Any]:
               "who": _short(commitments.who_line(c), 160), "what": _short(c["what"], 200),
               "due": commitments.due_line(c, today), "quote": _short(c["source_quote"], 160)}
              for c in await commitments.list_commitments(conn, view="proposed", today=today, limit=100)]
-    return {"projects": proposed_projects, "owner_facts": owner_facts, "pages": proposals, "commitments": found,
-            "total": len(proposed_projects) + len(owner_facts) + len(proposals) + len(found)}
+    project_facts = await facts.pending_project(conn)
+    return {"projects": proposed_projects, "owner_facts": owner_facts, "project_facts": project_facts,
+            "pages": proposals, "commitments": found,
+            "total": len(proposed_projects) + len(owner_facts) + len(project_facts) + len(proposals) + len(found)}
 
 
 @page.endpoint
@@ -594,6 +598,32 @@ async def decide_owner_fact(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "accepted": accept})
 
 
+@page.endpoint
+async def decide_project_fact(request: Request) -> JSONResponse:
+    """Значение проекта со слов другого: принять (сменяет то, с чем расходится), принять, не меняя прежнее,
+    или оставить прежнее — то же решение, что кнопками в боте (`facts.on_button`)."""
+    data = await page._body(request)
+    accept = _accept(data)
+    keep = data.get("keep_previous") is True
+    fact_id = request.path_params["fact_id"]
+    async with state_of(request).pool.acquire() as conn:
+        item = await facts.get_fact(conn, fact_id)
+        if item is None or item["subject_type"] != "project":
+            raise BadRequest("Такого предложения нет.", 404, "not_found")
+        if item["status"] != "proposed":
+            raise BadRequest("Уже решено.", 409, "decided")
+        try:
+            out = await facts.decide_owner_fact(conn, fact_id, accept, keep_previous=keep,
+                                                expected_fingerprint=_fingerprint(data) if accept else None)
+        except facts.FactsError as exc:
+            raise BadRequest(str(exc), {"not_found": 404}.get(exc.code, 409), exc.code) from None
+        if not out.get("ok", True):
+            raise BadRequest(out["error"], 409, out["code"])
+    await page._log(request, "memory.project_fact_accept" if accept else "memory.project_fact_reject",
+                    detail=f"факт № {fact_id}" + (", прежнее оставлено" if accept and keep else ""))
+    return JSONResponse({"ok": True, "accepted": accept})
+
+
 def routes() -> list[BaseRoute]:
     person = MEMORY + "/pages/{person_id:int}"
     project = MEMORY + "/projects/{project_id:int}"
@@ -616,4 +646,5 @@ def routes() -> list[BaseRoute]:
         Route(MEMORY + "/pending/commitments/{commitment_id:int}", decide_commitment, methods=["POST"]),
         Route(MEMORY + "/pending/projects/{project_id:int}", decide_project, methods=["POST"]),
         Route(MEMORY + "/pending/owner-facts/{fact_id:int}", decide_owner_fact, methods=["POST"]),
+        Route(MEMORY + "/pending/project-facts/{fact_id:int}", decide_project_fact, methods=["POST"]),
     ]

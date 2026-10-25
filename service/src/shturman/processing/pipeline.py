@@ -666,6 +666,7 @@ async def _run_tokens(conn: asyncpg.Connection, run_id: int) -> int:
 async def send_digests(conn: asyncpg.Connection, *, label: int | str, tz: str) -> dict[str, int]:
     """Сводки владельцу: договорённости (с кнопками), проекты и факты профиля — каждые одним
     сообщением, только то, что ещё не показано. `label` — метка пачки (номер прогона или слота)."""
+    from ..brief import core as brief      # сигнал о просрочке — в те же часы сводки
     zone = ZoneInfo(tz or "UTC")
     today = datetime.now(zone).date()
     digests = await commitments.build_digests(conn, run_id=label, today=today, tz=zone)
@@ -675,7 +676,9 @@ async def send_digests(conn: asyncpg.Connection, *, label: int | str, tz: str) -
                                   dedup_key=f"cm-digest:{digest['batch']}")
     return {"digest_messages": len(digests),
             "projects_shown": await projects.send_digest(conn, run_id=label),
-            "owner_facts_shown": await facts.send_owner_digest(conn, run_id=label)}
+            "owner_facts_shown": await facts.send_owner_digest(conn, run_id=label),
+            "project_facts_shown": await facts.send_project_digest(conn, run_id=label),
+            "overdue_signaled": await brief.send_overdue(conn, today=today, label=str(label))}
 
 
 async def finish_run(conn: asyncpg.Connection, run_id: int) -> int:
@@ -960,7 +963,8 @@ async def _apply_memory(conn: asyncpg.Connection, ctx: dict[str, Any], result: d
         _, outcome = await facts.record(
             conn, fact, subject_type=subject_type, person_id=person_id, project_id=project_id,
             tz=ctx.get("tz") or "UTC", run_id=ctx.get("run_id"), model=model)
-        _bump(stats, {"active": "facts_recorded", "proposed": "owner_facts_proposed",
+        proposed = "project_facts_proposed" if subject_type == "project" else "owner_facts_proposed"
+        _bump(stats, {"active": "facts_recorded", "proposed": proposed,
                       "duplicate": "facts_duplicates"}.get(outcome, f"facts_skipped_{outcome}"))
     mentions, dropped = extract.validate_projects(parsed, episode)
     for key, value in dropped.items():

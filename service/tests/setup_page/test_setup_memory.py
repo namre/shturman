@@ -248,7 +248,8 @@ async def test_pending_pages_and_commitments_are_decided_from_the_page(stand, co
     assert await conn.fetchval("SELECT confirmed FROM people WHERE id = $1", w.maria) is True
     assert await conn.fetchval("SELECT 1 FROM pages WHERE person_id = $1", w.maria) == 1
     assert (await s.page.post(f"/memory/pending/pages/{w.maria}", {"accept": False})).status_code == 409
-    assert (await s.page.get("/memory/pending")).json() == {"projects": [], "owner_facts": [], "pages": [],
+    assert (await s.page.get("/memory/pending")).json() == {"projects": [], "owner_facts": [], "project_facts": [],
+                                                            "pages": [],
                                                            "commitments": [], "total": 0}
 
     # отказ заводить страницу
@@ -278,7 +279,7 @@ def test_every_memory_action_is_in_the_audit_list():
                     "memory.commitment_accept", "memory.commitment_reject", "memory.project_create",
                     "memory.project_chats", "memory.project_archive", "memory.project_accept", "memory.project_reject",
                     "memory.fact_retract", "memory.owner_fact_accept", "memory.owner_fact_reject",
-                    "memory.profile_block"}
+                    "memory.project_fact_accept", "memory.project_fact_reject", "memory.profile_block"}
     assert used <= set(audit.ACTIONS)
     assert {"memory.owner_block", "memory.profile_block", "memory.owner_fact_accept"} <= audit.IMPORTANT
 
@@ -473,3 +474,37 @@ async def test_proposed_projects_are_decided_from_the_page(stand, conn, monkeypa
     assert rows == [("memory.project_accept", "ok", f"проект № {offered}"),
                     ("memory.project_reject", "ok", f"проект № {second}")]
     no_names(rows)
+
+
+async def test_project_values_said_by_others_are_decided_from_the_page(stand, conn, monkeypatch, own_bot, approvals):
+    """Р-107: значение проекта со слов другого — «Принять», «Оставить прежнее», «Принять, прежнее тоже верно»."""
+    from memory_helpers import owner
+
+    s, w = await world(stand, conn, monkeypatch)
+    with owner():
+        project = (await projects.create_project(conn, "ЖК Северный", []))["project"]["id"]
+    old = await add_fact(conn, "project", w.ivan_msgs[0], "подрядчик: «Альфа»", project_id=project,
+                         slot="подрядчик", origin="owner")
+    new = await add_fact(conn, "project", w.ivan_msgs[1], "подрядчик: «Бета»", project_id=project,
+                         slot="подрядчик", status="proposed")
+    other = await add_fact(conn, "project", w.ivan_msgs[2], "подрядчик: «Гамма»", project_id=project,
+                           slot="подрядчик", status="proposed")
+    await conn.execute("UPDATE facts SET conflicts_with = $1, chained = false WHERE id = ANY($2::bigint[])",
+                       old, [new, other])
+    await conn.execute("UPDATE facts SET chained = false WHERE id = $1", old)
+    waiting = (await s.page.get("/memory/pending")).json()
+    assert waiting["total"] == 2 and [f["id"] for f in waiting["project_facts"]] == [new, other]
+    item = waiting["project_facts"][0]
+    assert (item["slot"], item["text"], item["current"]) == ("подрядчик", "подрядчик: «Бета»", "подрядчик: «Альфа»")
+    assert (await s.page.post(f"/memory/pending/project-facts/{new}", {"accept": True})).status_code == 400
+    keep = await s.page.post(f"/memory/pending/project-facts/{new}",
+                             {"accept": True, "fingerprint": item["fingerprint"], "keep_previous": True})
+    assert keep.status_code == 200
+    current = [f["text"] for f in await facts.list_facts(conn, "project", project)]
+    assert sorted(current) == ["подрядчик: «Альфа»", "подрядчик: «Бета»"]
+    assert (await s.page.post(f"/memory/pending/project-facts/{other}", {"accept": False})).status_code == 200
+    assert await conn.fetchval("SELECT status FROM facts WHERE id = $1", other) == "rejected"
+    assert (await s.page.post(f"/memory/pending/owner-facts/{old}", {"accept": False})).status_code == 404
+    rows = await audit_rows(conn)
+    assert rows[-2:] == [("memory.project_fact_accept", "ok", f"факт № {new}, прежнее оставлено"),
+                         ("memory.project_fact_reject", "ok", f"факт № {other}")]

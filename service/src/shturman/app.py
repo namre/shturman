@@ -68,6 +68,7 @@ MODULES = (
     "shturman.notify.service",     # уведомления владельцу «вам написали», «вас упомянули» (Р-84)
     "shturman.rehearsal.service",  # репетиция ответов на основном аккаунте, без отправки (Р-85)
     "shturman.triage.service",     # разбор входящих моделью вместо «Вам написали» (Р-92)
+    "shturman.brief.service",      # справка при контакте: открытые договорённости с тем, кто пишет
     "shturman.dictation.service",  # ответ голосом, записанный грамотно, — без отправки (Р-103)
     "shturman.replies.service",    # продолжение задач после Telegram-решений владельца
     "shturman.remote_mcp",

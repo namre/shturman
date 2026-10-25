@@ -46,6 +46,10 @@ async def project_world(conn):
     w.price, _ = await facts.record(conn, await candidate(conn, w.group_msgs[0], "5 тыс за метр", slot="цена",
                                                           about="project"),
                                     subject_type="project", project_id=w.project, tz=TZ)
+    # цену сказал Иван, а значимое значение проекта действует только с «да» владельца
+    assert await conn.fetchval("SELECT status FROM facts WHERE id = $1", w.price) == "proposed"
+    with owner():
+        await facts.decide_owner_fact(conn, w.price, True)
     return w
 
 

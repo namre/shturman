@@ -1051,6 +1051,59 @@ def sanitize_fact(text: str) -> str:
     return cleaned[:FACT_LIMIT].rstrip()
 
 
+QUOTE_MIN_CHARS = 8          # цитата-основание факта: не меньше стольких знаков после нормализации
+QUOTE_MIN_WORDS = 2          # и не меньше стольких слов — «Ок» основанием не служит
+# Число в тексте: цифры, внутри — пробелы, тонкие пробелы, дефисы и скобки (телефоны, счета, «3 500 000»);
+# дробная часть — после точки или запятой без пробела («1.5», «15,10»). Перечисление «1, 2, 3» — разные числа.
+_NUMBER_RE = re.compile(r"\d(?:[\d \u00a0\u202f()-]*\d)?(?:[.,]\d+)*")
+_UNIT_RE = re.compile(r"\s*(тыс|млн|млрд|k\b|к\b|m\b)", re.IGNORECASE)
+_UNITS = {"тыс": 10 ** 3, "k": 10 ** 3, "к": 10 ** 3, "млн": 10 ** 6, "m": 10 ** 6, "млрд": 10 ** 9}
+
+
+def _numbers(text: str) -> list[tuple[str, str, float | None]]:
+    """Числа текста: (запись без разделителей групп, только цифры, значение с множителем «тыс/млн» или None)."""
+    out = []
+    text = text or ""
+    for m in _NUMBER_RE.finditer(text):
+        raw = re.sub(r"[ \u00a0\u202f()-]", "", m.group())
+        digits = re.sub(r"\D", "", raw)
+        value = None
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", raw):
+            value = float(raw.replace(",", "."))
+            unit = _UNIT_RE.match(text, m.end())
+            if unit:
+                value *= next(mult for name, mult in _UNITS.items() if unit.group(1).lower().startswith(name))
+        out.append((raw.replace(",", "."), digits, value))
+    return out
+
+
+def digit_runs(text: str) -> set[str]:
+    """Числа текста строками цифр (для сравнения номеров): разделители внутри числа не важны."""
+    return {digits for _, digits, _ in _numbers(text)}
+
+
+def quote_too_short(quote: str) -> bool:
+    needle = normalize(quote)
+    return len(needle) < QUOTE_MIN_CHARS or len(needle.split()) < QUOTE_MIN_WORDS
+
+
+def numbers_grounded(text: str, source: str) -> bool:
+    """Каждое число формулировки есть в тексте сообщения: суммы, сроки и счета модель не придумывает.
+
+    Число совпадает, если совпала запись (без пробелов и дефисов внутри, «1.5» ≠ «15»), значение с
+    множителем («1 млн» = «1 000 000») или — для номеров от 7 цифр (телефон, счёт) — все цифры номера
+    целиком («+7 (912) 345-67-89» = «+7 912 345 67 89»; кусок номера не засчитывается)."""
+    have = _numbers(source)
+    forms = {raw for raw, _, _ in have}
+    values = {value for _, _, value in have if value is not None}
+    long_digits = {digits for _, digits, _ in have if len(digits) >= 7}
+    for raw, digits, value in _numbers(text):
+        if raw in forms or (value is not None and value in values) or (len(digits) >= 7 and digits in long_digits):
+            continue
+        return False
+    return True
+
+
 def _sensitive(text: str, quote: str) -> bool:
     """Пароли, коды, PIN и номера карт не извлекаются никогда — при любом ключе: номер карты
     длиннее телефона, поэтому телефонам это не мешает."""
@@ -1063,6 +1116,7 @@ def validate_facts(
     """Проверяет факты и решения из ответа модели по тексту эпизода. Возвращает принятое и
     счётчики отброшенного. Нет ключа facts — не ошибка: так отвечала модель до версии 3."""
     dropped = {"malformed": 0, "bad_index": 0, "forwarded": 0, "by_service": 0, "ungrounded_quote": 0,
+               "short_quote": 0, "ungrounded_number": 0,
                "hedged": 0, "question": 0, "empty": 0, "bad_subject": 0, "sensitive": 0, "over_limit": 0}
     items = parsed.get("facts") if isinstance(parsed, dict) else None
     if items is None:
@@ -1096,6 +1150,11 @@ def validate_facts(
         if not grounded(quote, message.text):
             dropped["ungrounded_quote"] += 1
             continue
+        if quote_too_short(quote):
+            # «Ок», «да» основанием факта не служат: формулировку пишет модель, и короткой цитатой её
+            # не проверить (записка «держать, подкладывать, сигналить», шаг 1)
+            dropped["short_quote"] += 1
+            continue
         around = quote_context(quote, message.text)
         if any(is_hedged(part) for part in around) or is_hedged(quote):
             dropped["hedged"] += 1
@@ -1106,6 +1165,10 @@ def validate_facts(
         text = sanitize_fact(text)
         if len(text) < 3:
             dropped["empty"] += 1
+            continue
+        if not numbers_grounded(text, message.text):
+            # число формулировки (сумма, срок, счёт) должно стоять в самом сообщении
+            dropped["ungrounded_number"] += 1
             continue
         kind = item.get("kind") if item.get("kind") in ("fact", "decision") else "fact"
         slot = slot_of(item.get("slot"))

@@ -25,11 +25,14 @@
   | Сводка скрытого (Р-99) | `guard/alerts.py` | «Показать ассистенту все», «Все, кроме сильных правил», «Оставить все скрытыми», «Разбирать по одной» | `alerts._pressed` → карточка подтверждения `confirm` |
   | Договорённость и изменение договорённости | `processing/commitments.py` | «Верно», «Не так» / «Применить», «Оставить как есть» | `commitments.handle_callback` |
   | Факт о владельце | `processing/facts.py` | «Запомнить», «Не запоминать» | `facts.on_button` |
+  | Значение проекта со слов другого | `processing/facts.py` | «Принять», «Оставить прежнее», при противоречии — «Принять, прежнее тоже верно» | `facts.on_button` |
   | Страница о человеке | `processing/pages_build.py` | «Завести страницу», «Не нужно» | `pages_build.on_button` |
   | Предложенный проект | `processing/projects.py` | «Завести проект», «Не нужно» | `projects.on_button` |
 
 Чего нет: запросов облачного клиента MCP (`remote_mcp`): метка их кнопки хранится только в виде
-хеша, и собрать ту же кнопку нельзя — они решаются в боте. Меню бота (`/menu`) и команды —
+хеша, и собрать ту же кнопку нельзя — они решаются в боте. Справки при контакте и сигнала о просрочке
+(`brief/`, модуль кнопок `br`) — как и «Вам написали», это сообщения о событии; их кнопки меняют те же
+договорённости, что экран «Договорённости». Меню бота (`/menu`) и команды —
 тоже только в боте. Пункты сводок, ещё не ушедшие владельцу, не показываются (у них нет отпечатка
 показанного) — только их число.
 
@@ -65,7 +68,7 @@ REF = re.compile(
     r"|gd:[rc]:\d{1,18}:[A-Za-z0-9_-]{8,43}"
     r"|gd:b:[axko]"
     r"|cm:(?:a:\d{1,18}:[0-9a-f]{24}|r:\d{1,18}|rw:\d{1,18}:[a-z_]{3,20}|ca:\d{1,18}:[0-9a-f]{24}|cr:\d{1,18})"
-    r"|of:(?:a:\d{1,18}:[0-9a-f]{24}|r:\d{1,18})"
+    r"|of:(?:[ak]:\d{1,18}:[0-9a-f]{24}|r:\d{1,18})"
     r"|pg:[ar]:\d{1,18}"
     r"|pj:[ar]:\d{1,18}"
     r")$")
@@ -74,7 +77,7 @@ DRAFT_NOTE = ("Изменить текст здесь нельзя — как и
               "подготовить новый черновик: этот заменится.")
 SUGGEST_NOTE = (f"Изменить текст здесь нельзя. Свой вариант — «{words.DICTATE_OWN}» под карточкой в боте; "
                 "скопировать текст можно и оттуда.")
-PRIMARY = frozenset({"Отправить", "Да, сделать", "Прочитать один раз", "Показать ассистенту", words.COMMITMENT_YES,
+PRIMARY = frozenset({"Отправить", "Да, сделать", "Прочитать один раз", "Показать ассистенту", "принять", words.COMMITMENT_YES,
                      words.CHANGE_YES, words.FACT_YES, words.PAGE_YES, words.PROJECT_YES})
 
 
@@ -96,7 +99,7 @@ GROUPS = (("answers", "Ответы"), ("drafts", words.DRAFTS_MODE), ("permissi
           ("commitments", "Договорённости"), ("memory", "Память"), ("guard", "Защита"))
 _GROUP_OF = {"draft": "answers", "suggest": "drafts", "action": "permissions", "hidden": "guard", "hidden_summary": "guard",
              "commitment": "commitments",
-             "owner_fact": "memory", "page": "memory", "project": "memory"}
+             "owner_fact": "memory", "project_fact": "memory", "page": "memory", "project": "memory"}
 
 
 def group_of(kind: str, kind_title: str) -> str:
@@ -183,6 +186,7 @@ async def collect(conn: asyncpg.Connection, config: Any) -> dict[str, Any]:
         ("commitment", "Договорённость", await commitments.awaiting_owner(conn, today=today_of(config),
                                                                     tz=getattr(config, "timezone", None))),
         ("owner_fact", "Факт о вас", await facts.awaiting_owner(conn)),
+        ("project_fact", "Значение проекта", await facts.awaiting_project(conn)),
         ("page", "Страница памяти", await pages_build.awaiting_owner(conn, days=pages_build.Options().propose_days)),
         ("project", "Проект", await projects.awaiting_owner(conn)),
     ):
