@@ -54,7 +54,8 @@ def _row(item: dict[str, Any]) -> dict[str, Any]:
         basis = f"со слов: {clean_line(item['said_by'], 60)}"
     return {
         "id": item["id"], "v": item["approval_fingerprint"][:16], "kind": item["kind"],
-        "slot": clean_line(item["slot"], 40) or None, "text": clean_line(item["text"], 240),
+        "slot": clean_line(item.get("slot_label") or item["slot"], 80) or None, "text": clean_line(item["text"], 240),
+        "nature": item.get("nature") or "state",
         "since": item["valid_from"], "until": item["valid_to"], "basis": basis,
         "correction": item.get("change_kind") == "correction",
         "quote": clean_line(item["source_quote"], 200), "said_at": item["source"]["sent_at"],

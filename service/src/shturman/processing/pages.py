@@ -191,15 +191,16 @@ def said(origin: str, who: str | None = None) -> str:
 
 
 def facts_block(rows: Sequence[dict[str, Any]]) -> str:
-    """Действующие факты: [{"slot", "text", "since", "message_id", "origin", "who"?}]; `slot`,
-    `text` и `who` — чужой текст, экранируются здесь."""
+    """Действующие факты: [{"slot", "text", "since", "message_id", "origin", "who"?, "nature"?}]; `slot`,
+    `text` и `who` — чужой текст, экранируются здесь. Положение дел — «на дату», остальное — «с даты»."""
     if not rows:
         return NO_FACTS
     lines = []
     for row in rows:
-        slot = md_inline(row.get("slot"), 40)
+        slot = md_inline(row.get("slot"), 80)
         head = f"{slot}: " if slot else ""
-        lines.append(f"- {head}{md_inline(row['text'], 240)} (с {row['since']}) {link(row['message_id'])} "
+        when = "на" if row.get("nature") == "observation" else "с"
+        lines.append(f"- {head}{md_inline(row['text'], 240)} ({when} {row['since']}) {link(row['message_id'])} "
                      f"({said(row['origin'], row.get('who'))})")
     return "\n".join(lines)
 

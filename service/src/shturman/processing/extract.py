@@ -427,12 +427,21 @@ source_quote — фрагмент этого сообщения, скопиро�
 обязательно укажи project.
 17. slot — что за сведение, если оно сменяет прежнее: должность, компания, телефон, почта, адрес, \
 город, цена, бюджет, срок, статус, площадь, подрядчик, ответственный. Если факт ничего не \
-сменяет — null.
+сменяет — null. slot_detail — к чему именно относится значение, если у субъекта таких значений \
+может быть несколько: работа, закупка, объект, договор («закупка электрики ЖД4», «кровля»), 2–6 слов \
+из переписки. Для статуса, срока, цены и бюджета проекта указывай всегда, когда это ясно. Если значение \
+относится к субъекту целиком (должность, город, телефон) — null.
 18. text — сам факт одной короткой фразой до 200 знаков на языке переписки. Ничего не додумывай \
 и не вычисляй: только то, что прямо сказано.
-19. kind: decision — решение по проекту; fact — всё остальное.
+19. kind: decision — решение по проекту; fact — всё остальное. nature — что это за сведение: state — \
+держится, пока не сменится (должность, правило, привычка, бюджет, порядок работы); event — однажды \
+произошло (сделал, подключил, отправил, закрыли, утвердили); observation — положение дел на момент \
+(«сейчас», «пока», «на 29.09», работает или не работает, идёт работа). О {OWNER_LABEL} записывай \
+только state — то, что о нём верно надолго; его действия и положение дел — не факты о нём.
 20. Не больше 8 фактов. Предположения, слухи, вопросы и высказывания с оговорками — не факты. \
-Пароли, ключи, токены, коды подтверждения и номера карт не извлекай никогда.
+Пароли, ключи, токены, коды подтверждения и номера карт не извлекай никогда. Из длинного \
+документа, регламента, протокола, презентации или таблицы — не больше двух фактов: что это за \
+документ и что в нём важно для {OWNER_LABEL}; пункты и числа документа по одному не переписывай.
 21. projects — названия проектов, объектов и сделок, которые обсуждаются в сообщениях, ровно \
 так, как они написаны. Если таких нет — пустой список.
 
@@ -442,7 +451,8 @@ source_quote — фрагмент этого сообщения, скопиро�
 "same_as": номер или null, "project": "…" или null, "status": "open", "status_message": номер, \
 "{AFTER_MARK}2" или null, "status_quote": "…" или null, "new_due_expression": "…" или null}}], \
 "facts": [{{"message": 1, "source_quote": "…", "about": "У1", "project": "…" или null, \
-"slot": "должность" или null, "text": "…", "kind": "fact"}}], "projects": ["…"]}}
+"slot": "должность" или null, "slot_detail": "…" или null, "text": "…", "kind": "fact", \
+"nature": "state"}}], "projects": ["…"]}}
 """
 
 # Схема намеренно нестрогая. Исполнитель сверяет ответ модели со схемой и при любом расхождении
@@ -458,7 +468,8 @@ EXTRACT_SCHEMA: dict[str, Any] = {
                    "status: open | fulfilled | cancelled | rescheduled, status_message: integer or string or null, "
                    "status_quote: string or null, new_due_expression: string or null}; "
                    "facts: array of objects {message: integer, source_quote: string, about: string, "
-                   "project: string or null, slot: string or null, text: string, kind: fact | decision}; "
+                   "project: string or null, slot: string or null, slot_detail: string or null, text: string, "
+                   "kind: fact | decision, nature: state | event | observation}; "
                    "projects: array of strings",
 }
 
@@ -1046,11 +1057,47 @@ class FactCandidate:
     slot: str | None
     text: str
     kind: str                     # fact | decision
+    slot_detail: str | None = None   # к чему относится значение ключа (чужой текст, до SLOT_DETAIL_LIMIT)
+    nature: str = "state"            # state | event | observation (см. NATURES)
 
     @property
     def origin(self) -> str:
         """Кто это сказал: владелец (его сообщение) или собеседник."""
         return "owner" if self.message.is_outgoing else "other"
+
+
+# Вид сведения (Р-111): state — держится, пока не сменится; event — однажды произошло (только хронология);
+# observation — положение дел на момент (действует, пока свежее, см. facts.OBSERVATION_DAYS).
+NATURES = ("state", "event", "observation")
+SLOT_DETAIL_LIMIT = 60
+# Приметы момента: «сейчас», «пока», «снова», «на 29.09». Модель могла назвать такое свойством — код
+# поправляет только в сторону «положение дел»: оно лишь раньше уходит из действующих, ничего не сменяет.
+_MOMENT_RE = re.compile(
+    r"(?<![0-9a-zа-яё])(?:сейчас|пока|снова|опять|временно|на сегодня|на данный момент|на текущий момент"
+    r"|в данный момент|на \d{1,2}\.\d{1,2})(?![0-9a-zа-яё])", re.IGNORECASE)
+
+
+def nature_of(value: Any, text: str) -> str:
+    """Вид сведения из ответа модели; незнакомое — state. Приметы момента в тексте делают его observation."""
+    nature = value if value in NATURES else "state"
+    if nature == "state" and _MOMENT_RE.search(text or ""):
+        return "observation"
+    return nature
+
+
+def slot_detail_of(value: Any) -> str | None:
+    """Уточнение ключа: короткая строка без ссылок и разметки; пустое и слишком длинное — None."""
+    if not isinstance(value, str):
+        return None
+    cleaned = re.sub(r"\s+", " ", _URL_RE.sub("", clean_text(value, 200).replace("⏎", " "))).strip(" ;:—-«»\"'")
+    if len(cleaned) < 2 or len(cleaned) > SLOT_DETAIL_LIMIT:
+        return None
+    return cleaned
+
+
+def detail_norm(value: str | None) -> str:
+    """Ключ сравнения уточнения: то же, что у названий проектов; без уточнения — пустая строка."""
+    return norm_title(value) if value else ""
 
 
 def sanitize_fact(text: str) -> str:
@@ -1181,6 +1228,8 @@ def validate_facts(
             continue
         kind = item.get("kind") if item.get("kind") in ("fact", "decision") else "fact"
         slot = slot_of(item.get("slot"))
+        detail = slot_detail_of(item.get("slot_detail")) if slot else None
+        nature = nature_of(item.get("nature"), text) if kind == "fact" else "state"
         if _sensitive(text, quote):
             dropped["sensitive"] += 1
             continue
@@ -1202,13 +1251,16 @@ def validate_facts(
             if project is None:
                 kind = "fact"           # решение без проекта — просто факт о том, о ком сказано
             else:
-                subject, speaker, slot = "project", None, None
+                subject, speaker, slot, detail = "project", None, None, None
+        if nature == "event":
+            slot, detail = None, None   # событие ничего не сменяет
         marker = (message.id, normalize(text))
         if marker in seen:
             continue
         seen.add(marker)
         accepted.append(FactCandidate(message=message, quote=quote, about=subject, speaker_key=speaker,
-                                      project=project, slot=slot, text=text, kind=kind))
+                                      project=project, slot=slot, text=text, kind=kind,
+                                      slot_detail=detail, nature=nature))
     return accepted, dropped
 
 

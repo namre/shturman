@@ -249,7 +249,7 @@ async def test_stale_conflict_is_not_applied(conn):
 
 
 async def test_project_status_follows_the_latest_owner_word(conn):
-    """С2: прочие ключи проекта (статус) — значение проекта целиком: новое сменяет прежнее."""
+    """С2: статус проекта с уточнением — статус той работы: новое сменяет прежнее (Р-111)."""
     w = await seed(conn)
     with owner():
         project = (await projects.create_project(conn, "ЖК Северный", [w.group], ["Северный"]))["project"]["id"]
@@ -258,7 +258,8 @@ async def test_project_status_follows_the_latest_owner_word(conn):
     def reply(job):
         late = "стройка" in job["payload"]["input"]
         quote, text = ("этап — стройка", "этап: стройка") if late else ("этап — проектирование", "этап: проектирование")
-        return {"commitments": [], "facts": [fact(1, quote, "ПРОЕКТ", text, slot="статус", project="Северный")]}
+        return {"commitments": [], "facts": [fact(1, quote, "ПРОЕКТ", text, slot="статус", project="Северный",
+                                                  slot_detail="стадия проекта", nature="state")]}
     await run_with(conn, reply, now=T0 + timedelta(days=1, hours=1))
     assert await current(conn, project) == ["этап: стройка"]
 

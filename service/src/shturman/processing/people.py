@@ -922,8 +922,9 @@ async def merge_people(conn: asyncpg.Connection, source_id: int, target_id: int)
         from . import facts
         await conn.execute("UPDATE facts SET person_id = $2 WHERE person_id = $1", source_id, target_id)
         for row in await conn.fetch(
-                "SELECT DISTINCT slot FROM facts WHERE person_id = $1 AND slot IS NOT NULL", target_id):
-            await facts.rechain(conn, "person", target_id, None, row["slot"])
+                "SELECT DISTINCT slot, slot_detail_norm FROM facts WHERE person_id = $1 AND slot IS NOT NULL",
+                target_id):
+            await facts.rechain(conn, "person", target_id, None, row["slot"], row["slot_detail_norm"])
         await conn.execute("UPDATE pages SET dirty = true WHERE person_id = $1", target_id)
         await rebuild_forms(conn, target_id)
     return {"ok": True, "person_id": target_id, "merged": source_id}
@@ -956,10 +957,10 @@ async def split_person(conn: asyncpg.Connection, person_id: int, peer_id: int) -
             """UPDATE facts f SET person_id = $2 FROM messages m JOIN chats c ON c.id = m.chat_id
                WHERE f.person_id = $1 AND m.id = f.source_message_id
                  AND (m.sender_peer_id = $3 OR (c.type = 'personal_chat' AND c.peer_id = $3))
-               RETURNING f.slot""", person_id, new_id, peer_id)
-        for slot in {r["slot"] for r in moved if r["slot"] is not None}:
-            await facts.rechain(conn, "person", person_id, None, slot)
-            await facts.rechain(conn, "person", new_id, None, slot)
+               RETURNING f.slot, f.slot_detail_norm""", person_id, new_id, peer_id)
+        for slot, detail in {(r["slot"], r["slot_detail_norm"]) for r in moved if r["slot"] is not None}:
+            await facts.rechain(conn, "person", person_id, None, slot, detail)
+            await facts.rechain(conn, "person", new_id, None, slot, detail)
         if moved:
             await conn.execute("UPDATE pages SET dirty = true WHERE person_id = $1", person_id)
         # владелец решил, что это разные люди: пару больше не предлагаем

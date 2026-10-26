@@ -131,7 +131,7 @@ async def _to_dict(conn: asyncpg.Connection, row: asyncpg.Record, *, full: bool 
                     WHERE c.project_id = $1 AND c.status = 'open' AND NOT ch.excluded
                       AND m.deleted_at IS NULL AND m.agent_visible) AS commitments_open,
                    (SELECT count(*) {facts._FROM} WHERE {facts.VISIBLE} AND f.project_id = $1
-                      AND f.status = 'active' AND f.valid_to IS NULL AND f.kind = 'fact') AS facts,
+                      AND {facts.CURRENT} AND f.kind = 'fact') AS facts,
                    (SELECT count(*) {facts._FROM} WHERE {facts.VISIBLE} AND f.project_id = $1
                       AND f.status = 'active' AND f.kind = 'decision') AS decisions""", row["id"])
     sphere = await conn.fetchrow("SELECT id, title FROM spheres WHERE id = $1", row["sphere_id"]) \

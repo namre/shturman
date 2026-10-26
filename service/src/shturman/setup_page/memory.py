@@ -201,8 +201,9 @@ def _fact(item: dict[str, Any]) -> dict[str, Any]:
     origin = pages.ORIGIN_TEXT.get(item["origin"])
     if origin and item.get("said_by") and item["origin"] == "other":
         origin = f"{origin}: {clean_line(item['said_by'], 60)}"        # кто именно сказал
-    return {"id": item["id"], "kind": item["kind"], "slot": clean_line(item["slot"], 40) or None,
-            "text": clean_line(item["text"], 240), "since": item["valid_from"], "origin": origin}
+    return {"id": item["id"], "kind": item["kind"], "slot": clean_line(item.get("slot_label") or item["slot"], 80) or None,
+            "text": clean_line(item["text"], 240), "since": item["valid_from"], "origin": origin,
+            "nature": item.get("nature") or "state"}
 
 
 async def _facts(conn: Any, subject_type: str, subject_id: int | None = None) -> dict[str, list[dict[str, Any]]]:
