@@ -18,6 +18,8 @@
   * suggest  — «Черновик ответа» самого сервиса на входящее в личном чате основного аккаунта (Р-105,
                `create_suggestion`, карточку собирает `rehearsal/core.py`); через API не создаётся;
   * autoreply — автоответ доверенному: рождается согласованным.
+  * reminder — напоминание исполнителю по нажатию владельца «Отправить» (Р-110, `brief/remind.py`): создаётся
+               и сразу согласуется `approve`; своей карточки нет.
 Какие кнопки под карточкой — решает одна функция (`replies/delivery.py`), и в боте, и в приложении (Д-46).
 
 Автоответ доверенным рождается сразу в `approved` (правило включил владелец) и дальше идёт
@@ -712,7 +714,8 @@ async def finish(
         return True
     auto = done["origin"] == "autoreply"
     who = tgt.display_name if tgt is not None else "чат"
-    label = f"{who} ({'автоответ' if auto else 'черновик'} № {done['id']})"
+    kind = "автоответ" if auto else "напоминание" if done["origin"] == "reminder" else "черновик"
+    label = f"{who} ({kind} № {done['id']})"
     never_twice = "Само повторно не отправится: так сообщение не уйдёт дважды."
     if status == "sent":
         if auto or edited:

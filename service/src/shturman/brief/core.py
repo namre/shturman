@@ -409,10 +409,11 @@ async def handle(conn: asyncpg.Connection, rest: str, *, tz: str, clock: Callabl
                  ) -> dict[str, Any]:
     """s:<справка> — показать; z:<справка> — отложить на сутки; o:<ГГГГММДД> — показать просроченные;
     d:<договорённость> — выполнено; a:<договорённость>:<отпечаток> — принять; w:<договорённость> — не так;
-    n:<договорённость> — напомнить (`remind.py`); p:<напоминание>:<метка> — «В чат» под напоминанием."""
+    n:<договорённость> — напомнить (`remind.py`); p:<напоминание>:<метка> — «В чат» под напоминанием;
+    x:<напоминание>:<метка> — «Отправить» под напоминанием (Р-110)."""
     action, _, tail = rest.partition(":")
     raw, _, shown = tail.partition(":")
-    if action not in ("s", "z", "o", "d", "a", "w", "n", "p") or not raw.isascii() or not raw.isdigit() \
+    if action not in ("s", "z", "o", "d", "a", "w", "n", "p", "x") or not raw.isascii() or not raw.isdigit() \
             or len(raw) > 18:
         return _refused()
     now = clock()
@@ -444,6 +445,8 @@ async def handle(conn: asyncpg.Connection, rest: str, *, tz: str, clock: Callabl
         return await remind_mod.on_remind(conn, target, today=today)
     if action == "p":
         return await remind_mod.on_put(conn, target, shown)
+    if action == "x":
+        return await remind_mod.on_send(conn, target, shown)
     if action == "d":
         out = await commitments.close(conn, target, actor="owner", details={"via": "brief"})
         return _refused("Отмечено: выполнено." if out["ok"] else out["error"])

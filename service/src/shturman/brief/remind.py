@@ -12,9 +12,12 @@
                договорились): «Скопировать» и отправить оттуда;
   * `group`  — договорились в группе основного аккаунта: «Скопировать» и отправить туда;
   * `none`   — в читаемой переписке чата с ним нет: «Скопировать».
-Сервис ничего не отправляет и не согласует; от `SHTURMAN_SENDING` напоминание не зависит. Отправить от
-аккаунта помощника кнопкой — позже, отдельным решением: сейчас этому аккаунту запрещены и отправка, и запись
-в поле ввода (`docs/service.md`).
+Когда отправка включена на сервере (`SHTURMAN_SENDING`) и канал на связи — бизнес-бот с правом отвечать и
+входящее за сутки в личном чате основного аккаунта или сессия аккаунта помощника, — вместо «В чат» под
+напоминанием «Отправить» (Р-110, решение владельца 26.10.2026). Нажатие владельца создаёт черновик шлюза
+отправки (`origin = 'reminder'`) и согласует его тем же кодом, что «Отправить» под черновиком: все проверки
+отправки, «Остановить всё», пределы; отправляет обычный отправщик, итог — сообщением владельцу. Без нажатия
+ничего не уходит; пока отправка выключена — как раньше, «В чат» или «Скопировать».
 
 Кому предлагать (`remind.settings` в таблице `settings`): всем, кто обещал владельцу (по умолчанию), или
 только выбранным людям (по номеру в Telegram) и договорённостям из выбранных групп; можно и выключить.
@@ -245,9 +248,37 @@ async def _where(conn: asyncpg.Connection, route: str, chat_id: int | None) -> s
     return f" — «{textlib.one_line(row['title'], 60)}»"
 
 
-def card_buttons(row: Mapping[str, Any]) -> list[list[dict[str, Any]]]:
+SEND = "Отправить"
+SEND_WORDS = {
+    "business": "«Отправить» — уйдёт от вашего имени через бота согласований, только после вашего нажатия.",
+    "session": "«Отправить» — уйдёт от аккаунта помощника{where}, только после вашего нажатия.",
+}
+
+
+async def send_channel(conn: asyncpg.Connection, row: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Можно ли отправить напоминание сейчас: (канал, None) или (None, почему нет — словами).
+
+    То же правило, что у кнопок черновика ответа (`replies/delivery.py`): отправка включена на сервере
+    (`SHTURMAN_SENDING`), свой бот согласований, ассистент не остановлен и канал на связи — для основного
+    аккаунта бизнес-бот с правом отвечать и входящее за последние сутки, для аккаунта помощника его сессия."""
+    from ..outbox import policy
+    from ..replies import delivery
+    state = current_state()
+    if row["chat_id"] is None or state is None or getattr(state, "config", None) is None:
+        return None, None
+    tgt = await policy.target(conn, row["chat_id"])
+    if tgt is None or tgt.excluded:
+        return None, None
+    avail = delivery.decide(await delivery.facts(conn, state, tgt, text=row["text"], suggest=False))
+    return avail.send, avail.why
+
+
+def card_buttons(row: Mapping[str, Any], *, send: str | None = None) -> list[list[dict[str, Any]]]:
     rows: list[list[dict[str, Any]]] = []
-    if row["route"] == "put" and row["placed_at"] is None:
+    if send and row["draft_id"] is None:
+        # «Отправить» и «В чат» вместе не бывают (как у черновика ответа, Р-105)
+        rows.append([bridge.button(SEND, "br", f"x:{row['id']}:{row['nonce']}")])
+    elif row["route"] == "put" and row["placed_at"] is None:
         rows.append([bridge.button(PUT, "br", f"p:{row['id']}:{row['nonce']}")])
     if textlib.utf16_len(row["text"]) <= COPY_LIMIT:
         rows.append([{"text": COPY, "copy": row["text"]}])
@@ -256,9 +287,14 @@ def card_buttons(row: Mapping[str, Any]) -> list[list[dict[str, Any]]]:
 
 async def card(conn: asyncpg.Connection, row: Mapping[str, Any], name: str) -> dict[str, Any]:
     where = await _where(conn, row["route"], row["chat_id"])
-    lines = [f"Напоминание — {name}:", row["text"], ROUTE_WORDS[row["route"]].format(where=where),
-             "Сервис ничего не отправляет: отправляете вы."]
-    return {"text": bridge.fit_message("\n\n".join(lines)), "buttons": card_buttons(row)}
+    send, _ = await send_channel(conn, row)
+    if send:
+        lines = [f"Напоминание — {name}:", row["text"], SEND_WORDS[send].format(where=where),
+                 "Поправить текст можно, скопировав его и отправив самому."]
+    else:
+        lines = [f"Напоминание — {name}:", row["text"], ROUTE_WORDS[row["route"]].format(where=where),
+                 "Сервис ничего не отправляет: отправляете вы."]
+    return {"text": bridge.fit_message("\n\n".join(lines)), "buttons": card_buttons(row, send=send)}
 
 
 # --- нажатия ------------------------------------------------------------------------------------------------
@@ -340,6 +376,54 @@ async def on_put(conn: asyncpg.Connection, reminder_id: int, nonce: str) -> dict
 
     out["after_commit"] = run
     return out
+
+
+async def on_send(conn: asyncpg.Connection, reminder_id: int, nonce: str) -> dict[str, Any]:
+    """«Отправить» под напоминанием (Р-110): черновик шлюза отправки с происхождением `reminder` — и сразу
+    согласование тем же кодом, что «Отправить» под черновиком (`drafts.approve`): все проверки отправки,
+    выключатель, «Остановить всё», пределы. Дальше — обычный отправщик; итог владелец получает сообщением.
+    Сети здесь нет: в транзакции нажатия только черновик и согласование."""
+    import secrets as _secrets
+    from ..outbox import drafts, policy
+    from ..setup_page import audit
+    row = await conn.fetchrow("SELECT * FROM reminders WHERE id = $1 FOR UPDATE", reminder_id)
+    if row is None or not hmac.compare_digest(row["nonce"], nonce):
+        return _answer("Это напоминание уже недоступно — оно хранится сутки.")
+    if row["draft_id"] is not None:
+        status = await conn.fetchval("SELECT status FROM outbox_drafts WHERE id = $1", row["draft_id"])
+        if status not in (None, "failed", "rejected", "expired"):
+            return _answer("Это напоминание уже отправлено или отправляется.")
+    if not await commitments.is_visible(conn, row["commitment_id"]):
+        return _answer("Договорённость больше не видна (чат исключён или сообщение удалено).")
+    if await conn.fetchval("SELECT shturman_halted()"):
+        return _answer("Пока нельзя: ассистент остановлен. Продолжить — /resume.")
+    channel, why = await send_channel(conn, row)
+    if channel is None:
+        return _answer(("Отправить сейчас нельзя: " + why + ".") if why else "Отправить сейчас нельзя.")
+    tgt = await policy.target(conn, row["chat_id"])
+    assert tgt is not None
+    await policy.lock_chat(conn, tgt.chat_id)
+    if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM outbox_drafts WHERE chat_id = $1 AND status = 'pending')",
+                           tgt.chat_id):
+        return _answer("В этом чате ждёт вашего решения другой черновик — сначала решите его.")
+    cleaned = textlib.clean_outgoing(row["text"])
+    draft = await conn.fetchrow(
+        """INSERT INTO outbox_drafts (account_id, chat_id, channel, text, text_hash, origin, nonce, status,
+                                      expires_at, parts_total)
+           VALUES ($1, $2, $3, $4, $5, 'reminder', $6, 'pending', now() + interval '1 hour', $7) RETURNING *""",
+        tgt.account_id, tgt.chat_id, channel, cleaned, textlib.content_hash(cleaned), _secrets.token_urlsafe(16),
+        len(policy.parts_of(channel, cleaned)))
+    decided = await drafts.approve(conn, draft, tgt)
+    if decided.get("wait") or not decided.get("ok"):
+        message = decided.get("answer") or ("Не отправлено: " + str(decided.get("message") or ""))
+        await drafts.finish(conn, draft, tgt, "failed", code=decided.get("code") or "not_now",
+                            message=message, tell_owner=False)
+        await audit.write_conn(conn, "remind.send", audit.REFUSED,
+                               f"напоминание № {reminder_id}; причина: {decided.get('code') or 'not_now'}")
+        return _answer(message[:190])
+    await conn.execute("UPDATE reminders SET draft_id = $2 WHERE id = $1", reminder_id, draft["id"])
+    await audit.write_conn(conn, "remind.send", detail=f"напоминание № {reminder_id}; черновик № {draft['id']}")
+    return {"answer": "Принято, отправляю. Итог пришлю сообщением.", "edit_text": None, "remove_buttons": True}
 
 
 # --- уборка -------------------------------------------------------------------------------------------------
