@@ -47,6 +47,10 @@
   <button type="button" role="tab" id="tab-spheres" aria-controls="screen-spheres" aria-selected="false">
     <span>Сферы</span><span class="badge" id="tab-spheres-count" hidden></span>
   </button>
+  <button type="button" role="tab" id="tab-memory" aria-controls="screen-memory" aria-selected="false"
+          aria-label="Память" title="Память">
+    <span aria-hidden="true">🧠</span>
+  </button>
   <button type="button" role="tab" id="tab-rehearsal" aria-controls="screen-rehearsal" aria-selected="false"
           aria-label="Черновики" title="Черновики">
     <span aria-hidden="true">✍️</span>
@@ -427,6 +431,49 @@
   </section>
 
   <!-- экран «История» (Р-95): решения, действия ассистента, входы; доверие — сузить сразу, расширить — в боте -->
+  <!-- экран «Память» (шаг 6 записки «держать, подкладывать, сигналить»; memory_app.py) -->
+  <section id="screen-memory" role="tabpanel" aria-labelledby="tab-memory" hidden>
+    <div class="title-row"><h1>Память</h1></div>
+    <div id="mm-list-box">
+      <p class="lead muted">Что ассистент помнит о людях, проектах и о вас — с источником и историей изменений.</p>
+      <input type="search" id="mm-q" class="search" placeholder="Имя или проект" autocomplete="off" aria-label="Найти человека или проект">
+      <p class="muted" id="mm-loading">Загружаю…</p>
+      <div class="panel" id="mm-failed" hidden>
+        <h2>Не загрузилось</h2>
+        <p id="mm-failed-text">Сервер не ответил. Попробуйте ещё раз через минуту.</p>
+        <button type="button" class="primary" id="mm-retry">Повторить</button>
+      </div>
+      <ul class="cm-list" id="mm-list" aria-live="polite"></ul>
+      <p class="empty" id="mm-empty" hidden>Ничего не нашлось. В памяти — только подтверждённые вами люди и заведённые проекты.</p>
+    </div>
+    <div id="mm-subject" hidden>
+      <button type="button" class="link-btn" id="mm-back">← Все</button>
+      <h2 id="mm-subject-title"></h2>
+      <div class="mm-when">
+        <select id="mm-mode" aria-label="Что показать">
+          <option value="now">Сейчас</option>
+          <option value="as_of">Что действовало на дату</option>
+          <option value="known_at">Что ассистент знал на дату</option>
+        </select>
+        <input type="date" id="mm-date" aria-label="Дата" hidden>
+      </div>
+      <p class="muted small" id="mm-when-note" hidden></p>
+      <div class="banner cm-waiting" id="mm-pending" hidden>
+        <span id="mm-pending-text"></span>
+        <button type="button" class="link-btn" id="mm-pending-open">Открыть «Согласования»</button>
+      </div>
+      <ul class="cm-list" id="mm-current"></ul>
+      <p class="empty" id="mm-current-empty" hidden></p>
+      <details class="mm-feed">
+        <summary>Лента изменений</summary>
+        <ul class="cm-list" id="mm-history"></ul>
+      </details>
+      <p class="muted foot">«Поправить» — если записано с ошибкой: прежняя запись остаётся в ленте как исправленная.
+        «Не так» — значение неверно; если оно сменило прежнее, прежнее снова действует. Оба действия — сразу, с записью
+        в журнал и сообщением вам в бот.</p>
+    </div>
+  </section>
+
   <section id="screen-history" role="tabpanel" aria-labelledby="tab-history" hidden>
     <div class="title-row">
       <h1>История</h1>

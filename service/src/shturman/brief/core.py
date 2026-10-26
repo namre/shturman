@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -37,6 +38,14 @@ SHOW_LIMIT = 8                        # договорённостей в соо
 OVERDUE_LIMIT = 15                    # договорённостей в одном сигнале о просрочке
 STATUSES = ("open", "proposed")
 COVERAGE = "Видно только то, что есть в читаемых чатах; чего нет в них, ассистент не знает."
+MEETING_AHEAD = timedelta(minutes=45)  # справка перед встречей — когда до неё не больше стольких минут
+MEETING_EVERY = 300                   # секунд: как часто сервис ищет ближайшие встречи
+BRIEFS_KEEP = timedelta(days=14)      # строки справок старше — удаляются (нужны только для пауз и повторов)
+# Договорённость о созвоне или встрече: по формулировке «что» (её пишет модель, правило — код).
+MEETING_RE = re.compile(
+    r"\b(?:созвон\w*|созвонит\w*|позвон\w*|перезвон\w*|звонок|звонк\w*|встреч\w*|встрет\w*|"
+    r"переговор\w*|совещани\w*|планерк\w*|обход\w*|видеосвяз\w*|zoom|зум\w*|телемост\w*)\b",
+    flags=re.IGNORECASE)
 
 _MESSAGE = """
 SELECT m.id, m.chat_id, m.sent_at, m.kind, m.is_outgoing, m.deleted_at, m.edited_at, m.agent_visible,
@@ -71,8 +80,10 @@ def sender_peer(row: Mapping[str, Any]) -> int | None:
     """Собеседник-человек, написавший входящее; None — не человек, не входящее, служебное, бот."""
     if row["kind"] != "message" or row["deleted_at"] is not None or row["excluded"]:
         return None
-    if row["account_role"] != "owner":
-        return None    # чаты аккаунта помощника — не переписка владельца (как и у «Вам написали»)
+    if row["account_role"] != "owner" and row["chat_type"] == "personal_chat":
+        # личные чаты аккаунта помощника — не переписка владельца; группы, которые он читает, — да: в способе
+        # «Через бота и помощника» группы видны только ему (шаг 7 записки «держать, подкладывать, сигналить»)
+        return None
     if row["is_outgoing"] is not False or row["edited_at"] is not None or row["is_forwarded"]:
         return None
     if row["telegram_via_bot"] or row["telegram_sender_bot"] or not row["agent_visible"]:
@@ -285,6 +296,7 @@ def overdue_text(items: Sequence[Mapping[str, Any]], names: Sequence[str]) -> st
 async def send_overdue(conn: asyncpg.Connection, *, today: date, label: str) -> int:
     """Сигнал о новых просрочках — одним сообщением. Возвращает число договорённостей в нём."""
     await remind_mod.prune(conn)
+    await prune_briefs(conn)
     if not bridge.owns_bot() or await _halted(conn):
         return 0
     items = await overdue(conn, today=today, only_new=True)
@@ -310,6 +322,81 @@ async def _overdue_not_delivered(conn: asyncpg.Connection, job: dict[str, Any], 
     ids = [i for i in (job.get("context") or {}).get("commitment_ids") or [] if isinstance(i, int)]
     if ids:
         await conn.execute("UPDATE commitments SET overdue_signaled_due = NULL WHERE id = ANY($1::bigint[])", ids)
+
+
+# --- справка перед встречей -----------------------------------------------------------------------------
+
+def is_meeting(item: Mapping[str, Any]) -> bool:
+    return bool(MEETING_RE.search(str(item.get("what") or "").replace("ё", "е")))
+
+
+def meeting_text(name: str, at: datetime, n: Mapping[str, int], fresh: str) -> str:
+    """Только имя, время и числа — как у справки при контакте: формулировки — по «Показать»."""
+    parts = []
+    if n["theirs"]:
+        parts.append(f"обещано вам: {n['theirs']}")
+    if n["mine"]:
+        parts.append(f"обещали вы: {n['mine']}")
+    lines = [f"В {at:%H:%M} — созвон или встреча: {name}. Открытых договорённостей: {n['total']} "
+             f"({'; '.join(parts)})."]
+    extra = []
+    if n["overdue"]:
+        extra.append(f"срок прошёл: {n['overdue']}")
+    if n["unconfirmed"]:
+        extra.append(f"не подтверждено вами: {n['unconfirmed']}")
+    if extra:
+        lines.append(", ".join(extra).capitalize() + ".")
+    lines.append(f"{fresh} {COVERAGE}")
+    return "\n".join(lines)
+
+
+async def send_before_meetings(conn: asyncpg.Connection, *, tz: str, now: datetime | None = None) -> int:
+    """Справки перед встречами: принятые договорённости о созвоне или встрече со временем, до которого не
+    больше `MEETING_AHEAD`. Одна справка на договорённость и её время. Тихие часы и остановка — ничего.
+    Возвращает, сколько справок ушло."""
+    if not bridge.owns_bot() or await _halted(conn):
+        return 0
+    from ..notify import core as notify_core
+    from ..notify import settings as notify_settings
+    now = now or _now()
+    zone_ = zone(tz)
+    local = now.astimezone(zone_)
+    if notify_core.in_quiet(await notify_settings.load(conn), local):
+        return 0
+    today = local.date()
+    rows = await conn.fetch(
+        f"""{commitments._SELECT} AND c.status = 'open' AND c.direction IN ('owner_owes', 'owed_to_owner')
+            AND c.due_date = $1 AND c.due_time IS NOT NULL ORDER BY c.due_time, c.id LIMIT 50""", today)
+    sent = 0
+    for row in rows:
+        item = commitments.to_dict(row, today)
+        at = datetime.combine(today, row["due_time"], tzinfo=zone_)
+        if not (now < at <= now + MEETING_AHEAD) or not is_meeting(item):
+            continue
+        party = item["creditor"] if item["direction"] == "owner_owes" else item["debtor"]
+        if not party or party.get("peer_id") is None:
+            continue
+        key, peers, person_id = await subject_of(conn, int(party["peer_id"]))
+        async with conn.transaction():
+            brief_id = await conn.fetchval(
+                """INSERT INTO briefs (subject_key, peer_ids, kind, sent_at, commitment_id, meeting_at)
+                   VALUES ($1, $2, 'meeting', $3, $4, $5) ON CONFLICT DO NOTHING RETURNING id""",
+                key, peers, now, item["id"], at)
+            if brief_id is None:
+                continue
+            items = await open_with(conn, peers, today=today)
+            text = meeting_text(await name_of(conn, person_id, int(party["peer_id"])), at.astimezone(zone_),
+                                counts(items, today), await freshness(conn, zone_))
+            await bridge.notify_owner(
+                conn, text, dedup_key=f"brief:{brief_id}",
+                buttons=[[bridge.button("Показать", CALLBACK_MODULE, f"s:{brief_id}")]])
+        sent += 1
+    return sent
+
+
+async def prune_briefs(conn: asyncpg.Connection, *, now: datetime | None = None) -> int:
+    done = await conn.execute("DELETE FROM briefs WHERE sent_at < $1", (now or _now()) - BRIEFS_KEEP)
+    return int(done.split()[-1])
 
 
 # --- нажатия ----------------------------------------------------------------------------------------------

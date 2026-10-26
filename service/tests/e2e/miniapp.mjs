@@ -1488,6 +1488,66 @@ for (const [width, scheme, theme] of [[360, "light", THEME_LIGHT], [360, "dark",
   }
 }
 
+// --- экран «Память» (шаг 6 записки «держать, подкладывать, сигналить») -----------------------------
+// Что действует, источник и основание, лента изменений, «на дату», «Поправить»; не шире экрана.
+{
+  const MEM_OUT = process.env.E2E_MEMORY_OUT || OUT;
+  mkdirSync(MEM_OUT, { recursive: true });
+  const seeded = await (await fetch(CONTROL + "/memory/seed", { method: "POST" })).json();
+  for (const [width, scheme, theme] of [[390, "light", THEME_LIGHT], [360, "dark", THEME]]) {
+    const tag = `${width}-${scheme}`;
+    const { ctx, p, errs } = await openApp(width, scheme, theme);
+    await p.click("#tab-memory");
+    await p.waitForSelector("#mm-list li button");
+    await p.click("#mm-list li button:text('ЖК Северный')");
+    await p.waitForSelector("#mm-current li");
+    const current = await p.$$eval("#mm-current li .cm-what", (n) => n.map((x) => x.textContent));
+    // второй проход — после «Поправить» в первом
+    const expected = width === 390 ? "бюджет электрики 45 млн" : "бюджет электрики 4,5 млн";
+    check(`«Память» ${tag}: действует последнее значение`, current.length === 1 && current[0] === expected,
+          JSON.stringify(current));
+    const meta = await p.textContent("#mm-current li");
+    check(`«Память» ${tag}: источник, основание и цитата видны`, meta.includes("сказали вы") && meta.includes("«Бюджет электрики"), meta);
+    await p.evaluate(() => { document.querySelector(".mm-feed").open = true; });
+    const feed = await p.$$eval("#mm-history li .mm-state", (n) => n.map((x) => x.textContent));
+    check(`«Память» ${tag}: в ленте и действующее, и сменённое`, feed.includes("действует") && feed.includes("сменено"), JSON.stringify(feed));
+    const wide = await p.evaluate(() => {
+      const out = [...document.querySelectorAll("main button, main select, main input, .tabs button")]
+        .filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > window.innerWidth + 1).length;
+      return { wide: document.documentElement.scrollWidth <= window.innerWidth + 1, out };
+    });
+    check(`«Память» ${tag}: не шире экрана, кнопки и вкладки в экране`, wide.wide && wide.out === 0, JSON.stringify(wide));
+    await p.screenshot({ path: path.join(MEM_OUT, `app-memory-${tag}.png`), fullPage: true });
+    if (width === 390) {
+      // «на дату»: за 3 дня до сегодня действовало прежнее
+      const day = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+      await p.selectOption("#mm-mode", "as_of");
+      await p.fill("#mm-date", day);
+      await p.dispatchEvent("#mm-date", "change");
+      await p.waitForFunction(() => document.querySelector("#mm-when-note") && !document.querySelector("#mm-when-note").hidden);
+      await p.waitForFunction(() => [...document.querySelectorAll("#mm-current li .cm-what")].some((x) => x.textContent === "бюджет электрики 4 млн"));
+      const fixable = await p.locator("#mm-current li button:text('Поправить')").count();
+      check("«Память»: «на дату» — прежнее значение, без «Поправить»", fixable === 0);
+      await p.selectOption("#mm-mode", "now");
+      await p.waitForFunction(() => [...document.querySelectorAll("#mm-current li .cm-what")].some((x) => x.textContent === "бюджет электрики 45 млн"));
+      await p.click("#mm-current li button:text('Поправить')");
+      await p.fill("#mm-current li textarea", "бюджет электрики 4,5 млн");
+      await p.click("#mm-current li button:text('Сохранить')");
+      await p.waitForFunction(() => [...document.querySelectorAll("#mm-current li .cm-what")].some((x) => x.textContent === "бюджет электрики 4,5 млн"));
+      const fixed = await p.textContent("#mm-current li");
+      check("«Память»: «Поправить» — исправленное действует, помечено «исправлено вами»", fixed.includes("исправлено вами"), fixed);
+      let told = false;
+      for (let i = 0; i < 30 && !told; i++) {
+        told = (await control("/bot/sent")).some((m) => (m.text || "").includes("в памяти исправлено"));
+        if (!told) await new Promise((r) => setTimeout(r, 200));
+      }
+      check("«Память»: об исправлении из приложения — сообщение в бот", told);
+    }
+    check(`«Память» ${tag}: в консоли нет ошибок`, errs.length === 0, errs.join(" | "));
+    await ctx.close();
+  }
+}
+
 await browser.close();
 console.log(failed ? `ИТОГ: ${failed} FAIL` : "ИТОГ: OK");
 process.exit(failed ? 1 : 0);

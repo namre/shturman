@@ -560,6 +560,31 @@ async def main() -> None:
             "audit": [dict(r) for r in await conn.fetch(
                 "SELECT action, outcome, detail FROM setup_audit WHERE action LIKE 'app.commitment%' ORDER BY id")]})
 
+    async def memory_seed(request):
+        """Экран «Память» (шаг 6 записки): действующий проект со значением, которое сказал владелец, и
+        сменённым до того значением — для ленты изменений."""
+        from shturman import authority
+        from shturman.processing import facts, projects
+
+        account = seeded["owner_account"]
+        site, ids = await _chat(conn, account, 6201, "ЖК «Северный»: стройка", [
+            (1000, "Бюджет электрики по Северному — 4 млн, подрядчик тот же.", 5),
+            (1000, "Бюджет электрики по Северному теперь 4,5 млн.", 1)], group=True)
+        with authority.owner_context(1000, chat_id=1000, action="e2e.memory"):
+            project = (await projects.create_project(conn, "ЖК Северный", [site]))["project"]["id"]
+        made = []
+        for n, (text, quote, ago) in enumerate((("бюджет электрики 4 млн", "Бюджет электрики по Северному — 4 млн", 5),
+                                               ("бюджет электрики 45 млн", "Бюджет электрики по Северному теперь 4,5 млн", 1))):
+            made.append(await conn.fetchval(
+                """INSERT INTO facts (subject_type, project_id, kind, slot, text, text_norm, valid_from, status, origin,
+                                      source_message_id, source_quote, basis, chained, applied_at, created_at)
+                   VALUES ('project', $1, 'fact', 'бюджет', $2, $3, (now() - make_interval(days => $4))::date, 'active',
+                           'owner', $5, $6, 'owner', true, now() - make_interval(days => $4),
+                           now() - make_interval(days => $4)) RETURNING id""",
+                project, text, facts.text_norm(text), ago, ids[n], quote))
+        await facts.rechain(conn, "project", None, project, "бюджет")
+        return JSONResponse({"project": project, "facts": made})
+
     async def r96_seed(request):
         from shturman import authority
         from shturman.processing import commitments
@@ -822,6 +847,7 @@ async def main() -> None:
                                 Route("/pack4a/seed", pack4a_seed, methods=["POST"]),
                                 Route("/pack4a/seen", pack4a_seen),
                                 Route("/r96/seed", r96_seed, methods=["POST"]), Route("/r96/seen", r96_seen),
+                                Route("/memory/seed", memory_seed, methods=["POST"]),
                                 Route("/rehearsal/capped", rehearsal_capped, methods=["POST"]),
                                 Route("/rehearsal/settings", rehearsal_settings),
                                 Route("/spheres/seed", spheres_seed, methods=["POST"]),

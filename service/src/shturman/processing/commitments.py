@@ -811,10 +811,15 @@ def _render_commitment(item: dict[str, Any], today: date | None, tz: tzinfo | st
 
 def _render_change(change: asyncpg.Record, item: dict[str, Any], today: date | None) -> str:
     head = _CHANGE_TEXT[change["kind"]]
+    keep = ""
     if change["kind"] == "rescheduled":
         head += f" на {dates.format_due(change['new_due_date'], change['new_due_time'], today=today)}"
+        # Сигнал «срок изменился» (записка «держать, подкладывать, сигналить», шаг 7): это попытка переноса,
+        # а не перенос — действующий срок остаётся, пока владелец не подтвердит.
+        if item.get("status") == "open":
+            keep = f"\nПока вы не подтвердите, действует прежний. {_short(due_line(item, today), 140)}"
     return (f"{head}: {who_line(item)} — {_short(item['what'], 200)}\n"
-            f"«{_short(change['evidence_quote'], 160)}»")
+            f"«{_short(change['evidence_quote'], 160)}»{keep}")
 
 
 async def build_digests(
