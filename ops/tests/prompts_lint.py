@@ -19,7 +19,7 @@ import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 DEFAULT_FILES = ['prompts/deploy-remote.md', 'prompts/deploy.md', 'prompts/deploy-standalone.md',
-                 'prompts/guided-chat.md', 'prompts/operate-codex.md',
+                 'prompts/guided-chat.md', 'prompts/operate.md',
                  'docs/runbooks/hosting.md', 'docs/hosting.md', 'README.md', 'AGENTS.md', 'DEVELOPING.md',
                  'docs/runbooks/server-prepare.md', 'docs/runbooks/deploy.md', 'docs/runbooks/update.md',
                  'docs/runbooks/restore.md', 'docs/runbooks/symptoms.md', 'docs/runbooks/deploy-standalone.md']

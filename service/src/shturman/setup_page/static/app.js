@@ -765,7 +765,7 @@
     "ok": "обновлено — проверки прошли",
     "rolled-back": "обновление не встало — всё вернули как было",
     "not-installed": "обновление не установлено — работает прежняя версия, данные не тронуты",
-    "failed-needs-human": "обновление прошло с ошибками — попросите Codex «откатить последнее обновление»",
+    "failed-needs-human": "обновление прошло с ошибками — попросите агента, который сопровождает сервер, «откатить последнее обновление»",
     "rollback-failed": "обновление не встало, и откат не удался — нужен тот, кто сопровождает сервер"
   };
   function drawUpdate(u, line, problems) {
@@ -802,7 +802,7 @@
 
   function copyCodex() {
     var text = $("now-update-codex").textContent || "";
-    function done() { toast("Текст для Codex скопирован."); }
+    function done() { toast("Текст для агента скопирован."); }
     function fallback() {
       try {
         var range = document.createRange();

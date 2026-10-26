@@ -245,7 +245,7 @@ def test_feedback_import_turns_forwarded_reports_into_draft_rows(tmp_path):
     defects.write_text("| Д-41 | 2026-10-17 | x | О2 | мешает | логика | Codex | не исправлено | нет |\n", "utf-8")
     out = tool.run([str(src)], defects=defects)
     assert "| Д-42 | 2026-10-20 | запрос в боте истёк" in out
-    assert "Обновления делает Codex" in out and "v0.0.9-rc.2 → v0.0.10-rc.1" in out and "без вмешательства" in out
+    assert "Обновления делает агент сопровождения" in out and "v0.0.9-rc.2 → v0.0.10-rc.1" in out and "без вмешательства" in out
     assert "rm -rf" not in out and "20261020T100000Z-3c4d" in out
     # Черновик — в файл вне репозитория; путь внутри рабочего каталога репозитория не принимается.
     draft = tmp_path / "draft.md"

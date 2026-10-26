@@ -44,7 +44,8 @@ RESULTS = {"clean": "без вмешательства", "intervened": "с вм�
            "не прошло": "не прошло"}
 SEVERITY = ("критично", "мешает", "косметика")
 CAUSES = ("сценарий", "логика", "промпт", "эксплуатация", "сопровождение")
-FIRST = ("владелец", "система", "Codex", "оператор (Claude)", "Claude")
+# «агент сопровождения» — с 0.0.17; «Codex» — в строках дефектов, записанных раньше.
+FIRST = ("владелец", "система", "агент сопровождения", "Codex", "оператор (Claude)", "Claude")
 UPDATE_RESULTS = ("ok", "rolled-back", "failed-needs-human", "rollback-failed", "running")
 SCENARIO = re.compile(r"^[ОУП]\d{1,2}$")
 DOCTOR = re.compile(r"^(PASS|WARN|FAIL|SKIP)  ([a-z0-9][a-z0-9-]{0,40}): (.*)$")
@@ -177,7 +178,7 @@ def snapshot(repo: Path, doctor_lines: list[str], vocab: set[str]) -> dict:
 # --- строки дефектов ---
 
 def defect(line: str, vocab: set[str]) -> dict | None:
-    """Строка дефекта (формат — prompts/operate-codex.md, п. 8) → поля; не та форма — None."""
+    """Строка дефекта (формат — prompts/operate.md, п. 8) → поля; не та форма — None."""
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     if len(cells) != 9:
         return None

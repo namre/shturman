@@ -277,9 +277,9 @@ async def test_buttons_how_later_skip(rig, conn):
     notice = await conn.fetchval("SELECT id FROM update_notices WHERE kind = 'release'")
     with authority.owner_context(1000, chat_id=1000, action="test.telegram.callback"):
         out = await bridge.dispatch_callback(conn, f"sh:up:how:{notice}", 1000)
-    assert out["answer"].startswith("Текст для Codex")
+    assert out["answer"].startswith("Текст для агента сопровождения")
     codex = (await sent(conn))[-1]["text"]
-    assert "v0.0.10" in codex and "prompts/operate-codex.md" in codex and "./ops/update.sh --all" in codex
+    assert "v0.0.10" in codex and "prompts/operate.md" in codex and "./ops/update.sh --all" in codex
     assert "в терминал меня не отправляй" in codex
     # Чужой не нажмёт.
     assert (await bridge.dispatch_callback(conn, f"sh:up:skip:{notice}", 2001))["answer"] == "Кнопка недоступна."
