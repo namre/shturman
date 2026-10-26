@@ -362,6 +362,41 @@ def morning_problem(have: dict[str, Any] | None, *, now: datetime | None = None,
     return None
 
 
+SCHEDULED_SPAN = timedelta(minutes=60)   # столько после времени сводки или обзора длится их плановое чтение архива
+
+
+async def running_now(conn: asyncpg.Connection, *, now: datetime | None = None,
+                      span: timedelta = SCHEDULED_SPAN) -> str | None:
+    """Идёт ли сейчас плановая сводка или обзор недели Hermes: ключ задачи или None.
+
+    Время — то, что сообщил плагин (задача в Hermes и пояс шлюза), а если он не сообщал — выбор владельца
+    или умолчание. Нужно границе выдачи архива (`archive_guard`): обзор недели читает много чатов подряд,
+    и это не тревога. Отчёт плагина мог подложить держатель токена Hermes — тогда он знает и окно; поэтому
+    окно ослабляет только признак «много чатов подряд», а не пределы выдачи, объём и ловушки."""
+    now = now or datetime.now(timezone.utc)
+    want, have = await desired(conn), await actual(conn)
+    choice = _current_choice(want, have)
+    jobs_ = (have or {}).get("jobs") or {}
+    zone = (have or {}).get("timezone")
+    for key in KEYS:
+        job = jobs_.get(key) if isinstance(jobs_.get(key), dict) and jobs_[key].get("exists") else None
+        enabled = bool(job.get("enabled")) if job else bool(choice[key].get("enabled"))
+        if not enabled:
+            continue
+        time_text = (job or {}).get("time") or choice[key].get("time")
+        for shift in (0, 1):     # окно могло начаться вчера (обзор поздно вечером)
+            planned = _scheduled_today(time_text, zone, now - timedelta(days=shift))
+            if planned is None:
+                continue
+            if key == "weekly-review":
+                day = (job or {}).get("day", choice[key].get("day"))
+                if not isinstance(day, int) or (planned.isoweekday() % 7) != day:
+                    continue
+            if planned <= now < planned + span:
+                return key
+    return None
+
+
 BOOT_DELAY = 30              # секунд после запуска до первого «посмотреть»: плагин успевает подключиться
 
 

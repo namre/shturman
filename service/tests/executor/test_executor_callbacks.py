@@ -113,3 +113,26 @@ async def test_failed_handler_or_failed_edit_does_not_stop_the_bot(rig):
 
 async def _ok():
     return {"answer": "Сделано.", "edit_text": "Итог", "remove_buttons": True}
+
+
+async def test_reply_buttons_of_service_modules_become_real_buttons(rig):
+    """Справка «Показать» и граница выдачи архива отвечают новым сообщением с кнопками `bridge.button`
+    (словарями) и «Скопировать»: в Telegram уходят настоящие кнопки, а не «text»/«data»."""
+    handler({"answer": "", "reply": {"text": "Договорённости:", "buttons": [
+        [bridge.button("1 — выполнено", "tcb", "d:1"), bridge.button("1 — не так", "tcb", "w:1")],
+        [{"text": "Скопировать", "copy": "Напоминаю: смета"}]]}})
+    await bind(rig)
+    await press(rig, "sh:tcb:yes")
+    sent = [c for c in rig.tg.calls("sendMessage") if c.get("text") == "Договорённости:"]
+    assert len(sent) == 1
+    assert sent[0]["reply_markup"] == {"inline_keyboard": [
+        [{"text": "1 — выполнено", "callback_data": "sh:tcb:d:1"}, {"text": "1 — не так", "callback_data": "sh:tcb:w:1"}],
+        [{"text": "Скопировать", "copy_text": {"text": "Напоминаю: смета"}}]]}
+
+
+async def test_reply_with_foreign_button_goes_without_buttons(rig):
+    handler({"answer": "", "reply": {"text": "Ответ", "buttons": [[{"text": "Чужая", "data": "ea:approve:1"}]]}})
+    await bind(rig)
+    await press(rig, "sh:tcb:yes")
+    sent = [c for c in rig.tg.calls("sendMessage") if c.get("text") == "Ответ"]
+    assert len(sent) == 1 and "reply_markup" not in sent[0]

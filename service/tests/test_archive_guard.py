@@ -452,3 +452,53 @@ async def test_store_is_untouched_by_canaries(conn):
     await archive_guard.add_canary(conn)
     assert await conn.fetchval("SELECT count(*) FROM chats") == 0
     assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+
+
+# --- плановая сводка и обзор недели (ложная тревога в пятницу 23.10) ------------------------------------------
+
+async def _spread(conn, n, caller="mcp"):
+    await conn.execute(
+        "INSERT INTO archive_disclosures (caller, tool, pending, messages, chats) VALUES ($1, 'get_context', false, $2, $3)",
+        caller, n, list(range(1, n + 1)))
+
+
+async def _report(conn, *, weekly="17:47", day=5, zone="Europe/Moscow", enabled=True):
+    from shturman import summaries
+    await summaries._put(conn, summaries.ACTUAL, {
+        "jobs": {"weekly-review": {"exists": True, "enabled": enabled, "time": weekly, "day": day},
+                 "morning-brief": {"exists": True, "enabled": True, "time": "08:27"}},
+        "timezone": zone, "reported_at": "2026-10-23T14:00:00+00:00"})
+
+
+async def test_scheduled_windows_follow_the_hermes_report(conn):
+    from datetime import datetime, timezone
+    from shturman import summaries
+    await _report(conn)
+    friday = datetime(2026, 10, 23, 14, 50, tzinfo=timezone.utc)          # 17:50 по Москве, пятница
+    assert await summaries.running_now(conn, now=friday) == "weekly-review"
+    assert await summaries.running_now(conn, now=friday.replace(hour=16)) is None             # 19:00 — окно прошло
+    assert await summaries.running_now(conn, now=friday.replace(day=22)) is None              # четверг — нет обзора
+    assert await summaries.running_now(conn, now=friday.replace(hour=5, minute=40)) == "morning-brief"   # 08:40
+    await _report(conn, enabled=False)
+    assert await summaries.running_now(conn, now=friday) is None
+
+
+async def test_weekly_review_spread_is_not_an_alarm_but_volume_and_others_still_are(conn, monkeypatch):
+    from shturman import summaries
+    await conn.execute("INSERT INTO archive_guard (id, state) VALUES (1, 'open') ON CONFLICT (id) DO UPDATE SET state = 'open', quiet_until = NULL")
+    await _spread(conn, 40)
+    monkeypatch.setattr(summaries, "running_now", lambda conn, **kw: _const("weekly-review"))
+    assert await archive_guard._anomaly(conn, "mcp", archive_guard.Stats()) == (None, None)
+    # внешний клиент — без поблажки; и в окно обзора тревога по-прежнему на очень широком чтении
+    await _spread(conn, 40, caller="remote")
+    assert (await archive_guard._anomaly(conn, "remote", archive_guard.Stats()))[0] == "chats"
+    await _spread(conn, archive_guard.ALARM_CHATS_SCHEDULED)
+    assert (await archive_guard._anomaly(conn, "mcp", archive_guard.Stats()))[0] == "chats"
+    monkeypatch.setattr(summaries, "running_now", lambda conn, **kw: _const(None))
+    await conn.execute("DELETE FROM archive_disclosures")
+    await _spread(conn, 40)
+    assert (await archive_guard._anomaly(conn, "mcp", archive_guard.Stats()))[0] == "chats"     # вне окна — тревога
+
+
+async def _const(value):
+    return value
