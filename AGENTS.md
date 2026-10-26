@@ -105,7 +105,7 @@
 | Посредник `sh.namre.app` | `docs/relay.md` |
 | Бот согласований, приложение «Штурман» | `docs/approvals-bot.md`, `docs/miniapp.md` |
 | Дополнения | `docs/runbooks/deploy.md`, шаг 8; `docs/search.md`, `docs/guard.md`, `docs/voice.md`, `docs/media.md` |
-| Сопровождение | `prompts/operate-codex.md`, `docs/scenarios-ops.md` |
+| Сопровождение | `prompts/operate.md`, `docs/scenarios-ops.md` |
 | Обновление | `docs/runbooks/update.md`, `UPGRADING.md`, `docs/releases.md` |
 | Восстановление из копии, откат | `docs/runbooks/restore.md` |
 | Что-то не работает; карточка «Подтвердите» в боте | `docs/runbooks/symptoms.md` |

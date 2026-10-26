@@ -79,6 +79,8 @@ class FreeText(unittest.TestCase):
         d = rf.defect("| Д-? | 2026-10-20 | бот молчал | О8 | мешает | эксплуатация, сопровождение | Codex | не исправлено | нет |", VOCAB)
         self.assertEqual((d["function"], d["severity"], d["cause"], d["first"]),
                          ("О8", "мешает", "эксплуатация, сопровождение", "Codex"))
+        new = rf.defect("| Д-? | 2026-10-26 | бот молчал | О8 | мешает | сопровождение | агент сопровождения | не исправлено | нет |", VOCAB)
+        self.assertEqual(new["first"], "агент сопровождения")      # с 0.0.17; «Codex» — в прежних строках
         self.assertIsNone(rf.defect("не строка", VOCAB))
         odd = rf.defect("| Д-1; rm | вчера | x | ls -la | очень | всё | я | - | - |", VOCAB)
         self.assertEqual((odd["no"], odd["function"], odd["severity"], odd["cause"], odd["first"]), ("Д-?", "?", "?", "?", "?"))
