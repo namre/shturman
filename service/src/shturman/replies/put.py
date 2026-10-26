@@ -103,7 +103,8 @@ async def check(conn: asyncpg.Connection, tgt: policy.Target | None, text: str) 
         return "too_long"
     used = await conn.fetchval(
         """SELECT (SELECT count(*) FROM outbox_drafts WHERE put_started_at > now() - interval '1 hour')
-                + (SELECT count(*) FROM dictations WHERE put_started_at > now() - interval '1 hour')""")
+                + (SELECT count(*) FROM dictations WHERE put_started_at > now() - interval '1 hour')
+                + (SELECT count(*) FROM reminders WHERE put_started_at > now() - interval '1 hour')""")
     if used >= HOURLY_CAP:
         return "cap"
     return None
