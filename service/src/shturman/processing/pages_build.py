@@ -295,7 +295,8 @@ async def _from_base(
 
 
 _FACTS = f"""
-SELECT f.id, f.kind, f.slot, f.text, f.valid_from, f.valid_to, f.status, f.origin, f.decided_at,
+SELECT f.id, f.kind, f.slot, f.slot_detail, f.nature, {facts.STALE} AS stale, f.text, f.valid_from, f.valid_to,
+       f.status, f.origin, f.decided_at,
        f.source_message_id, f.superseded_by, nf.source_message_id AS next_source, fm.sender_name,
        (SELECT pp.person_id FROM person_peers pp WHERE pp.peer_id = fm.sender_peer_id) AS sender_person
 FROM facts f JOIN messages fm ON fm.id = f.source_message_id JOIN chats fc ON fc.id = fm.chat_id
@@ -324,7 +325,7 @@ async def _facts_from_base(
     decisions: list[dict[str, Any]] = []
 
     def what(r: asyncpg.Record) -> str:
-        slot = pages.md_inline(r["slot"], 40)
+        slot = pages.md_inline(facts.slot_label(r["slot"], r["slot_detail"]), 80)
         return (f"{slot}: " if slot else "") + pages.md_inline(r["text"], 240)
 
     def who(r: asyncpg.Record, origin: str) -> str | None:
@@ -345,8 +346,9 @@ async def _facts_from_base(
                 decisions.append({"day": r["valid_from"].isoformat(), "text": r["text"],
                                   "message_id": r["source_message_id"], "origin": origin, "who": speaker})
             continue
+        word = {"event": "событие", "observation": "положение дел"}.get(r["nature"], "факт")
         entries.append(Entry(key=f"f{r['id']}", day=r["valid_from"].isoformat(),
-                             text=f"факт{said}: {what(r)}", sources=(r["source_message_id"],), origin=origin))
+                             text=f"{word}{said}: {what(r)}", sources=(r["source_message_id"],), origin=origin))
         if r["status"] == "retracted":
             day = (r["decided_at"].date() if r["decided_at"] else r["valid_from"]).isoformat()
             entries.append(Entry(key=f"fz{r['id']}", day=day, text=f"владелец отметил как неверное: {what(r)}",
@@ -357,8 +359,10 @@ async def _facts_from_base(
                 sources.append(r["next_source"])
             entries.append(Entry(key=f"fz{r['id']}", day=r["valid_to"].isoformat(),
                                  text=f"больше не действует: {what(r)}", sources=tuple(sources), origin=origin))
-        else:
-            current.append({"id": r["id"], "slot": r["slot"], "text": r["text"], "since": r["valid_from"].isoformat(),
+        elif r["status"] == "active" and r["nature"] != "event" and not r["stale"]:
+            # событие действующим не бывает, устаревшее положение дел — только в хронологии (Р-111)
+            current.append({"id": r["id"], "slot": facts.slot_label(r["slot"], r["slot_detail"]), "text": r["text"],
+                            "since": r["valid_from"].isoformat(), "nature": r["nature"],
                             "message_id": r["source_message_id"], "origin": origin, "who": speaker})
     current.sort(key=lambda x: (x["slot"] is None, x["slot"] or "", x["since"]))
     entries.sort(key=lambda e: e.day)
@@ -1534,6 +1538,23 @@ async def mark_deleted(conn: asyncpg.Connection, message_ids: Sequence[int]) -> 
     return count
 
 
+async def mark_stale_observations(conn: asyncpg.Connection) -> int:
+    """Положение дел устарело (facts.OBSERVATION_DAYS) после последней сборки страницы: страница ждёт
+    перерисовки, чтобы оно ушло из блока действующих фактов. Смотрятся только устаревшие за последний месяц."""
+    days = facts.OBSERVATION_DAYS + 1
+    done = await conn.execute(
+        f"""UPDATE pages g SET dirty = true
+            WHERE NOT g.dirty AND g.problem IS NULL AND EXISTS (
+                SELECT 1 FROM facts f
+                WHERE f.nature = 'observation' AND f.status = 'active' AND f.valid_to IS NULL
+                  AND f.valid_from + {days} <= CURRENT_DATE AND f.valid_from + {days} > CURRENT_DATE - 30
+                  AND (g.built_at IS NULL OR g.built_at < (f.valid_from + {days})::timestamptz)
+                  AND ((g.entity_type = 'person' AND f.subject_type = 'person' AND f.person_id = g.person_id)
+                       OR (g.entity_type = 'project' AND f.subject_type = 'project' AND f.project_id = g.project_id)
+                       OR (g.entity_type = 'owner' AND f.subject_type = 'owner')))""")
+    return int(done.split()[-1])
+
+
 async def mark_orphans(conn: asyncpg.Connection) -> int:
     """Обход на случай пропущенного события: записи, у которых источник удалён (в том числе
     вместе с чатом) или оказался в исключённом чате."""
@@ -1552,6 +1573,7 @@ async def render_dirty(
     async with _writing(conn):
         await facts.repair_chains(conn)        # на случай стирания, прошедшего мимо уборки
         await mark_orphans(conn)
+        await mark_stale_observations(conn)
         if not await conn.fetchval("SELECT 1 FROM pages WHERE dirty LIMIT 1"):
             return None
         return await _render(conn, Path(pages_dir), tz=tz, today=_today(tz, now), options=options,

@@ -193,4 +193,26 @@ sed -i 's|"own_llm": false|"own_llm": true|' "$tmp/status-nollm.json"
 ./ops/doctor.sh > "$tmp/out.txt" 2>&1 || true
 grep -q '^WARN  archive-guard: доступ ассистента к архиву закрыт' "$tmp/out.txt" || bad "нет WARN archive-guard"
 grep -q 'Обработка переписки при этом идёт через Hermes' "$tmp/out.txt" && bad "приписка о Hermes при своей модели"
+
+# Строка memory (Р-111): сервис прежней версии — строки нет; ссылки целы — PASS с числами на разбор;
+# нарушенная ссылка — WARN.
+grep -q '  memory:' "$tmp/out.txt" && bad "у сервиса без полей memory_* строки быть не должно"
+memory_status() {
+  python3 - "$fx/status.json" "$1" > "$tmp/status-mem.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.update(memory_facts_current=111, memory_broken=int(sys.argv[2]), memory_paraphrases=2, memory_project_outside=72,
+         memory_empty_projects=2, memory_quotes_changed=5, memory_stale=12)
+print(json.dumps(d))
+PY
+  sed -i "s|$tmp/status-[a-z]*.json|$tmp/status-mem.json|" "$tmp/stub/docker"
+  ./ops/doctor.sh > "$tmp/out.txt" 2>&1 || true
+  grep -q "line [0-9]*:" "$tmp/out.txt" && bad "ошибки оболочки в doctor (memory)"
+  true
+}
+memory_status 0
+grep -q '^PASS  memory: действуют фактов: 111, ссылки целы; на разбор владельцу — пересказов: 2, фактов проекта из чатов вне проекта: 72, пустых проектов: 2, источник изменён: 5, положение дел устарело (только в хронологии): 12$' \
+  "$tmp/out.txt" || bad "нет PASS memory"
+memory_status 3
+grep -q '^WARN  memory: нарушенных ссылок между фактами: 3 — ошибка' "$tmp/out.txt" || bad "нарушенные ссылки — не WARN"
 echo "doctor rows: ok"

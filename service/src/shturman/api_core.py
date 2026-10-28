@@ -262,7 +262,13 @@ async def overview(state: AppState) -> dict[str, Any]:
         from .processing import commitment_stats, pipeline as processing_pipeline
         processing = await processing_pipeline.overview(conn)
         processing.update(await commitment_stats.status_fields(conn))
+        from .processing import memory_health
+        memory = await memory_health.overview(conn)
     out = dict(row)
+    # Память (Р-111): действующих фактов, нарушенных ссылок (должно быть 0) и признаков «попало не то» —
+    # пересказы, факты проекта из чужих чатов, пустые проекты, изменённые источники, устаревшее положение
+    # дел. Только числа; строка memory в ./ops/doctor.sh.
+    out.update(memory)
     # Очередь заданий: всего ждут, неудачных за всё время (jobs_failed — не за час) и по группам —
     # модель и бот: сколько ждут, давность самого старого готового, выполнено за час (Д-25; строка jobs
     # в ./ops/doctor.sh — «разбираются» или «за час не выполнено ни одного»). Только числа.

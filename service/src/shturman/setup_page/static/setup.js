@@ -2705,7 +2705,8 @@
   function factsSection(title, hint, items, empty, after) {
     var body = items.length ? el("ul", { class: "mem-facts" }, items.map(function (f) {
       var error = el("p", { class: "note warn mem-error", role: "alert", hidden: true });
-      var meta = [f.since ? (f.kind === "decision" ? day(f.since) : "с " + day(f.since)) : "", ORIGIN_WORDS[f.origin] || f.origin || ""]
+      var meta = [f.since ? (f.kind === "decision" ? day(f.since) : (f.nature === "observation" ? "на " : "с ") + day(f.since)) : "",
+                  ORIGIN_WORDS[f.origin] || f.origin || ""]
         .filter(Boolean).join(" · ");
       return el("li", { class: "mem-fact" }, [
         el("div", { class: "mem-fact-main" }, [

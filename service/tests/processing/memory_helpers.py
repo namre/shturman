@@ -10,9 +10,14 @@ from proc_helpers import OWNER, T0, TZ, answer, buttons_of, claim, press
 NOW = T0 + timedelta(hours=1)
 
 
-def fact(message, quote, about, text, *, slot=None, kind="fact", project=None):
-    return {"message": message, "source_quote": quote, "about": about, "text": text, "slot": slot,
-            "kind": kind, "project": project}
+def fact(message, quote, about, text, *, slot=None, kind="fact", project=None, slot_detail=None, nature=None):
+    out = {"message": message, "source_quote": quote, "about": about, "text": text, "slot": slot,
+           "kind": kind, "project": project}
+    if slot_detail is not None:
+        out["slot_detail"] = slot_detail
+    if nature is not None:
+        out["nature"] = nature
+    return out
 
 
 def owner():

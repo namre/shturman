@@ -2837,7 +2837,9 @@
   function mmMeta(item, history) {
     var meta = el("div", "cm-meta");
     if (item.slot) meta.appendChild(el("span", null, item.slot));
-    meta.appendChild(el("span", null, "с " + ddmm(item.since) + (item.until ? " по " + ddmm(item.until) : "")));
+    // положение дел — «на дату», событие — просто дата, остальное — «с даты» (Р-111)
+    var when = item.nature === "observation" ? "на " : item.nature === "event" ? "" : "с ";
+    meta.appendChild(el("span", null, when + ddmm(item.since) + (item.until ? " по " + ddmm(item.until) : "")));
     if (item.basis) meta.appendChild(el("span", null, item.basis));
     if (item.correction) meta.appendChild(el("span", null, "исправлено вами"));
     if (item.chat) meta.appendChild(el("span", null, "чат: " + item.chat));

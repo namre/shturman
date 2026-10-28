@@ -14,10 +14,16 @@
   * факт о самом владельце — proposed: профиль меняется только с одобрения владельца (кнопки ✓/✗
     в боте, модуль `of`, или экран «Память» на странице настройки).
 
-Смена по ключу. У сменяемого факта есть slot (должность, телефон, цена…). Все действующие факты
-одного субъекта с одним ключом выстраиваются по дате: у каждого valid_to — дата следующего,
+Смена по ключу. У сменяемого факта есть slot (должность, телефон, цена…) и, если таких значений у
+субъекта несколько, уточнение slot_detail («статус: закупка электрики»). Все действующие факты одного
+субъекта с одним ключом и одним уточнением выстраиваются по дате: у каждого valid_to — дата следующего,
 superseded_by — следующий; открыт (valid_to IS NULL) только последний. Тот же текст, что у
 открытого, — дубль и не пишется. Закрытый факт не стирается: он остаётся в хронологии.
+
+Вид сведения (nature, Р-111): state — держится, пока не сменится; event — однажды произошло: пишется в
+хронологию и действующим не бывает; observation — положение дел на момент: действует, пока свежее
+(OBSERVATION_DAYS дней от даты сообщения), потом остаётся только в хронологии. О владельце пишется только
+state: его действия и положение дел в профиль не предлагаются.
 
 Видимость. Факт не показывается никому, если сообщение-источник удалено, скрыто защитой от
 внедрённых инструкций или его чат исключён. Удалённое и исключённое стирается (`purge_*`),
@@ -65,7 +71,9 @@ DIGEST_MAX_ITEMS = 10      # фактов о владельце в одном с
 DIGEST_MAX_SENDS = 3       # сколько раз пункт уходит владельцу, если сообщение не доставляется
 
 SUBJECTS = ("person", "project", "owner")
-UNTRUSTED_FIELDS = ["text", "slot", "source_quote", "chat.title", "said_by"]
+UNTRUSTED_FIELDS = ["text", "slot", "slot_detail", "slot_label", "source_quote", "chat.title", "said_by"]
+# Положение дел («сейчас», «пока», «на 29.09», статус без уточнения) действует столько дней от даты сообщения.
+OBSERVATION_DAYS = 14
 
 STATUS_TEXT = {"proposed": "ждёт решения", "active": "действует", "rejected": "отклонён",
                "retracted": "отмечен как неверный"}
@@ -73,7 +81,11 @@ STATUS_TEXT = {"proposed": "ждёт решения", "active": "действу�
 # Видимость. Псевдонимы: f — facts, fm — сообщение-источник, fc — его чат.
 VISIBLE = "fm.deleted_at IS NULL AND fm.agent_visible AND NOT fc.excluded"
 _FROM = """FROM facts f JOIN messages fm ON fm.id = f.source_message_id JOIN chats fc ON fc.id = fm.chat_id"""
-_SELECT = f"""SELECT f.*, fm.sent_at AS source_sent_at, fm.chat_id, fm.is_outgoing AS source_outgoing,
+# Положение дел устарело: старше OBSERVATION_DAYS дней (по дате базы — точности «до дня» достаточно).
+STALE = f"(f.nature = 'observation' AND f.valid_from < CURRENT_DATE - {OBSERVATION_DAYS})"
+# Действует сейчас: применено, не закрыто, не событие и не устаревшее положение дел.
+CURRENT = f"(f.status = 'active' AND f.valid_to IS NULL AND f.nature <> 'event' AND NOT {STALE})"
+_SELECT = f"""SELECT f.*, {STALE} AS stale, fm.sent_at AS source_sent_at, fm.chat_id, fm.is_outgoing AS source_outgoing,
                      fm.sender_name AS source_sender, fc.title AS chat_title,
                      EXISTS (SELECT 1 FROM person_peers sp WHERE sp.peer_id = fm.sender_peer_id
                              AND sp.person_id = f.person_id) AS source_by_subject
@@ -90,6 +102,17 @@ class FactsError(ValueError):
 
 def text_norm(text: str | None) -> str:
     return extract.normalize(text or "")
+
+
+def slot_label(slot: str | None, detail: str | None) -> str | None:
+    """Ключ для показа: «статус (закупка электрики)»; без ключа — None. Чужой текст: экранирует вызывающий."""
+    if not slot:
+        return None
+    return f"{slot} ({detail})" if detail else slot
+
+
+def is_stale(nature: str, valid_from: date, on: date) -> bool:
+    return nature == "observation" and (on - valid_from).days > OBSERVATION_DAYS
 
 
 _APPROVAL_FIELDS = ("subject_type", "person_id", "project_id", "kind", "slot", "text", "valid_from",
@@ -113,7 +136,11 @@ def to_dict(row: asyncpg.Record) -> dict[str, Any]:
         "project_id": row["project_id"], "kind": row["kind"], "slot": row["slot"], "text": row["text"],
         "valid_from": row["valid_from"].isoformat(),
         "valid_to": row["valid_to"].isoformat() if row["valid_to"] else None,
-        "current": row["status"] == "active" and row["valid_to"] is None,
+        "current": (row["status"] == "active" and row["valid_to"] is None and row["nature"] != "event"
+                    and not row["stale"]),
+        # вид сведения: state | event | observation; stale — положение дел старше OBSERVATION_DAYS
+        "nature": row["nature"], "stale": bool(row["stale"]),
+        "slot_detail": row["slot_detail"], "slot_label": slot_label(row["slot"], row["slot_detail"]),
         "superseded_by": row["superseded_by"], "status": row["status"], "origin": row["origin"],
         # основание: owner — сказал владелец; self — сам человек; member — подтверждённый человек из чата
         # проекта; said — со слов другого, ничего не сменяет; approved — принял владелец; None — записано до 0.0.16
@@ -156,8 +183,7 @@ async def list_facts(
             if subject_id is None:
                 return []
     where, args = _subject_where(subject_type, subject_id)
-    status = ("f.status IN ('active', 'retracted')" if include_closed
-              else "f.status = 'active' AND f.valid_to IS NULL")
+    status = "f.status IN ('active', 'retracted')" if include_closed else CURRENT
     rows = await conn.fetch(
         f"{_SELECT} AND {where} AND {status} ORDER BY f.valid_from, fm.sent_at, f.id", *args)
     return [to_dict(r) for r in rows]
@@ -187,6 +213,8 @@ async def facts_in_force(conn: asyncpg.Connection, subject_type: str, subject_id
     out = []
     for row in await _subject_rows(conn, subject_type, subject_id):
         start = row["effective_from"] or row["valid_from"]
+        if row["nature"] == "event" or is_stale(row["nature"], start, on):
+            continue                       # событие не «действует»; положение дел — пока свежее
         if row["status"] == "active" and start <= on and (row["valid_to"] is None or row["valid_to"] > on):
             out.append({**to_dict(row), "state_at": "active"})
     return out
@@ -215,18 +243,20 @@ async def facts_known_at(conn: asyncpg.Connection, subject_type: str, subject_id
     latest: dict[tuple[Any, ...], Any] = {}
     for row in rows:
         if applied(row) and row["chained"] and row["slot"]:
-            key = (row["slot"],)
+            key = (row["slot"], row["slot_detail_norm"])
             if key not in latest or _order(row) > _order(latest[key]):
                 latest[key] = row
     out = []
     for row in rows:
-        if withdrawn(row):
+        if withdrawn(row) or row["nature"] == "event":
             continue
         if not applied(row):
             if row["status"] == "proposed" or row["decided_at"] is None or row["decided_at"] > at:
                 out.append({**to_dict(row), "state_at": "proposed"})
             continue
-        if row["chained"] and row["slot"] and latest.get((row["slot"],)) is not row:
+        if is_stale(row["nature"], row["valid_from"], at.date()):
+            continue
+        if row["chained"] and row["slot"] and latest.get((row["slot"], row["slot_detail_norm"])) is not row:
             continue
         successor = by_id.get(row["superseded_by"]) if not row["chained"] else None
         if successor is not None and applied(successor):
@@ -261,18 +291,19 @@ async def touch_pages(conn: asyncpg.Connection, subject_type: str, person_id: in
 # --- смена по ключу ------------------------------------------------------------------------------------
 
 async def rechain(conn: asyncpg.Connection, subject_type: str, person_id: int | None,
-                  project_id: int | None, slot: str | None) -> None:
-    """Выстраивает действующие факты одного ключа по дате: каждый закрыт датой следующего,
-    открыт только последний (см. описание модуля)."""
+                  project_id: int | None, slot: str | None, detail_norm: str = "") -> None:
+    """Выстраивает действующие факты одного ключа и одного уточнения по дате: каждый закрыт датой
+    следующего, открыт только последний (см. описание модуля)."""
     if slot is None:
         return
     rows = await conn.fetch(
         """SELECT f.id, f.valid_from, f.valid_to, f.superseded_by, m.sent_at FROM facts f
            JOIN messages m ON m.id = f.source_message_id
            WHERE f.subject_type = $1 AND f.person_id IS NOT DISTINCT FROM $2
-             AND f.project_id IS NOT DISTINCT FROM $3 AND f.slot = $4 AND f.status = 'active' AND f.chained
+             AND f.project_id IS NOT DISTINCT FROM $3 AND f.slot = $4 AND f.slot_detail_norm = $5
+             AND f.status = 'active' AND f.chained AND f.nature <> 'event'
            ORDER BY f.valid_from, m.sent_at, f.id FOR UPDATE OF f""",
-        subject_type, person_id, project_id, slot)
+        subject_type, person_id, project_id, slot, detail_norm or "")
     for n, row in enumerate(rows):
         following = rows[n + 1] if n + 1 < len(rows) else None
         valid_to = following["valid_from"] if following else None
@@ -284,7 +315,7 @@ async def rechain(conn: asyncpg.Connection, subject_type: str, person_id: int | 
 
 async def _duplicate(conn: asyncpg.Connection, subject_type: str, person_id: int | None,
                      project_id: int | None, kind: str, slot: str | None, norm: str, message_id: int,
-                     *, owner_said: bool = False) -> bool:
+                     *, owner_said: bool = False, detail_norm: str = "") -> bool:
     """Тот же факт уже есть: тот же текст в действующих сейчас, в ждущих, отклонённых или
     отмеченных неверными, либо тот же текст из того же сообщения. Значение проекта, которое сказал сам
     владелец, чужое ждущее или отклонённое предложение с тем же текстом не перекрывает: его слово —
@@ -295,9 +326,10 @@ async def _duplicate(conn: asyncpg.Connection, subject_type: str, person_id: int
            WHERE f.subject_type = $1 AND f.person_id IS NOT DISTINCT FROM $2
              AND f.project_id IS NOT DISTINCT FROM $3 AND f.kind = $4 AND f.text_norm = $5
              AND (f.source_message_id = $6 {decided}
-                  OR (f.status = 'active' AND f.valid_to IS NULL AND f.slot IS NOT DISTINCT FROM $7))
+                  OR (f.status = 'active' AND f.valid_to IS NULL AND f.slot IS NOT DISTINCT FROM $7
+                      AND f.slot_detail_norm = $8))
            LIMIT 1""",
-        subject_type, person_id, project_id, kind, norm, message_id, slot))
+        subject_type, person_id, project_id, kind, norm, message_id, slot, detail_norm or ""))
 
 
 async def _said_by(conn: asyncpg.Connection, sender_peer_id: int | None, person_id: int | None) -> bool:
@@ -347,15 +379,18 @@ async def _project_member(conn: asyncpg.Connection, message: extract.Msg, projec
         message.sender_peer_id, project_id, message.chat_id))
 
 
-async def _current_value(conn: asyncpg.Connection, project_id: int, slot: str | None, norm: str) -> int | None:
-    """Действующее значение того же ключа проекта с другим текстом — с ним новое расходится."""
+async def _current_value(conn: asyncpg.Connection, project_id: int, slot: str | None, norm: str,
+                         detail_norm: str = "") -> int | None:
+    """Действующее значение того же ключа и того же уточнения проекта с другим текстом — с ним новое
+    расходится. «Бюджет (кровля)» и «бюджет (электрика)» друг другу не противоречат."""
     if slot is None:
         return None
     return await conn.fetchval(
         f"""SELECT f.id {_FROM} WHERE {VISIBLE} AND f.subject_type = 'project' AND f.project_id = $1
-              AND f.slot = $2 AND f.status = 'active' AND f.valid_to IS NULL AND f.text_norm <> $3
+              AND f.slot = $2 AND f.slot_detail_norm = $4 AND f.status = 'active' AND f.valid_to IS NULL
+              AND f.nature <> 'event' AND f.text_norm <> $3
             ORDER BY f.valid_from DESC, f.id DESC LIMIT 1""",
-        project_id, slot, norm)
+        project_id, slot, norm, detail_norm or "")
 
 
 async def record(
@@ -378,18 +413,25 @@ async def record(
       * прочее о проекте действует со слов владельца или подтверждённого человека из чата проекта;
         со слов остальных — пишется без ключа («со слов …»), ничего не сменяет;
       * значения проекта сами по ключу друг друга не сменяют (chained = false): у проекта несколько
-        работ, и ключ без уточнения путал бы их. Сменяет только «Принять» владельца."""
+        работ, и ключ без уточнения путал бы их. Сменяет только «Принять» владельца;
+      * статус проекта без уточнения — положение дел на момент: ничего не сменяет и со временем уходит
+        в хронологию; с уточнением («статус: закупка электрики») сменяет статус той же работы;
+      * о владельце пишется только свойство: событие и положение дел — итог owner_transient."""
     norm = text_norm(candidate.text)
     if not norm:
         return None, "empty"
     message = candidate.message
     kind = candidate.kind if subject_type == "project" else "fact"
-    slot = None if kind == "decision" else candidate.slot
+    nature = candidate.nature if kind == "fact" and candidate.nature in extract.NATURES else "state"
+    slot = None if kind == "decision" or nature == "event" else candidate.slot
+    detail = candidate.slot_detail if slot else None
     chained = True
     conflicts_with = None
     if subject_type == "owner":
         if not message.is_outgoing:
             return None, "not_owner_message"
+        if nature != "state":
+            return None, "owner_transient"
         status, basis = "proposed", None
     elif subject_type == "person":
         status = "active"
@@ -404,8 +446,13 @@ async def record(
     else:
         protected = slot in PROTECTED_PROJECT_SLOTS or looks_protected(candidate.text)
         # Значимые значения проекта сами по ключу друг друга не сменяют: «бюджет» кровли и электрики —
-        # разные работы. Прочие ключи проекта (статус, этап, площадь) — значение проекта целиком.
+        # разные работы. Статус без уточнения — тоже: «торги закрыты» не отменяет «сервис заработал».
+        # Прочие ключи проекта (площадь) — значение проекта целиком.
         chained = not protected
+        if slot == "статус" and detail is None:
+            chained = False
+            if nature == "state":
+                nature = "observation"
         if message.is_outgoing:
             status, basis = "active", "owner"
         elif protected:
@@ -414,23 +461,26 @@ async def record(
             status, basis = "active", "member"
         else:
             status, basis, slot = "active", "said", None
+    if slot is None:
+        detail = None
+    dnorm = extract.detail_norm(detail)
     if await _duplicate(conn, subject_type, person_id, project_id, kind, slot, norm, message.id,
-                        owner_said=subject_type == "project" and message.is_outgoing):
+                        owner_said=subject_type == "project" and message.is_outgoing, detail_norm=dnorm):
         return None, "duplicate"
     if subject_type == "project" and status == "proposed":
-        conflicts_with = await _current_value(conn, project_id, slot, norm)
+        conflicts_with = await _current_value(conn, project_id, slot, norm, dnorm)
     valid_from = message.sent_at.astimezone(ZoneInfo(tz)).date()
     fact_id = await conn.fetchval(
         """INSERT INTO facts (subject_type, person_id, project_id, kind, slot, text, text_norm, valid_from,
                               status, origin, source_message_id, source_quote, run_id, model,
-                              basis, chained, conflicts_with, applied_at)
+                              basis, chained, conflicts_with, applied_at, nature, slot_detail, slot_detail_norm)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                   CASE WHEN $9 = 'active' THEN now() END) RETURNING id""",
+                   CASE WHEN $9 = 'active' THEN now() END, $18, $19, $20) RETURNING id""",
         subject_type, person_id, project_id, kind, slot, candidate.text, norm, valid_from, status,
         candidate.origin, message.id, candidate.quote[: extract.QUOTE_LIMIT], run_id,
-        (model or "")[:120] or None, basis, chained, conflicts_with)
+        (model or "")[:120] or None, basis, chained, conflicts_with, nature, detail, dnorm)
     if status == "active":
-        await rechain(conn, subject_type, person_id, project_id, slot)
+        await rechain(conn, subject_type, person_id, project_id, slot, dnorm)
         await touch_pages(conn, subject_type, person_id, project_id)
     return fact_id, status
 
@@ -439,7 +489,7 @@ async def record(
 
 async def _locked(conn: asyncpg.Connection, fact_id: int) -> asyncpg.Record | None:
     return await conn.fetchrow(
-        f"""SELECT f.*, fm.is_outgoing AS source_outgoing {_FROM} WHERE f.id = $1 AND {VISIBLE}
+        f"""SELECT f.*, {STALE} AS stale, fm.is_outgoing AS source_outgoing {_FROM} WHERE f.id = $1 AND {VISIBLE}
             FOR UPDATE OF f""", fact_id)
 
 
@@ -459,7 +509,8 @@ async def retract_fact(conn: asyncpg.Connection, fact_id: int) -> dict[str, Any]
             "UPDATE facts SET status = 'retracted', decided_at = now(), superseded_by = NULL WHERE id = $1",
             fact_id)
         await _reopen_replaced(conn, fact_id)
-        await rechain(conn, row["subject_type"], row["person_id"], row["project_id"], row["slot"])
+        await rechain(conn, row["subject_type"], row["person_id"], row["project_id"], row["slot"],
+                      row["slot_detail_norm"])
         await touch_pages(conn, row["subject_type"], row["person_id"], row["project_id"])
     return {"ok": True, "changed": True, "fact": await get_fact(conn, fact_id)}
 
@@ -482,7 +533,7 @@ async def correct_fact(conn: asyncpg.Connection, fact_id: int, text: str) -> dic
         row = await _locked(conn, fact_id)
         if row is None:
             raise FactsError("Такого факта нет.", "not_found")
-        if row["status"] != "active" or row["valid_to"] is not None:
+        if row["status"] != "active" or row["valid_to"] is not None or row["nature"] == "event" or row["stale"]:
             raise FactsError("Поправить можно только то, что действует сейчас.", "not_current")
         norm = text_norm(text)
         if norm == row["text_norm"]:
@@ -490,9 +541,10 @@ async def correct_fact(conn: asyncpg.Connection, fact_id: int, text: str) -> dic
         new_id = await conn.fetchval(
             """INSERT INTO facts (subject_type, person_id, project_id, kind, slot, text, text_norm, valid_from,
                                   effective_from, status, origin, source_message_id, source_quote, basis, change_kind,
-                                  chained, applied_at, decided_at)
+                                  chained, applied_at, decided_at, nature, slot_detail, slot_detail_norm)
                SELECT subject_type, person_id, project_id, kind, slot, $2, $3, valid_from, effective_from, 'active',
-                      'owner', source_message_id, source_quote, 'owner', 'correction', chained, now(), now()
+                      'owner', source_message_id, source_quote, 'owner', 'correction', chained, now(), now(),
+                      nature, slot_detail, slot_detail_norm
                FROM facts WHERE id = $1 RETURNING id""", fact_id, text, norm)
         if row["subject_type"] == "owner":
             fresh = await conn.fetchrow("SELECT * FROM facts WHERE id = $1", new_id)
@@ -506,20 +558,26 @@ async def correct_fact(conn: asyncpg.Connection, fact_id: int, text: str) -> dic
         await conn.execute(
             "UPDATE facts SET superseded_by = $2 WHERE superseded_by = $1 AND NOT chained AND status = 'active'",
             fact_id, new_id)
-        await rechain(conn, row["subject_type"], row["person_id"], row["project_id"], row["slot"])
+        await rechain(conn, row["subject_type"], row["person_id"], row["project_id"], row["slot"],
+                      row["slot_detail_norm"])
         await touch_pages(conn, row["subject_type"], row["person_id"], row["project_id"])
     return {"ok": True, "changed": True, "fact": await get_fact(conn, new_id), "replaced": fact_id}
 
 
 STATE_WORDS = {
     "current": "действует", "closed": "сменено", "proposed": "ждёт вашего решения", "rejected": "не принято",
-    "wrong": "отмечено неверным", "corrected": "исправлено",
+    "wrong": "отмечено неверным", "corrected": "исправлено", "event": "событие — в хронологии",
+    "stale": "положение дел на ту дату",
 }
 
 
 def history_state(row: Any) -> str:
     if row["status"] == "active":
-        return "current" if row["valid_to"] is None else "closed"
+        if row["nature"] == "event":
+            return "event"
+        if row["valid_to"] is not None:
+            return "closed"
+        return "stale" if row["stale"] else "current"
     if row["status"] == "retracted":
         return "corrected" if row["superseded_by"] is not None else "wrong"
     return row["status"]
@@ -575,7 +633,7 @@ async def decide_owner_fact(
                           basis = 'approved', approved_by = $2, approved_via = $3, approval_fingerprint = $4
                    WHERE id = $1""",
                 fact_id, str(authority.current_owner_id()), principal.source, fingerprint(row))
-            await rechain(conn, "owner", None, None, row["slot"])
+            await rechain(conn, "owner", None, None, row["slot"], row["slot_detail_norm"])
             await touch_pages(conn, "owner", None, None)
         else:
             await conn.execute("UPDATE facts SET status = 'rejected', decided_at = now() WHERE id = $1", fact_id)
@@ -598,7 +656,8 @@ async def _decide_project(conn: asyncpg.Connection, row: asyncpg.Record, accept:
             "SELECT 1 FROM facts WHERE id = $1 AND status = 'active' AND valid_to IS NULL", row["conflicts_with"]):
         # то, что было на карточке «сейчас действует», уже не действует: решение по устаревшей карточке
         # не применяется — предложение придёт заново с тем, что действует сейчас
-        current = await _current_value(conn, row["project_id"], row["slot"], row["text_norm"])
+        current = await _current_value(conn, row["project_id"], row["slot"], row["text_norm"],
+                                       row["slot_detail_norm"])
         await conn.execute(
             """UPDATE facts SET conflicts_with = $2, batch = NULL, pos = NULL, notified_at = NULL,
                       digest_fingerprint = NULL, digest_attempts = 0 WHERE id = $1""", fact_id, current)
@@ -626,12 +685,12 @@ async def _release(conn: asyncpg.Connection, doomed: str, *args: Any) -> int:
     """Удаляет факты по условию и заново выстраивает затронутые ключи: факт, который сменил
     удаляемый, снова действует. Страницы ждут перерисовки."""
     rows = await conn.fetch(f"DELETE FROM facts f WHERE {doomed} "
-                            "RETURNING subject_type, person_id, project_id, slot", *args)
+                            "RETURNING subject_type, person_id, project_id, slot, slot_detail_norm", *args)
     if rows:
         await _reopen_replaced(conn)
     seen = set()
     for r in rows:
-        key = (r["subject_type"], r["person_id"], r["project_id"], r["slot"])
+        key = (r["subject_type"], r["person_id"], r["project_id"], r["slot"], r["slot_detail_norm"])
         if key not in seen:
             seen.add(key)
             await rechain(conn, *key)
@@ -662,11 +721,11 @@ async def repair_chains(conn: asyncpg.Connection) -> int:
     ключи выстраиваются заново: последний действующий факт снова открыт. Возвращает число ключей."""
     await _reopen_replaced(conn)
     rows = await conn.fetch(
-        """SELECT DISTINCT subject_type, person_id, project_id, slot FROM facts
+        """SELECT DISTINCT subject_type, person_id, project_id, slot, slot_detail_norm FROM facts
            WHERE status = 'active' AND chained AND slot IS NOT NULL AND valid_to IS NOT NULL
              AND superseded_by IS NULL""")
     for r in rows:
-        await rechain(conn, r["subject_type"], r["person_id"], r["project_id"], r["slot"])
+        await rechain(conn, r["subject_type"], r["person_id"], r["project_id"], r["slot"], r["slot_detail_norm"])
         await touch_pages(conn, r["subject_type"], r["person_id"], r["project_id"])
     return len(rows)
 
@@ -684,7 +743,8 @@ def said(row: Any) -> str:
 
 
 def _item_text(row: asyncpg.Record) -> str:
-    slot = f"{row['slot']}: " if row["slot"] else ""
+    label = slot_label(row["slot"], row.get("slot_detail"))
+    slot = f"{_short(label, 80)}: " if label else ""
     return (f"{slot}{_short(row['text'], 200)} (с {row['valid_from']:%d.%m.%Y}; {said(row)})\n"
             f"«{_short(row['source_quote'], 160)}»")
 
@@ -736,14 +796,15 @@ def _project_buttons(row: Any, print_: str, prefix: str = "") -> list[list[dict[
 
 _PROJECT_SELECT = f"""SELECT f.*, fm.sent_at AS source_sent_at, fm.chat_id, fm.is_outgoing AS source_outgoing,
        fm.sender_name AS source_sender, fc.title AS chat_title, pr.title AS project_title,
-       cf.text AS current_text, cf.slot AS current_slot
+       cf.text AS current_text, cf.slot AS current_slot, {STALE} AS stale
   {_FROM} JOIN projects pr ON pr.id = f.project_id
   LEFT JOIN facts cf ON cf.id = f.conflicts_with AND cf.status = 'active' AND cf.valid_to IS NULL
   WHERE {VISIBLE} AND f.subject_type = 'project' AND f.status = 'proposed' AND pr.status = 'active'"""
 
 
 def _project_item_text(row: asyncpg.Record) -> str:
-    slot = f"{row['slot']}: " if row["slot"] else ""
+    label = slot_label(row["slot"], row.get("slot_detail"))
+    slot = f"{_short(label, 80)}: " if label else ""
     who = _short(row["source_sender"], 60) or "собеседник"
     text = (f"«{_short(row['project_title'], 60)}» — {slot}{_short(row['text'], 200)}\n"
             f"Сказал {who}, {row['valid_from']:%d.%m.%Y}: «{_short(row['source_quote'], 160)}»")
@@ -849,7 +910,8 @@ async def awaiting_project(conn: asyncpg.Connection, *, limit: int = 100) -> dic
 async def pending_project(conn: asyncpg.Connection, *, limit: int = 100) -> list[dict[str, Any]]:
     """Все ждущие значения проектов со слов других — для страницы настройки, показанные или нет."""
     rows = await conn.fetch(f"{_PROJECT_SELECT} ORDER BY f.id LIMIT $1", limit)
-    return [{"id": r["id"], "project": _short(r["project_title"], 80), "slot": r["slot"],
+    return [{"id": r["id"], "project": _short(r["project_title"], 80),
+             "slot": slot_label(r["slot"], r["slot_detail"]),
              "text": _short(r["text"], 240), "said_by": _short(r["source_sender"], 60) or "собеседник",
              "since": r["valid_from"].isoformat(), "quote": _short(r["source_quote"], 200),
              "current": _short(r["current_text"], 200) if r["current_text"] else None,
