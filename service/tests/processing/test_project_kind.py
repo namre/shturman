@@ -51,7 +51,7 @@ async def test_organization_is_proposed_and_signed_as_such(conn):
     reply = lambda job: {"commitments": [], "facts": [],  # noqa: E731
                          "projects": [{"title": "ГК Альфа", "kind": "organization"}]}
     await run_with(conn, reply)
-    await say(conn, w.ivan_chat, [(IVAN, "Иван Петров", "ГК Альфа ждёт счёт")], start=T0 + timedelta(days=2), first_id=10)
+    await say(conn, w.ivan_chat, [(IVAN, "Иван Петров", "ГК Альфа ждёт оплату 120 тыс до пятницы")], start=T0 + timedelta(days=2), first_id=10)
     await run_with(conn, lambda job: {"commitments": [], "facts": [], "projects": ["ГК Альфа"]},   # без вида — тоже
                    now=T0 + timedelta(days=2, hours=1))
     assert sorted(r["kind"] or "-" for r in await conn.fetch("SELECT kind FROM project_mentions")) == [
