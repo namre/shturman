@@ -6,6 +6,8 @@ data/
 !service/tests/guard/data/
 # синтетический набор вопросов для измерения поиска по смыслу — тоже не данные экземпляра
 !service/tests/search/data/
+# синтетический проверочный набор памяти (tools/memory_eval.py) — тоже не данные экземпляра
+!service/tests/processing/data/
 *.session
 *.session-journal
 __pycache__/
