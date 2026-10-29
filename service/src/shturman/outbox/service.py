@@ -786,7 +786,36 @@ async def _apply_rule_update(conn: asyncpg.Connection, payload: dict[str, Any]) 
         f"""UPDATE watch_rules SET {', '.join(f'{c} = ${i}' for i, c in enumerate(columns, 2))},
                    updated_at = now() WHERE id = $1 RETURNING *""",
         rule_id, *[changes[c] for c in columns])
+    # Ужесточение через внутренний API применяется сразу — владелец узнаёт о нём сообщением (ОТ-39).
+    # Под карточкой и со страницы настройки сообщение не уходит: итог он уже видит сам (confirm.tell).
+    said = _rule_changed(current, changes)
+    if said:
+        await confirm.tell(conn, f"Изменено правило наблюдателя «{textlib.one_line(row['name'], 100)}»: "
+                                 + "; ".join(said) + ".", silent=True)
     return confirm.Done(result=watcher.rule_public(row))
+
+
+def _rule_changed(current: Any, changes: dict[str, Any]) -> list[str]:
+    """Что изменилось в правиле — коротко, для сообщения владельцу после правки (без слов и выражений)."""
+    out: list[str] = []
+    for key, value in changes.items():
+        old = current[key]
+        if (set(value) == set(old or ())) if isinstance(value, list) else value == old:
+            continue
+        if key == "enabled":
+            out.append("включено" if value else "выключено")
+        elif key in ("chat_ids", "sphere_ids", "keywords", "regexes"):
+            word = {"chat_ids": "чатов", "sphere_ids": "сфер", "keywords": "слов", "regexes": "выражений"}[key]
+            out.append(f"{word} было {len(old or ())}, стало {len(value)}")
+        elif key == "use_lemmas":
+            out.append("словоформы " + ("учитываются" if value else "не учитываются"))
+        elif key in _RULE_LABELS:
+            out.append(f"{_RULE_LABELS[key]}: было {policy.show(old)}, стало {policy.show(value)}")
+        elif key == "name":
+            out.append(f"прежнее название «{textlib.one_line(old, 100)}»")
+        elif key == "description":
+            out.append("изменено, что считать важным")
+    return out
 
 
 @confirm.applier(RULE_DELETE)
