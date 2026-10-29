@@ -25,6 +25,9 @@
 Блоки decisions и facts необязательны: страницы версии 0.0.7 их не имеют и читаются как раньше.
 У проекта в шапке ещё два списка — chats (чаты проекта) и participants (участники); оба пишет код.
 У организации и подразделения (Р-112) — ещё строка kind: organization или kind: unit; у проекта её нет.
+participants у проекта — люди из его чатов, договорённостей и фактов; у человека — список projects
+(проекты, к которым он относится по тем же правилам), если такие есть. Оба пишет код (projects.participants,
+projects.projects_of_person).
 
 Виды страниц: person — человек (`people/<имя>-<id>.md`), project — проект
 (`projects/<название>-<id>.md`), owner — профиль владельца (`owner/profile.md`).
@@ -109,7 +112,7 @@ _REL_PATH = re.compile(
 _FRONT_KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?")
 _PLAIN_ALIAS = re.compile(r"[A-Za-zА-Яа-яЁё](?:[A-Za-zА-Яа-яЁё0-9 .-]*[A-Za-zА-Яа-яЁё0-9.])?")
 _YAML_WORDS = frozenset({"null", "true", "false", "yes", "no", "on", "off", "y", "n"})
-_OUR_KEYS = ("entity_id", "type", "kind", "aliases", "chats", "participants", "updated")
+_OUR_KEYS = ("entity_id", "type", "kind", "aliases", "chats", "participants", "projects", "updated")
 
 
 class PageError(ValueError):
@@ -297,6 +300,8 @@ class Page:
     # только у проекта: названия чатов и участники (пишет код)
     chats: list[str] = field(default_factory=list)
     participants: list[str] = field(default_factory=list)
+    # только у человека: проекты, к которым он относится (пишет код; пусто — строки нет)
+    projects: list[str] = field(default_factory=list)
     updated: str = ""
     # строки шапки, которые писал не код (например, tags из Obsidian): сохраняются как есть
     front_extra: list[str] = field(default_factory=list)
@@ -348,6 +353,7 @@ def parse(text: str) -> Page:
     page.aliases = _parse_flow_list(seen.get("aliases", "")) or []
     page.chats = _parse_flow_list(seen.get("chats", "")) or []
     page.participants = _parse_flow_list(seen.get("participants", "")) or []
+    page.projects = _parse_flow_list(seen.get("projects", "")) or []
     page.updated = seen.get("updated", "")
 
     body = lines[end + 1:]
@@ -396,6 +402,8 @@ def render(page: Page) -> str:
         out.append(f"chats: {_flow_list(page.chats)}\n")
     if page.type == PROJECT or page.participants:
         out.append(f"participants: {_flow_list(page.participants)}\n")
+    if page.projects:
+        out.append(f"projects: {_flow_list(page.projects)}\n")
     out.append(f"updated: {page.updated}\n")
     out.extend(line + "\n" for line in page.front_extra)
     out.append("---\n")

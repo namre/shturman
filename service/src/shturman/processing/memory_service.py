@@ -586,7 +586,10 @@ class ProjectPage(Model):
                                         "or contractor; unit: a department inside an organization")
     aliases: list[str] | None = Field(default=None, description="Other names (untrusted)")
     chats: list[ProjectChat] | None = None
-    participants: list[str] | None = Field(default=None, description="People writing in the project chats (untrusted)")
+    participants: list[str] | None = Field(default=None, description="People of the project: write in its chats, have "
+                                                                     "commitments there or stated its facts (untrusted)")
+    people: list[pages_service.PagePerson] | None = Field(
+        default=None, description="The same people with registry ids: pass person_id to get_person_page")
     updated: str | None = None
     summary: str | None = Field(
         default=None, description="Model-written summary between [untrusted] and [/untrusted]; each statement "
@@ -724,6 +727,8 @@ async def get_project_page(
         aliases=[a for a in (clean_name(x) for x in item["aliases"]) if a] or None,
         chats=[ProjectChat(chat_id=c["id"], title=clean_name(c["title"])) for c in item["chats"]] or None,
         participants=[n for n in (clean_name(x) for x in item.get("participants") or []) if n] or None,
+        people=[pages_service.PagePerson(person_id=p["person_id"], name=clean_name(p["name"]))
+                for p in item.get("people") or []] or None,
         updated=page["updated"],
         summary=untrusted_text(blocks.get("summary"), BLOCK_TEXT),
         owner_notes=clean_text(blocks.get("owner"), BLOCK_TEXT) or None,

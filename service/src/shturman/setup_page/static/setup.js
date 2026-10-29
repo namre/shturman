@@ -2860,6 +2860,9 @@
       el("div", { class: "mem-title" }, [
         el("h3", { text: p.title }),
         p.aliases && p.aliases.length ? el("p", { class: "small", text: "Ещё называют: " + p.aliases.join(", ") }) : null,
+        p.projects && p.projects.length ? el("p", { class: "small", text: "Проекты: " + p.projects.map(function (x) {
+          return x.title + (x.kind && x.kind !== "project" ? " (" + kindTitle(x.kind).toLowerCase() + ")" : "") + (x.status === "archived" ? " — в архиве" : "");
+        }).join(", ") }) : null,
         el("p", { class: "small", text: p.updated ? "Страница обновлена " + day(p.updated) : "Страница ещё не записана." })
       ])
     ].concat(flagNotes(p));

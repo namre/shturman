@@ -1,7 +1,7 @@
 """Экран «Память ассистента» на странице настройки: люди, проекты, профиль владельца и то, что ждёт его решения.
 
   GET    /shturman-setup/api/memory/pages                          страницы о людях; ?q= — поиск
-  GET    /shturman-setup/api/memory/pages/{person_id}              страница: блоки текстом, факты, пометки
+  GET    /shturman-setup/api/memory/pages/{person_id}              страница: блоки текстом, факты, пометки, проекты
   PUT    /shturman-setup/api/memory/pages/{person_id}/owner-block  ваши заметки: {text}
   GET    /shturman-setup/api/memory/projects                       заведённые проекты (действующие, затем архив)
   POST   /shturman-setup/api/memory/projects                       завести проект: {title, chat_ids?, aliases?}
@@ -267,9 +267,13 @@ async def get_page(request: Request) -> JSONResponse:
         if found is None or found["person_id"] is None:
             raise BadRequest("У этого человека нет страницы.", 404, "not_found")
         known = await _facts(conn, "person", found["person_id"])
+        linked = await projects.projects_of_person(conn, found["person_id"])
     return JSONResponse({
         **_row(found), "aliases": [a for a in found["aliases"] if a != found["title"]],
         **await _blocks(state, found), "facts": known["facts"] + known["decisions"],
+        # связи страниц: проекты, организации и подразделения, к которым относится человек
+        "projects": [{"id": p["project_id"], "title": clean_line(p["title"], 80) or "без названия",
+                      "kind": p["kind"], "status": p["status"]} for p in linked],
     })
 
 
