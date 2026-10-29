@@ -11,6 +11,13 @@
 Статусы: proposed — ждёт владельца; active — ведётся; archived — страница остаётся, сводка больше
 не пересобирается; rejected — владелец отказался.
 
+Вид (Р-112, `kind`): project — объект, сделка, работа; organization — компания, заказчик, подрядчик;
+unit — подразделение (отдел, служба) внутри организации. Ведутся одинаково — страница, чаты, другие
+названия, договорённости, факты, — но значения работы (WORK_SLOTS: статус, срок, бюджет, цена,
+площадь) к организации и подразделению по ключу не пишутся: они у проекта, иначе одна компания
+собирает статусы всех своих работ. Вид предложения — тот, которым модель чаще называла упоминания;
+у заведённого его меняет владелец (`set_project_kind`).
+
 Обязательству проект ставится при записи: по чатам проекта, иначе по названию, которое назвала
 модель (сопоставление с названиями и алиасами действующих проектов).
 
@@ -19,9 +26,10 @@
   list_projects(conn, status=None) -> list[dict]
       status None — все, кроме отклонённых; иначе proposed | active | archived | rejected.
   get_project(conn, project_id) -> dict | None
-  create_project(conn, title, chat_ids=(), aliases=(), origin="owner", *, description=None) -> dict
+  create_project(conn, title, chat_ids=(), aliases=(), origin="owner", *, description=None, kind=None) -> dict
       origin="owner" — только владелец; проект сразу действует. Если такой же проект уже
       предложен моделью, он принимается. origin="model" — предложение (для обработки).
+  set_project_kind(conn, project_id, kind) -> dict               только владелец
   set_project_chats(conn, project_id, chat_ids) -> dict          только владелец
   change_project_chats(conn, project_id, add=(), remove=()) -> dict
       то же относительно нынешнего перечня (для решения, подтверждённого позже); только владелец
@@ -67,6 +75,14 @@ SIMILAR = 90               # похожесть названий, с котор�
 # Групповые чаты: из них предлагаются проекты по второму правилу.
 GROUP_TYPES = ("private_group", "private_supergroup", "public_supergroup")
 UNTRUSTED_FIELDS = ["title", "aliases[]", "chats[].title", "participants[]"]
+
+KINDS = extract.PROJECT_KINDS
+KIND_TITLES = {"project": "проект", "organization": "организация", "unit": "подразделение"}
+# Кнопка «завести …» и строка «… заведён» в сообщении владельцу — по виду
+_KIND_ACC = {"project": "проект", "organization": "организацию", "unit": "подразделение"}
+_KIND_DONE = {"project": "Проект заведён.", "organization": "Организация заведена.", "unit": "Подразделение заведено."}
+# Значения работы: у организации и подразделения не пишутся по ключу (см. описание модуля)
+WORK_SLOTS = frozenset({"статус", "срок", "бюджет", "цена", "площадь"})
 
 
 class ProjectsError(ValueError):
@@ -138,6 +154,7 @@ async def _to_dict(conn: asyncpg.Connection, row: asyncpg.Record, *, full: bool 
         if row["sphere_id"] is not None else None
     out = {
         "id": row["id"], "title": row["title"], "status": row["status"], "origin": row["origin"],
+        "kind": row["kind"],
         # сфера проекта (Р-82): название — слова владельца, не чужой текст
         "sphere_id": sphere["id"] if sphere else None, "sphere": sphere["title"] if sphere else None,
         "aliases": await _aliases(conn, row["id"]), "chats": await _chats(conn, row["id"]),
@@ -220,15 +237,26 @@ async def for_commitment(conn: asyncpg.Connection, chat_id: int, label: str | No
     return None
 
 
-async def active_titles(conn: asyncpg.Connection, limit: int = 30) -> list[str]:
+async def active_titles(conn: asyncpg.Connection, limit: int = 30,
+                        kinds: Sequence[str] = ("project",)) -> list[str]:
     return [r["title"] for r in await conn.fetch(
-        "SELECT title FROM projects WHERE status = 'active' ORDER BY updated_at DESC, id LIMIT $1", limit)]
+        """SELECT title FROM projects WHERE status = 'active' AND kind = ANY($2::text[])
+           ORDER BY updated_at DESC, id LIMIT $1""", limit, list(kinds))]
+
+
+async def kind_of(conn: asyncpg.Connection, project_id: int | None) -> str | None:
+    if project_id is None:
+        return None
+    return await conn.fetchval("SELECT kind FROM projects WHERE id = $1", project_id)
 
 
 async def record_mentions(
     conn: asyncpg.Connection, title: str, episode: extract.Episode, *, run_id: int | None,
+    kind: str | None = None,
 ) -> int:
-    """Записывает сообщения эпизода, в которых названо ещё не заведённое название проекта."""
+    """Записывает сообщения эпизода, в которых названо ещё не заведённое название проекта;
+    `kind` — как его назвала модель (None — не назвала)."""
+    kind = extract.project_kind(kind)
     key = norm(title)
     if not key or await _known_name(conn, key):
         return 0
@@ -237,9 +265,9 @@ async def record_mentions(
     for message in episode.messages:
         if message.is_source and padded in f" {norm(message.text)} ":
             done = await conn.execute(
-                """INSERT INTO project_mentions (title, title_norm, chat_id, message_id, episode, run_id)
-                   VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (title_norm, message_id) DO NOTHING""",
-                title, key, episode.chat_id, message.id, episode_key, run_id)
+                """INSERT INTO project_mentions (title, title_norm, chat_id, message_id, episode, run_id, kind)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (title_norm, message_id) DO NOTHING""",
+                title, key, episode.chat_id, message.id, episode_key, run_id, kind)
             added += int(done.endswith("1"))
     return added
 
@@ -331,10 +359,14 @@ async def _activate(conn: asyncpg.Connection, project_id: int, principal: author
 async def create_project(
     conn: asyncpg.Connection, title: str, chat_ids: Iterable[int] = (), aliases: Iterable[str] = (),
     origin: str = "owner", *, description: str | None = None, reason: dict[str, Any] | None = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
-    """Заводит проект (см. описание модуля). Возвращает {"ok", "project", "created"}."""
+    """Заводит проект (см. описание модуля). Возвращает {"ok", "project", "created"}. `kind` None —
+    проект, а у уже предложенного моделью — её вид."""
     if origin not in ("owner", "model"):
         raise ProjectsError("Неизвестное происхождение проекта.")
+    if kind is not None and kind not in KINDS:
+        raise ProjectsError("Вид: project, organization или unit.", "bad_kind")
     principal = authority.requires_owner() if origin == "owner" else None
     title = clean_title(title)
     key = norm(title)
@@ -355,13 +387,15 @@ async def create_project(
         await check_names(conn, key, alias_list, project_id=same["id"] if same else None)
         if same is None:
             project_id = await conn.fetchval(
-                """INSERT INTO projects (title, title_norm, description, status, origin, reason)
-                   VALUES ($1, $2, $3, 'proposed', $4, $5::jsonb) RETURNING id""",
-                title, key, description, origin, json.dumps(reason or {}))
+                """INSERT INTO projects (title, title_norm, description, status, origin, reason, kind)
+                   VALUES ($1, $2, $3, 'proposed', $4, $5::jsonb, $6) RETURNING id""",
+                title, key, description, origin, json.dumps(reason or {}), kind or "project")
         else:
             project_id = same["id"]
             if description:
                 await conn.execute("UPDATE projects SET description = $2 WHERE id = $1", project_id, description)
+            if kind is not None:     # владелец заводит предложенное и сам назвал вид — его слово
+                await conn.execute("UPDATE projects SET kind = $2 WHERE id = $1", project_id, kind)
         await conn.executemany(
             """INSERT INTO project_chats (project_id, chat_id, origin) VALUES ($1, $2, $3)
                ON CONFLICT DO NOTHING""", [(project_id, c, origin) for c in chats])
@@ -441,6 +475,23 @@ async def archive_project(conn: asyncpg.Connection, project_id: int) -> dict[str
     return {"ok": True, "changed": True, "project": await get_project(conn, project_id)}
 
 
+async def set_project_kind(conn: asyncpg.Connection, project_id: int, kind: str) -> dict[str, Any]:
+    """Вид заведённого проекта (Р-112): проект, организация, подразделение. Только владелец.
+    Уже записанные факты не пересматриваются; страница перерисовывается с новым видом."""
+    authority.requires_owner()
+    if kind not in KINDS:
+        raise ProjectsError("Вид: project, organization или unit.", "bad_kind")
+    async with conn.transaction():
+        row = await _owned(conn, project_id, ("active", "archived"))
+        changed = row["kind"] != kind
+        if changed:
+            await conn.execute("UPDATE projects SET kind = $2, updated_at = now() WHERE id = $1", project_id, kind)
+            await conn.execute("UPDATE pages SET dirty = true WHERE project_id = $1", project_id)
+    if changed:
+        _wake()
+    return {"ok": True, "changed": changed, "project": await get_project(conn, project_id)}
+
+
 async def decide_project_proposal(conn: asyncpg.Connection, project_id: int, accept: bool) -> dict[str, Any]:
     """Решение владельца о предложенном проекте. Согласие — только по проверенному владельцу."""
     async with conn.transaction():
@@ -481,7 +532,8 @@ async def propose(conn: asyncpg.Connection, *, now: datetime | None = None,
     rows = await conn.fetch(
         """SELECT pm.title_norm, count(*) AS mentions, count(DISTINCT pm.episode) AS episodes,
                   (array_agg(pm.title ORDER BY pm.id DESC))[1] AS title,
-                  array_agg(DISTINCT pm.chat_id ORDER BY pm.chat_id) AS chats
+                  array_agg(DISTINCT pm.chat_id ORDER BY pm.chat_id) AS chats,
+                  mode() WITHIN GROUP (ORDER BY pm.kind) FILTER (WHERE pm.kind IS NOT NULL) AS kind
            FROM project_mentions pm
            JOIN messages m ON m.id = pm.message_id AND m.deleted_at IS NULL AND m.agent_visible
            JOIN chats c ON c.id = pm.chat_id AND NOT c.excluded
@@ -497,8 +549,9 @@ async def propose(conn: asyncpg.Connection, *, now: datetime | None = None,
         if await _known_name(conn, r["title_norm"]) or await _known_name(conn, norm(title)):
             continue
         try:
-            await create_project(conn, title, origin="model", reason={
-                "mentions": r["mentions"], "episodes": r["episodes"], "chats": list(r["chats"])[:10]})
+            await create_project(conn, title, origin="model", kind=extract.project_kind(r["kind"]) or "project",
+                                 reason={"mentions": r["mentions"], "episodes": r["episodes"],
+                                         "chats": list(r["chats"])[:10]})
         except ProjectsError:
             continue
         stats["projects_proposed"] += 1
@@ -526,6 +579,11 @@ async def propose(conn: asyncpg.Connection, *, now: datetime | None = None,
     return stats
 
 
+def _kind_prefix(kind: str) -> str:
+    """«организация: » перед названием в сообщении владельцу; у проекта — ничего, как раньше."""
+    return "" if kind == "project" else f"{KIND_TITLES[kind]}: "
+
+
 def _reason_text(reason: dict[str, Any]) -> str:
     if reason.get("messages"):
         return f"групповой чат: сообщений за {PROPOSE_DAYS} дн. — {int(reason['messages'])}"
@@ -538,7 +596,7 @@ def _reason_text(reason: dict[str, Any]) -> str:
 async def send_digest(conn: asyncpg.Connection, *, run_id: int | str, max_items: int = DIGEST_MAX_ITEMS) -> int:
     """Одно сообщение владельцу с предложенными проектами и кнопками ✓ завести / ✗ не нужно."""
     rows = await conn.fetch(
-        """SELECT id, title, reason FROM projects
+        """SELECT id, title, reason, kind FROM projects
            WHERE status = 'proposed' AND batch IS NULL AND digest_attempts < $2 ORDER BY id LIMIT $1""",
         max_items, DIGEST_MAX_SENDS)
     if not rows:
@@ -546,9 +604,9 @@ async def send_digest(conn: asyncpg.Connection, *, run_id: int | str, max_items:
     batch = f"pj{run_id}"
     lines, buttons = [], []
     for pos, r in enumerate(rows, start=1):
-        lines.append(f"{pos}. {clean_line(r['title'], TITLE_LIMIT) or 'без названия'} — "
+        lines.append(f"{pos}. {_kind_prefix(r['kind'])}{clean_line(r['title'], TITLE_LIMIT) or 'без названия'} — "
                      f"{_reason_text(_loads(r['reason']) or {})}")
-        buttons.append([bridge.button(f"{pos} — завести проект", CALLBACK_MODULE, f"a:{r['id']}"),
+        buttons.append([bridge.button(f"{pos} — завести {_KIND_ACC[r['kind']]}", CALLBACK_MODULE, f"a:{r['id']}"),
                         bridge.button(f"{pos} — не нужно", CALLBACK_MODULE, f"r:{r['id']}")])
         await conn.execute(
             """UPDATE projects SET batch = $2, pos = $3, notified_at = now(), digest_attempts = digest_attempts + 1
@@ -556,8 +614,9 @@ async def send_digest(conn: asyncpg.Connection, *, run_id: int | str, max_items:
     waiting = await conn.fetchval(
         "SELECT count(*) FROM projects WHERE status = 'proposed' AND batch IS NULL AND digest_attempts < $1",
         DIGEST_MAX_SENDS)
-    text = ("Проекты из переписки: завести страницу проекта? "
-            "Отклонённое больше не предлагается.\n\n" + "\n".join(lines))
+    head = ("Проекты из переписки: завести страницу проекта?" if all(r["kind"] == "project" for r in rows)
+            else "Проекты, организации и подразделения из переписки: завести страницу?")
+    text = head + " Отклонённое больше не предлагается.\n\n" + "\n".join(lines)
     if waiting:
         text += f"\n\nЕщё ждут решения: {waiting}. Придут со следующим прогоном."
     await bridge.notify_owner(conn, bridge.fit_message(text), buttons=buttons, handler=HANDLER_DIGEST,
@@ -599,11 +658,12 @@ async def awaiting_owner(conn: asyncpg.Connection, *, limit: int = 100) -> dict[
     (`setup_page/approvals.py`): тот же пункт и те же данные кнопок, подписи словами. Решение
     приходит обратно в `on_button`. Ещё не показанные только считаются (`later`)."""
     rows = await conn.fetch(
-        """SELECT id, title, reason FROM projects WHERE status = 'proposed' AND batch IS NOT NULL
+        """SELECT id, title, reason, kind FROM projects WHERE status = 'proposed' AND batch IS NOT NULL
            ORDER BY notified_at NULLS LAST, id LIMIT $1""", limit)
     items = [{"id": r["id"], "title": "Завести страницу проекта?",
-              "text": f"{clean_line(r['title'], TITLE_LIMIT) or 'без названия'} — {_reason_text(_loads(r['reason']) or {})}",
-              "buttons": [[bridge.button("Завести проект", CALLBACK_MODULE, f"a:{r['id']}"),
+              "text": f"{_kind_prefix(r['kind'])}{clean_line(r['title'], TITLE_LIMIT) or 'без названия'} — "
+                      f"{_reason_text(_loads(r['reason']) or {})}",
+              "buttons": [[bridge.button(f"Завести {_KIND_ACC[r['kind']]}", CALLBACK_MODULE, f"a:{r['id']}"),
                            bridge.button("Не нужно", CALLBACK_MODULE, f"r:{r['id']}")]],
               "card_message_id": None} for r in rows]
     later = await conn.fetchval(
@@ -619,7 +679,7 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
     action, _, raw = rest.partition(":")
     if action not in ("a", "r") or not raw.isdigit() or len(raw) > 18:
         return refused
-    row = await conn.fetchrow("SELECT status, batch FROM projects WHERE id = $1", int(raw))
+    row = await conn.fetchrow("SELECT status, batch, kind FROM projects WHERE id = $1", int(raw))
     if row is None:
         return refused
     if row["status"] != "proposed":
@@ -627,7 +687,7 @@ async def on_button(conn: asyncpg.Connection, rest: str, user_id: int) -> dict[s
     else:
         try:
             await decide_project_proposal(conn, int(raw), accept=action == "a")
-            answer = "Проект заведён." if action == "a" else "Не заводим."
+            answer = _KIND_DONE[row["kind"]] if action == "a" else "Не заводим."
         except ProjectsError as exc:
             answer = str(exc)
     if row["batch"]:
@@ -711,10 +771,11 @@ async def pending_approvals(conn: asyncpg.Connection, *, limit: int = 100) -> di
 
     out: dict[str, list[dict[str, Any]]] = {}
     out["projects"] = [
-        {"id": r["id"], "title": r["title"], "text": _reason_text(_loads(r["reason"]) or {}),
+        {"id": r["id"], "title": r["title"], "kind": r["kind"],
+         "text": _kind_prefix(r["kind"]) + _reason_text(_loads(r["reason"]) or {}),
          "created_at": r["created_at"].isoformat()}
         for r in await conn.fetch(
-            "SELECT id, title, reason, created_at FROM projects WHERE status = 'proposed' ORDER BY id LIMIT $1",
+            "SELECT id, title, reason, kind, created_at FROM projects WHERE status = 'proposed' ORDER BY id LIMIT $1",
             limit)]
     out["owner_facts"] = [
         {"id": r["id"], "title": r["slot"] or "о вас", "text": _short(r["text"], 240),

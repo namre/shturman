@@ -8,6 +8,7 @@
   GET    /shturman-setup/api/memory/projects/{id}                  страница проекта, факты, решения, чаты
   PUT    /shturman-setup/api/memory/projects/{id}/chats            весь перечень чатов: {chat_ids}
   POST   /shturman-setup/api/memory/projects/{id}/archive          в архив
+  PUT    /shturman-setup/api/memory/projects/{id}/kind             вид: {kind: project | organization | unit}
   PUT    /shturman-setup/api/memory/projects/{id}/owner-block      ваши заметки о проекте: {text}
   GET    /shturman-setup/api/memory/chats                          чаты, которые читает сервис (для выбора)
   GET    /shturman-setup/api/memory/profile                        профиль: одобренные факты о вас, ваши правила
@@ -26,7 +27,7 @@
 применяется сразу (`confirm.apply_owner`) тем же кодом, что нажатие кнопки в боте согласований:
 заметки (человека, проекта, профиля) — `pages.owner_block` (коммит «Правка владельца»), согласие
 завести страницу — `pages.accept`, принятие договорённости — `commitments.decide` с отпечатком того,
-что владелец видел; проект — `projects.create|chats|archive|accept` (`processing/memory_service.py`),
+что владелец видел; проект — `projects.create|chats|archive|kind|accept` (`processing/memory_service.py`),
 «Неверно» — `facts.retract`. Факт о владельце решает `facts.decide_owner_fact` в контексте владельца,
 тоже с отпечатком. Отказы (не заводить страницу или проект, договорённость или факт неверны)
 применяются сразу, как и через API.
@@ -282,6 +283,8 @@ async def put_owner_block(request: Request) -> JSONResponse:
 
 def _project_row(item: dict[str, Any]) -> dict[str, Any]:
     return {"id": item["id"], "title": item["title"], "status": item["status"],
+            # вид (Р-112): project | organization | unit; менять — PUT …/projects/{id}/kind
+            "kind": item.get("kind") or "project",
             "chats": [clean_line(c["title"], 80) or "без названия" for c in item["chats"]],
             "commitments_open": item["commitments_open"], "facts": item["facts"], "decisions": item["decisions"],
             "updated": (item["page"] or {}).get("updated"),
@@ -396,6 +399,22 @@ async def archive_project(request: Request) -> JSONResponse:
         await confirm.apply_owner(conn, memory_service.PROJECT_ARCHIVE, {"project_id": project_id})
     await page._log(request, "memory.project_archive", detail=f"проект № {project_id}")
     return JSONResponse({"ok": True})
+
+
+@page.endpoint
+async def project_kind(request: Request) -> JSONResponse:
+    data = await page._body(request)
+    project_id = request.path_params["project_id"]
+    kind = data.get("kind")
+    if kind not in projects.KINDS:
+        raise BadRequest("поле kind: project, organization или unit")
+    async with state_of(request).pool.acquire() as conn:
+        await _active_project(conn, project_id)
+        out = (await confirm.apply_owner(conn, memory_service.PROJECT_KIND,
+                                         {"project_id": project_id, "kind": kind}))["result"]
+    if out["changed"]:
+        await page._log(request, "memory.project_kind", detail=f"проект № {project_id} → {kind}")
+    return JSONResponse({"ok": True, "changed": out["changed"], "project": _project_row(out["project"])})
 
 
 @page.endpoint
@@ -637,6 +656,7 @@ def routes() -> list[BaseRoute]:
         Route(project, get_project, methods=["GET"]),
         Route(project + "/chats", project_chats, methods=["PUT"]),
         Route(project + "/archive", archive_project, methods=["POST"]),
+        Route(project + "/kind", project_kind, methods=["PUT"]),
         Route(project + "/owner-block", project_owner_block, methods=["PUT"]),
         Route(MEMORY + "/chats", list_chats, methods=["GET"]),
         Route(MEMORY + "/profile", get_profile, methods=["GET"]),

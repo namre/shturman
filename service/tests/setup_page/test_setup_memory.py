@@ -277,7 +277,8 @@ def test_every_memory_action_is_in_the_audit_list():
     used = set(re.findall(r'"(memory\.[a-z_]+)"', source))
     assert used == {"memory.owner_block", "memory.page_accept", "memory.page_reject",
                     "memory.commitment_accept", "memory.commitment_reject", "memory.project_create",
-                    "memory.project_chats", "memory.project_archive", "memory.project_accept", "memory.project_reject",
+                    "memory.project_chats", "memory.project_archive", "memory.project_kind", "memory.project_accept",
+                    "memory.project_reject",
                     "memory.fact_retract", "memory.owner_fact_accept", "memory.owner_fact_reject",
                     "memory.project_fact_accept", "memory.project_fact_reject", "memory.profile_block"}
     assert used <= set(audit.ACTIONS)
@@ -306,6 +307,25 @@ async def group(conn, w):
     msgs = await say(conn, chat_id, [(2001, "Иван Петров", "Решили: фасад — керамогранит."),
                                      (2001, "Иван Петров", "Бюджет фасада 12 млн.")], first_id=50)
     return chat_id, msgs
+
+
+async def test_project_kind_is_changed_from_the_page(stand, conn, monkeypatch, own_bot, approvals):
+    """Вид проекта (Р-112): проект, организация, подразделение — меняет владелец со страницы, сразу."""
+    s, w = await world(stand, conn, monkeypatch)
+    pid = (await s.page.post("/memory/projects", {"title": "ГК Береговая"})).json()["project"]["id"]
+    assert (await s.page.get(f"/memory/projects/{pid}")).json()["kind"] == "project"
+    assert (await s.page.put(f"/memory/projects/{pid}/kind", {"kind": "company"})).status_code == 400
+    assert (await s.page.put("/memory/projects/999999/kind", {"kind": "unit"})).status_code == 404
+    changed = await s.page.put(f"/memory/projects/{pid}/kind", {"kind": "organization"})
+    assert changed.status_code == 200 and changed.json()["changed"] is True
+    assert changed.json()["project"]["kind"] == "organization"
+    assert [p["kind"] for p in (await s.page.get("/memory/projects")).json()["projects"]] == ["organization"]
+    same = await s.page.put(f"/memory/projects/{pid}/kind", {"kind": "organization"})
+    assert same.json()["changed"] is False
+    assert await approvals.pending() == 0                         # со страницы — без карточки в боте
+    rows = [r for r in await audit_rows(conn) if r[0] == "memory.project_kind"]
+    assert rows == [("memory.project_kind", "ok", f"проект № {pid} → organization")]
+    no_names(rows)
 
 
 async def test_projects_are_created_shown_changed_and_archived_from_the_page(stand, conn, monkeypatch, own_bot,

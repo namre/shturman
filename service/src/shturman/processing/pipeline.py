@@ -244,6 +244,7 @@ async def _enqueue_extract(
     known = [{"who": _who(r["debtor_peer_id"], r["direction"], labels), "what": r["what"],
               "due_expression": r["due_expression"]} for r in known_rows]
     titles = await projects.active_titles(conn)
+    organizations = await projects.active_titles(conn, kinds=("organization", "unit"))
     key = f"cm-x{extract.PROMPT_VERSION}:{episode.chat_id}:{episode.first_id}-{episode.last_id}"
     if late:
         # Тот же эпизод уже разбирали без расшифровки или пересказа вложения: ключ — по новому тексту.
@@ -254,7 +255,7 @@ async def _enqueue_extract(
     job_id = await bridge.request_structured(
         conn, handler=HANDLER_EXTRACT, instructions=extract.EXTRACT_INSTRUCTIONS,
         input=extract.build_extract_input(episode, labels, ZoneInfo(tz), chat_kind=_chat_kind(chat_type), known=known,
-                                          projects=titles),
+                                          projects=titles, organizations=organizations),
         json_schema=extract.EXTRACT_SCHEMA, schema_name="commitments",
         context={"run_id": run_id, "chat_id": episode.chat_id, "tz": tz,
                  "message_ids": [m.id for m in episode.messages],
@@ -917,13 +918,14 @@ def _bump(stats: dict[str, int], key: str, by: int = 1) -> None:
 
 
 async def _mention(conn: asyncpg.Connection, label: str, episode: Episode, ctx: dict[str, Any],
-                   stats: dict[str, int]) -> int | None:
+                   stats: dict[str, int], kind: str | None = None) -> int | None:
     """Метка проекта от модели: действующий проект — его номер; незнакомое название, которое
-    действительно есть в тексте эпизода, — упоминание для будущего предложения владельцу."""
+    действительно есть в тексте эпизода, — упоминание для будущего предложения владельцу
+    (`kind` — как его назвала модель: проект, организация, подразделение)."""
     found = await projects.resolve(conn, label)
     if found is None and extract.find_mention(label, episode) is not None:
         _bump(stats, "project_mentions", await projects.record_mentions(
-            conn, label, episode, run_id=ctx.get("run_id")))
+            conn, label, episode, run_id=ctx.get("run_id"), kind=kind))
     return found
 
 
@@ -971,6 +973,12 @@ async def _apply_memory(conn: asyncpg.Connection, ctx: dict[str, Any], result: d
             _bump(stats, f"facts_without_subject_{subject}")
             continue
         subject_type, person_id, project_id = subject
+        if (subject_type == "project" and fact.slot in projects.WORK_SLOTS
+                and await projects.kind_of(conn, project_id) in ("organization", "unit")):
+            # значение работы — у проекта, а не у компании или отдела (Р-112): пишется без ключа
+            # и ничего не сменяет, иначе одна организация собирает статусы всех своих работ
+            fact = dataclasses.replace(fact, slot=None, slot_detail=None)
+            _bump(stats, "facts_org_work_unkeyed")
         _, outcome = await facts.record(
             conn, fact, subject_type=subject_type, person_id=person_id, project_id=project_id,
             tz=ctx.get("tz") or "UTC", run_id=ctx.get("run_id"), model=model)
@@ -981,7 +989,7 @@ async def _apply_memory(conn: asyncpg.Connection, ctx: dict[str, Any], result: d
     for key, value in dropped.items():
         _bump(stats, f"projects_dropped_{key}", value)
     for mention in mentions:
-        await _mention(conn, mention.title, episode, ctx, stats)
+        await _mention(conn, mention.title, episode, ctx, stats, mention.kind)
 
 
 async def _apply_resolution(conn: asyncpg.Connection, ctx: dict[str, Any], result: dict[str, Any]) -> dict[str, int]:

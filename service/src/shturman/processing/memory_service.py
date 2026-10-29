@@ -74,12 +74,13 @@ logger = logging.getLogger("shturman.memory")
 PROJECT_CREATE = "projects.create"
 PROJECT_CHATS = "projects.chats"
 PROJECT_ARCHIVE = "projects.archive"
+PROJECT_KIND = "projects.kind"          # вид проекта (Р-112): только со страницы настройки, у API маршрута нет
 PROJECT_ACCEPT = "projects.accept"
 FACT_RETRACT = "facts.retract"
 BLOCK_TEXT = pages_service.BLOCK_TEXT
 
 DESCRIPTION_CARD = 300   # знаков описания проекта, которое показывается на карточке целиком
-_STATUS = {"name_taken": 409, "not_found": 404, "bad_status": 409, "exists": 409, "bad_chat": 404, "changed_meanwhile": 409,
+_STATUS = {"name_taken": 409, "not_found": 404, "bad_kind": 400, "bad_status": 409, "exists": 409, "bad_chat": 404, "changed_meanwhile": 409,
            "frozen": 409, "bad_person": 409}
 
 
@@ -319,6 +320,16 @@ async def archive_project(request: Request) -> JSONResponse:
     return answer or JSONResponse(result)
 
 
+@confirm.applier(PROJECT_KIND)
+async def _apply_kind(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
+    confirm.must_not_widen(True)
+    try:
+        result = await projects.set_project_kind(conn, int(payload["project_id"]), str(payload["kind"]))
+    except projects.ProjectsError as exc:
+        raise _refused(exc) from None
+    return confirm.Done(result=result)
+
+
 @confirm.applier(PROJECT_ACCEPT)
 async def _apply_accept(conn: asyncpg.Connection, payload: dict[str, Any]) -> confirm.Done:
     project_id = int(payload["project_id"])
@@ -552,6 +563,9 @@ class ProjectItem(Model):
     title: str | None = Field(default=None, description="Project name (untrusted)")
     aliases: list[str] | None = Field(default=None, description="Other names (untrusted)")
     status: Literal["active", "archived"]
+    kind: Literal["project", "organization", "unit"] = Field(
+        default="project", description="project: an object, deal or line of work; organization: a company, client "
+                                        "or contractor; unit: a department inside an organization")
     chats: list[ProjectChat] | None = None
     open_commitments: int = 0
     updated: str | None = Field(default=None, description="Date of the last page change")
@@ -567,6 +581,9 @@ class ProjectPage(Model):
     entity_id: str = Field(description="Stable page id, e.g. project:3")
     title: str | None = Field(default=None, description="Project name (untrusted)")
     status: Literal["active", "archived"]
+    kind: Literal["project", "organization", "unit"] = Field(
+        default="project", description="project: an object, deal or line of work; organization: a company, client "
+                                        "or contractor; unit: a department inside an organization")
     aliases: list[str] | None = Field(default=None, description="Other names (untrusted)")
     chats: list[ProjectChat] | None = None
     participants: list[str] | None = Field(default=None, description="People writing in the project chats (untrusted)")
@@ -609,7 +626,7 @@ _PROJECT_ENTITY = re.compile(r"(?:project:)?(\d{1,18})")
 async def _items(conn: asyncpg.Connection, rows: list[dict[str, Any]]) -> list[ProjectItem]:
     return [ProjectItem(
         sphere=sanitize.clean_line(r.get("sphere"), 60) or None,
-        project_id=r["id"], title=clean_name(r["title"]), status=r["status"],
+        project_id=r["id"], title=clean_name(r["title"]), status=r["status"], kind=r.get("kind") or "project",
         aliases=[a for a in (clean_name(x) for x in r["aliases"]) if a] or None,
         chats=[ProjectChat(chat_id=c["id"], title=clean_name(c["title"])) for c in r["chats"]] or None,
         open_commitments=r["commitments_open"], updated=(r["page"] or {}).get("updated"))
@@ -624,7 +641,9 @@ async def list_projects_tool(
     spheres: SpheresArg = None,
 ) -> Annotated[CallToolResult, ProjectsResult]:
     """List the owner's projects (objects, deals, lines of work) that have a memory page: name,
-    other names, chats, the number of open commitments and the sphere. Call get_project_page with
+    other names, chats, the number of open commitments and the sphere. Organizations (companies,
+    clients, contractors) and their units are kept the same way, marked by `kind`; the status,
+    deadline and budget of a job are kept on the project, not on the organization. Call get_project_page with
     a project_id to read the page. `spheres` keeps only projects of those spheres ("без сферы" —
     projects without a sphere).
 
@@ -701,6 +720,7 @@ async def get_project_page(
         notes.append("The project is archived: its summary is no longer updated.")
     return as_result(ProjectPageResult(page=ProjectPage(
         project_id=item["id"], entity_id=page["entity_id"], title=clean_name(item["title"]), status=item["status"],
+        kind=item.get("kind") or "project",
         aliases=[a for a in (clean_name(x) for x in item["aliases"]) if a] or None,
         chats=[ProjectChat(chat_id=c["id"], title=clean_name(c["title"])) for c in item["chats"]] or None,
         participants=[n for n in (clean_name(x) for x in item.get("participants") or []) if n] or None,
