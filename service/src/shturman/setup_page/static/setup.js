@@ -2918,8 +2918,38 @@
     ] : []);
   }
 
+  // Вид проекта (Р-112): у организации и подразделения статус, срок и бюджет работ по ключу не пишутся
+  var PROJECT_KINDS = [["project", "Проект"], ["organization", "Организация"], ["unit", "Подразделение"]];
+
+  function kindTitle(kind) {
+    for (var i = 0; i < PROJECT_KINDS.length; i++) if (PROJECT_KINDS[i][0] === kind) return PROJECT_KINDS[i][1];
+    return "Проект";
+  }
+
+  function projectKind(p) {
+    var select = el("select", { id: "mem-project-kind" }, PROJECT_KINDS.map(function (k) {
+      return el("option", { value: k[0], text: k[1] });
+    }));
+    select.value = p.kind || "project";
+    var save = el("button", { class: "btn ghost", id: "mem-project-kind-save", type: "button", text: "Сохранить",
+      onclick: function () {
+        busy(save, true);
+        call("PUT", "memory/projects/" + p.id + "/kind", { kind: select.value }).then(function (r) {
+          busy(save, false);
+          if (!r.ok) { toast(r.error, true); return; }
+          toast(r.data.changed ? "Вид сохранён. Страница обновится при ближайшей сборке." : "Ничего не изменилось.");
+          showMemory(true);
+        });
+      } });
+    return memSection("Что это", "Проект — объект, сделка или работа. Организация — компания, заказчик или подрядчик; подразделение — отдел или служба. "
+      + "Статус, сроки и бюджет работ ассистент ведёт у проекта, а не у организации, которая её заказывает или делает. Уже записанное не пересматривается.", [
+      el("div", { class: "mem-add" }, [el("div", { class: "field grow" }, [el("label", { for: "mem-project-kind", text: "Вид" }), select]), save])
+    ]);
+  }
+
   function projectMeta(p) {
     var parts = [];
+    if (p.kind && p.kind !== "project") parts.push(kindTitle(p.kind).toLowerCase());
     if (p.sphere) parts.push("сфера «" + p.sphere + "»");
     parts.push(p.chats.length ? p.chats.length + " " + plural(p.chats.length, "чат", "чата", "чатов") : "без чатов");
     if (p.commitments_open) parts.push("открытых договорённостей: " + p.commitments_open);
@@ -2939,7 +2969,8 @@
         function () { mem.projectId = p.id; mem.project = null; openAndFocus(); })]);
     };
     var nodes = [
-      el("p", { class: "small", text: "Проект — объект, сделка или направление работы. У проекта своя страница: сводка по его чатам, решения, факты и договорённости." }),
+      el("p", { class: "small", text: "Проект — объект, сделка или направление работы. У проекта своя страница: сводка по его чатам, решения, факты и договорённости. "
+        + "Так же ведутся организации (компании, заказчики, подрядчики) и подразделения — вид меняется на странице проекта." }),
       el("div", { class: "row" }, [el("button", { class: "btn", id: "mem-project-new", type: "button", text: "Завести проект",
         onclick: function () { mem.creating = true; openAndFocus(); } })])
     ];
@@ -3066,7 +3097,8 @@
       el("button", { class: "link mem-back", type: "button", text: "← Все проекты",
                      onclick: function () { mem.projectId = null; mem.project = null; showMemory(true); } }),
       el("div", { class: "mem-title" }, [
-        el("h3", {}, [p.title, archived ? el("span", { class: "badge", text: "в архиве" }) : null]),
+        el("h3", {}, [p.title, p.kind && p.kind !== "project" ? el("span", { class: "badge", text: kindTitle(p.kind).toLowerCase() }) : null,
+                      archived ? el("span", { class: "badge", text: "в архиве" }) : null]),
         p.aliases.length ? el("p", { class: "small", text: "Ещё называют: " + p.aliases.join(", ") }) : null,
         p.participants.length ? el("p", { class: "small", text: "Участники: " + p.participants.join(", ") }) : null,
         el("p", { class: "small", text: p.updated ? "Страница обновлена " + day(p.updated) : "Страница ещё не записана: появится после ближайшей сборки." })
@@ -3081,6 +3113,7 @@
     nodes.push(commitmentsSection(p));
     nodes.push(timelineSection(p));
     nodes.push(projectChats(p));
+    nodes.push(projectKind(p));
     nodes.push(projectSphere(p));
     if (!archived) {
       var error = el("p", { class: "note warn mem-error", role: "alert", hidden: true });

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _with
 from datetime import datetime, timedelta, tzinfo
 from typing import Any, Sequence
 
@@ -402,8 +402,10 @@ EXTRACT_INSTRUCTIONS = f"""\
 11. same_as — если это то же самое дело, что обязательство раньше в ТВОЁМ списке commitments (один \
 предложил созвониться, другой ответил «окей, сейчас назначу»; «гляну цену» и «утром сообщу цену»; \
 «сейчас найду» и «сейчас скину»), укажи его порядковый номер в твоём списке (с 1); иначе null.
-12. project — название проекта (объекта, сделки), к которому относится обязательство, как оно \
-написано в переписке или в списке «Проекты владельца»; если не ясно — null.
+12. project — название проекта (объекта, сделки, работы), к которому относится обязательство, как оно \
+написано в переписке или в списке «Проекты владельца»; если обязательство не о работе, а об \
+организации или подразделении в целом — их название из переписки или из списка «Организации и \
+подразделения владельца»; если не ясно — null.
 13. Состояние на сегодня. Блок «После» — что было в чате дальше, до сегодняшнего дня. Для каждого \
 обязательства по сообщениям ПОЗЖЕ обещания (в «Сообщения» и «После») определи status: open — не \
 видно, что сделано; fulfilled — сделано (прислали, оплатили, «поправил», «сделал», «пополнил», \
@@ -416,7 +418,8 @@ EXTRACT_INSTRUCTIONS = f"""\
 
 Кроме обязательств, извлеки ФАКТЫ и РЕШЕНИЯ, которые стоит помнить: о человеке — должность, \
 компания, телефон, адрес, город («я теперь в „Альфе“», «мой новый номер …»); о проекте — цена, \
-бюджет, срок, статус, площадь, подрядчик; о {OWNER_LABEL} — то, что он прямо сказал о себе или \
+бюджет, срок, статус, площадь, подрядчик; об организации или подразделении — адрес, телефон, почта, \
+ответственный, чем занимается; о {OWNER_LABEL} — то, что он прямо сказал о себе или \
 о своих постоянных правилах; РЕШЕНИЕ по проекту — что именно решили, договорились, утвердили.
 
 Правила для фактов — соблюдай все:
@@ -424,7 +427,9 @@ EXTRACT_INSTRUCTIONS = f"""\
 source_quote — фрагмент этого сообщения, скопированный ДОСЛОВНО. Из блоков «Ранее» и «После», \
 пересланных сообщений и сообщений, написанных ассистентом, ничего не извлекай.
 16. about — о ком или о чём факт: {OWNER_LABEL}, метка участника (У1, У2…) или ПРОЕКТ. Для ПРОЕКТ \
-обязательно укажи project.
+обязательно укажи project — название проекта, организации или подразделения. Статус, срок, бюджет, \
+цена и площадь работы относятся к проекту — объекту, сделке или работе, — а не к организации или \
+отделу, которые её ведут или заказывают: тогда в project — название объекта или работы.
 17. slot — что за сведение, если оно сменяет прежнее: должность, компания, телефон, почта, адрес, \
 город, цена, бюджет, срок, статус, площадь, подрядчик, ответственный. Если факт ничего не \
 сменяет — null. slot_detail — к чему именно относится значение, если у субъекта таких значений \
@@ -442,8 +447,10 @@ source_quote — фрагмент этого сообщения, скопиро�
 Пароли, ключи, токены, коды подтверждения и номера карт не извлекай никогда. Из длинного \
 документа, регламента, протокола, презентации или таблицы — не больше двух фактов: что это за \
 документ и что в нём важно для {OWNER_LABEL}; пункты и числа документа по одному не переписывай.
-21. projects — названия проектов, объектов и сделок, которые обсуждаются в сообщениях, ровно \
-так, как они написаны. Если таких нет — пустой список.
+21. projects — проекты, объекты, сделки, организации и подразделения, которые обсуждаются в \
+сообщениях: title — название ровно так, как оно написано; kind — project (объект, сделка, работа), \
+organization (компания, заказчик, подрядчик, контрагент) или unit (отдел, служба, филиал внутри \
+организации). Если таких нет — пустой список.
 
 Ответ — один JSON-объект: {{"commitments": [{{"message": 1, "source_quote": "…", "what": "…", \
 "due_expression": "…" или null, "due_message": номер или null, "recipient": "У1" или null, \
@@ -452,7 +459,7 @@ source_quote — фрагмент этого сообщения, скопиро�
 "{AFTER_MARK}2" или null, "status_quote": "…" или null, "new_due_expression": "…" или null}}], \
 "facts": [{{"message": 1, "source_quote": "…", "about": "У1", "project": "…" или null, \
 "slot": "должность" или null, "slot_detail": "…" или null, "text": "…", "kind": "fact", \
-"nature": "state"}}], "projects": ["…"]}}
+"nature": "state"}}], "projects": [{{"title": "…", "kind": "project"}}]}}
 """
 
 # Схема намеренно нестрогая. Исполнитель сверяет ответ модели со схемой и при любом расхождении
@@ -470,7 +477,7 @@ EXTRACT_SCHEMA: dict[str, Any] = {
                    "facts: array of objects {message: integer, source_quote: string, about: string, "
                    "project: string or null, slot: string or null, slot_detail: string or null, text: string, "
                    "kind: fact | decision, nature: state | event | observation}; "
-                   "projects: array of strings",
+                   "projects: array of objects {title: string, kind: project | organization | unit}",
 }
 
 RESOLVE_INSTRUCTIONS = f"""\
@@ -514,19 +521,22 @@ def _known_line(n: int, item: dict[str, Any], tz: tzinfo | None = None) -> str:
 
 def build_extract_input(
     episode: Episode, labels: dict[tuple, str], tz: tzinfo | None, *, chat_kind: str,
-    known: Sequence[dict[str, Any]] = (), projects: Sequence[str] = (),
+    known: Sequence[dict[str, Any]] = (), projects: Sequence[str] = (), organizations: Sequence[str] = (),
 ) -> str:
     """Данные запроса на извлечение. `known` — уже записанные обязательства чата:
     [{"who": метка или имя, "what": ..., "due_expression": ...}] — для отметки дублей;
-    `projects` — названия действующих проектов владельца (чтобы модель называла их одинаково)."""
+    `projects` — названия действующих проектов владельца (чтобы модель называла их одинаково),
+    `organizations` — его действующих организаций и подразделений (Р-112)."""
     parts = ["<переписка>", render_conversation(episode, labels, tz, chat_kind=chat_kind)]
     if known:
         parts.append("Уже записано:")
         parts.extend(_known_line(n, item) for n, item in enumerate(known, start=1))
-    names = [clean_text(name, PROJECT_TITLE_LIMIT) for name in projects]
-    names = [name for name in names if name]
-    if names:
-        parts.append("Проекты владельца: " + "; ".join(names) + ".")
+    for heading, values in (("Проекты владельца", projects),
+                            ("Организации и подразделения владельца", organizations)):
+        names = [clean_text(name, PROJECT_TITLE_LIMIT) for name in values]
+        names = [name for name in names if name]
+        if names:
+            parts.append(f"{heading}: " + "; ".join(names) + ".")
     parts.append("</переписка>")
     return "\n".join(parts)
 
@@ -1270,6 +1280,17 @@ class Mention:
 
     title: str
     message: Msg
+    kind: str | None = None       # как назвала модель: project | organization | unit (см. PROJECT_KINDS)
+
+
+# Вид страницы проекта (Р-112): объект или работа; организация (компания, заказчик, подрядчик);
+# подразделение (отдел, служба внутри организации). Ответ без вида читается как раньше.
+PROJECT_KINDS = ("project", "organization", "unit")
+
+
+def project_kind(value: Any) -> str | None:
+    """Вид упоминания из ответа модели; незнакомый — None (решит код, по умолчанию проект)."""
+    return value if isinstance(value, str) and value in PROJECT_KINDS else None
 
 
 def find_mention(title: str, episode: Episode) -> Mention | None:
@@ -1297,7 +1318,9 @@ def validate_projects(parsed: Any, episode: Episode) -> tuple[list[Mention], dic
     out: list[Mention] = []
     seen: set[str] = set()
     for item in items:
-        title = project_label(item)
+        # строка — как до 0.0.17; объект {"title", "kind"} — с видом (Р-112)
+        raw, kind = (item.get("title"), project_kind(item.get("kind"))) if isinstance(item, dict) else (item, None)
+        title = project_label(raw)
         if title is None:
             dropped["malformed"] += 1
             continue
@@ -1312,7 +1335,7 @@ def validate_projects(parsed: Any, episode: Episode) -> tuple[list[Mention], dic
             dropped["ungrounded"] += 1
             continue
         seen.add(key)
-        out.append(found)
+        out.append(_with(found, kind=kind))
     return out, dropped
 
 

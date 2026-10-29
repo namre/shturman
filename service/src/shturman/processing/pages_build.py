@@ -442,6 +442,7 @@ class Subject:
 
     kind: str                            # person | project | owner
     name: str                            # как есть (в файле экранируется)
+    project_kind: str = "project"        # у проекта: project | organization | unit (Р-112)
     aliases: list[str] = field(default_factory=list)
     chats: list[str] = field(default_factory=list)
     participants: list[str] = field(default_factory=list)
@@ -455,7 +456,7 @@ class Subject:
 
 
 async def _project(conn: asyncpg.Connection, project_id: int) -> dict[str, Any] | None:
-    row = await conn.fetchrow("SELECT id, title, status FROM projects WHERE id = $1", project_id)
+    row = await conn.fetchrow("SELECT id, title, status, kind FROM projects WHERE id = $1", project_id)
     if row is None:
         return None
     aliases = [clean_line(r["alias"], 120) for r in await conn.fetch(
@@ -466,7 +467,8 @@ async def _project(conn: asyncpg.Connection, project_id: int) -> dict[str, Any] 
            WHERE pc.project_id = $1 ORDER BY pc.added_at, c.id LIMIT 30""", project_id)]
     from . import projects as projects_
     names = [clean_line(p["name"], 120) for p in await projects_.participants(conn, project_id, limit=20)]
-    return {"id": row["id"], "name": row["title"], "status": row["status"], "aliases": [a for a in aliases if a],
+    return {"id": row["id"], "name": row["title"], "status": row["status"], "kind": row["kind"],
+            "aliases": [a for a in aliases if a],
             "chats": chats, "participants": [n for n in names if n]}
 
 
@@ -485,7 +487,7 @@ async def _subject(
         return Subject(kind=kind, name=project["name"], aliases=project["aliases"], chats=project["chats"],
                        participants=project["participants"], entries=entries + fact_entries, table=table,
                        facts=current, decisions=decisions, with_summary=project["status"] == "active",
-                       project_id=project["id"]), None
+                       project_id=project["id"], project_kind=project["kind"]), None
     if kind == pages.OWNER_PAGE:
         fact_entries, current, _ = await _facts_from_base(conn, "owner", None)
         return Subject(kind=kind, name="Профиль владельца", entries=fact_entries, table=None, facts=current,
@@ -582,6 +584,7 @@ async def _compose(
     page.aliases = subject.aliases
     if subject.kind == pages.PROJECT:
         page.chats, page.participants = subject.chats, subject.participants
+        page.kind = "" if subject.project_kind == "project" else subject.project_kind
     kept = page.updated
     try:
         date.fromisoformat(kept)
@@ -839,7 +842,8 @@ PROJECT_SUMMARY_INSTRUCTIONS = f"""\
 
 Правила — соблюдай все:
 1. Верни от 0 до 8 коротких утверждений: что это за проект, на каком он этапе, кто в нём \
-участвует, что сейчас главное. Одно утверждение — одна фраза до 200 знаков, по-русски.
+участвует, что сейчас главное. Если в данных «Организация:» или «Подразделение:» — страница о \
+компании или отделе: чем занимается, кто в нём, какие работы с ним идут, что сейчас главное. Одно утверждение — одна фраза до 200 знаков, по-русски.
 2. Каждое утверждение опирается на сообщения: в sources перечисли номера из квадратных скобок, \
 от одного до пяти. Номеров, которых нет в данных, не указывай. Утверждение без источника не пиши.
 3. origin: owner — это сказал {OWNER_LABEL}; other — это сказал другой участник; model — это твой \
@@ -923,13 +927,14 @@ async def _sample_project(
 def _summary_input(
     name: str, today: date, table_text: str, timeline_text: str, sample: Sequence[asyncpg.Record],
     zone: ZoneInfo, options: Options, *, kind: str = pages.PERSON, facts_text: str = "",
-    decisions_text: str = "",
+    decisions_text: str = "", project_kind: str = "project",
 ) -> str:
     def numbered(text: str) -> str:
         return extract.clean_text(_LINK_TO_NUMBER.sub(r"[\1]", pages.without_keys(text)), 600)
 
     if kind == pages.PROJECT:
-        head = f"Проект: {extract.clean_name(name) or 'название неизвестно'}. Сегодня {today.isoformat()}."
+        label = {"organization": "Организация", "unit": "Подразделение"}.get(project_kind, "Проект")
+        head = f"{label}: {extract.clean_name(name) or 'название неизвестно'}. Сегодня {today.isoformat()}."
     else:
         head = f"Человек: {extract.clean_name(name) or 'имя неизвестно'}. Сегодня {today.isoformat()}."
     parts = ["<страница>", head]
@@ -1022,14 +1027,15 @@ async def _plan_summary(
     page, kind = draft.page, draft.row["entity_type"]
     since = now - timedelta(days=options.sample_days)
     if kind == pages.PROJECT:
-        project = await conn.fetchrow("SELECT id, title, status FROM projects WHERE id = $1", draft.row["project_id"])
+        project = await conn.fetchrow("SELECT id, title, status, kind FROM projects WHERE id = $1",
+                                      draft.row["project_id"])
         if project is None or project["status"] != "active":
             return None
-        name = project["title"]
+        name, project_kind = project["title"], project["kind"]
         sample = await _sample_project(conn, project["id"], since=since, options=options)
     elif kind == pages.PERSON:
         person = await _person(conn, draft.row["person_id"])
-        name = person["name"]
+        name, project_kind = person["name"], "project"
         sample = await _sample(conn, person["peers"], since=since, options=options)
     else:
         return None
@@ -1039,7 +1045,8 @@ async def _plan_summary(
         return None
     offered = await _alive(conn, referenced)
     offered.update({r["id"]: r["is_outgoing"] for r in sample})
-    extra = {"kind": kind, "facts_text": page.facts or "", "decisions_text": page.decisions or ""}
+    extra = {"kind": kind, "facts_text": page.facts or "", "decisions_text": page.decisions or "",
+             "project_kind": project_kind}
     text = _summary_input(name, today, page.commitments, page.timeline, sample, zone, options, **extra)
     # отпечаток не зависит от даты запроса: иначе сводка запрашивалась бы каждую ночь
     stable = _summary_input(name, date.min, page.commitments, page.timeline, sample, zone, options, **extra)

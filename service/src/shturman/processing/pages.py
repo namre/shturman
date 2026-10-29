@@ -24,6 +24,7 @@
 
 Блоки decisions и facts необязательны: страницы версии 0.0.7 их не имеют и читаются как раньше.
 У проекта в шапке ещё два списка — chats (чаты проекта) и participants (участники); оба пишет код.
+У организации и подразделения (Р-112) — ещё строка kind: organization или kind: unit; у проекта её нет.
 
 Виды страниц: person — человек (`people/<имя>-<id>.md`), project — проект
 (`projects/<название>-<id>.md`), owner — профиль владельца (`owner/profile.md`).
@@ -108,7 +109,7 @@ _REL_PATH = re.compile(
 _FRONT_KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?")
 _PLAIN_ALIAS = re.compile(r"[A-Za-zА-Яа-яЁё](?:[A-Za-zА-Яа-яЁё0-9 .-]*[A-Za-zА-Яа-яЁё0-9.])?")
 _YAML_WORDS = frozenset({"null", "true", "false", "yes", "no", "on", "off", "y", "n"})
-_OUR_KEYS = ("entity_id", "type", "aliases", "chats", "participants", "updated")
+_OUR_KEYS = ("entity_id", "type", "kind", "aliases", "chats", "participants", "updated")
 
 
 class PageError(ValueError):
@@ -290,6 +291,8 @@ def _parse_flow_list(value: str) -> list[str] | None:
 class Page:
     entity_id: str = ""
     type: str = "person"
+    # только у проекта, не «project»: organization | unit (Р-112; пишет код)
+    kind: str = ""
     aliases: list[str] = field(default_factory=list)
     # только у проекта: названия чатов и участники (пишет код)
     chats: list[str] = field(default_factory=list)
@@ -341,6 +344,7 @@ def parse(text: str) -> Page:
     if not seen.get("entity_id"):
         raise PageError("в шапке нет entity_id")
     page.entity_id, page.type = seen["entity_id"], seen.get("type", "")
+    page.kind = seen.get("kind", "")
     page.aliases = _parse_flow_list(seen.get("aliases", "")) or []
     page.chats = _parse_flow_list(seen.get("chats", "")) or []
     page.participants = _parse_flow_list(seen.get("participants", "")) or []
@@ -384,8 +388,10 @@ def parse(text: str) -> Page:
 
 def render(page: Page) -> str:
     """Собирает файл. Блок владельца и строки хронологии выводятся как есть."""
-    out = ["---\n", f"entity_id: {page.entity_id}\n", f"type: {page.type}\n",
-           f"aliases: {_flow_list(page.aliases)}\n"]
+    out = ["---\n", f"entity_id: {page.entity_id}\n", f"type: {page.type}\n"]
+    if page.type == PROJECT and page.kind in ("organization", "unit"):
+        out.append(f"kind: {page.kind}\n")
+    out.append(f"aliases: {_flow_list(page.aliases)}\n")
     if page.type == PROJECT or page.chats:
         out.append(f"chats: {_flow_list(page.chats)}\n")
     if page.type == PROJECT or page.participants:

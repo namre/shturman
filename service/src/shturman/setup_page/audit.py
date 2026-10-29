@@ -88,6 +88,7 @@ ACTIONS = {
     "memory.project_create": "Заведён проект",
     "memory.project_chats": "Изменены чаты проекта",
     "memory.project_archive": "Проект перенесён в архив",
+    "memory.project_kind": "Изменён вид проекта",
     "memory.project_accept": "Заведён предложенный проект",
     "memory.project_reject": "Предложенный проект решено не заводить",
     "memory.fact_retract": "Факт отмечен как неверный",

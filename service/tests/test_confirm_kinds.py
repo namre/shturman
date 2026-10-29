@@ -15,6 +15,8 @@ EXPECTED = {
     "commitments.decide", "people.merge", "people.split", "people.alias",
     "pages.owner_block", "pages.accept",
     "projects.create", "projects.chats", "projects.archive", "projects.accept", "facts.retract",
+    # вид проекта (Р-112): проект, организация, подразделение — только владелец со страницы настройки
+    "projects.kind",
     # сферы (Р-82): любое изменение через внутренний API ждёт владельца, в том числе «убрать» и «удалить»
     "spheres.create", "spheres.update", "spheres.delete", "spheres.chats", "spheres.project",
     # уведомления владельцу (Р-84): расширение (больше сообщений, текст в уведомлении) ждёт владельца,

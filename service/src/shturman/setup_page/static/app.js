@@ -2829,7 +2829,8 @@
     var list = $("mm-list"), d = mm.list || { people: [], projects: [] };
     list.textContent = "";
     if (!$("mm-q").value.trim()) list.appendChild(mmEntry(d.owner, "о вас: профиль"));
-    d.projects.forEach(function (p) { list.appendChild(mmEntry(p, "проект")); });
+    var KIND_NOTE = { organization: "организация", unit: "подразделение" };
+    d.projects.forEach(function (p) { list.appendChild(mmEntry(p, KIND_NOTE[p.project_kind] || "проект")); });
     d.people.forEach(function (p) { list.appendChild(mmEntry(p, "человек")); });
     show("mm-empty", !list.childNodes.length);
   }

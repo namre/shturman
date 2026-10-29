@@ -87,6 +87,8 @@ async def app_memory_list(request: Request) -> JSONResponse:
     out_people = [{"kind": "person", "id": p["person_id"], "title": clean_line(p["title"], 80)}
                   for p in people if not query or query in (p["title"] or "").casefold()][:LIST_LIMIT]
     out_projects = [{"kind": "project", "id": p["id"], "title": clean_line(p["title"], 80),
+                     # вид страницы (Р-112): project | organization | unit
+                     "project_kind": p.get("kind") or "project",
                      "waiting": waiting.get(("project", p["id"]), 0)}
                     for p in active if not query or query in (p["title"] or "").casefold()
                     or any(query in (a or "").casefold() for a in p.get("aliases") or [])][:LIST_LIMIT]

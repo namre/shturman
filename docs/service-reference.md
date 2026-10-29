@@ -98,6 +98,7 @@
 | `GET /shturman-setup/api/memory/projects/{id}` | Страница проекта текстом, `facts` и `decisions` из базы, чаты (`id`, название), участники, другие названия |
 | `PUT /shturman-setup/api/memory/projects/{id}/chats` | `{chat_ids}` — весь перечень: `apply_owner(projects.chats)` |
 | `POST /shturman-setup/api/memory/projects/{id}/archive` | `apply_owner(projects.archive)`; уже в архиве — 409 |
+| `PUT /shturman-setup/api/memory/projects/{id}/kind` | `{kind}` — `project`, `organization` или `unit` (Р-112): `apply_owner(projects.kind)`; у внутреннего API такого маршрута нет |
 | `PUT /shturman-setup/api/memory/projects/{id}/owner-block` | `{text}` — заметки о проекте: `pages.owner_block` с `entity_id` `project:N` |
 | `GET /shturman-setup/api/memory/chats` | Чаты, которые читает сервис (не исключённые, с сообщениями): номер, название, вид — для выбора чатов проекта |
 | `GET /shturman-setup/api/memory/profile` | Профиль: одобренные факты о владельце и его правила (блок владельца страницы `owner:profile`) |
@@ -116,7 +117,7 @@
 | `GET /shturman-setup/api/spheres/folders`, `POST …/spheres/folders/make`, `POST …/spheres/{id}/folders`, `POST …/spheres/{id}/proposals` | Папки Telegram; «Сделать сферу из папки» `{account_id, folder_id, sphere_id?}`; «Связать папку» `{account_id, folder_id, link}`; решение по предложенным `{account_id, folder_id, accept, chats?}` |
 | `GET /shturman-setup/api/tg/accounts/{id}/sections`, `POST …/bulk` | Раскладка списка чатов; «Включить все» `{section, enabled: true, months?}` (исключённые и служебные пропускаются) и «Выключить все» в разделе |
 
-Внутренний API эти маршруты не меняют: через `/api/pages…`, `/api/commitments…`, `/api/projects…`, `/api/facts…` и `/api/owner/profile…` те же решения по-прежнему ждут нажатия в боте. Журнал — `memory.owner_block`, `memory.profile_block`, `memory.owner_fact_accept` (в списке важных), `memory.page_accept`, `memory.page_reject`, `memory.commitment_accept`, `memory.commitment_reject`, `memory.project_create`, `memory.project_chats`, `memory.project_archive`, `memory.project_accept`, `memory.project_reject`, `memory.fact_retract`, `memory.owner_fact_reject`; в записи — номера и числа, без имён, названий и текста.
+Внутренний API эти маршруты не меняют: через `/api/pages…`, `/api/commitments…`, `/api/projects…`, `/api/facts…` и `/api/owner/profile…` те же решения по-прежнему ждут нажатия в боте. Журнал — `memory.owner_block`, `memory.profile_block`, `memory.owner_fact_accept` (в списке важных), `memory.page_accept`, `memory.page_reject`, `memory.commitment_accept`, `memory.commitment_reject`, `memory.project_create`, `memory.project_chats`, `memory.project_archive`, `memory.project_kind`, `memory.project_accept`, `memory.project_reject`, `memory.fact_retract`, `memory.owner_fact_reject`; в записи — номера и числа, без имён, названий и текста.
 
 **Отдельный вход.** Страница — не ещё один клиент внутреннего API: её маршруты (`/shturman-setup/api/…`) зовут функции сервиса напрямую и не принимают его токены.
 
@@ -361,7 +362,7 @@
 | Вход в аккаунт Telegram; снятие с паузы; включение чатов; «брать новые чаты сами»; более глубокая история | Пауза, выход, отмена входа, выключение чатов, более мелкая история |
 | Принятие предложенного обязательства (в том числе «вернуть в работу» и «закрыть» для неодобренного); объединение и разделение людей; алиас неподтверждённому человеку | Работа с принятым обязательством; отклонение предложений; алиас подтверждённому человеку |
 | Запись блока владельца на странице памяти; согласие завести страницу | Отказ завести страницу; сборка страниц; запуск обработки |
-| Завести проект; принять предложенный проект; изменить чаты проекта; убрать проект в архив; отметить факт неверным; правила в профиле владельца (блок владельца страниц проекта и профиля) | Отказ от предложенного проекта |
+| Завести проект; принять предложенный проект; изменить чаты проекта; убрать проект в архив; изменить вид проекта (`projects.kind`, Р-112 — только владелец на странице настройки, у внутреннего API маршрута нет); отметить факт неверным; правила в профиле владельца (блок владельца страниц проекта и профиля) | Отказ от предложенного проекта |
 | Любое изменение сфер: завести, переименовать, удалить, отнести чат к сфере или убрать, сфера проекта (`spheres.create`, `spheres.update`, `spheres.delete`, `spheres.chats`, `spheres.project`; Р-82) — в том числе «убрать» и «удалить»: в следующих шагах сферы будут решать обработку, модель и границу ответов | Посмотреть сферы (`GET /api/spheres`) |
 | Расширение черновиков ответов (`rehearsal.settings`, Р-85, Р-105): включить, новые люди в списке, выше дневной предел, короче пауза | Выключить, убрать людей, ниже предел, длиннее пауза (с сообщением владельцу) |
 | «Продолжить» после «Остановить всё» (`halt.resume`, Р-87) — из «Настроек Штурмана» и приложения; **только нажатием в самом боте**: из приложения «Да, сделать» не принимается, внутренний API и ассистент её не просят | «Остановить всё» — со страницы, из приложения, в боте (меню «Пауза», `/pause`, `/stop`) |
