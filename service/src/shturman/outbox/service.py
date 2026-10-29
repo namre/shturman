@@ -786,9 +786,10 @@ async def _apply_rule_update(conn: asyncpg.Connection, payload: dict[str, Any]) 
         f"""UPDATE watch_rules SET {', '.join(f'{c} = ${i}' for i, c in enumerate(columns, 2))},
                    updated_at = now() WHERE id = $1 RETURNING *""",
         rule_id, *[changes[c] for c in columns])
-    # Ужесточение через внутренний API применяется сразу — владелец узнаёт о нём сообщением (ОТ-39).
-    # Под карточкой и со страницы настройки сообщение не уходит: итог он уже видит сам (confirm.tell).
-    said = _rule_changed(current, changes)
+    # Ужесточение без владельца (токен ассистента, оператор) применяется сразу — владелец узнаёт о нём
+    # сообщением (ОТ-39). Его собственная правка, нажатие под карточкой и страница настройки — без
+    # сообщения: итог он уже видит сам.
+    said = _rule_changed(current, changes) if confirm.unconfirmed() else []
     if said:
         await confirm.tell(conn, f"Изменено правило наблюдателя «{textlib.one_line(row['name'], 100)}»: "
                                  + "; ".join(said) + ".", silent=True)

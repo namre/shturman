@@ -4,7 +4,7 @@
 
 from datetime import date
 
-from shturman.processing import facts, pages, people, projects
+from shturman.processing import facts, pages, pages_build, people, projects
 
 from memory_helpers import owner
 from pages_helpers import NOW, PETR, build, commitment, seed
@@ -60,6 +60,7 @@ async def test_links_follow_only_what_is_visible(conn):
 
 async def test_person_page_lists_projects_and_project_page_its_people(conn, config):
     w = await world(conn)
+    await pages_build.ensure_page(conn, w.ivan)            # страница подтверждённого человека
     await build(conn, config, now=NOW)
     person_path = await conn.fetchval("SELECT path FROM pages WHERE person_id = $1", w.ivan)
     project_path = await conn.fetchval("SELECT path FROM pages WHERE project_id = $1", w.project)
