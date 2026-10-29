@@ -453,6 +453,7 @@ class Subject:
     with_summary: bool = True
     peers: list[int] = field(default_factory=list)
     project_id: int | None = None
+    projects: list[str] = field(default_factory=list)   # у человека: его проекты (связи страниц)
 
 
 async def _project(conn: asyncpg.Connection, project_id: int) -> dict[str, Any] | None:
@@ -499,8 +500,10 @@ async def _subject(
                       if person["merged_into"] is not None else "это запись самого владельца: страница не ведётся")
     entries, table = await _from_base(conn, person["peers"], zone, options)
     fact_entries, current, _ = await _facts_from_base(conn, "person", person["id"])
+    from . import projects as projects_
+    linked = [clean_line(p["title"], 120) for p in await projects_.projects_of_person(conn, person["id"])]
     return Subject(kind=kind, name=person["name"], aliases=person["aliases"], entries=entries + fact_entries,
-                   table=table, facts=current, peers=person["peers"]), None
+                   table=table, facts=current, peers=person["peers"], projects=[t for t in linked if t]), None
 
 
 async def _compose(
@@ -585,6 +588,8 @@ async def _compose(
     if subject.kind == pages.PROJECT:
         page.chats, page.participants = subject.chats, subject.participants
         page.kind = "" if subject.project_kind == "project" else subject.project_kind
+    elif subject.kind == pages.PERSON:
+        page.projects = subject.projects
     kept = page.updated
     try:
         date.fromisoformat(kept)

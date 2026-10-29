@@ -7,10 +7,10 @@
 
 import pytest
 
-from shturman import bridge, confirm, jobs
+from shturman import authority, bridge, confirm, jobs
 from shturman.outbox import autoreply, policy
 
-from outbox_helpers import HELPER, IVAN, MARIA, OWNER, add_chat, add_message, env  # noqa: F401 - env — фикстура
+from outbox_helpers import HELPER, IVAN, MARIA, OWNER, add_chat, add_message, env, take  # noqa: F401 - env — фикстура
 
 RULE = {"name": "Срочное", "description": "Просят владельца срочно ответить", "keywords": ["срочно"]}
 
@@ -492,6 +492,27 @@ async def test_narrowing_a_watch_rule_is_immediate_in_both_modes(env, either_mod
     assert answer.status_code == 200 and await approvals.pending() == 0
     key, value = next(iter(change.items()))
     assert answer.json()[key] == value
+
+
+async def test_narrowing_a_watch_rule_is_told_to_the_owner(env):
+    """ОТ-39: ужесточение через внутренний API без владельца применяется сразу — владелец узнаёт о нём
+    сообщением. Его собственная правка (контекст владельца) сообщением не дублируется."""
+    rule_id, chat, _ = await a_rule(env)
+    await take(env.conn, bridge.NOTIFY_OWNER)
+    answer = await env.client.put(f"/api/watch/rules/{rule_id}",
+                                  json={"enabled": False, "chat_ids": [chat], "max_notifications_per_day": 1})
+    assert answer.status_code == 200
+    told = [j["payload"]["text"] for j in await take(env.conn, bridge.NOTIFY_OWNER)]
+    assert len(told) == 1 and told[0].startswith("Изменено правило наблюдателя «Срочное»: ")
+    assert "выключено" in told[0] and "чатов было 2, стало 1" in told[0]
+    assert "уведомлений вам в сутки: было" in told[0] and "горит" not in told[0]      # слова не пересказываются
+    # то же значение ещё раз — ничего не изменилось и сообщать нечего
+    assert (await env.client.put(f"/api/watch/rules/{rule_id}", json={"enabled": False})).status_code == 200
+    assert await take(env.conn, bridge.NOTIFY_OWNER) == []
+    # сам владелец сузил правило — сообщения нет
+    with authority.owner_context(OWNER, chat_id=OWNER, action="test.owner"):
+        assert (await env.client.put(f"/api/watch/rules/{rule_id}", json={"keywords": ["срочно"]})).status_code == 200
+    assert await take(env.conn, bridge.NOTIFY_OWNER) == []
 
 
 async def test_dropping_a_chat_from_a_rule_is_immediate(env, either_mode, approvals):

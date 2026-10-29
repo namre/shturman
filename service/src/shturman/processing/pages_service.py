@@ -68,7 +68,7 @@ from ..mcp_server import (
     untrusted_snippet,
     untrusted_text,
 )
-from . import pages, pages_build, people, pipeline
+from . import pages, pages_build, people, pipeline, projects
 
 logger = logging.getLogger("shturman.pages")
 
@@ -340,6 +340,13 @@ class PagePerson(Model):
     name: str | None = Field(default=None, description="Display name (untrusted)")
 
 
+class PersonProject(Model):
+    project_id: int = Field(description="Pass it as `project` to get_project_page")
+    title: str | None = Field(default=None, description="Project name (untrusted)")
+    kind: Literal["project", "organization", "unit"] = "project"
+    status: Literal["active", "archived"] = "active"
+
+
 class PersonPage(Model):
     person_id: int = Field(description="Registry person id of the page")
     entity_id: str = Field(description="Stable page id, e.g. person:12")
@@ -366,6 +373,9 @@ class PersonPage(Model):
         default=None, description="Remarks about the page state, e.g. the summary is out of date")
     spheres: list[str] | None = Field(
         default=None, description="Spheres of the chats where this person has a direct chat or wrote recently")
+    projects: list[PersonProject] | None = Field(
+        default=None, description="Projects, organizations and units this person is linked to: writes in their "
+                                  "chats, has a commitment there or stated a current fact about them")
 
 
 class PersonPageResult(Reply):
@@ -466,6 +476,7 @@ async def get_person_page(
             raise ToolError("Pass `person` (an id or a name) or `sender_id`.")
         page = await pages_build.get_page(conn, person_id, visible_only=True) if person_id is not None else None
         marks = await spheres_mod.titles_by_person(conn, [page["person_id"]]) if page is not None else {}
+        linked = await projects.projects_of_person(conn, page["person_id"]) if page is not None else []
     if page is None:
         return as_result(PersonPageResult(
             status="not_found",
@@ -484,6 +495,8 @@ async def get_person_page(
         timeline=untrusted_text(blocks.get("timeline"), BLOCK_TEXT),
         notes=notes or None,
         spheres=[n for n in (clean_name(t, 60) for t in marks.get(page["person_id"], [])) if n] or None,
+        projects=[PersonProject(project_id=p["project_id"], title=clean_name(p["title"]), kind=p["kind"],
+                                status=p["status"]) for p in linked] or None,
     )))
 
 

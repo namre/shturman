@@ -123,16 +123,56 @@ async def _aliases(conn: asyncpg.Connection, project_id: int) -> list[str]:
         "SELECT alias FROM project_aliases WHERE project_id = $1 ORDER BY id", project_id)]
 
 
+# Связи страниц (пакет 0.0.17): человек относится к проекту, если писал в его чатах, обещал или ему
+# обещали в договорённости проекта, или сказал о проекте действующий факт. Только видимое: чат не
+# исключён, сообщение не удалено и видно ассистенту; договорённость принята (не предложение).
+_LINKS = """
+  SELECT pc.project_id, pp.person_id, 'chat' AS via, count(*) AS n FROM project_chats pc
+  JOIN chats c ON c.id = pc.chat_id AND NOT c.excluded
+  JOIN messages m ON m.chat_id = c.id AND m.deleted_at IS NULL AND m.agent_visible AND m.kind = 'message'
+  JOIN person_peers pp ON pp.peer_id = m.sender_peer_id
+  WHERE {where_pc} GROUP BY 1, 2
+  UNION ALL
+  SELECT k.project_id, pp.person_id, 'commitment', count(*) FROM commitments k
+  JOIN chats c ON c.id = k.chat_id AND NOT c.excluded
+  JOIN messages m ON m.id = k.source_message_id AND m.deleted_at IS NULL AND m.agent_visible
+  JOIN person_peers pp ON pp.peer_id IN (k.debtor_peer_id, k.creditor_peer_id)
+  WHERE {where_k} AND k.status IN ('open', 'done', 'team') GROUP BY 1, 2
+  UNION ALL
+  SELECT f.project_id, pp.person_id, 'fact', count(*) FROM facts f
+  JOIN messages m ON m.id = f.source_message_id AND m.deleted_at IS NULL AND m.agent_visible
+  JOIN chats c ON c.id = m.chat_id AND NOT c.excluded
+  JOIN person_peers pp ON pp.peer_id = m.sender_peer_id
+  WHERE {where_f} AND f.subject_type = 'project' AND f.status = 'active' GROUP BY 1, 2"""
+LINK_VIA = ("chat", "commitment", "fact")
+
+
 async def participants(conn: asyncpg.Connection, project_id: int, limit: int = 30) -> list[dict[str, Any]]:
-    """Люди с сообщениями в чатах проекта (видимыми), кроме владельца: по числу сообщений."""
+    """Люди проекта, кроме владельца: писали в его чатах, участвуют в его договорённостях или сказали
+    о нём действующий факт (_LINKS). Порядок — по числу сообщений в чатах проекта, затем по остальному.
+    `via` — откуда связь: chat | commitment | fact."""
+    links = _LINKS.format(where_pc="pc.project_id = $1", where_k="k.project_id = $1", where_f="f.project_id = $1")
     rows = await conn.fetch(
-        """SELECT p.id, p.display_name, count(*) AS n FROM project_chats pc
-           JOIN chats c ON c.id = pc.chat_id AND NOT c.excluded
-           JOIN messages m ON m.chat_id = c.id AND m.deleted_at IS NULL AND m.agent_visible AND m.kind = 'message'
-           JOIN person_peers pp ON pp.peer_id = m.sender_peer_id
-           JOIN people p ON p.id = pp.person_id AND NOT p.is_owner AND p.merged_into IS NULL
-           WHERE pc.project_id = $1 GROUP BY p.id ORDER BY n DESC, p.id LIMIT $2""", project_id, limit)
-    return [{"person_id": r["id"], "name": r["display_name"], "messages": r["n"]} for r in rows]
+        f"""SELECT p.id, p.display_name, sum(l.n) FILTER (WHERE l.via = 'chat') AS messages, sum(l.n) AS total,
+                   array_agg(DISTINCT l.via) AS via
+            FROM ({links}) l JOIN people p ON p.id = l.person_id AND NOT p.is_owner AND p.merged_into IS NULL
+            GROUP BY p.id ORDER BY coalesce(sum(l.n) FILTER (WHERE l.via = 'chat'), 0) DESC, sum(l.n) DESC, p.id
+            LIMIT $2""", project_id, limit)
+    return [{"person_id": r["id"], "name": r["display_name"], "messages": int(r["messages"] or 0),
+             "via": [v for v in LINK_VIA if v in r["via"]]} for r in rows]
+
+
+async def projects_of_person(conn: asyncpg.Connection, person_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    """Обратная связь: заведённые проекты (действующие и в архиве), к которым относится человек, —
+    по тем же правилам, что `participants`. Действующие первыми, затем по числу связей."""
+    links = _LINKS.format(where_pc="pp.person_id = $1", where_k="k.project_id IS NOT NULL AND pp.person_id = $1",
+                          where_f="f.project_id IS NOT NULL AND pp.person_id = $1")
+    rows = await conn.fetch(
+        f"""SELECT j.id, j.title, j.kind, j.status, array_agg(DISTINCT l.via) AS via
+            FROM ({links}) l JOIN projects j ON j.id = l.project_id AND j.status IN ('active', 'archived')
+            GROUP BY j.id ORDER BY j.status = 'archived', sum(l.n) DESC, j.id LIMIT $2""", person_id, limit)
+    return [{"project_id": r["id"], "title": r["title"], "kind": r["kind"], "status": r["status"],
+             "via": [v for v in LINK_VIA if v in r["via"]]} for r in rows]
 
 
 def _loads(value: Any) -> Any:
@@ -167,10 +207,12 @@ async def _to_dict(conn: asyncpg.Connection, row: asyncpg.Record, *, full: bool 
         "untrusted_fields": list(UNTRUSTED_FIELDS),
     }
     if full:
+        linked = await participants(conn, row["id"])
         reason = _loads(row["reason"]) or {}
         out.update(description=row["description"], reason={
             k: v for k, v in reason.items() if k in ("mentions", "episodes", "messages", "chats")},
-            participants=[p["name"] for p in await participants(conn, row["id"])])
+            participants=[p["name"] for p in linked],
+            people=[{"person_id": p["person_id"], "name": p["name"], "via": p["via"]} for p in linked])
     return out
 
 
